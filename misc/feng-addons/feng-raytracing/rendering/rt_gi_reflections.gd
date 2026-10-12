@@ -14,10 +14,11 @@ var shadow_shader := RID()
 var sbt := RID()
 var sbt_range := 0
 var frame_buffer := RID()
+var candidate_sampler := RID()
 var temporal_shader := RID()
 var temporal_pipeline := RID()
-var composite_shader := RID()
-var composite_pipeline := RID()
+var candidate_shader := RID()
+var candidate_pipeline := RID()
 
 func _keep(rid: RID) -> RID:
 	if rid.is_valid():
@@ -41,15 +42,16 @@ func release() -> void:
 	sbt = RID()
 	sbt_range = 0
 	frame_buffer = RID()
+	candidate_sampler = RID()
 	temporal_shader = RID()
 	temporal_pipeline = RID()
-	composite_shader = RID()
-	composite_pipeline = RID()
+	candidate_shader = RID()
+	candidate_pipeline = RID()
 	rd = null
 
 func initialize(device: RenderingDevice, p_sky_array: bool) -> bool:
 	if rd == device and sky_array == p_sky_array and ray_pipeline.is_valid() \
-			and temporal_pipeline.is_valid() and composite_pipeline.is_valid():
+			and temporal_pipeline.is_valid() and candidate_pipeline.is_valid():
 		return true
 	release()
 	rd = device
@@ -61,8 +63,12 @@ func initialize(device: RenderingDevice, p_sky_array: bool) -> bool:
 		error = build_error
 		return false
 	frame_buffer = _keep(rd.uniform_buffer_create(256))
-	if not frame_buffer.is_valid():
-		error = "RT reflection frame buffer creation failed"
+	var sampler_state := RDSamplerState.new()
+	sampler_state.min_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+	sampler_state.mag_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+	candidate_sampler = _keep(rd.sampler_create(sampler_state))
+	if not frame_buffer.is_valid() or not candidate_sampler.is_valid():
+		error = "RT reflection frame buffer or candidate sampler creation failed"
 		var buffer_error := error
 		release()
 		error = buffer_error
@@ -139,7 +145,7 @@ func _create_ray_pipeline() -> bool:
 	return true
 
 func _create_compute_pipelines() -> bool:
-	for shader_name in ["gi_reflection_temporal", "gi_reflection_composite"]:
+	for shader_name in ["gi_reflection_temporal", "gi_reflection_candidate"]:
 		var source := RDShaderSource.new()
 		source.source_compute = FileAccess.get_file_as_string(SHADER_DIR + shader_name + ".glslinc")
 		var spirv := rd.shader_compile_spirv_from_source(source)
@@ -158,8 +164,8 @@ func _create_compute_pipelines() -> bool:
 			temporal_shader = shader
 			temporal_pipeline = pipeline
 		else:
-			composite_shader = shader
-			composite_pipeline = pipeline
+			candidate_shader = shader
+			candidate_pipeline = pipeline
 	return true
 
 func _texture(size: Vector2i, format: int) -> RID:
@@ -181,13 +187,19 @@ func create_state(size: Vector2i) -> Dictionary:
 	var resources: Array[RID] = []
 	var raw := _texture(size, RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT)
 	resources.append(raw)
+	var raw_coverage := _texture(size, RenderingDevice.DATA_FORMAT_R16_SFLOAT)
+	resources.append(raw_coverage)
+	var raw_virtual_hit := _texture(size, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT)
+	resources.append(raw_virtual_hit)
 	var histories: Array = []
 	var formats := [RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
 			RenderingDevice.DATA_FORMAT_R32_SFLOAT,
 			RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
 			RenderingDevice.DATA_FORMAT_R32_SFLOAT,
 			RenderingDevice.DATA_FORMAT_R16G16_SFLOAT,
-			RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT]
+			RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
+			RenderingDevice.DATA_FORMAT_R16_SFLOAT,
+			RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT]
 	for history_index in 2:
 		var images: Array[RID] = []
 		for format in formats:
@@ -201,7 +213,9 @@ func create_state(size: Vector2i) -> Dictionary:
 		if not rid.is_valid():
 			_free_resources(resources)
 			return {}
-	return {"size": size, "raw": raw, "history": histories, "resources": resources,
+	return {"size": size, "raw": raw, "raw_coverage": raw_coverage,
+			"raw_virtual_hit": raw_virtual_hit,
+			"history": histories, "resources": resources,
 			"ubo": ubo, "ping": 0, "valid": false, "generation": -1, "signature": [],
 			"exposure": 1.0, "camera": Transform3D.IDENTITY, "vp": Projection.IDENTITY,
 			"last_seen": Engine.get_frames_drawn()}
@@ -246,9 +260,10 @@ func _dispatch(shader: RID, pipeline: RID, uniforms: Array[RDUniform], size: Vec
 	return true
 
 func trace(scene: Variant, textures: Array[RID], frame_data: PackedByteArray, lighting: Dictionary,
-		output: RID, dfg_texture: RID, size: Vector2i) -> bool:
-	if scene == null or not scene.tlas.is_valid() or not output.is_valid() or not dfg_texture.is_valid():
-		error = "RT reflection scene, output or native DFG LUT is unavailable"
+		output: RID, coverage_output: RID, virtual_hit_output: RID, dfg_texture: RID, size: Vector2i) -> bool:
+	if scene == null or not scene.tlas.is_valid() or not output.is_valid() \
+			or not coverage_output.is_valid() or not virtual_hit_output.is_valid() or not dfg_texture.is_valid():
+		error = "RT reflection scene, radiance/coverage/virtual-hit outputs or native DFG LUT is unavailable"
 		return false
 	if textures.size() < 5:
 		error = "RT reflection requires depth, normal, albedo, ORM and emission G-buffer inputs"
@@ -258,6 +273,8 @@ func trace(scene: Variant, textures: Array[RID], frame_data: PackedByteArray, li
 		return false
 	var uniforms: Array[RDUniform] = scene.build_trace_uniforms(textures, lighting, frame_buffer, output,
 			dfg_texture, true, sky_array)
+	uniforms.append(U.image(26, coverage_output))
+	uniforms.append(U.image(27, virtual_hit_output))
 	var uniform_set := rd.uniform_set_create(uniforms, ray_shader, 0)
 	if not uniform_set.is_valid():
 		error = "RT reflection descriptor binding failed"
@@ -308,13 +325,14 @@ func resolve(state: Dictionary, scene_sampler_rid: RID, frame: Dictionary, textu
 	var next_index: int = 1 - int(state.ping)
 	var next: Array = state.history[next_index]
 	var sampled := [state.raw, previous[0], previous[1], previous[2], previous[3],
-			textures[0], textures[1], textures[3], previous[4], textures[4], textures[2], previous[5]]
+			textures[0], textures[1], textures[3], previous[4], textures[4], textures[2], previous[5],
+			state.raw_coverage, previous[6], state.raw_virtual_hit, previous[7]]
 	var uniforms: Array[RDUniform] = []
 	for index in sampled.size():
 		uniforms.append(U.sampled(index, scene_sampler_rid, sampled[index]))
-	for index in 6:
-		uniforms.append(U.image(12 + index, next[index]))
-	uniforms.append(U.uniform_buffer(18, state.ubo))
+	for index in 8:
+		uniforms.append(U.image(16 + index, next[index]))
+	uniforms.append(U.uniform_buffer(24, state.ubo))
 	if not _dispatch(temporal_shader, temporal_pipeline, uniforms, state.size):
 		state.valid = false
 		return false
@@ -328,13 +346,13 @@ func resolve(state: Dictionary, scene_sampler_rid: RID, frame: Dictionary, textu
 	state.last_seen = Engine.get_frames_drawn()
 	return true
 
-func composite(state: Dictionary, target: RID, native_indirect_specular: RID,
-		scene_sampler_rid: RID, full_size: Vector2i, replacement_strength: float) -> bool:
-	if state.is_empty() or not state.valid or not target.is_valid() \
-			or not native_indirect_specular.is_valid() or not scene_sampler_rid.is_valid():
+func publish_candidate(state: Dictionary, output_rgba16f: RID, full_size: Vector2i) -> bool:
+	if state.is_empty() or not state.valid or not output_rgba16f.is_valid() \
+			or not candidate_sampler.is_valid() or not candidate_pipeline.is_valid():
 		return false
 	var result: Array = state.history[state.ping]
-	var uniforms: Array[RDUniform] = [U.image(0, target),
-			U.sampled(1, scene_sampler_rid, native_indirect_specular),
-			U.sampled(2, scene_sampler_rid, result[0]), U.uniform_buffer(3, state.ubo)]
-	return _dispatch(composite_shader, composite_pipeline, uniforms, full_size)
+	var uniforms: Array[RDUniform] = [U.image(0, output_rgba16f),
+			U.sampled(1, candidate_sampler, result[0]),
+			U.sampled(2, candidate_sampler, result[6]),
+			U.uniform_buffer(3, state.ubo)]
+	return _dispatch(candidate_shader, candidate_pipeline, uniforms, full_size)

@@ -1,14 +1,14 @@
 # Feng Hardware Ray Tracing
 
-Add **Hardware RTGI** from the FRP pass library. Its default position is after Lighting and before Sky; keep it before native Transparent, Temporal AA, Bloom and Post Process, and before custom fog passes. The library template starts disabled. Scene meshes are discovered automatically; no registration component or project autoload is required.
+With Feng Render Pipeline and Feng Ray Tracing installed, a new FRP renderer includes **Hardware RTGI** after Lighting and before SSR/Reflection Resolve, initially disabled. Enable it when needed; existing authored renderers keep their settings and position. Keep it before native Sky, Transparent, Temporal AA, Bloom and Post Process, and before custom fog passes. Scene meshes are discovered automatically; no registration component or project autoload is required.
 
-The pass provides one-bounce hardware-traced diffuse GI and an independent one-bounce specular reflection replacement on Vulkan ray tracing pipelines and D3D12 DXR. Reflections use GGX visible-normal sampling, the native DFG lookup and the receiver's GBuffer material values. A hit evaluates the supported material, selected directional sun, emission and FengSkyLight diffuse/specular lighting; a miss uses the captured FengSkyLight radiance. There is no WorldEnvironment sky fallback.
+The pass provides one-bounce hardware-traced diffuse GI and an independent one-bounce specular reflection replacement on Vulkan ray tracing pipelines and D3D12 DXR. Diffuse ownership and the specular slot are independent: Magic GI can own diffuse while RTGI owns reflections, or RTGI diffuse strength can be zero while reflections remain active. Reflections use GGX visible-normal sampling, the native DFG lookup and the receiver's GBuffer material values. A reflection hit evaluates the supported material with selected directional sun, emission and FengSkyLight lighting; a primary miss publishes zero candidate coverage so Reflection Resolve can use the next configured source. Diffuse misses and secondary lighting may still sample captured FengSkyLight radiance. There is no WorldEnvironment sky fallback.
 
 ## Settings
 
 - **Strength:** diffuse GI contribution. Zero leaves native diffuse lighting unchanged and does not turn off reflections. Diffuse ownership transfers to the unique Magic GI pass when its resolved RTGI strength is zero.
 - **Reflections Enabled:** enables hardware-traced reflections; enabled by default when the pass is enabled.
-- **Reflection Strength:** native indirect-specular replacement fraction from zero to one. Zero keeps the native indirect specular term. A valid RT result replaces that fraction; direct specular remains intact. The captured native term includes SkyLight and local reflection probes, so successful RT reflection replaces both together and does not double-add them.
+- **Reflection Strength:** reflection-candidate coverage from zero to one. Zero keeps the RT candidate transparent so lower-priority configured sources can contribute; by default these are SSR, FengReflectProbe and FengSkyLight. A valid RT hit contributes a premultiplied candidate; direct specular remains intact.
 - **Max Distance:** maximum ray distance in scene meters.
 - **Samples Per Pixel:** 1, 2 or 4 cosine samples per pixel.
 - **Importance Sampling:** enabled by default. Each diffuse sample also samples an emissive triangle using world area times emitted luminance, traces visibility, and combines the light and cosine estimators with balance MIS. The distribution is cached until scene materials, geometry or transforms change.
@@ -18,7 +18,7 @@ The pass provides one-bounce hardware-traced diffuse GI and an independent one-b
 
 Both traces use temporally distributed samples. Spatial filtering and half-resolution diffuse upsampling respect depth, normal and material boundaries; sharp mirrors are not spatially blurred. One sample per pixel still needs several frames to converge after a camera cut or newly revealed surface.
 
-The native indirect-specular attachment is captured after DFG and energy compensation and at the native exposure point. The RT contribution uses that same exposure once. If the trace, scene, DFG LUT or supported-geometry check fails, native lighting remains in place.
+The native indirect-specular attachment is captured after DFG and energy compensation and at the native exposure point. The RT contribution uses that same exposure once. Internal Reflection Resolve combines current-frame per-pixel candidates using the priority configured by a scene `FengReflectionSettings` node; the default order is GI, SSR, FengReflectProbe, then FengSkyLight. A ray miss or unavailable RT output has zero coverage, so lower-priority candidates can fill it. FengReflectProbe is provided by the independent feng-reflect-probe addon; Godot `ReflectionProbe` is not sampled by FRP. If tracing or native component capture is unavailable, the Sky-only native baseline remains in place.
 
 ## Scene support
 
@@ -26,7 +26,7 @@ ArrayMesh and PrimitiveMesh triangle surfaces support transforms, per-instance m
 
 Skinned/blend-shaped geometry, Terrain3D/GridMap, custom shader materials, transparent materials, material overlays and advanced material layers are unsupported. Their presence in the visible world causes an explicit warning and retains native indirect lighting; unsupported geometry is not silently removed from the acceleration structure. Local omni/spot/area light nodes are not evaluated by this pass; opaque emissive mesh surfaces are sampled as area emitters. WorldEnvironment ambient and sky reflection remain isolated from the FengSkyLight indirect inputs.
 
-The pass must run before native Transparent, Temporal AA, Bloom and Post Process. The validator checks those native pass bounds. Custom Height Fog is not represented by a native pass ID, so keep Height Fog after RTGI; the validator cannot currently detect a manually moved Height Fog pass that runs first.
+The pass must run before Reflection Resolve, native Sky, Transparent, Temporal AA, Bloom and Post Process. The validator checks these native pass bounds and requires Reflection Resolve after enabled GI/SSR providers. Custom Height Fog is not represented by a native pass ID, so keep Height Fog after RTGI; the validator cannot currently detect a manually moved Height Fog pass that runs first.
 
 ## Backend and lifetime
 

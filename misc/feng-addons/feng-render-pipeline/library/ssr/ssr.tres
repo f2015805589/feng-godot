@@ -1,0 +1,63 @@
+[gd_resource type="CompositorEffect" script_class="FengSSRPass" load_steps=12 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/ssr_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_output.gd" id="3"]
+
+[sub_resource type="Resource" id="Color"]
+script = ExtResource("2")
+binding = 0
+source = 0
+
+[sub_resource type="Resource" id="Depth"]
+script = ExtResource("2")
+binding = 1
+source = 1
+
+[sub_resource type="Resource" id="NormalRoughness"]
+script = ExtResource("2")
+binding = 2
+source = 2
+
+[sub_resource type="Resource" id="Albedo"]
+script = ExtResource("2")
+binding = 3
+source = 3
+
+[sub_resource type="Resource" id="ORM"]
+script = ExtResource("2")
+binding = 4
+source = 4
+
+[sub_resource type="Resource" id="Emission"]
+script = ExtResource("2")
+binding = 5
+source = 5
+
+[sub_resource type="Resource" id="IndirectSpecular"]
+script = ExtResource("2")
+binding = 6
+source = 10
+
+[sub_resource type="Resource" id="MotionVectors"]
+script = ExtResource("2")
+binding = 7
+source = 9
+
+[sub_resource type="Resource" id="SSRReflection"]
+script = ExtResource("3")
+name = &"ssr_reflection"
+usage = 265
+scale = Vector2(1, 1)
+
+[resource]
+resource_name = "SSR"
+script = ExtResource("1")
+enabled = true
+stable_id = "library:ssr"
+inputs = Array[ExtResource("2")]([SubResource("Color"), SubResource("Depth"), SubResource("NormalRoughness"), SubResource("Albedo"), SubResource("ORM"), SubResource("Emission"), SubResource("IndirectSpecular"), SubResource("MotionVectors")])
+outputs = Array[ExtResource("3")]([SubResource("SSRReflection")])
+access_resolved_color = true
+access_resolved_depth = true
+needs_motion_vectors = true
+needs_normal_roughness = true

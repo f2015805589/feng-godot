@@ -1,0 +1,73 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube raw_radiance;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly imageCube filtered_radiance;
+layout(set = 0, binding = 2, std140) uniform PrefilterParameters {
+	ivec4 face_size_mip;
+	vec4 filter_parameters;
+} params;
+
+const float PI = 3.14159265358979323846;
+
+vec3 cube_direction(int face, vec2 st) {
+	float s = st.x * 2.0 - 1.0;
+	float t = st.y * 2.0 - 1.0;
+	if (face == 0) return normalize(vec3(1.0, -t, -s));
+	if (face == 1) return normalize(vec3(-1.0, -t, s));
+	if (face == 2) return normalize(vec3(s, 1.0, t));
+	if (face == 3) return normalize(vec3(s, -1.0, -t));
+	if (face == 4) return normalize(vec3(s, -t, 1.0));
+	return normalize(vec3(-s, -t, -1.0));
+}
+
+vec2 hammersley(uint index, uint count) {
+	uint bits = bitfieldReverse(index);
+	return vec2(float(index) / float(count), float(bits) * 2.3283064365386963e-10);
+}
+
+vec3 importance_sample_ggx(vec2 xi, vec3 normal, float roughness) {
+	float alpha = max(roughness * roughness, 1e-4);
+	float alpha2 = alpha * alpha;
+	float phi = 2.0 * PI * xi.x;
+	float cos_theta = sqrt(max((1.0 - xi.y) / max(1.0 + (alpha2 - 1.0) * xi.y, 1e-6), 0.0));
+	float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+	vec3 half_tangent = vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+	vec3 up = abs(normal.z) < 0.999 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+	vec3 tangent = normalize(cross(up, normal));
+	vec3 bitangent = cross(normal, tangent);
+	return normalize(tangent * half_tangent.x + bitangent * half_tangent.y + normal * half_tangent.z);
+}
+
+bool finite_rgb(vec3 value) { return !any(isnan(value)) && !any(isinf(value)); }
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = params.face_size_mip.xy;
+	int face = int(gl_GlobalInvocationID.z);
+	int mip = params.face_size_mip.w;
+	if (any(greaterThanEqual(pixel, size)) || face < 0 || face >= 6) return;
+	vec3 normal = cube_direction(face, (vec2(pixel) + 0.5) / vec2(size));
+	float max_lod = max(params.filter_parameters.x, 0.0);
+	float roughness = max_lod > 0.0 ? pow(float(mip) / max_lod, 2.0) : 0.0;
+	if (mip == 0 || roughness < 1e-4) {
+		vec3 value = textureLod(raw_radiance, normal, 0.0).rgb;
+		imageStore(filtered_radiance, ivec3(pixel, face), vec4(finite_rgb(value) ? max(value, vec3(0.0)) : vec3(0.0), 1.0));
+		return;
+	}
+	uint sample_count = uint(clamp(params.filter_parameters.y, 16.0, 512.0));
+	vec3 sum = vec3(0.0);
+	float weight = 0.0;
+	for (uint sample_index = 0u; sample_index < sample_count; sample_index++) {
+		vec2 xi = hammersley(sample_index, sample_count);
+		vec3 half_vector = importance_sample_ggx(xi, normal, roughness);
+		vec3 light_direction = normalize(2.0 * dot(normal, half_vector) * half_vector - normal);
+		float no_l = max(dot(normal, light_direction), 0.0);
+		if (no_l <= 0.0) continue;
+		vec3 radiance = textureLod(raw_radiance, light_direction, 0.0).rgb;
+		if (finite_rgb(radiance)) { sum += max(radiance, vec3(0.0)) * no_l; weight += no_l; }
+	}
+	vec3 result = weight > 1e-6 ? sum / weight : textureLod(raw_radiance, normal, 0.0).rgb;
+	if (!finite_rgb(result)) result = vec3(0.0);
+	imageStore(filtered_radiance, ivec3(pixel, face), vec4(max(result, vec3(0.0)), 1.0));
+}

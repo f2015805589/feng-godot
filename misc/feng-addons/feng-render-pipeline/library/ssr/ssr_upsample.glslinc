@@ -1,0 +1,221 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D receiver_guide;
+layout(set = 0, binding = 1) uniform sampler2D material_guide;
+layout(set = 0, binding = 2) uniform sampler2D ssr_reflection;
+layout(set = 0, binding = 3) uniform sampler2D depth_texture;
+layout(set = 0, binding = 4) uniform sampler2D normal_texture;
+layout(set = 0, binding = 5) uniform sampler2D albedo_texture;
+layout(set = 0, binding = 6) uniform sampler2D orm_texture;
+layout(set = 0, binding = 7) uniform sampler2D emission_texture;
+layout(rgba16f, set = 0, binding = 8) uniform writeonly image2D reflection_candidate;
+layout(set = 0, binding = 9, std140) uniform SSRParams {
+	mat4 inverse_projection;
+	mat4 projection;
+	vec4 resolution;
+	vec4 trace;
+	vec4 temporal;
+	vec4 options;
+	mat4 view_to_world;
+	mat4 previous_world_to_view;
+	mat4 previous_projection;
+} params;
+
+const uint MATERIAL_MODEL_MASK = 0x0fu;
+const uint UNLIT_MATERIAL_MODEL = 0u;
+
+bool finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+void write_empty(ivec2 pixel) {
+	imageStore(reflection_candidate, pixel, vec4(0.0));
+}
+
+bool compatible_material(vec4 current, vec4 sample_material) {
+	if (any(isnan(current)) || any(isinf(current)) || any(isnan(sample_material)) || any(isinf(sample_material))) {
+		return false;
+	}
+	vec3 scale = max(max(abs(current.rgb), abs(sample_material.rgb)), vec3(0.04));
+	if (any(greaterThan(abs(current.rgb - sample_material.rgb), scale * 0.12 + vec3(0.008)))) {
+		return false;
+	}
+	float f90_tolerance = max(0.035, max(current.a, sample_material.a) * 0.12);
+	return abs(current.a - sample_material.a) <= f90_tolerance;
+}
+
+int full_pixel_for_guide(int guide_pixel, int full_size, int guide_size) {
+	return clamp(int((float(guide_pixel) + 0.5) * float(full_size) / float(guide_size)),
+			0, full_size - 1);
+}
+
+float guide_center(int guide_pixel, int full_size, int guide_size) {
+	return (float(full_pixel_for_guide(guide_pixel, full_size, guide_size)) + 0.5)
+			* float(guide_size) / float(full_size);
+}
+
+void guide_axis_taps(float uv, int full_size, int guide_size,
+		out int first, out int second, out float fraction) {
+	if (guide_size <= 1) {
+		first = 0;
+		second = 0;
+		fraction = 0.0;
+		return;
+	}
+	float target = clamp(uv, 0.0, 1.0) * float(guide_size);
+	int base = clamp(int(floor(target - 0.5)), 0, guide_size - 2);
+	float lower = guide_center(base, full_size, guide_size);
+	float upper = guide_center(base + 1, full_size, guide_size);
+	if (target < lower && base > 0) {
+		base -= 1;
+		lower = guide_center(base, full_size, guide_size);
+		upper = guide_center(base + 1, full_size, guide_size);
+	} else if (target > upper && base + 2 < guide_size) {
+		base += 1;
+		lower = guide_center(base, full_size, guide_size);
+		upper = guide_center(base + 1, full_size, guide_size);
+	}
+	first = base;
+	second = base + 1;
+	fraction = clamp((target - lower) / max(upper - lower, 1e-6), 0.0, 1.0);
+}
+
+float sign_not_zero(float value) {
+	return value < 0.0 ? -1.0 : 1.0;
+}
+
+vec3 oct_decode(vec2 encoded) {
+	vec2 f = encoded * 2.0 - 1.0;
+	vec3 normal = vec3(f, 1.0 - abs(f.x) - abs(f.y));
+	if (normal.z < 0.0) {
+		normal.xy = (1.0 - abs(normal.yx)) * vec2(sign_not_zero(normal.x), sign_not_zero(normal.y));
+	}
+	float len2 = dot(normal, normal);
+	return len2 > 1e-8 ? normal * inversesqrt(len2) : vec3(0.0, 0.0, 1.0);
+}
+
+bool reconstruct_view_position(vec2 uv, float depth, out vec3 position) {
+	vec4 view_h = params.inverse_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	if (!finite_float(view_h.w) || abs(view_h.w) < 1e-7 || any(isnan(view_h)) || any(isinf(view_h))) {
+		position = vec3(0.0);
+		return false;
+	}
+	position = view_h.xyz / view_h.w;
+	return finite_vec3(position) && -position.z > 0.0;
+}
+
+void main() {
+	ivec2 full_pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 full_size = imageSize(reflection_candidate);
+	if (any(greaterThanEqual(full_pixel, full_size))) {
+		return;
+	}
+	float raw_depth = texelFetch(depth_texture, full_pixel, 0).r;
+	vec2 full_uv = (vec2(full_pixel) + 0.5) / vec2(full_size);
+	vec3 position;
+	if (!finite_float(raw_depth) || raw_depth <= 0.0
+			|| !reconstruct_view_position(full_uv, raw_depth, position)) {
+		write_empty(full_pixel);
+		return;
+	}
+	vec3 center_normal = mat3(params.view_to_world)
+			* (texelFetch(normal_texture, full_pixel, 0).rgb * 2.0 - 1.0);
+	float normal_length2 = dot(center_normal, center_normal);
+	if (!finite_float(normal_length2) || normal_length2 < 1e-8) {
+		write_empty(full_pixel);
+		return;
+	}
+	center_normal *= inversesqrt(normal_length2);
+	float center_depth = -position.z;
+	vec4 center_orm = texelFetch(orm_texture, full_pixel, 0);
+	vec4 center_emission = texelFetch(emission_texture, full_pixel, 0);
+	if (!finite_float(center_orm.a) || !finite_float(center_orm.g)
+			|| !finite_float(center_orm.b) || !finite_float(center_emission.a)) {
+		write_empty(full_pixel);
+		return;
+	}
+	uint material_model = uint(round(clamp(center_orm.a, 0.0, 1.0) * 255.0)) & MATERIAL_MODEL_MASK;
+	if (material_model == UNLIT_MATERIAL_MODEL) {
+		write_empty(full_pixel);
+		return;
+	}
+	float center_roughness = clamp(center_orm.g, 0.0, 1.0);
+	float center_metallic = clamp(center_orm.b, 0.0, 1.0);
+	float center_specular = clamp(center_emission.a, 0.0, 1.0);
+	vec3 center_albedo = texelFetch(albedo_texture, full_pixel, 0).rgb;
+	if (!finite_vec3(center_albedo)) {
+		write_empty(full_pixel);
+		return;
+	}
+	center_albedo = max(center_albedo, vec3(0.0));
+	vec3 center_f0 = mix(vec3(0.16 * center_specular * center_specular), center_albedo, center_metallic);
+	float center_f90 = clamp(50.0 * center_f0.g, center_metallic, 1.0);
+	if (!finite_vec3(center_f0) || dot(center_f0, center_f0) <= 1e-8) {
+		write_empty(full_pixel);
+		return;
+	}
+	vec4 center_material = vec4(center_f0, center_f90);
+	ivec2 half_size = textureSize(ssr_reflection, 0);
+	int base_x;
+	int next_x;
+	int base_y;
+	int next_y;
+	float fraction_x;
+	float fraction_y;
+	guide_axis_taps(full_uv.x, full_size.x, half_size.x, base_x, next_x, fraction_x);
+	guide_axis_taps(full_uv.y, full_size.y, half_size.y, base_y, next_y, fraction_y);
+	vec3 reflected_sum = vec3(0.0);
+	float confidence_sum = 0.0;
+	float weight_sum = 0.0;
+	float depth_tolerance = max(0.04, center_depth * 0.025);
+	for (int y = 0; y < 2; y++) {
+		for (int x = 0; x < 2; x++) {
+			ivec2 sample_pixel = ivec2(x == 0 ? base_x : next_x,
+					y == 0 ? base_y : next_y);
+			vec4 guide = texelFetch(receiver_guide, sample_pixel, 0);
+			vec4 sample_material = texelFetch(material_guide, sample_pixel, 0);
+			vec4 reflection = texelFetch(ssr_reflection, sample_pixel, 0);
+			if (any(isnan(guide)) || any(isinf(guide)) || any(isnan(reflection)) || any(isinf(reflection))
+					|| guide.r <= 0.0 || abs(guide.r - center_depth) > depth_tolerance
+					|| abs(guide.g - center_roughness) > 0.18
+					|| !compatible_material(center_material, sample_material)) {
+				continue;
+			}
+			float normal_dot = max(dot(oct_decode(guide.ba), center_normal), 0.0);
+			if (normal_dot < 0.78) {
+				continue;
+			}
+			vec2 bilinear = vec2(x == 0 ? 1.0 - fraction_x : fraction_x,
+					y == 0 ? 1.0 - fraction_y : fraction_y);
+			float depth_weight = exp(-abs(guide.r - center_depth) / max(0.01, center_depth * 0.012));
+			float normal_weight = pow(normal_dot, 20.0);
+			float roughness_weight = exp(-abs(guide.g - center_roughness) * 8.0);
+			float weight = bilinear.x * bilinear.y * depth_weight * normal_weight * roughness_weight;
+			float confidence = clamp(reflection.a, 0.0, 1.0);
+			reflected_sum += reflection.rgb * weight;
+			confidence_sum += confidence * weight;
+			// Keep compatible misses in the denominator; they must reduce
+			// confidence instead of spreading a neighboring hit across an edge.
+			weight_sum += weight;
+		}
+	}
+	if (weight_sum <= 1e-6 || confidence_sum <= 1e-6) {
+		write_empty(full_pixel);
+		return;
+	}
+	vec3 premultiplied_reflection = reflected_sum / weight_sum;
+	float confidence = clamp(confidence_sum / weight_sum, 0.0, 1.0);
+	float intensity_value = finite_float(params.options.z) ? clamp(params.options.z, 0.0, 4.0) : 0.0;
+	confidence *= clamp(intensity_value, 0.0, 1.0);
+	if (!finite_vec3(premultiplied_reflection) || !finite_float(confidence) || confidence <= 1e-6) {
+		write_empty(full_pixel);
+		return;
+	}
+	imageStore(reflection_candidate, full_pixel,
+			vec4(clamp(premultiplied_reflection, vec3(0.0), vec3(65504.0)), confidence));
+}

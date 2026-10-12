@@ -2010,8 +2010,8 @@ void fragment_shader(in SceneData scene_data) {
 			}
 		}
 		if ((use_frp_sky_lighting || implementation_data.sky_lighting_pad0 != 0u) && implementation_data.cloud_projection_parameters[27].z > 0.5) {
-			// Attenuate only the FengSkyLight diffuse provider before local probes
-			// and custom irradiance are added. IBL specular remains unchanged.
+			// Attenuate only the FengSkyLight diffuse provider contribution.
+			// IBL specular remains unchanged.
 			ambient_light *= frp_cloud_provider_ao_visibility(cloud_world_position);
 		}
 	}
@@ -2131,112 +2131,13 @@ void fragment_shader(in SceneData scene_data) {
 	}
 #else
 
-	// FRP has no global illumination and no screen space effects: there is no SDFGI,
-	// no VoxelGI and no GI/SSAO/SSIL/SSR buffer in this renderer, so indirect lighting is
-	// the ambient light and the reflection probes only.
+	// Native FRP lighting supplies SkyLight diffuse/specular. GI, AO and reflection
+	// candidates are provided by separately scheduled addon passes.
 #endif // !USE_LIGHTMAP
 
 
-	{ // process reflections
-
-		vec4 reflection_accum = vec4(0.0, 0.0, 0.0, 0.0);
-		vec4 ambient_accum = vec4(0.0, 0.0, 0.0, 0.0);
-#ifdef LIGHT_CLEARCOAT_USED
-		vec4 cc_reflection_accum = vec4(0.0, 0.0, 0.0, 0.0);
-#endif
-
-		uint cluster_reflection_offset = cluster_offset + implementation_data.cluster_type_size * 4;
-
-		uint item_min;
-		uint item_max;
-		uint item_from;
-		uint item_to;
-
-		cluster_get_item_range(cluster_reflection_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
-
-		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
-		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
-
-#ifdef LIGHT_ANISOTROPY_USED
-		// https://google.github.io/filament/Filament.html#lighting/imagebasedlights/anisotropy
-		vec3 anisotropic_direction = anisotropy >= 0.0 ? binormal : tangent;
-		vec3 anisotropic_tangent = cross(anisotropic_direction, view);
-		vec3 anisotropic_normal = cross(anisotropic_tangent, anisotropic_direction);
-		vec3 bent_normal = normalize(mix(normal, anisotropic_normal, abs(anisotropy) * clamp(5.0 * roughness, 0.0, 1.0)));
-#else
-		vec3 bent_normal = normal;
-#endif
-		vec3 ref_vec = normalize(reflect(-view, bent_normal));
-		// Interpolate between mirror and rough reflection by using linear_roughness * linear_roughness.
-		ref_vec = mix(ref_vec, bent_normal, roughness * roughness * roughness * roughness);
-
-		for (uint i = item_from; i < item_to; i++) {
-			uint mask = cluster_buffer.data[cluster_reflection_offset + i];
-			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
-
-			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
-			while (merged_mask != 0) {
-				uint bit = findMSB(merged_mask);
-				merged_mask &= ~(1u << bit);
-
-				if (((1u << bit) & mask) == 0) { //do not process if not originally here
-					continue;
-				}
-
-				uint reflection_index = 32 * i + bit;
-
-				if (!bool(reflections.data[reflection_index].mask & instances.data[instance_index].layer_mask)) {
-					continue; //not masked
-				}
-
-#ifndef LIGHT_CLEARCOAT_USED
-				if (reflection_accum.a >= 1.0 && ambient_accum.a >= 1.0) {
-					break;
-				}
-#else
-				if (reflection_accum.a >= 1.0 && cc_reflection_accum.a >= 1.0 && ambient_accum.a >= 1.0) {
-					break;
-				}
-#endif // LIGHT_CLEARCOAT_USED
-
-				reflection_process(reflection_index, vertex, ref_vec, normal, roughness, ambient_light,
-#ifdef LIGHT_CLEARCOAT_USED
-						cc_ref_vec, mix(0.001, 0.1, clearcoat_roughness), cc_reflection_accum,
-#endif
-						ambient_accum, reflection_accum);
-			}
-		}
-
-		if (ambient_accum.a < 1.0) {
-			ambient_accum.rgb = ambient_light * (1.0 - ambient_accum.a) + ambient_accum.rgb;
-		}
-
-		if (reflection_accum.a < 1.0) {
-			reflection_accum.rgb = indirect_specular_light * (1.0 - reflection_accum.a) + reflection_accum.rgb;
-		}
-
-#ifdef LIGHT_CLEARCOAT_USED
-		if (cc_reflection_accum.a < 1.0) {
-			cc_reflection_accum.rgb = cc_specular_light * (1.0 - cc_reflection_accum.a) + cc_reflection_accum.rgb;
-		}
-#endif
-
-		if (reflection_accum.a > 0.0) {
-			indirect_specular_light = reflection_accum.rgb;
-		}
-
-#ifdef LIGHT_CLEARCOAT_USED
-		if (cc_reflection_accum.a > 0.0) {
-			cc_specular_light = cc_reflection_accum.rgb;
-		}
-#endif
-
-#if !defined(USE_LIGHTMAP)
-		if (ambient_accum.a > 0.0) {
-			ambient_light = ambient_accum.rgb;
-		}
-#endif
-	}
+	// Native FRP reflection is SkyLight-only; scheduled addon candidates are
+	// composed by the internal reflection resolver before Sky.
 
 	//finalize ambient light here
 	{

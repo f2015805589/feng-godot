@@ -10,6 +10,8 @@ const NRDRenderer = preload("../rendering/rt_gi_nrd.gd")
 const U = preload("res://addons/feng-render-pipeline/rd/uniforms.gd")
 const Selection = preload("res://addons/feng-render-pipeline/pipeline/indirect_gi_selection.gd")
 const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
+const REFLECTION_OUTPUT: StringName = &"rtgi_reflection"
+const PIPELINE_SCOPE: StringName = NativeSpec.SCOPE_PIPELINE
 
 @export_range(0, 8, 0.01) var strength := 1.0:
 	set(value):
@@ -57,6 +59,7 @@ var _diffuse_temporal_pipeline := RID()
 var _diffuse_composite_shader := RID()
 var _diffuse_composite_pipeline := RID()
 var _reflection_backends: Dictionary = {} # native sky texture type -> independent pass backend.
+var _runtime_start_queued := false
 
 func _init() -> void:
 	stage = 8 # Post Lighting, before Sky, Transparent and the temporal/post transforms.
@@ -64,24 +67,87 @@ func _init() -> void:
 	access_resolved_color = true
 	access_resolved_depth = true
 	needs_normal_roughness = true
-	for source in [FengPassTexture.Source.DEPTH, FengPassTexture.Source.NORMAL_ROUGHNESS,
-			FengPassTexture.Source.ALBEDO, FengPassTexture.Source.ORM, FengPassTexture.Source.EMISSION]:
-		_add_input(source)
-	_add_input(FengPassTexture.Source.INDIRECT_SPECULAR)
+	inputs = _make_inputs()
+	outputs = _make_outputs()
 	_sky_input = FengPassTexture.new()
 	_sky_input.source = FengPassTexture.Source.CUSTOM
 	_sky_input.custom_scope = &"frp_clustered"
 	_sky_input.custom_name = &"sky_light_diffuse"
-	_start_runtime.call_deferred()
 
-func _add_input(source: int) -> void:
-	var input := FengPassTexture.new()
-	input.source = source
-	input.binding = inputs.size() + 1
-	inputs.append(input)
+func _make_inputs() -> Array[FengPassTexture]:
+	var declarations: Array[FengPassTexture] = []
+	for source in [FengPassTexture.Source.DEPTH, FengPassTexture.Source.NORMAL_ROUGHNESS,
+			FengPassTexture.Source.ALBEDO, FengPassTexture.Source.ORM, FengPassTexture.Source.EMISSION,
+			FengPassTexture.Source.INDIRECT_SPECULAR]:
+		var input := FengPassTexture.new()
+		input.binding = declarations.size() + 1
+		input.source = source
+		declarations.append(input)
+	return declarations
+
+func _make_outputs() -> Array[OutputDeclaration]:
+	var reflection := OutputDeclaration.new()
+	reflection.name = REFLECTION_OUTPUT
+	reflection.data_format = RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
+	reflection.usage = OutputDeclaration.Usage.SAMPLED | OutputDeclaration.Usage.STORAGE | OutputDeclaration.Usage.COPY_TO
+	reflection.scale = Vector2.ONE
+	return [reflection]
+
+## Repair serialized pass resources from builds that stored an incomplete binding list.
+## RTGI's shader ABI requires these six sampled textures at bindings 1 through 6.
+func ensure_frp_contract() -> bool:
+	var expected := _make_inputs()
+	var changed := false
+	if not _inputs_match(inputs, expected):
+		inputs = expected
+		changed = true
+	if not _outputs_match(outputs, _make_outputs()):
+		outputs = _make_outputs()
+		changed = true
+	if not access_resolved_color:
+		access_resolved_color = true
+		changed = true
+	if not access_resolved_depth:
+		access_resolved_depth = true
+		changed = true
+	if not needs_normal_roughness:
+		needs_normal_roughness = true
+		changed = true
+	return changed
+
+func _outputs_match(actual: Array[OutputDeclaration], expected: Array[OutputDeclaration]) -> bool:
+	if actual.size() != expected.size():
+		return false
+	for index in expected.size():
+		var input := actual[index]
+		var required := expected[index]
+		if input == null or input.name != required.name or input.data_format != required.data_format \
+				or input.usage != required.usage or input.scale != required.scale:
+			return false
+	return true
+
+func _inputs_match(actual: Array[FengPassTexture], expected: Array[FengPassTexture]) -> bool:
+	if actual.size() != expected.size():
+		return false
+	for index in expected.size():
+		var input := actual[index]
+		var required := expected[index]
+		if input == null or input.binding != required.binding or input.source != required.source \
+				or input.binding_type != FengPassTexture.BindingType.SAMPLED_TEXTURE \
+				or input.custom_scope != &"" or input.custom_name != &"":
+			return false
+	return true
 
 func _start_runtime() -> void:
 	Runtime.start()
+
+func _queue_runtime_start() -> void:
+	if _runtime_start_queued:
+		return
+	_runtime_start_queued = true
+	# _frp_prepare runs on the render thread. Start the main-thread snapshot tick only
+	# after an enabled pass actually claims diffuse or reflection work for this frame.
+	_start_runtime.call_deferred()
 
 func can_share_view_execution() -> bool:
 	return true
@@ -89,6 +155,9 @@ func can_share_view_execution() -> bool:
 func get_indirect_gi_kind() -> StringName:
 	# Only diffuse ownership is planned here. Reflections remain independent of MagicGI.
 	return Selection.KIND_RT
+
+func get_reflection_source_kind() -> StringName:
+	return &"gi"
 
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray(["strength", "reflections_enabled", "reflection_strength", "max_distance",
@@ -115,8 +184,12 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 	var reflection_active := _reflection_slot_active(ctx, options)
 	if not diffuse_active and not reflection_active:
 		return
+	var rd := RenderingServer.get_rendering_device()
+	if rd == null or not rd.has_feature(RenderingDevice.SUPPORTS_RAYTRACING_PIPELINE):
+		return
 	var buffers := ctx.get_render_scene_buffers()
 	if buffers != null:
+		_queue_runtime_start()
 		Runtime.request_target(buffers.get_render_target())
 	if diffuse_active:
 		ctx.request_sky_light_diffuse()
@@ -135,6 +208,7 @@ func _execute_frame(ctx: FRPPassContext) -> void:
 	var buffers := ctx.get_render_scene_buffers()
 	if buffers == null:
 		return
+	_clear_reflection_outputs(rd, buffers)
 	var target := buffers.get_render_target()
 	if not target.is_valid():
 		return
@@ -143,13 +217,14 @@ func _execute_frame(ctx: FRPPassContext) -> void:
 	var diffuse_active := Selection.is_owner(ctx, String(get_parameter_key()), Selection.KIND_RT, false) \
 			and is_finite(diffuse_amount) and diffuse_amount > 0.0
 	var reflection_amount := float(options.get("reflection_strength", 0.0))
-	var reflection_active := _reflection_slot_active(ctx, options)
+	var reflection_active := _reflection_slot_active(ctx, options) and ctx.is_reflection_components_available()
 	if not diffuse_active and not reflection_active:
 		return
 	if not rd.has_feature(RenderingDevice.SUPPORTS_RAYTRACING_PIPELINE):
 		warn_once("Hardware RT pipelines are unavailable; native diffuse and specular lighting remain active.")
 		invalidate(target)
 		return
+	_queue_runtime_start()
 	Runtime.request_target(target)
 	var snapshot := Runtime.snapshot_for_target(target)
 	if not bool(snapshot.get("valid", false)):
@@ -262,24 +337,35 @@ func _execute_frame(ctx: FRPPassContext) -> void:
 				state.reflection = reflection_state
 			if not reflection_state.is_empty():
 				var reflection_frame := _pack_trace_frame(frame, full_size, generation, view, 1.0, trace_options)
-				if reflection_backend.trace(state.scene, textures.slice(0, 5), reflection_frame, frame,
-						reflection_state.raw, dfg, full_size):
-						var signature := _reflection_signature(snapshot, [state.scene.geometry_key, state.scene.transform_key],
-								frame, trace_options, reflection_amount, full_size)
-						if reflection_backend.resolve(reflection_state, state.scene.sampler, frame,
-								textures.slice(0, 5), generation, signature, trace_options, reflection_amount):
-							var native_indirect: RID = textures[5]
-							var composite_target: RID = ctx.get_indirect_specular_composite_target(view)
-							if reflection_backend.composite(reflection_state, composite_target, native_indirect,
-									state.scene.sampler, full_size, reflection_amount):
-								ctx.mark_indirect_specular_modified(view)
-						else:
-							reflection_state.valid = false
-				else:
+				var candidate_output := buffers.get_texture_slice(PIPELINE_SCOPE, REFLECTION_OUTPUT, view, 0, 1, 1)
+				if not candidate_output.is_valid():
+					warn_once("RTGI reflection candidate output is unavailable for the current frame/view.")
+					reflection_state.valid = false
+				elif not reflection_backend.trace(state.scene, textures.slice(0, 5), reflection_frame, frame,
+						reflection_state.raw, reflection_state.raw_coverage,
+						reflection_state.raw_virtual_hit, dfg, full_size):
 					warn_once(reflection_backend.error)
 					reflection_state.valid = false
+				else:
+					var signature := _reflection_signature(snapshot, [state.scene.geometry_key, state.scene.transform_key],
+							frame, trace_options, reflection_amount, full_size)
+					if reflection_backend.resolve(reflection_state, state.scene.sampler, frame,
+							textures.slice(0, 5), generation, signature, trace_options, reflection_amount):
+						if not (reflection_backend.publish_candidate(reflection_state, candidate_output, full_size) \
+								and ctx.publish_reflection_candidate(&"gi", candidate_output, view)):
+							warn_once("RTGI reflection candidate could not be published for the current frame/view.")
+					else:
+						reflection_state.valid = false
 		state.last_seen = Engine.get_frames_drawn()
 	refresh_owned()
+
+func _clear_reflection_outputs(rd: RenderingDevice, buffers: RenderSceneBuffersRD) -> void:
+	if not buffers.has_texture(PIPELINE_SCOPE, REFLECTION_OUTPUT):
+		return
+	for view in buffers.get_view_count():
+		var output := buffers.get_texture_slice(PIPELINE_SCOPE, REFLECTION_OUTPUT, view, 0, 1, 1)
+		if output.is_valid():
+			rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 
 func _sweep_idle_states(rd: RenderingDevice) -> void:
 	var frame := Engine.get_frames_drawn()
@@ -386,7 +472,6 @@ func _reflection_signature(snapshot: Dictionary, scene_key: Array, frame: Dictio
 		options: Dictionary, replacement_strength: float, size: Vector2i) -> Array:
 	return [snapshot.get("world_id", 0), snapshot.get("registry_epoch", 0),
 		snapshot.get("snapshot_generation", 0), scene_key, _lighting_signature(frame),
-		frame.get("light_buffer_exposure_normalization", 1.0),
 		frame.get("inverse_projection_unjittered", frame.get("inverse_projection", Projection.IDENTITY)),
 		frame.get("camera_generation", 0), frame.get("dfg_texture", RID()), size,
 		options.get("max_distance", max_distance),

@@ -33,11 +33,15 @@ autoload 注册保留在项目中，可在不需要插件运行时服务时手�
 
 ## 默认管线
 
-新 Renderer 包含 **9 个原生条目和 8 个库条目，共 17 个**。
-仅 Debug Buffers 默认关闭，其余条目默认开启；已保存资源保留自己的开关和参数。
+新 Renderer 包含 9 个原生条目和 10 个 FRP 库条目；安装 Feng Ray Tracing 后还会加入关闭状态的
+RTGI，因此总数为 20（未安装时为 19）。RTGI 和 Debug Buffers 默认关闭，其余条目默认开启；
+已保存资源保留自己的开关和参数。纯 FRP 项目缺少 ray-tracing 插件时也可正常加载。
+从源码 `bin` 启动的 editor 会扫描旁边 `misc/feng-addons` 中带 `plugin.cfg` 的插件并自动链接；
+只有 FRP 插件文件的独立安装不会带 ray-tracing 后端，因此不会加入 RTGI。
 
 ```text
-Shadow → VT → GBuffer → Cloud Shadows → Lighting → Magic GI → Sky
+Shadow → VT → GBuffer → Cloud Shadows → GTAO → Lighting → Magic GI → [RTGI if installed]
+       → SSR → [internal Reflection Resolve] → Sky
        → Volumetric Cloud Trace → Height Fog → Volumetric Cloud → Transparent
        → Temporal AA → Eye Adaptation → Bloom → Color Grade → Post Process → Debug Buffers
 ```
@@ -60,6 +64,8 @@ Post Process 保持 ID 7，Bloom 使用 ID 8。
 Pass 是可排序的资源条目；Operation 是条目内部的渲染步骤。resolve、副本和高光合并由
 所属 Pass 执行。GBuffer 在同一遍几何中写运动矢量，velocity 位于 shader location 4。
 前向 fallback 与透明物体使用 Lighting 准备的 Cluster 灯光列表。
+`stage` 是序列化兼容用的隐藏别名，FRP 调度只看 Passes 数组；独立 CompositorEffect
+仍使用原生 callback stage。
 
 ### 顺序与开关
 
@@ -80,6 +86,22 @@ FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；
 - **Magic GI**：在 Lighting 后把有效 surface PRT 烘焙与当前太阳/环境 SH 组合为漫反射间接光。
   按当前 render target 匹配快照；没有匹配的有效烘焙时保持场景色不变，贡献纹理清零。
   光照变化更新 SH，无需重烘焙。烘焙由可选的 feng-magic-gi 插件提供。
+- **RTGI**：默认加入并关闭。启用 ray-tracing 插件后，可在 Lighting 后提供漫反射 GI 和镜面候选；
+  漫反射 GI 和镜面反射是独立槽位，Magic GI 可继续提供漫反射。
+  RTGI 资源携带完整 GBuffer 和间接高光输入，仅在启用且设备支持硬件光追时启动场景快照运行时。
+- **SSR**：默认启用，在 RTGI 后、内部 Reflection Resolve 前生成屏幕空间候选。使用 FRP 自有 HiZ
+	深度层级、透视校正的层级射线遍历、时域过滤和引导式上采样，不调用 Godot Environment SSR。
+	Max Steps 是层级节点访问预算；耗尽时按未命中处理，不表示屏幕最大像素数。命中候选按覆盖率参与合成；
+	未命中区域继续按 `FengReflectionSettings` 的优先级使用后续来源。Thickness 限制命中可接受的表面平面误差；
+	它只收紧像素覆盖容差，不扩大命中范围。
+- **Reflection Resolve**：FRP 内部调度，在 GI、SSR、FengReflectProbe 候选之后、Sky 之前执行，
+	不显示在 Passes 数组或库菜单。场景中的 `FengReflectionSettings` 节点默认按所在 `World3D`
+	作用于该世界已注册的 viewport（包括编辑器视口和 SubViewport）；填写 Target Viewport 后只作用于
+	指定视口。它设置 `GI → SSR → FengReflectProbe → FengSkyLight` 的逐像素来源优先级；未放置该节点时使用默认顺序。
+	候选按覆盖率合成，只替换 Sky-only 原生间接镜面项一次。
+- **FengReflectProbe**：由独立 feng-reflect-probe 插件提供，与 Godot `ReflectionProbe` 分离；FRP 不采样
+	原生 ReflectionProbe，也不会在缺少 FengReflectProbe 时隐式回退到它。目标由主线程按 world/viewport
+	注册路由并发布快照；渲染回调不读取场景树或设置节点。
 - **Cloud Shadows**：在 GBuffer 后准备云阴影与 Sky AO；组件上的两项功能默认关闭。
 - **Volumetric Cloud Trace**：在 Sky 后追踪云辐射、透射和深度；**Volumetric Cloud** 在
   Height Fog 后合成，透明表面可通过材质的 Cloud Fogging 参与深度相关云传输。
@@ -124,9 +146,10 @@ TAA 按当前/历史 pre-exposure 比例重标定历史颜色；Bloom 的亮度�
 
 ### 渲染范围
 
-FRP 原生光照支持环境光和聚簇反射探针，插件可通过 Magic GI 增加烘焙间接光。
-Environment 的 SSAO、SSIL、SSR、SDFGI、VoxelGI 以及原生调试几何不属于 FRP 管线；
-开启这些选项不会为 FRP 生成对应效果。材质与缓冲调试使用 Debug Buffers。
+FRP 原生光照提供 SkyLight 间接漫反射和 SkyLight 镜面基线；独立反射候选由 RTGI、SSR 与
+feng-reflect-probe 提供，再由内部 Reflection Resolve 按配置合成。Magic GI 只提供漫反射，不发布
+反射候选。Environment 的 SSAO、SSIL、SSR、SDFGI、VoxelGI 与原生调试几何不会为 FRP 自动生成对应效果。
+材质与缓冲调试使用 Debug Buffers。
 
 ## 编写 Pass
 
@@ -157,8 +180,9 @@ func _take_owned_rids() -> Array[RID]:
 - `Source.COLOR` 是内部 HDR 场景色。处理它的效果通常放在 Lighting 后、Tonemap 前。
   同一 Pass 的 storage-image 绑定可引用自身输出；邻域采样应使用独立输入纹理。
 
-在 FengRenderer 中，`stage` 保留为回调参数和旧资源迁移提示，位置由列表决定。
-普通 Compositor 仍按回调阶段执行。显式管线会在自定义 Pass 所需位置 resolve 附件，
+在 FengRenderer 中，`stage` 是序列化兼容用的隐藏存储别名，读写原生
+`CompositorEffect.effect_callback_type`。FRP 的位置只由 Passes 列表决定；普通 Compositor
+仍按可见的原生回调阶段执行，旧 schema 迁移也会读取 `stage`。显式管线会在自定义 Pass 所需位置 resolve 附件，
 并将颜色写回 MSAA 附件；普通 Compositor 的阶段路径不提供这项回写。
 回调在渲染线程运行，场景树操作应交给主线程。纹理 RID 的寿命随视口缓冲变化。
 
@@ -262,7 +286,8 @@ Volume 的一次性查询和缓存求值共用字段编译与混合规则。配�
 
 `pipeline/library_manager.gd` 的 manifest 定义库身份、模板、默认开关和插入位置。
 `DEFAULT_LIBRARY_SEEDED` 控制默认管线中的库条目；其它模板只通过 Library 菜单添加。
-同步保留作者参数、已识别条目的顺序和显式删除记录。缺少对应 GBuffer/Lighting/Sky 锚点时，
+新条目按锚点组的固定顺序插入；同步保留已有作者条目的位置、参数和显式删除记录。
+缺少对应 GBuffer/Lighting/Sky 锚点时，
 依赖该锚点的库效果由作者手动添加并放在对应工作之后。
 
 GTAO 默认启用，位于 GBuffer 后、Lighting 前，可在管线中移动、关闭或删除。默认半分辨率
@@ -270,10 +295,10 @@ GTAO 默认启用，位于 GBuffer 后、Lighting 前，可在管线中移动、
 的性能实现，不代表 UE 的全分辨率默认路径。默认半径为 2 m，falloff 起点和 thickness blend
 均为 0.5，强度为 1，历史权重为 0.9。AO 只乘到原生环境间接漫反射与 Magic GI 的漫反射贡献；
 直接光、镜面、发光材质、天空背景和雾不受影响。RTGI 拥有漫反射槽且强度大于 0 时，GTAO
-本帧跳过；反射专用或漫反射强度为 0 的 RTGI 配置仍使用 GTAO。Hardware RTGI 保持可选，
-不会加入默认管线。
+本帧跳过；反射专用或漫反射强度为 0 的 RTGI 配置仍使用 GTAO。Hardware RTGI 默认加入管线，
+但保持关闭，可按需要启用。
 
-当前 Renderer schema 为 10。迁移处理旧原生 ID、合并后的 Operation、默认实现和 Bloom 位置，
+当前 Renderer schema 为 11。迁移处理旧原生 ID、合并后的 Operation、默认实现和 Bloom 位置，
 并尽量保留开关与自定义条目的相对位置。仅含旧阶段效果的资源会补齐原生调度。
 若 Inspector 仍报告原生 ID/名称不匹配，创建当前 Renderer 并迁入自定义效果和参数。
 

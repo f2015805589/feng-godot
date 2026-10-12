@@ -119,6 +119,26 @@ func execute():
 	if output.is_valid():
 		rd.texture_clear(output, Color(0,0,0,0), 0, 1, 0, 1)
 	owned.append(output)
+	var coverage_format := RDTextureFormat.new()
+	coverage_format.width = 1
+	coverage_format.height = 1
+	coverage_format.format = RenderingDevice.DATA_FORMAT_R16_SFLOAT
+	coverage_format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
+			| RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT | RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
+	var coverage_output: RID = rd.texture_create(coverage_format, RDTextureView.new())
+	if coverage_output.is_valid():
+		rd.texture_clear(coverage_output, Color(0,0,0,0), 0, 1, 0, 1)
+	owned.append(coverage_output)
+	var virtual_hit_format := RDTextureFormat.new()
+	virtual_hit_format.width = 1
+	virtual_hit_format.height = 1
+	virtual_hit_format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
+	virtual_hit_format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
+			| RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT | RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
+	var virtual_hit_output: RID = rd.texture_create(virtual_hit_format, RDTextureView.new())
+	if virtual_hit_output.is_valid():
+		rd.texture_clear(virtual_hit_output, Color(0,0,0,0), 0, 1, 0, 1)
+	owned.append(virtual_hit_output)
 	var dfg_image := Image.create(1,1,false,Image.FORMAT_RGBAH)
 	dfg_image.set_pixel(0,0,Color(1,1,0,1))
 	var dfg_format := RDTextureFormat.new()
@@ -269,7 +289,10 @@ func execute():
 		reflection_ready = scene_owner.sync_scene(snapshot, reflection_backend.sbt_range)
 	var reflection_layer0_ok := false
 	var reflection_layer1_ok := false
+	var reflection_miss_ok := false
+	var reflection_inputs: Array[RID] = []
 	if reflection_ready:
+		reflection_ready = coverage_output.is_valid() and virtual_hit_output.is_valid()
 		var material_model_opaque := 1.0 / 255.0
 		var orm_bytes := PackedFloat32Array([1.0, 0.0, 1.0, material_model_opaque]).to_byte_array()
 		reflection_ready = rd.texture_update(inputs[3], 0, orm_bytes) == OK
@@ -283,7 +306,7 @@ func execute():
 		var emission_tex := rd.texture_create(emission_desc, RDTextureView.new(),
 				[PackedFloat32Array([0.0,0.0,0.0,0.5]).to_byte_array()])
 		owned.append(emission_tex)
-		var reflection_inputs: Array[RID] = [inputs[0], inputs[1], inputs[2], inputs[3], emission_tex]
+		reflection_inputs = [inputs[0], inputs[1], inputs[2], inputs[3], emission_tex]
 		# With the identity inverse projection this sample is at +Z; keep the camera
 		# at the origin so its reflected ray travels toward the z=2 secondary surface.
 		frame.camera_transform = Transform3D.IDENTITY
@@ -292,32 +315,66 @@ func execute():
 		var reflection_frame: PackedByteArray = pass_instance._pack_trace_frame(frame, Vector2i.ONE, 2, 0, 1.0,
 				{"samples_per_pixel": 1, "max_distance": 100.0})
 		var first_layer_trace_ok := reflection_ready and reflection_backend.trace(scene_owner, reflection_inputs,
-				reflection_frame, {"sky_radiance_texture": sky_array}, output, dfg, Vector2i.ONE)
+				reflection_frame, {"sky_radiance_texture": sky_array}, output, coverage_output,
+				virtual_hit_output, dfg, Vector2i.ONE)
 		if not first_layer_trace_ok:
 			print("RTGI_CASE sky_array_secondary_first_trace_error ", reflection_backend.error)
 			reflection_ready = false
 		if first_layer_trace_ok:
 			var layer0_value := Image.create_from_data(1,1,false,Image.FORMAT_RGBAH,rd.texture_get_data(output,0)).get_pixel(0,0)
-			reflection_layer0_ok = absf(layer0_value.r - 2.0) < 0.05 and layer0_value.a > 0.0
-			print("RTGI_CASE sky_array_secondary_layer0 ", layer0_value)
+			var layer0_coverage := Image.create_from_data(1,1,false,Image.FORMAT_RH,
+					rd.texture_get_data(coverage_output,0)).get_pixel(0,0).r
+			var layer0_virtual_hit := Image.create_from_data(1,1,false,Image.FORMAT_RGBAF,
+					rd.texture_get_data(virtual_hit_output,0)).get_pixel(0,0)
+			reflection_layer0_ok = absf(layer0_value.r - 2.0) < 0.05 and layer0_value.a > 0.0 \
+					and absf(layer0_coverage - 1.0) < 0.01 and layer0_virtual_hit.a > 0.99 \
+					and is_finite(layer0_virtual_hit.r) and is_finite(layer0_virtual_hit.g) \
+					and is_finite(layer0_virtual_hit.b)
+			print("RTGI_CASE geometry_hit_coverage_one ", layer0_value, " coverage=", layer0_coverage,
+				" virtual_hit=", layer0_virtual_hit)
 			snapshot.instances[0].mesh.materials[2].roughness = 1.0
 			snapshot.snapshot_generation += 1
 			reflection_ready = scene_owner.sync_scene(snapshot, reflection_backend.sbt_range)
 			reflection_frame = pass_instance._pack_trace_frame(frame, Vector2i.ONE, 3, 0, 1.0,
 					{"samples_per_pixel": 1, "max_distance": 100.0})
 			var second_layer_trace_ok := reflection_ready and reflection_backend.trace(scene_owner, reflection_inputs,
-					reflection_frame, {"sky_radiance_texture": sky_array}, output, dfg, Vector2i.ONE)
+					reflection_frame, {"sky_radiance_texture": sky_array}, output, coverage_output,
+					virtual_hit_output, dfg, Vector2i.ONE)
 			if not second_layer_trace_ok:
 				print("RTGI_CASE sky_array_secondary_trace_error ", reflection_backend.error)
 			reflection_ready = second_layer_trace_ok
 		if reflection_ready:
 			var layer1_value := Image.create_from_data(1,1,false,Image.FORMAT_RGBAH,rd.texture_get_data(output,0)).get_pixel(0,0)
-			reflection_layer1_ok = absf(layer1_value.r - 50.0) < 0.5 and layer1_value.a > 0.0
-			print("RTGI_CASE sky_array_secondary_layer1 ", layer1_value)
+			var layer1_coverage := Image.create_from_data(1,1,false,Image.FORMAT_RH,
+					rd.texture_get_data(coverage_output,0)).get_pixel(0,0).r
+			reflection_layer1_ok = absf(layer1_value.r - 50.0) < 0.5 and layer1_value.a > 0.0 \
+					and absf(layer1_coverage - 1.0) < 0.01
+			print("RTGI_CASE geometry_only_roughness_layer ", layer1_value, " coverage=", layer1_coverage)
 		else:
 			print("RTGI_CASE sky_array_secondary_init_or_trace_error ", reflection_ready, " ", reflection_backend.error)
-	passed = passed and reflection_layer0_ok and reflection_layer1_ok
-	print("RTGI_CASE sky_array_secondary_roughness_layers ",reflection_layer0_ok,"/",reflection_layer1_ok)
+	if reflection_ready:
+		snapshot.instances[0].transform.origin = Vector3(0.0, 0.0, 200.0)
+		snapshot.snapshot_generation += 1
+		reflection_ready = scene_owner.sync_scene(snapshot, reflection_backend.sbt_range)
+		var miss_frame: PackedByteArray = pass_instance._pack_trace_frame(frame, Vector2i.ONE, 4, 0, 1.0,
+				{"samples_per_pixel": 4, "max_distance": 100.0})
+		var miss_trace_ok := reflection_ready and reflection_backend.trace(scene_owner, reflection_inputs,
+				miss_frame, {"sky_radiance_texture": sky_array}, output, coverage_output,
+				virtual_hit_output, dfg, Vector2i.ONE)
+		if miss_trace_ok:
+			var miss_value := Image.create_from_data(1,1,false,Image.FORMAT_RGBAH,rd.texture_get_data(output,0)).get_pixel(0,0)
+			var miss_coverage := Image.create_from_data(1,1,false,Image.FORMAT_RH,
+					rd.texture_get_data(coverage_output,0)).get_pixel(0,0).r
+			var miss_virtual_hit := Image.create_from_data(1,1,false,Image.FORMAT_RGBAF,
+					rd.texture_get_data(virtual_hit_output,0)).get_pixel(0,0)
+			reflection_miss_ok = absf(miss_value.r) < 0.001 and miss_value.a < 0.0 \
+					and absf(miss_coverage) < 0.001 and miss_virtual_hit == Color(0, 0, 0, 0)
+			print("RTGI_CASE miss_keeps_native_specular_fallback ", reflection_miss_ok,
+				" raw=", miss_value, " coverage=", miss_coverage, " virtual_hit=", miss_virtual_hit)
+		else:
+			print("RTGI_CASE miss_trace_error ", reflection_backend.error)
+	passed = passed and reflection_layer0_ok and reflection_layer1_ok and reflection_miss_ok
+	print("RTGI_CASE geometry_hit_miss_priority ",reflection_layer0_ok,"/",reflection_layer1_ok,"/",reflection_miss_ok)
 	reflection_backend.release()
 	if not pass_instance.ensure_diffuse_compute(rd):
 		passed = false

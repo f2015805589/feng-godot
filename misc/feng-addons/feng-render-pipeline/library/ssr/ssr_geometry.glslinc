@@ -1,0 +1,229 @@
+bool ssr_geometry_finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool ssr_geometry_finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool ssr_geometry_reconstruct_view_position(mat4 inverse_projection, vec2 uv,
+		float raw_depth, out vec3 view_position) {
+	view_position = vec3(0.0);
+	if (!ssr_geometry_finite_float(raw_depth) || raw_depth <= 0.0
+			|| any(isnan(uv)) || any(isinf(uv))) {
+		return false;
+	}
+	vec4 view_h = inverse_projection * vec4(uv * 2.0 - 1.0, raw_depth, 1.0);
+	if (any(isnan(view_h)) || any(isinf(view_h)) || abs(view_h.w) <= 1e-7) {
+		return false;
+	}
+	view_position = view_h.xyz / view_h.w;
+	return ssr_geometry_finite_vec3(view_position) && -view_position.z > 0.0;
+}
+
+bool ssr_geometry_unproject_ndc(mat4 inverse_projection, vec2 uv,
+		float ndc_depth, out vec3 view_position) {
+	view_position = vec3(0.0);
+	if (!ssr_geometry_finite_float(ndc_depth)
+			|| any(isnan(uv)) || any(isinf(uv))) {
+		return false;
+	}
+	vec4 view_h = inverse_projection * vec4(uv * 2.0 - 1.0, ndc_depth, 1.0);
+	if (any(isnan(view_h)) || any(isinf(view_h)) || abs(view_h.w) <= 1e-7) {
+		return false;
+	}
+	view_position = view_h.xyz / view_h.w;
+	return ssr_geometry_finite_vec3(view_position);
+}
+
+bool ssr_geometry_pixel_corner_plane_depth(mat4 inverse_projection, vec2 uv,
+		vec3 plane_point, vec3 plane_normal, out float linear_depth,
+		out float denominator) {
+	linear_depth = 0.0;
+	denominator = 0.0;
+	vec3 ray_start;
+	vec3 ray_end;
+	if (!ssr_geometry_unproject_ndc(inverse_projection, uv, 0.25, ray_start)
+			|| !ssr_geometry_unproject_ndc(inverse_projection, uv, 0.75, ray_end)) {
+		return false;
+	}
+	vec3 ray_direction = ray_end - ray_start;
+	float normal_length_squared = dot(plane_normal, plane_normal);
+	float ray_length_squared = dot(ray_direction, ray_direction);
+	denominator = dot(plane_normal, ray_direction);
+	float denominator_scale_squared = normal_length_squared * ray_length_squared;
+	if (!ssr_geometry_finite_vec3(ray_direction)
+			|| !ssr_geometry_finite_float(normal_length_squared) || normal_length_squared <= 0.0
+			|| !ssr_geometry_finite_float(ray_length_squared) || ray_length_squared <= 0.0
+			|| !ssr_geometry_finite_float(denominator)
+			|| !ssr_geometry_finite_float(denominator_scale_squared)
+			|| denominator_scale_squared <= 0.0
+			|| abs(denominator) <= sqrt(denominator_scale_squared) * 1e-5) {
+		return false;
+	}
+	float intersection_t = dot(plane_normal, plane_point - ray_start) / denominator;
+	vec3 intersection_position = ray_start + ray_direction * intersection_t;
+	linear_depth = -intersection_position.z;
+	return ssr_geometry_finite_float(intersection_t)
+			&& ssr_geometry_finite_vec3(intersection_position)
+			&& ssr_geometry_finite_float(linear_depth) && linear_depth > 0.0;
+}
+
+bool ssr_geometry_plane_pixel_depth_envelope(mat4 inverse_projection,
+		ivec2 pixel, ivec2 full_size, vec3 plane_point, vec3 plane_normal,
+		float center_depth, out vec2 depth_envelope) {
+	depth_envelope = vec2(0.0);
+	if (any(lessThanEqual(full_size, ivec2(0)))
+			|| any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, full_size))
+			|| !ssr_geometry_finite_vec3(plane_point)
+			|| !ssr_geometry_finite_vec3(plane_normal)
+			|| !ssr_geometry_finite_float(center_depth) || center_depth <= 0.0) {
+		return false;
+	}
+	depth_envelope = vec2(center_depth);
+	float denominator_sign = 0.0;
+	for (int corner_y = 0; corner_y <= 1; corner_y++) {
+		for (int corner_x = 0; corner_x <= 1; corner_x++) {
+			vec2 corner_uv = (vec2(pixel) + vec2(float(corner_x), float(corner_y)))
+					/ vec2(full_size);
+			float corner_depth;
+			float denominator;
+			if (!ssr_geometry_pixel_corner_plane_depth(inverse_projection, corner_uv,
+					plane_point, plane_normal, corner_depth, denominator)) {
+				return false;
+			}
+			float corner_sign = denominator < 0.0 ? -1.0 : 1.0;
+			if (denominator_sign != 0.0 && corner_sign != denominator_sign) {
+				return false;
+			}
+			denominator_sign = corner_sign;
+			depth_envelope.x = min(depth_envelope.x, corner_depth);
+			depth_envelope.y = max(depth_envelope.y, corner_depth);
+		}
+	}
+	return ssr_geometry_finite_float(depth_envelope.x)
+			&& ssr_geometry_finite_float(depth_envelope.y)
+			&& depth_envelope.x > 0.0 && depth_envelope.x <= depth_envelope.y;
+}
+
+bool ssr_geometry_choose_axis_tangent(vec3 center_position,
+		vec3 negative_position, bool negative_valid,
+		vec3 positive_position, bool positive_valid, out vec3 tangent) {
+	float nearest_distance_squared = 1e30;
+	tangent = vec3(0.0);
+	bool found = false;
+	if (negative_valid) {
+		vec3 candidate = negative_position - center_position;
+		float distance_squared = dot(candidate, candidate);
+		if (ssr_geometry_finite_vec3(candidate) && ssr_geometry_finite_float(distance_squared)
+				&& distance_squared > 0.0 && distance_squared < nearest_distance_squared) {
+			nearest_distance_squared = distance_squared;
+			tangent = candidate;
+			found = true;
+		}
+	}
+	if (positive_valid) {
+		vec3 candidate = positive_position - center_position;
+		float distance_squared = dot(candidate, candidate);
+		if (ssr_geometry_finite_vec3(candidate) && ssr_geometry_finite_float(distance_squared)
+				&& distance_squared > 0.0 && distance_squared < nearest_distance_squared) {
+			nearest_distance_squared = distance_squared;
+			tangent = candidate;
+			found = true;
+		}
+	}
+	return found && ssr_geometry_finite_vec3(tangent);
+}
+
+bool ssr_geometry_fit_local_plane(vec3 center_position,
+		vec3 x_negative, bool x_negative_valid, vec3 x_positive, bool x_positive_valid,
+		vec3 y_negative, bool y_negative_valid, vec3 y_positive, bool y_positive_valid,
+		out vec3 geometric_normal) {
+	geometric_normal = vec3(0.0);
+	if (!ssr_geometry_finite_vec3(center_position)) {
+		return false;
+	}
+	vec3 tangent_x;
+	vec3 tangent_y;
+	if (!ssr_geometry_choose_axis_tangent(center_position,
+			x_negative, x_negative_valid, x_positive, x_positive_valid, tangent_x)
+			|| !ssr_geometry_choose_axis_tangent(center_position,
+			y_negative, y_negative_valid, y_positive, y_positive_valid, tangent_y)) {
+		return false;
+	}
+	geometric_normal = cross(tangent_x, tangent_y);
+	float normal_length_squared = dot(geometric_normal, geometric_normal);
+	float tangent_x_length_squared = dot(tangent_x, tangent_x);
+	float tangent_y_length_squared = dot(tangent_y, tangent_y);
+	float tangent_area_squared = tangent_x_length_squared * tangent_y_length_squared;
+	float camera_direction_length_squared = dot(center_position, center_position);
+	if (!ssr_geometry_finite_vec3(geometric_normal)
+			|| !ssr_geometry_finite_float(tangent_x_length_squared) || tangent_x_length_squared <= 0.0
+			|| !ssr_geometry_finite_float(tangent_y_length_squared) || tangent_y_length_squared <= 0.0
+			|| !ssr_geometry_finite_float(tangent_area_squared) || tangent_area_squared <= 0.0
+			|| !ssr_geometry_finite_float(normal_length_squared) || normal_length_squared <= 0.0
+			|| !ssr_geometry_finite_float(camera_direction_length_squared)
+			|| camera_direction_length_squared <= 1e-12) {
+		geometric_normal = vec3(0.0);
+		return false;
+	}
+	// Cross area divided by tangent area is sin^2(angle), independent of world scale.
+	float normalized_area_squared = normal_length_squared / tangent_area_squared;
+	if (!ssr_geometry_finite_float(normalized_area_squared) || normalized_area_squared <= 1e-8) {
+		geometric_normal = vec3(0.0);
+		return false;
+	}
+	geometric_normal *= inversesqrt(normal_length_squared);
+	vec3 camera_direction = -center_position * inversesqrt(camera_direction_length_squared);
+	float camera_facing = dot(geometric_normal, camera_direction);
+	if (!ssr_geometry_finite_float(camera_facing) || abs(camera_facing) <= 1e-4) {
+		geometric_normal = vec3(0.0);
+		return false;
+	}
+	if (camera_facing < 0.0) {
+		geometric_normal = -geometric_normal;
+	}
+	return ssr_geometry_finite_vec3(geometric_normal);
+}
+
+bool ssr_geometry_intersect_ray_plane(vec3 ray_origin, vec3 ray_direction,
+		vec3 plane_point, vec3 plane_normal, float minimum_t, float maximum_t,
+		out float facing, out float intersection_t, out vec3 intersection_position) {
+	facing = 0.0;
+	intersection_t = 0.0;
+	intersection_position = vec3(0.0);
+	if (!ssr_geometry_finite_vec3(ray_origin) || !ssr_geometry_finite_vec3(ray_direction)
+			|| !ssr_geometry_finite_vec3(plane_point) || !ssr_geometry_finite_vec3(plane_normal)
+			|| !ssr_geometry_finite_float(minimum_t) || !ssr_geometry_finite_float(maximum_t)
+			|| minimum_t < 0.0 || maximum_t < minimum_t) {
+		return false;
+	}
+	facing = dot(plane_normal, -ray_direction);
+	float denominator = dot(plane_normal, ray_direction);
+	if (!ssr_geometry_finite_float(facing) || abs(facing) <= 0.03
+			|| !ssr_geometry_finite_float(denominator)) {
+		return false;
+	}
+	intersection_t = dot(plane_normal, plane_point - ray_origin) / denominator;
+	if (!ssr_geometry_finite_float(intersection_t)
+			|| intersection_t < minimum_t || intersection_t > maximum_t) {
+		return false;
+	}
+	intersection_position = ray_origin + ray_direction * intersection_t;
+	return ssr_geometry_finite_vec3(intersection_position);
+}
+
+float ssr_geometry_full_pixel_footprint(mat4 projection, mat4 inverse_projection,
+		float linear_depth, ivec2 full_size) {
+	if (!ssr_geometry_finite_float(linear_depth) || linear_depth <= 0.0
+			|| any(lessThanEqual(full_size, ivec2(0)))) {
+		return 1e-4;
+	}
+	bool orthographic = abs(inverse_projection[3][3] - 1.0) < 1e-4;
+	float depth_scale = orthographic ? 1.0 : linear_depth;
+	float projection_x = max(abs(projection[0][0]), 1e-4);
+	float projection_y = max(abs(projection[1][1]), 1e-4);
+	float pixel_width = 2.0 * depth_scale / (projection_x * float(full_size.x));
+	float pixel_height = 2.0 * depth_scale / (projection_y * float(full_size.y));
+	return max(length(vec2(pixel_width, pixel_height)) * 0.75, 1e-4);
+}

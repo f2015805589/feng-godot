@@ -1,0 +1,132 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depth_texture;
+layout(set = 0, binding = 1) uniform sampler2D normal_roughness_texture;
+layout(set = 0, binding = 2) uniform sampler2D albedo_texture;
+layout(set = 0, binding = 3) uniform sampler2D orm_texture;
+layout(set = 0, binding = 4) uniform sampler2D emission_texture;
+layout(set = 0, binding = 5) uniform sampler2D dfg_texture;
+layout(set = 0, binding = 6) uniform samplerCubeArray probe_cubemaps;
+
+struct ProbeData {
+	mat4 local_to_world;
+	mat4 world_to_local;
+	mat4 source_world_to_local;
+	vec4 capture_origin_blend;
+	vec4 half_size_intensity;
+};
+layout(set = 0, binding = 7, std430) readonly buffer ProbeBuffer {
+	ProbeData probes[];
+} probe_buffer;
+
+layout(rgba16f, set = 0, binding = 8) uniform writeonly image2D candidate_output;
+layout(set = 0, binding = 9, std140) uniform CandidateParameters {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	ivec4 size_probe_mips;
+	vec4 exposure;
+} params;
+
+bool finite_float(float value) { return !isnan(value) && !isinf(value); }
+bool finite_vec3(vec3 value) { return !any(isnan(value)) && !any(isinf(value)); }
+
+bool inside_box(vec3 position, vec3 direction, vec3 half_size, out float exit_distance) {
+	float enter_distance = -1e30;
+	exit_distance = 1e30;
+	for (int axis = 0; axis < 3; axis++) {
+		float p = position[axis];
+		float d = direction[axis];
+		float h = half_size[axis];
+		if (abs(d) < 1e-7) {
+			if (abs(p) > h) return false;
+			continue;
+		}
+		float a = (-h - p) / d;
+		float b = (h - p) / d;
+		enter_distance = max(enter_distance, min(a, b));
+		exit_distance = min(exit_distance, max(a, b));
+	}
+	return finite_float(exit_distance) && exit_distance >= max(enter_distance, 0.0);
+}
+
+void store_empty(ivec2 pixel) { imageStore(candidate_output, pixel, vec4(0.0)); }
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = params.size_probe_mips.xy;
+	if (any(greaterThanEqual(pixel, size))) return;
+	if (params.size_probe_mips.z <= 0) { store_empty(pixel); return; }
+	float depth = texelFetch(depth_texture, pixel, 0).r;
+	vec4 orm = texelFetch(orm_texture, pixel, 0);
+	uint material_model = uint(round(clamp(orm.a, 0.0, 1.0) * 255.0)) & 0x0fu;
+	if (!(depth > 0.0) || !finite_float(depth) || material_model == 0u) { store_empty(pixel); return; }
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+	vec4 view_h = params.inverse_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	if (!finite_float(view_h.w) || abs(view_h.w) <= 1e-8) { store_empty(pixel); return; }
+	vec3 view_position = view_h.xyz / view_h.w;
+	vec3 world_position = (params.view_to_world * vec4(view_position, 1.0)).xyz;
+	vec3 normal_view = texelFetch(normal_roughness_texture, pixel, 0).xyz * 2.0 - 1.0;
+	vec3 normal_world = mat3(params.view_to_world) * normal_view;
+	float normal_length = length(normal_world);
+	if (!finite_vec3(world_position) || !finite_vec3(normal_world) || !(normal_length > 1e-6)) { store_empty(pixel); return; }
+	normal_world /= normal_length;
+	bool orthographic = abs(params.inverse_projection[3][3] - 1.0) < 1e-4;
+	vec3 view_vector = orthographic ? mat3(params.view_to_world) * vec3(0.0, 0.0, 1.0)
+			: params.view_to_world[3].xyz - world_position;
+	float view_length = length(view_vector);
+	if (!(view_length > 1e-6) || !finite_vec3(view_vector)) { store_empty(pixel); return; }
+	vec3 view_direction = view_vector / view_length;
+	float roughness = clamp(orm.g, 0.0, 1.0);
+	float metallic = clamp(orm.b, 0.0, 1.0);
+	float material_specular = clamp(texelFetch(emission_texture, pixel, 0).a, 0.0, 1.0);
+	vec3 albedo = max(texelFetch(albedo_texture, pixel, 0).rgb, vec3(0.0));
+	vec3 f0 = mix(vec3(0.16 * material_specular * material_specular), albedo, metallic);
+	float f90 = clamp(50.0 * f0.g, metallic, 1.0);
+	float no_v = max(dot(normal_world, view_direction), 1e-4);
+	vec2 dfg = textureLod(dfg_texture, vec2(no_v, 1.0 - roughness), 0.0).rg;
+	if (!finite_float(dfg.x) || !finite_float(dfg.y) || !(dfg.y > 1e-4)) { store_empty(pixel); return; }
+	vec3 energy_compensation = 1.0 + f0 * (1.0 / dfg.y - 1.0);
+	vec3 reflection_world = normalize(reflect(-view_direction, normal_world));
+	float exposure = params.exposure.x;
+	if (!finite_float(exposure) || exposure <= 0.0) { store_empty(pixel); return; }
+	float remaining = 1.0;
+	float total_coverage = 0.0;
+	vec3 result = vec3(0.0);
+	int probe_count = min(params.size_probe_mips.z, 256);
+	for (int probe_index = 0; probe_index < probe_count && remaining > 1e-3; probe_index++) {
+		ProbeData probe = probe_buffer.probes[probe_index];
+		vec3 local_position = (probe.world_to_local * vec4(world_position, 1.0)).xyz;
+		vec3 local_direction = mat3(probe.world_to_local) * reflection_world;
+		vec3 half_size = max(probe.half_size_intensity.xyz, vec3(1e-4));
+		if (any(greaterThan(abs(local_position), half_size))) continue;
+		float exit_distance = 0.0;
+		if (!inside_box(local_position, local_direction, half_size, exit_distance)) continue;
+		float face_distance = min(half_size.x - abs(local_position.x),
+				min(half_size.y - abs(local_position.y), half_size.z - abs(local_position.z)));
+		float blend_distance = max(probe.capture_origin_blend.w, 1e-4);
+		float coverage = probe.capture_origin_blend.w > 0.0
+				? smoothstep(0.0, blend_distance, max(face_distance, 0.0)) : 1.0;
+		if (!(coverage > 0.0)) continue;
+		vec3 local_hit = local_position + local_direction * exit_distance;
+		vec3 world_hit = (probe.local_to_world * vec4(local_hit, 1.0)).xyz;
+		vec3 parallax_direction = normalize(mat3(probe.source_world_to_local)
+				* (world_hit - probe.capture_origin_blend.xyz));
+		if (!finite_vec3(parallax_direction)) continue;
+		float lod = sqrt(roughness) * float(max(params.size_probe_mips.w - 1, 0));
+		vec3 radiance = textureLod(probe_cubemaps,
+				vec4(parallax_direction, float(probe_index)), lod).rgb;
+		if (!finite_vec3(radiance)) continue;
+		vec3 brdf = energy_compensation * ((vec3(f90) - f0) * dfg.x + f0 * dfg.y);
+		vec3 specular = max(radiance, vec3(0.0)) * max(brdf, vec3(0.0))
+				* max(probe.half_size_intensity.w, 0.0) * exposure;
+		if (!finite_vec3(specular)) continue;
+		float contribution = clamp(coverage, 0.0, 1.0) * remaining;
+		result += specular * contribution;
+		total_coverage += contribution;
+		remaining *= 1.0 - clamp(coverage, 0.0, 1.0);
+	}
+	if (!finite_vec3(result) || !finite_float(total_coverage)) { store_empty(pixel); return; }
+	imageStore(candidate_output, pixel, vec4(clamp(result, vec3(0.0), vec3(65504.0)),
+			clamp(total_coverage, 0.0, 1.0)));
+}

@@ -118,8 +118,50 @@ static func validate_schedule(
 				warnings.append("Pass '%s' must precede native '%s'; authored order was retained and the previous valid schedule remains active." % [_pass_display_name(pass_entry), NativeSpec.pass_name(int(required_id))])
 
 	warnings.append_array(_validate_custom_contracts(passes, native_positions, native_states, declared_provided_ids, is_entry_enabled_fn))
+	warnings.append_array(_validate_reflection_resolve_order(passes, is_entry_enabled_fn))
 	warnings.append_array(_validate_cloud_fog_order(passes, is_entry_enabled_fn))
 	return _unique_warnings(warnings)
+
+static func _validate_reflection_resolve_order(passes: Array, is_entry_enabled_fn: Callable) -> PackedStringArray:
+	var warnings := PackedStringArray()
+	var source_positions: Dictionary = {&"gi": [], &"ssr": [], &"feng_probe": []}
+	var resolve_positions: Array[int] = []
+	var sky_index := -1
+	for index in passes.size():
+		var pass_entry = passes[index]
+		if pass_entry == null:
+			continue
+		if sky_index < 0 and pass_entry is BuiltinPass \
+				and (pass_entry as BuiltinPass).native_id == NativeSpec.PASS_SKY:
+			sky_index = index
+		if not is_entry_enabled_fn.call(pass_entry):
+			continue
+		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
+		if source_pass == null or not source_pass.has_method("get_reflection_source_kind"):
+			continue
+		var kind := StringName(source_pass.call("get_reflection_source_kind"))
+		if kind == &"resolve":
+			resolve_positions.append(index)
+		elif source_positions.has(kind):
+			source_positions[kind].append(index)
+
+	if resolve_positions.size() > 1:
+		warnings.append("Only one enabled Reflection Resolve pass may replace the native indirect-specular term.")
+	for kind in [&"gi", &"ssr", &"feng_probe"]:
+		if source_positions[kind].size() > 1:
+			warnings.append("More than one enabled %s reflection candidate provider is scheduled; candidate publication will fail closed." % String(kind).to_upper())
+		if sky_index >= 0:
+			for source_index in source_positions[kind]:
+				if source_index > sky_index:
+					warnings.append("Reflection candidate providers must run before native Sky; authored order was retained and the previous valid schedule remains active.")
+	for resolve_index in resolve_positions:
+		if sky_index >= 0 and resolve_index > sky_index:
+			warnings.append("Reflection Resolve must run before native Sky; authored order was retained and the previous valid schedule remains active.")
+		for kind in [&"gi", &"ssr", &"feng_probe"]:
+			for source_index in source_positions[kind]:
+				if source_index > resolve_index:
+					warnings.append("Reflection Resolve must follow enabled GI, SSR and FengReflectProbe candidate providers; authored order was retained and the previous valid schedule remains active.")
+	return warnings
 
 static func _validate_cloud_fog_order(passes: Array, is_entry_enabled_fn: Callable) -> PackedStringArray:
 	var warnings := PackedStringArray()

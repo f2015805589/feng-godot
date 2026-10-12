@@ -16,13 +16,17 @@ const OutputDeclaration = preload("pass_output.gd")
 static var _owned_rid_snapshots: Dictionary = {}
 static var _owned_rid_snapshots_mutex := Mutex.new()
 
-@export_enum("Pre Opaque", "Post Opaque", "Post Sky", "Pre Transparent", "Post Transparent", "Pre GBuffer", "Post GBuffer", "Pre Lighting", "Post Lighting") var stage: int = EFFECT_CALLBACK_TYPE_POST_TRANSPARENT:
+## Legacy serialized alias for CompositorEffect.effect_callback_type. FRP schedule
+## placement comes from FengRenderer.passes; this hidden storage property remains so
+## older .tres resources and scripts that read/write `stage` keep working.
+@export_storage var stage: int = EFFECT_CALLBACK_TYPE_POST_TRANSPARENT:
+	get:
+		return effect_callback_type
 	set(value):
 		var next_stage := clampi(value, 0, EFFECT_CALLBACK_TYPE_MAX - 1)
-		if stage == next_stage and effect_callback_type == next_stage:
+		if effect_callback_type == next_stage:
 			return
-		stage = next_stage
-		effect_callback_type = stage
+		effect_callback_type = next_stage
 		emit_changed()
 
 ## Authored declarations emit changed so Inspector and UndoRedo edits rebuild the
@@ -72,7 +76,6 @@ func _on_contract_resource_changed() -> void:
 	emit_changed()
 
 func _init() -> void:
-	effect_callback_type = stage
 	property_list_changed.connect(_invalidate_parameter_layout)
 	script_changed.connect(_invalidate_parameter_layout)
 
@@ -374,8 +377,6 @@ func get_configuration_warnings() -> PackedStringArray:
 	var warnings := PackedStringArray()
 	if stage < 0 or stage >= EFFECT_CALLBACK_TYPE_MAX:
 		warnings.append("Pass stage is outside the CompositorEffect callback range.")
-	if effect_callback_type != stage:
-		warnings.append("Pass stage is out of sync with effect_callback_type.")
 	var bindings := {}
 	for declaration in inputs:
 		if declaration == null:

@@ -108,9 +108,17 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	clear_cloud_native_inputs();
 	clear_cloud_projection_parameters();
 	clear_cloud_outputs();
-	set_cloud_capture_context(false, 0, -1, 0, Vector3(), 1.0f);
+	set_reflection_capture_context(false, 0, -1, 0, Vector3(), 1.0f);
 	sky_light_diffuse_requested = false;
 	indirect_specular_requested = false;
+	reflection_components_requested = false;
+	reflection_components_available = false;
+	for (int view = 0; view < 2; view++) {
+		for (int source = 0; source < 3; source++) {
+			reflection_candidates[view][source] = RID();
+			reflection_candidate_blocked[view][source] = false;
+		}
+	}
 	indirect_specular_target_provider = std::function<RID(int)>();
 	begin_indirect_specular_callback();
 	tonemap_mode_override = -1;
@@ -465,7 +473,7 @@ PackedFloat32Array FRPPassContext::get_cloud_atmosphere_parameters() const {
 	return parameters;
 }
 
-void FRPPassContext::set_cloud_capture_context(bool p_active, uint64_t p_batch_id, int p_face_index, int p_face_count, const Vector3 &p_origin_world_m, float p_exposure_normalization) {
+void FRPPassContext::set_reflection_capture_context(bool p_active, uint64_t p_batch_id, int p_face_index, int p_face_count, const Vector3 &p_origin_world_m, float p_exposure_normalization) {
 	cloud_capture_active = false;
 	cloud_capture_batch_id = 0;
 	cloud_capture_face_index = -1;
@@ -481,6 +489,10 @@ void FRPPassContext::set_cloud_capture_context(bool p_active, uint64_t p_batch_i
 	cloud_capture_face_count = p_face_count;
 	cloud_capture_origin_world_m = p_origin_world_m;
 	cloud_capture_exposure_normalization = Math::is_finite(p_exposure_normalization) && p_exposure_normalization > 0.0f ? p_exposure_normalization : 1.0f;
+}
+
+void FRPPassContext::set_cloud_capture_context(bool p_active, uint64_t p_batch_id, int p_face_index, int p_face_count, const Vector3 &p_origin_world_m, float p_exposure_normalization) {
+	set_reflection_capture_context(p_active, p_batch_id, p_face_index, p_face_count, p_origin_world_m, p_exposure_normalization);
 }
 
 void FRPPassContext::set_tonemap_exposure_texture(RID p_texture) {
@@ -502,6 +514,101 @@ void FRPPassContext::request_sky_light_diffuse() {
 void FRPPassContext::request_indirect_specular() {
 	ERR_FAIL_NULL_MSG(render_data, "FRP pass context used outside of an FRP frame.");
 	indirect_specular_requested = true;
+}
+
+void FRPPassContext::request_reflection_components() {
+	ERR_FAIL_NULL_MSG(render_data, "FRP pass context used outside of an FRP frame.");
+	reflection_components_requested = true;
+	request_indirect_specular();
+}
+
+RID FRPPassContext::get_sky_light_specular_texture(int p_view) const {
+	if (p_view < 0 || p_view >= 2 || p_view >= get_view_count()) {
+		return RID();
+	}
+	if (!reflection_components_requested || !reflection_components_available || render_data == nullptr) {
+		return RID();
+	}
+	Ref<RenderSceneBuffersRD> buffers = get_render_scene_buffers();
+	if (buffers.is_null() || !buffers->has_texture(SNAME("frp_clustered"), SNAME("sky_light_specular"))) {
+		return RID();
+	}
+	RID texture = buffers->get_texture_slice(SNAME("frp_clustered"), SNAME("sky_light_specular"), p_view, 0);
+	RD *rd = RD::get_singleton();
+	if (texture.is_null() || rd == nullptr || !rd->texture_is_valid(texture)) {
+		return RID();
+	}
+	const RD::TextureFormat format = rd->texture_get_format(texture);
+	const Vector2i internal_size = get_internal_size();
+	if (format.texture_type != RD::TEXTURE_TYPE_2D || format.format != RD::DATA_FORMAT_R16G16B16A16_SFLOAT ||
+			format.width != uint32_t(internal_size.x) || format.height != uint32_t(internal_size.y) ||
+			!(format.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT)) {
+		return RID();
+	}
+	return texture;
+}
+
+static int _frp_reflection_source_index(const StringName &p_source) {
+	if (p_source == StringName("gi")) {
+		return 0;
+	}
+	if (p_source == StringName("ssr")) {
+		return 1;
+	}
+	if (p_source == StringName("feng_probe")) {
+		return 2;
+	}
+	return -1;
+}
+
+bool FRPPassContext::publish_reflection_candidate(const StringName &p_source, RID p_texture, int p_view) {
+	if (render_data == nullptr || p_view < 0 || p_view >= 2 || p_view >= get_view_count()) {
+		return false;
+	}
+	const int source_index = _frp_reflection_source_index(p_source);
+	if (source_index < 0 || !reflection_components_requested || !reflection_components_available) {
+		return false;
+	}
+	RD *rd = RD::get_singleton();
+	ERR_FAIL_NULL_V_MSG(rd, false, "RenderingDevice is not available for a reflection candidate.");
+	ERR_FAIL_COND_V_MSG(p_texture.is_null() || !rd->texture_is_valid(p_texture), false, "Reflection candidate RID is not a valid RenderingDevice texture.");
+	const RD::TextureFormat format = rd->texture_get_format(p_texture);
+	const Vector2i internal_size = get_internal_size();
+	ERR_FAIL_COND_V_MSG(format.texture_type != RD::TEXTURE_TYPE_2D || format.format != RD::DATA_FORMAT_R16G16B16A16_SFLOAT ||
+			format.width != uint32_t(internal_size.x) || format.height != uint32_t(internal_size.y) ||
+			!(format.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT), false,
+			"Reflection candidates must be full-resolution, sampleable RGBA16F 2D textures.");
+	RID &slot = reflection_candidates[p_view][source_index];
+	if (reflection_candidate_blocked[p_view][source_index]) {
+		return false;
+	}
+	if (slot.is_valid()) {
+		slot = RID();
+		reflection_candidate_blocked[p_view][source_index] = true;
+		if (!reflection_candidate_duplicate_warned) {
+			WARN_PRINT("FRP rejected a second reflection candidate publisher for the same source and view in one frame.");
+			reflection_candidate_duplicate_warned = true;
+		}
+		return false;
+	}
+	slot = p_texture;
+	return true;
+}
+
+RID FRPPassContext::get_reflection_candidate(const StringName &p_source, int p_view) const {
+	if (p_view < 0 || p_view >= 2 || p_view >= get_view_count()) {
+		return RID();
+	}
+	const int source_index = _frp_reflection_source_index(p_source);
+	if (source_index < 0 || !reflection_components_requested || !reflection_components_available) {
+		return RID();
+	}
+	if (reflection_candidate_blocked[p_view][source_index]) {
+		return RID();
+	}
+	RID texture = reflection_candidates[p_view][source_index];
+	RD *rd = RD::get_singleton();
+	return texture.is_valid() && rd != nullptr && rd->texture_is_valid(texture) ? texture : RID();
 }
 
 void FRPPassContext::begin_indirect_specular_callback() {
@@ -779,6 +886,12 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("request_sky_light_diffuse"), &FRPPassContext::request_sky_light_diffuse);
 	ClassDB::bind_method(D_METHOD("request_indirect_specular"), &FRPPassContext::request_indirect_specular);
 	ClassDB::bind_method(D_METHOD("is_indirect_specular_requested"), &FRPPassContext::is_indirect_specular_requested);
+	ClassDB::bind_method(D_METHOD("request_reflection_components"), &FRPPassContext::request_reflection_components);
+	ClassDB::bind_method(D_METHOD("is_reflection_components_requested"), &FRPPassContext::is_reflection_components_requested);
+	ClassDB::bind_method(D_METHOD("is_reflection_components_available"), &FRPPassContext::is_reflection_components_available);
+	ClassDB::bind_method(D_METHOD("get_sky_light_specular_texture", "view"), &FRPPassContext::get_sky_light_specular_texture, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("publish_reflection_candidate", "source", "texture", "view"), &FRPPassContext::publish_reflection_candidate, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_reflection_candidate", "source", "view"), &FRPPassContext::get_reflection_candidate, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("get_indirect_specular_composite_target", "view"), &FRPPassContext::get_indirect_specular_composite_target, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("mark_indirect_specular_modified", "view"), &FRPPassContext::mark_indirect_specular_modified, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("set_cloud_snapshot", "material_parameters", "shape_texture", "detail_texture", "weather_texture", "curl_texture", "primary_sun", "secondary_sun", "source_signature"), &FRPPassContext::set_cloud_snapshot, DEFVAL(0));
@@ -809,6 +922,8 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("has_cloud_outputs"), &FRPPassContext::has_cloud_outputs);
 	ClassDB::bind_method(D_METHOD("has_cloud_shadow_outputs"), &FRPPassContext::has_cloud_shadow_outputs);
 	ClassDB::bind_method(D_METHOD("get_cloud_output", "index"), &FRPPassContext::get_cloud_output);
+	ClassDB::bind_method(D_METHOD("set_reflection_capture_context", "active", "batch_id", "face_index", "face_count", "origin_world_m", "exposure_normalization"), &FRPPassContext::set_reflection_capture_context);
+	ClassDB::bind_method(D_METHOD("is_reflection_capture"), &FRPPassContext::is_reflection_capture);
 	ClassDB::bind_method(D_METHOD("is_cloud_capture"), &FRPPassContext::is_cloud_capture);
 	ClassDB::bind_method(D_METHOD("get_cloud_capture_batch_id"), &FRPPassContext::get_cloud_capture_batch_id);
 	ClassDB::bind_method(D_METHOD("get_cloud_capture_face_index"), &FRPPassContext::get_cloud_capture_face_index);

@@ -12,6 +12,7 @@ const PassBase = preload("../passes/pass_base.gd")
 const LibraryManager = preload("../pipeline/library_manager.gd")
 
 const MENU_LABEL := "Add Pass from Library"
+const LEGACY_RESOLVE_LIBRARY_PATH := "reflection-resolve/reflection_resolve.tres"
 
 var _editor_plugin_ref: WeakRef
 var _menu: PopupMenu
@@ -38,6 +39,7 @@ func setup() -> void:
 	_menu = PopupMenu.new()
 	_menu.name = "FengRenderPipeline"
 	_menu.id_pressed.connect(_on_library_item)
+	_menu.about_to_popup.connect(_refresh_library)
 	# add_tool_submenu_item() reparents popup into the editor tool menu and
 	# requires it to be parentless; adding it as a child first trips the
 	# ERR_FAIL_COND in EditorNode::add_tool_submenu_item.
@@ -118,8 +120,12 @@ func _refresh_library() -> void:
 
 
 func _add_library_entry(path: String, manifest: Dictionary) -> void:
-	var template = load(path)
+	if LibraryManager.normalize_library_path(path) == LEGACY_RESOLVE_LIBRARY_PATH:
+		return
+	var template = LibraryManager.load_template(manifest) if not manifest.is_empty() else load(path)
 	if template == null or not template is PassBase:
+		return
+	if _single_instance_provider_already_present(manifest, template):
 		return
 
 	var label := String(template.resource_name).strip_edges()
@@ -133,6 +139,37 @@ func _add_library_entry(path: String, manifest: Dictionary) -> void:
 	_library_entries.append({"path": path, "manifest": manifest, "label": label})
 	_menu.add_item(label, menu_id)
 	_menu.set_item_tooltip(menu_id, path)
+
+func _single_instance_provider_already_present(manifest: Dictionary, template: PassBase) -> bool:
+	var stable_id := StringName(manifest.get("id", ""))
+	if stable_id != &"library:rt_gi" and stable_id != &"library:ssr":
+		return false
+	var renderer = find_selected_renderer()
+	if renderer == null:
+		return false
+	var template_kind := _reflection_or_gi_kind(template)
+	for pass_entry in renderer.passes:
+		if pass_entry == null:
+			continue
+		if pass_entry.stable_id == stable_id:
+			return true
+		if _reflection_or_gi_kind(pass_entry) == template_kind and template_kind != &"":
+			return true
+	return false
+
+func _reflection_or_gi_kind(pass_entry: Variant) -> StringName:
+	var source_pass = pass_entry.get_parameter_source() if pass_entry != null and pass_entry.has_method("get_parameter_source") else pass_entry
+	if source_pass == null:
+		return &""
+	if source_pass.has_method("get_indirect_gi_kind"):
+		var gi_kind := StringName(source_pass.call("get_indirect_gi_kind"))
+		if gi_kind == &"rt_gi":
+			return &"rt_gi"
+	if source_pass.has_method("get_reflection_source_kind"):
+		var reflection_kind := StringName(source_pass.call("get_reflection_source_kind"))
+		if reflection_kind == &"ssr":
+			return &"ssr"
+	return &""
 
 
 func _make_unique_library_label(base: String, path: String) -> String:
@@ -184,6 +221,7 @@ func _on_library_item(id: int) -> void:
 	next.insert(LibraryManager.calculate_insert_index(current, instance.stable_id), instance)
 	var metadata := _metadata_after_library_add(renderer, path)
 	_record_renderer_change(renderer, next, "Add FRP Pass from Library", metadata)
+	_refresh_library()
 	_refresh_inspector()
 
 

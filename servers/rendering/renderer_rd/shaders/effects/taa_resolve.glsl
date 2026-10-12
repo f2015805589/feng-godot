@@ -239,12 +239,10 @@ vec3 sample_catmull_rom_9(sampler2D stex, vec2 uv, vec2 resolution, out bool val
 	result += textureLod(stex, vec2(texPos12.x, texPos3.y), 0.0).xyz * w12.x * w3.y;
 	result += textureLod(stex, vec2(texPos3.x, texPos3.y), 0.0).xyz * w3.x * w3.y;
 
-	// Catmull-Rom's negative lobes can reconstruct finite negative RGB from
-	// nonnegative texels near a sharp HDR edge. Radiance cannot be negative, so
-	// reject that history before max() erases the evidence. Some drivers also
-	// turn max(NaN, 0) into zero, which would silently blend invalid history.
+	// Catmull-Rom's negative lobes can undershoot finite nonnegative radiance
+	// near a sharp HDR edge. Clamp that finite ringing without rejecting history.
+	// Some drivers turn max(NaN, 0) into zero, so keep numeric validation first.
 	valid_history = !any(isnan(result)) && !any(isinf(result));
-	valid_history = valid_history && all(greaterThanEqual(result, vec3(0.0f)));
 	return max(result, 0.0f);
 }
 
@@ -369,7 +367,7 @@ vec3 temporal_antialiasing(uvec2 pos_group_top_left, uvec2 pos_group, uvec2 pos_
 	if (valid_history) {
 		color_history *= params.history_exposure_ratio;
 	} else {
-		// An FP16 overflow, NaN or negative Catmull reconstruction must not poison
+		// An FP16 overflow or NaN reconstruction must not poison
 		// later frames. Treat it as current history, then apply the same existing
 		// neighborhood clipping and flicker reduction as every valid sample.
 		color_history = color_input;

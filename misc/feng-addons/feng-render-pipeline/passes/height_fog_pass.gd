@@ -314,7 +314,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	ctx.set_height_fog_parameters(frame_parameters)
 	_capture_cloud_visibility(ctx)
 	_pre_exposure = ctx.get_pre_exposure(0)
-	_capture_exposure_normalization = ctx.get_scene_exposure_normalization() if _capture_snapshot_active else 1.0
+	_capture_exposure_normalization = ctx.get_scene_exposure_normalization() if capture_inline else 1.0
 	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
 	if _advanced_fog_requested(snapshot):
 		_frame_inputs = _read_volume_frame_inputs(ctx, buffers,
@@ -1040,7 +1040,7 @@ func _observer_height(camera_y: float, density: float, height: float, density2: 
 
 func _parameter_bytes() -> PackedByteArray:
 	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
-	var exposure := _pre_exposure * (_capture_exposure_normalization if _capture_snapshot_active else 1.0)
+	var exposure := _pre_exposure * _capture_exposure_normalization
 	return PackedFloat32Array([value.x, exposure, value.z, value.w]).to_byte_array()
 
 func _init() -> void:
@@ -1141,7 +1141,7 @@ func _update_volume_sampling_ubo(view: int, rd: RenderingDevice,
 		1.0 if volume_valid else 0.0,
 		float(packet[13]) if volume_valid else 0.0,
 		float(packet[12]) if volume_valid else 0.0,
-		0.0,
+		_capture_exposure_normalization if capture_inline else 1.0,
 	]))
 	var bytes := values.to_byte_array()
 	return bytes.size() == VOLUME_SAMPLING_UBO_BYTES \

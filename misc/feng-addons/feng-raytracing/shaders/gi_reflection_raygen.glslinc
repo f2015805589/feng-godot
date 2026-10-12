@@ -30,6 +30,8 @@ layout(set = 0, binding = 20, std140) uniform GIFrame {
 } gi_frame;
 layout(set = 0, binding = 21, rgba16f) uniform writeonly image2D gi_reflection_output;
 layout(set = 0, binding = 23) uniform sampler2D gi_dfg_lut;
+layout(set = 0, binding = 26, r16f) uniform writeonly image2D gi_reflection_coverage;
+layout(set = 0, binding = 27, rgba32f) uniform writeonly image2D gi_reflection_virtual_hit;
 layout(location = 0) rayPayloadEXT GIPathPayload gi_payload;
 
 const uint GI_RAY_MODE_REFLECTION = 2u;
@@ -92,6 +94,8 @@ float gi_smith_g1(float no_x, float roughness) {
 
 void store_invalid(ivec2 pixel) {
 	imageStore(gi_reflection_output, pixel, vec4(0.0));
+	imageStore(gi_reflection_coverage, pixel, vec4(0.0));
+	imageStore(gi_reflection_virtual_hit, pixel, vec4(0.0));
 }
 
 void main() {
@@ -183,6 +187,7 @@ void main() {
 	float max_distance = max(gi_frame.data.trace_parameters.x, 0.001);
 	vec3 result = vec3(0.0);
 	float hit_distance_sum = 0.0;
+	vec3 virtual_hit_sum = vec3(0.0);
 	uint hit_count = 0u;
 	for (uint sample_index = 0u; sample_index < sample_count; sample_index++) {
 		vec2 xi = vec2((float(sample_index) + temporal_sample.x) / float(sample_count),
@@ -207,13 +212,27 @@ void main() {
 		gi_payload.hit_distance = 0.0;
 		traceRayEXT(gi_scene_tlas, gl_RayFlagsNoneEXT, 0x01u, 0u, 0u, 0u,
 				world_position + normal * 0.001, 0.001, direction, max_distance, 0);
-		result += gi_finite_nonnegative(gi_payload.radiance) * fresnel * visibility * energy_compensation;
 		if (gi_payload.flags != GI_RAY_MODE_MISS) {
-			hit_count++;
-			hit_distance_sum += max(gi_payload.hit_distance, 0.0);
+			vec3 hit_position = world_position + normal * 0.001 + direction * gi_payload.hit_distance;
+			vec3 virtual_hit = hit_position - normal * (2.0 * dot(hit_position - world_position, normal));
+			if (!any(isnan(hit_position)) && !any(isinf(hit_position))
+					&& !any(isnan(virtual_hit)) && !any(isinf(virtual_hit))) {
+				result += gi_finite_nonnegative(gi_payload.radiance) * fresnel * visibility * energy_compensation;
+				hit_count++;
+				hit_distance_sum += max(gi_payload.hit_distance, 0.0);
+				virtual_hit_sum += virtual_hit;
+			}
 		}
 	}
 	result = min(gi_finite_nonnegative(result / float(sample_count)) * p0 * scene_normalization, vec3(GI_HALF_MAX));
 	float hit_data = hit_count * 2u >= sample_count ? max(hit_distance_sum / max(float(hit_count), 1.0), 0.001) : -max_distance;
 	imageStore(gi_reflection_output, pixel, vec4(result, hit_data));
+	float coverage = clamp(float(hit_count) / float(sample_count), 0.0, 1.0);
+	imageStore(gi_reflection_coverage, pixel, vec4(coverage));
+	vec3 virtual_hit = hit_count > 0u ? virtual_hit_sum / float(hit_count) : vec3(0.0);
+	if (coverage > 0.0 && !any(isnan(virtual_hit)) && !any(isinf(virtual_hit))) {
+		imageStore(gi_reflection_virtual_hit, pixel, vec4(virtual_hit, coverage));
+	} else {
+		imageStore(gi_reflection_virtual_hit, pixel, vec4(0.0));
+	}
 }

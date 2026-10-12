@@ -1,9 +1,45 @@
-[gd_resource type="CompositorEffect" script_class="FengRTGIPass" load_steps=2 format=3]
+[gd_resource type="CompositorEffect" script_class="FengRTGIPass" load_steps=9 format=3]
 
 [ext_resource type="Script" path="res://addons/feng-raytracing/passes/feng_rt_gi_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
+
+[sub_resource type="Resource" id="Depth"]
+script = ExtResource("2")
+binding = 1
+source = 1
+
+[sub_resource type="Resource" id="NormalRoughness"]
+script = ExtResource("2")
+binding = 2
+source = 2
+
+[sub_resource type="Resource" id="Albedo"]
+script = ExtResource("2")
+binding = 3
+source = 3
+
+[sub_resource type="Resource" id="ORM"]
+script = ExtResource("2")
+binding = 4
+source = 4
+
+[sub_resource type="Resource" id="Emission"]
+script = ExtResource("2")
+binding = 5
+source = 5
+
+[sub_resource type="Resource" id="IndirectSpecular"]
+script = ExtResource("2")
+binding = 6
+source = 10
 
 [resource]
 resource_name = "Hardware RTGI"
 script = ExtResource("1")
 stage = 8
 enabled = false
+stable_id = "library:rt_gi"
+inputs = Array[ExtResource("2")]([SubResource("Depth"), SubResource("NormalRoughness"), SubResource("Albedo"), SubResource("ORM"), SubResource("Emission"), SubResource("IndirectSpecular")])
+access_resolved_color = true
+access_resolved_depth = true
+needs_normal_roughness = true

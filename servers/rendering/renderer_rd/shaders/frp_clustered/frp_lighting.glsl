@@ -124,6 +124,21 @@ layout(location = 0) out vec4 frag_color;
 
 #ifdef MODE_SEPARATE_SPECULAR
 layout(location = 1) out vec4 specular_color;
+#define FRP_HAS_SEPARATE_SPECULAR 1
+#else
+#define FRP_HAS_SEPARATE_SPECULAR 0
+#endif
+
+#ifdef MODE_SKY_LIGHT_DIFFUSE
+#define FRP_HAS_SKY_LIGHT_DIFFUSE 1
+#else
+#define FRP_HAS_SKY_LIGHT_DIFFUSE 0
+#endif
+
+#ifdef MODE_INDIRECT_SPECULAR
+#define FRP_HAS_INDIRECT_SPECULAR 1
+#else
+#define FRP_HAS_INDIRECT_SPECULAR 0
 #endif
 
 #ifdef MODE_SKY_LIGHT_DIFFUSE
@@ -138,12 +153,20 @@ layout(location = 1) out vec4 sky_light_diffuse_color;
 layout(location = 2) out vec4 indirect_specular_color;
 #endif
 #endif
+
 #elif defined(MODE_INDIRECT_SPECULAR)
 #ifdef MODE_SEPARATE_SPECULAR
 layout(location = 2) out vec4 indirect_specular_color;
 #else
 layout(location = 1) out vec4 indirect_specular_color;
 #endif
+#endif
+
+#ifdef MODE_REFLECTION_COMPONENTS
+// Native combined indirect specular is Sky-only; alpha remains zero for additive replacement.
+// This matching sidecar stores the unweighted provider/environment term in RGB and
+// whether that term is a valid source in alpha.
+layout(location = 1 + FRP_HAS_SEPARATE_SPECULAR + FRP_HAS_SKY_LIGHT_DIFFUSE + FRP_HAS_INDIRECT_SPECULAR) out vec4 sky_light_specular_color;
 #endif
 
 // Per-pixel BxDF state selected from ORM alpha. The shared clustered traversal
@@ -250,6 +273,8 @@ void main() {
 	vec3 diffuse_light = vec3(0.0, 0.0, 0.0);
 	vec3 ambient_light = vec3(0.0, 0.0, 0.0);
 	vec3 global_sky_light_diffuse = vec3(0.0);
+	vec3 global_sky_light_specular = vec3(0.0);
+	bool global_sky_specular_valid = false;
 #if !defined(MODE_RENDER_DEPTH)
 	bool use_frp_sky_lighting = implementation_data.sky_lighting_enabled != 0u;
 	mat3 frp_radiance_inverse_xform = use_frp_sky_lighting ? implementation_data.sky_lighting_inverse_xform : scene_data.radiance_inverse_xform;
@@ -259,8 +284,8 @@ void main() {
 	float frp_ibl_energy = use_frp_sky_lighting ? implementation_data.sky_lighting_parameters.x : scene_data.ambient_light_color_energy.a;
 #endif
 
-	// Indirect lighting: ambient light and the reflection probes that the cluster
-	// light list carries. FRP has no GI or screen space effect buffers to blend in.
+	// Native deferred lighting resolves ambient/SkyLight diffuse and Sky-only specular.
+	// FRP library GI, AO and reflection candidates consume their scheduled inputs.
 	if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT)) {
 		ambient_light = scene_data.ambient_light_color_energy.rgb;
 
@@ -309,70 +334,17 @@ void main() {
 		}
 		if (cloud_sky_ao_active) {
 			// The cloud AO filter has already applied its configured strength.
-			// Attenuate only the FengSkyLight provider term before local probes blend in.
+			// Attenuate only the FengSkyLight provider term.
 			ambient_light *= frp_cloud_provider_ao_visibility(cloud_world_position);
 		}
 
-		// Reflection probes.
-		{
-			vec4 reflection_accum = vec4(0.0, 0.0, 0.0, 0.0);
-			vec4 ambient_accum = vec4(0.0, 0.0, 0.0, 0.0);
-
-			uint cluster_reflection_offset = cluster_offset + implementation_data.cluster_type_size * 4;
-
-			uint item_min;
-			uint item_max;
-			uint item_from;
-			uint item_to;
-
-			cluster_get_item_range(cluster_reflection_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
-
-			item_from = subgroupBroadcastFirst(subgroupMin(item_from));
-			item_to = subgroupBroadcastFirst(subgroupMax(item_to));
-
-			vec3 ref_vec = normalize(reflect(-view, normal));
-			ref_vec = mix(ref_vec, normal, roughness * roughness * roughness * roughness);
-
-			for (uint i = item_from; i < item_to; i++) {
-				uint mask = cluster_buffer.data[cluster_reflection_offset + i];
-				mask &= cluster_get_range_clip_mask(i, item_min, item_max);
-
-				uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
-				while (merged_mask != 0) {
-					uint bit = findMSB(merged_mask);
-					merged_mask &= ~(1u << bit);
-
-					if (((1u << bit) & mask) == 0) { //do not process if not originally here
-						continue;
-					}
-
-					uint reflection_index = 32 * i + bit;
-
-					if (reflection_accum.a >= 1.0 && ambient_accum.a >= 1.0) {
-						break;
-					}
-
-					reflection_process(reflection_index, vertex, ref_vec, normal, roughness, ambient_light, ambient_accum, reflection_accum);
-				}
-			}
-
-			if (ambient_accum.a < 1.0) {
-				ambient_accum.rgb = ambient_light * (1.0 - ambient_accum.a) + ambient_accum.rgb;
-			}
-			// Publish only the provider contribution left after local probe coverage.
-			if (use_frp_sky_lighting && frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
-				global_sky_light_diffuse = ambient_light * (1.0 - ambient_accum.a);
-			}
-
-			if (reflection_accum.a < 1.0) {
-				reflection_accum.rgb = indirect_specular_light * (1.0 - reflection_accum.a) + reflection_accum.rgb;
-			}
-
-			if (reflection_accum.a > 0.0) {
-				indirect_specular_light = reflection_accum.rgb;
-			}
-
-			ambient_light = ambient_accum.rgb;
+		// The native mirror baseline is SkyLight-only. FRP reflection candidates,
+		// including FengReflectProbe, are resolved by scheduled addon passes.
+		global_sky_light_specular = indirect_specular_light;
+		global_sky_specular_valid = bool(scene_data.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP) &&
+				frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT;
+		if (use_frp_sky_lighting && frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
+			global_sky_light_diffuse = ambient_light;
 		}
 
 		// Finalize ambient.
@@ -394,7 +366,9 @@ void main() {
 		float NdotV = clamp(dot(normal, view), 0.0001, 1.0);
 		vec2 env_brdf = prefiltered_dfg(roughness, NdotV).xy;
 		float f90 = clamp(50.0 * f0.g, metallic, 1.0);
-		indirect_specular_light *= energy_compensation * ((f90 - f0) * env_brdf.x + f0 * env_brdf.y);
+		vec3 indirect_specular_brdf = energy_compensation * ((f90 - f0) * env_brdf.x + f0 * env_brdf.y);
+		indirect_specular_light *= indirect_specular_brdf;
+		global_sky_light_specular *= indirect_specular_brdf;
 	}
 
 	// Direct lighting.
@@ -717,6 +691,7 @@ void main() {
 	ambient_light *= implementation_data.pre_exposure;
 	global_sky_light_diffuse *= implementation_data.pre_exposure;
 	indirect_specular_light *= implementation_data.pre_exposure;
+	global_sky_light_specular *= implementation_data.pre_exposure;
 
 	vec3 color = frp_compose_bxdf(shading_model_id, brdf, ambient_light, diffuse_light, direct_specular_light, indirect_specular_light);
 
@@ -731,6 +706,9 @@ void main() {
 	sky_light_diffuse_color = vec4(global_sky_light_diffuse, 0.0);
 #endif
 #ifdef MODE_INDIRECT_SPECULAR
-	indirect_specular_color = vec4(indirect_specular_light, 0.0);
+	indirect_specular_color = frp_normalize_shading_model(shading_model_id) == FRP_SHADING_MODEL_UNLIT ? vec4(0.0) : vec4(indirect_specular_light, 0.0);
+#endif
+#ifdef MODE_REFLECTION_COMPONENTS
+	sky_light_specular_color = global_sky_specular_valid ? vec4(global_sky_light_specular, 1.0) : vec4(0.0);
 #endif
 }

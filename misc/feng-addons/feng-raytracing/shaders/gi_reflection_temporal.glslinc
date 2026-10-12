@@ -13,13 +13,19 @@ layout(set = 0, binding = 8) uniform sampler2D previous_material;
 layout(set = 0, binding = 9) uniform sampler2D current_emission;
 layout(set = 0, binding = 10) uniform sampler2D current_albedo;
 layout(set = 0, binding = 11) uniform sampler2D previous_albedo;
-layout(set = 0, binding = 12, rgba16f) uniform writeonly image2D next_radiance;
-layout(set = 0, binding = 13, r32f) uniform writeonly image2D next_depth;
-layout(set = 0, binding = 14, rgba16f) uniform writeonly image2D next_normal_roughness;
-layout(set = 0, binding = 15, r32f) uniform writeonly image2D next_hit_data;
-layout(set = 0, binding = 16, rg16f) uniform writeonly image2D next_material;
-layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D next_albedo;
-layout(set = 0, binding = 18, std140) uniform ReflectionTemporal {
+layout(set = 0, binding = 12) uniform sampler2D raw_coverage;
+layout(set = 0, binding = 13) uniform sampler2D previous_coverage;
+layout(set = 0, binding = 14) uniform sampler2D raw_virtual_hit;
+layout(set = 0, binding = 15) uniform sampler2D previous_virtual_hit;
+layout(set = 0, binding = 16, rgba16f) uniform writeonly image2D next_radiance;
+layout(set = 0, binding = 17, r32f) uniform writeonly image2D next_depth;
+layout(set = 0, binding = 18, rgba16f) uniform writeonly image2D next_normal_roughness;
+layout(set = 0, binding = 19, r32f) uniform writeonly image2D next_hit_data;
+layout(set = 0, binding = 20, rg16f) uniform writeonly image2D next_material;
+layout(set = 0, binding = 21, rgba16f) uniform writeonly image2D next_albedo;
+layout(set = 0, binding = 22, r16f) uniform writeonly image2D next_coverage;
+layout(set = 0, binding = 23, rgba32f) uniform writeonly image2D next_virtual_hit;
+layout(set = 0, binding = 24, std140) uniform ReflectionTemporal {
 	vec4 parameters; // History weight, exposure ratio, relative depth threshold, minimum normal dot.
 	vec4 thresholds; // Roughness, hit-distance, metallic and specular rejection thresholds.
 	uvec4 state; // Valid history, generation low, generation high, replacement-strength bits.
@@ -30,6 +36,8 @@ layout(set = 0, binding = 18, std140) uniform ReflectionTemporal {
 } temporal;
 
 const float GI_HALF_MAX = 65504.0;
+const float GI_MIRROR_ROUGHNESS = 0.02;
+const float GI_LOBE_HISTORY_ROUGHNESS = 0.12;
 
 bool finite_float(float value) {
 	return !isnan(value) && !isinf(value);
@@ -64,17 +72,27 @@ bool same_material(float roughness, vec2 material, vec3 albedo,
 			&& (material.x <= 0.01 || length(albedo - other_albedo) <= 0.05);
 }
 
-bool compatible_hit(float current_hit, float old_hit, float roughness) {
-	if (!finite_float(old_hit) || old_hit == 0.0) {
-		return false;
+float hit_history_similarity(float current_hit_distance, float old_hit_distance, float roughness) {
+	if (!finite_float(current_hit_distance) || current_hit_distance == 0.0
+			|| !finite_float(old_hit_distance) || old_hit_distance == 0.0) {
+		return 0.0;
 	}
-	// Broad lobes legitimately alternate between sky and geometry and different
-	// hit distances. Rejecting those samples prevents the estimator converging.
-	if (roughness >= 0.3) {
-		return true;
+	// A mirror requires matching geometry; opening the lobe gradually admits
+	// independent hit/miss samples from the same receiver material.
+	float lobe_openness = smoothstep(GI_MIRROR_ROUGHNESS,
+			GI_LOBE_HISTORY_ROUGHNESS, roughness);
+	bool current_hit_found = current_hit_distance > 0.0;
+	bool previous_hit_found = old_hit_distance > 0.0;
+	if (current_hit_found != previous_hit_found) {
+		return lobe_openness;
 	}
-	float limit = max(abs(old_hit), 1.0) * mix(temporal.thresholds.y, 1.0, smoothstep(0.1, 0.3, roughness));
-	return (current_hit > 0.0) == (old_hit > 0.0) && abs(abs(current_hit) - abs(old_hit)) <= limit;
+	if (!current_hit_found) {
+		return 1.0;
+	}
+	float limit = max(abs(old_hit_distance), 1.0) * temporal.thresholds.y;
+	float distance_similarity = 1.0 - smoothstep(limit, limit * 4.0,
+			abs(abs(current_hit_distance) - abs(old_hit_distance)));
+	return mix(distance_similarity, 1.0, lobe_openness);
 }
 
 void main() {
@@ -85,14 +103,19 @@ void main() {
 	}
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
 	vec4 raw = texelFetch(raw_reflection, pixel, 0);
+	vec4 virtual_hit = texelFetch(raw_virtual_hit, pixel, 0);
+	float raw_coverage_value = texelFetch(raw_coverage, pixel, 0).r;
+	float current_coverage = finite_float(raw_coverage_value) ? clamp(raw_coverage_value, 0.0, 1.0) : 0.0;
 	float depth = texelFetch(current_depth, nearest_texel(uv, textureSize(current_depth, 0)), 0).r;
 	vec3 normal = world_normal(uv);
 	vec4 orm = texelFetch(current_orm, nearest_texel(uv, textureSize(current_orm, 0)), 0);
 	float roughness = clamp(orm.g, 0.0, 1.0);
+	bool mirror_mode = roughness <= GI_MIRROR_ROUGHNESS;
 	vec2 material = vec2(clamp(orm.b, 0.0, 1.0),
 			clamp(texelFetch(current_emission, nearest_texel(uv, textureSize(current_emission, 0)), 0).a, 0.0, 1.0));
 	vec3 albedo = max(texelFetch(current_albedo, nearest_texel(uv, textureSize(current_albedo, 0)), 0).rgb, vec3(0.0));
-	bool current_valid = valid_radiance(raw) && depth > 0.0 && finite_float(depth)
+	bool current_valid = valid_radiance(raw) && finite_float(raw_coverage_value)
+			&& depth > 0.0 && finite_float(depth)
 			&& !any(isnan(normal)) && !any(isinf(normal)) && finite_float(roughness)
 			&& !any(isnan(material)) && !any(isinf(material))
 			&& !any(isnan(albedo)) && !any(isinf(albedo));
@@ -102,6 +125,7 @@ void main() {
 	float spatial_blend = smoothstep(0.12, 0.35, roughness);
 	if (current_valid && spatial_blend > 0.0) {
 		vec3 spatial = current_radiance;
+		float spatial_coverage = current_coverage;
 		float total = 1.0;
 		float sigma = mix(0.65, 1.35, roughness);
 		for (int y = -2; y <= 2; y++) {
@@ -111,7 +135,10 @@ void main() {
 					continue;
 				}
 				vec4 sample_value = texelFetch(raw_reflection, tap, 0);
-				if (!valid_radiance(sample_value) || !compatible_hit(raw.a, sample_value.a, roughness)) {
+				float sample_coverage_value = texelFetch(raw_coverage, tap, 0).r;
+				float sample_hit_similarity = hit_history_similarity(raw.a, sample_value.a, roughness);
+				if (!valid_radiance(sample_value) || !finite_float(sample_coverage_value)
+						|| !finite_float(sample_hit_similarity) || sample_hit_similarity <= 1e-4) {
 					continue;
 				}
 				vec2 tap_uv = (vec2(tap) + 0.5) / vec2(size);
@@ -128,37 +155,50 @@ void main() {
 				}
 				float weight = spatial_blend * exp(-float(x * x + y * y) / (2.0 * sigma * sigma))
 						* exp(-abs(tap_depth - depth) / max(abs(depth) * 0.01, 1e-5))
-						* pow(max(normal_dot, 0.0), mix(256.0, 48.0, roughness));
+						* pow(max(normal_dot, 0.0), mix(256.0, 48.0, roughness))
+						* clamp(sample_hit_similarity, 0.0, 1.0);
 				spatial += finite_nonnegative_half(sample_value.rgb) * weight;
+				spatial_coverage += clamp(sample_coverage_value, 0.0, 1.0) * weight;
 				total += weight;
 			}
 		}
 		current_radiance = spatial / total;
+		current_coverage = clamp(spatial_coverage / total, 0.0, 1.0);
 	}
 
 	float exposure_ratio = temporal.parameters.y;
-	bool use_history = temporal.state.x != 0u && current_valid && finite_float(exposure_ratio)
-			&& exposure_ratio >= 0.25 && exposure_ratio <= 4.0;
 	vec4 world_h = temporal.inverse_view_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
-	vec4 old_clip = temporal.previous_view_projection * vec4(world_h.xyz / world_h.w, 1.0);
-	vec3 old_ndc = old_clip.xyz / old_clip.w;
+	bool world_position_valid = finite_float(world_h.w) && abs(world_h.w) > 1e-8
+			&& !any(isnan(world_h)) && !any(isinf(world_h));
+	vec3 world_position = world_position_valid ? world_h.xyz / world_h.w : vec3(0.0);
+	bool virtual_hit_valid = !any(isnan(virtual_hit)) && !any(isinf(virtual_hit))
+			&& virtual_hit.w > 1e-4 && all(greaterThanEqual(virtual_hit.xyz, vec3(-GI_HALF_MAX)))
+			&& all(lessThanEqual(virtual_hit.xyz, vec3(GI_HALF_MAX)));
+	vec4 reprojection_point = mirror_mode ? vec4(virtual_hit.xyz, 1.0) : vec4(world_position, 1.0);
+	vec4 old_clip = temporal.previous_view_projection * reprojection_point;
+	bool old_clip_valid = finite_float(old_clip.w) && old_clip.w > 1e-8
+			&& !any(isnan(old_clip)) && !any(isinf(old_clip));
+	vec3 old_ndc = old_clip_valid ? old_clip.xyz / old_clip.w : vec3(0.0);
 	vec2 old_uv = old_ndc.xy * 0.5 + 0.5;
-	use_history = use_history && abs(world_h.w) > 1e-8 && old_clip.w > 1e-8
-			&& !any(isnan(old_ndc)) && !any(isinf(old_ndc))
+	bool use_history = temporal.state.x != 0u && current_valid && finite_float(exposure_ratio)
+			&& exposure_ratio >= 0.25 && exposure_ratio <= 4.0 && world_position_valid
+			&& old_clip_valid && !any(isnan(old_ndc)) && !any(isinf(old_ndc))
 			&& all(greaterThanEqual(old_uv, vec2(0.0))) && all(lessThan(old_uv, vec2(1.0)));
-	// Surface reprojection is suitable for broad reflection lobes. A moving
-	// mirror requires reflected-hit reprojection; drop that history here.
-	float motion_weight = temporal.motion.x > 0.5 ? smoothstep(0.12, 0.45, roughness) * 0.9 : 1.0;
-	use_history = use_history && motion_weight > 0.0;
+	if (mirror_mode) {
+		use_history = use_history && virtual_hit_valid && current_coverage > 1e-4;
+	}
 	vec3 radiance = current_radiance;
+	float coverage = current_coverage;
 	float history_length = 1.0;
 	if (use_history) {
 		vec2 old_position = old_uv * vec2(size) - 0.5;
 		ivec2 old_base = ivec2(floor(old_position));
 		vec2 fraction = fract(old_position);
 		vec3 old_sum = vec3(0.0);
+		float old_coverage_sum = 0.0;
 		float old_count_sum = 0.0;
 		float old_weight_sum = 0.0;
+		float old_base_weight_sum = 0.0;
 		// Validate every bilinear tap before interpolation, so invalid geometry
 		// cannot contaminate an otherwise valid reprojected sample.
 		for (int y = 0; y < 2; y++) {
@@ -173,26 +213,55 @@ void main() {
 				vec2 old_material = texelFetch(previous_material, old_pixel, 0).rg;
 				vec3 old_albedo = texelFetch(previous_albedo, old_pixel, 0).rgb;
 				float old_hit = texelFetch(previous_hit_data, old_pixel, 0).r;
+				float old_coverage = texelFetch(previous_coverage, old_pixel, 0).r;
+				bool old_mirror_mode = old_normal_roughness.w <= GI_MIRROR_ROUGHNESS;
+				bool depth_matches = mirror_mode
+						|| abs(old_ndc.z - old_depth) <= max(abs(old_ndc.z) * temporal.parameters.z, 1e-5);
+				bool surface_guide_matches = mirror_mode == old_mirror_mode
+						&& dot(normal, normalize(old_normal_roughness.xyz)) >= temporal.parameters.w
+						&& same_material(roughness, material, albedo, old_normal_roughness.w, old_material, old_albedo);
+				float reflection_guide_similarity = 0.0;
+				if (mirror_mode) {
+					vec4 old_virtual_hit = texelFetch(previous_virtual_hit, old_pixel, 0);
+					vec3 old_normal = normalize(old_normal_roughness.xyz);
+					float expected_old_plane_offset = dot(old_normal, world_position);
+					float plane_tolerance = max(0.02, abs(expected_old_plane_offset) * 0.001);
+					float point_tolerance = max(0.04, roughness * 0.4
+							+ length(virtual_hit.xyz - world_position) * 0.005);
+					bool mirror_guide_matches = !any(isnan(old_virtual_hit)) && !any(isinf(old_virtual_hit))
+							&& old_virtual_hit.w > 1e-4
+							&& finite_float(expected_old_plane_offset)
+							&& abs(expected_old_plane_offset - old_hit) <= plane_tolerance
+							&& distance(virtual_hit.xyz, old_virtual_hit.xyz) <= point_tolerance;
+					reflection_guide_similarity = mirror_guide_matches ? 1.0 : 0.0;
+				} else {
+					reflection_guide_similarity = hit_history_similarity(raw.a, old_hit, roughness);
+				}
 				if (!valid_radiance(old_value) || old_value.a < 1.0 || !(old_depth > 0.0)
-						|| !finite_float(old_depth)
-						|| abs(old_ndc.z - old_depth) > max(abs(old_ndc.z) * temporal.parameters.z, 1e-5)
-						|| !(dot(normal, normalize(old_normal_roughness.xyz)) >= temporal.parameters.w)
-						|| !same_material(roughness, material, albedo, old_normal_roughness.w, old_material, old_albedo)
-						|| !compatible_hit(raw.a, old_hit, roughness)) {
+						|| !finite_float(old_depth) || !finite_float(old_coverage)
+						|| !depth_matches || !surface_guide_matches) {
 					continue;
 				}
-				float tap_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+				float tap_base_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
 						* (y == 0 ? 1.0 - fraction.y : fraction.y);
+				old_base_weight_sum += tap_base_weight;
+				if (!finite_float(reflection_guide_similarity) || reflection_guide_similarity <= 1e-4) {
+					continue;
+				}
+				float tap_weight = tap_base_weight * clamp(reflection_guide_similarity, 0.0, 1.0);
 				old_sum += finite_nonnegative_half(old_value.rgb * exposure_ratio) * tap_weight;
+				old_coverage_sum += clamp(old_coverage, 0.0, 1.0) * tap_weight;
 				old_count_sum += clamp(old_value.a, 1.0, 64.0) * tap_weight;
 				old_weight_sum += tap_weight;
 			}
 		}
 		if (old_weight_sum > 1e-4) {
 			float old_count = old_count_sum / old_weight_sum;
-			float weight = min(clamp(temporal.parameters.x, 0.0, 0.98), old_count / (old_count + 1.0));
-			weight = min(weight, motion_weight);
+			float guide_confidence = clamp(old_weight_sum / max(old_base_weight_sum, 1e-4), 0.0, 1.0);
+			float weight = min(clamp(temporal.parameters.x, 0.0, 0.98), old_count / (old_count + 1.0))
+					* guide_confidence;
 			radiance = mix(current_radiance, old_sum / old_weight_sum, weight);
+			coverage = mix(current_coverage, old_coverage_sum / old_weight_sum, weight);
 			history_length = min(old_count + 1.0, 64.0);
 		}
 	}
@@ -200,7 +269,12 @@ void main() {
 	imageStore(next_radiance, pixel, vec4(current_valid ? radiance : vec3(0.0), current_valid ? history_length : 0.0));
 	imageStore(next_depth, pixel, vec4(current_valid ? depth : 0.0));
 	imageStore(next_normal_roughness, pixel, vec4(current_valid ? normal : vec3(0.0), current_valid ? roughness : 0.0));
-	imageStore(next_hit_data, pixel, vec4(current_valid ? raw.a : 0.0));
+	float plane_offset = dot(normal, world_position);
+	imageStore(next_hit_data, pixel, vec4(current_valid
+			? (mirror_mode ? plane_offset : raw.a) : 0.0));
 	imageStore(next_material, pixel, vec4(current_valid ? material : vec2(0.0), 0.0, 0.0));
 	imageStore(next_albedo, pixel, vec4(current_valid ? albedo : vec3(0.0), current_valid ? 1.0 : 0.0));
+	imageStore(next_coverage, pixel, vec4(current_valid ? clamp(coverage, 0.0, 1.0) : 0.0));
+	imageStore(next_virtual_hit, pixel, current_valid && mirror_mode && virtual_hit_valid
+			? vec4(virtual_hit.xyz, current_coverage) : vec4(0.0));
 }

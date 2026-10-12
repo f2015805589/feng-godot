@@ -1,0 +1,1165 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D raw_reflection;
+layout(set = 0, binding = 1) uniform sampler2D raw_receiver;
+layout(set = 0, binding = 2) uniform sampler2D raw_hit;
+layout(set = 0, binding = 3) uniform sampler2D raw_material;
+layout(set = 0, binding = 4) uniform sampler2D motion_vectors;
+layout(set = 0, binding = 5) uniform sampler2D previous_reflection;
+layout(set = 0, binding = 6) uniform sampler2D previous_receiver;
+layout(set = 0, binding = 7) uniform sampler2D previous_hit;
+layout(set = 0, binding = 8) uniform sampler2D previous_material;
+layout(rgba16f, set = 0, binding = 9) uniform writeonly image2D next_reflection;
+layout(rgba16f, set = 0, binding = 10) uniform writeonly image2D next_receiver;
+layout(rgba32f, set = 0, binding = 11) uniform writeonly image2D next_hit;
+layout(rgba16f, set = 0, binding = 12) uniform writeonly image2D next_material;
+layout(set = 0, binding = 14) uniform sampler2D depth_texture;
+layout(set = 0, binding = 15) uniform sampler2D raw_previous_hit; // A: invalid 0, static 1, dynamic 2.
+layout(set = 0, binding = 16, std140) uniform SSRParams {
+	mat4 inverse_projection;
+	mat4 projection;
+	vec4 resolution;
+	vec4 trace;
+	vec4 temporal;
+	vec4 options;
+	mat4 view_to_world;
+	mat4 previous_world_to_view;
+	mat4 previous_projection;
+} params;
+
+// SSR_GEOMETRY_INCLUDE
+
+const float SSR_HALF_MAX = 65504.0;
+// Keep truly polished mirrors tied to the same hit; glossy lobes gradually
+// trade that screen-space guide for unbiased hit/miss accumulation.
+const float STRICT_MIRROR_ROUGHNESS = 0.02;
+const float LOBE_HISTORY_ROUGHNESS = 0.12;
+
+bool finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool finite_vec2(vec2 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool finite_vec4(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool finite_mat4(mat4 value) {
+	return finite_vec4(value[0]) && finite_vec4(value[1])
+			&& finite_vec4(value[2]) && finite_vec4(value[3]);
+}
+
+vec2 sign_not_zero(vec2 value) {
+	return mix(vec2(-1.0), vec2(1.0), greaterThanEqual(value, vec2(0.0)));
+}
+
+vec3 oct_decode(vec2 encoded) {
+	vec2 f = encoded * 2.0 - 1.0;
+	vec3 normal = vec3(f, 1.0 - abs(f.x) - abs(f.y));
+	if (normal.z < 0.0) {
+		normal.xy = (1.0 - abs(normal.yx)) * sign_not_zero(normal.xy);
+	}
+	float len2 = dot(normal, normal);
+	return len2 > 1e-8 ? normal * inversesqrt(len2) : vec3(0.0, 0.0, 1.0);
+}
+
+bool compatible_material(vec4 current, vec4 previous) {
+	if (any(isnan(current)) || any(isinf(current)) || any(isnan(previous)) || any(isinf(previous))) {
+		return false;
+	}
+	vec3 scale = max(max(abs(current.rgb), abs(previous.rgb)), vec3(0.04));
+	if (any(greaterThan(abs(current.rgb - previous.rgb), scale * 0.12 + vec3(0.008)))) {
+		return false;
+	}
+	float f90_tolerance = max(0.035, max(current.a, previous.a) * 0.12);
+	return abs(current.a - previous.a) <= f90_tolerance;
+}
+
+bool compatible_receiver(vec4 current, vec4 previous, vec4 current_material,
+		vec4 previous_material, float expected_previous_depth, bool compare_depth) {
+	if (any(isnan(current)) || any(isinf(current)) || any(isnan(previous)) || any(isinf(previous))
+			|| current.r <= 0.0 || previous.r <= 0.0
+			|| !compatible_material(current_material, previous_material)) {
+		return false;
+	}
+	if (compare_depth && abs(expected_previous_depth - previous.r) > max(0.05, expected_previous_depth * 0.035)) {
+		return false;
+	}
+	if (abs(current.g - previous.g) > 0.18) {
+		return false;
+	}
+	return dot(oct_decode(current.ba), oct_decode(previous.ba)) >= 0.88;
+}
+
+int full_pixel_for_guide(int guide_pixel, int full_size, int guide_size) {
+	return clamp(int((float(guide_pixel) + 0.5) * float(full_size) / float(guide_size)),
+			0, full_size - 1);
+}
+
+float guide_center(int guide_pixel, int full_size, int guide_size) {
+	return (float(full_pixel_for_guide(guide_pixel, full_size, guide_size)) + 0.5)
+			* float(guide_size) / float(full_size);
+}
+
+void guide_axis_taps(float uv, int full_size, int guide_size,
+		out int first, out int second, out float fraction) {
+	if (guide_size <= 1) {
+		first = 0;
+		second = 0;
+		fraction = 0.0;
+		return;
+	}
+	float target = clamp(uv, 0.0, 1.0) * float(guide_size);
+	int base = clamp(int(floor(target - 0.5)), 0, guide_size - 2);
+	float lower = guide_center(base, full_size, guide_size);
+	float upper = guide_center(base + 1, full_size, guide_size);
+	if (target < lower && base > 0) {
+		base -= 1;
+		lower = guide_center(base, full_size, guide_size);
+		upper = guide_center(base + 1, full_size, guide_size);
+	} else if (target > upper && base + 2 < guide_size) {
+		base += 1;
+		lower = guide_center(base, full_size, guide_size);
+		upper = guide_center(base + 1, full_size, guide_size);
+	}
+	first = base;
+	second = base + 1;
+	fraction = clamp((target - lower) / max(upper - lower, 1e-6), 0.0, 1.0);
+}
+
+bool previous_receiver_projection(vec2 uv, float raw_depth, out vec2 previous_uv,
+		out float previous_depth) {
+	vec4 current_view = params.inverse_projection * vec4(uv * 2.0 - 1.0, raw_depth, 1.0);
+	if (!finite_float(current_view.w) || abs(current_view.w) < 1e-7
+			|| any(isnan(current_view)) || any(isinf(current_view))) {
+		previous_uv = vec2(-1.0);
+		previous_depth = 0.0;
+		return false;
+	}
+	current_view /= current_view.w;
+	vec4 world = params.view_to_world * current_view;
+	vec4 previous_view = params.previous_world_to_view * world;
+	vec4 previous_clip = params.previous_projection * previous_view;
+	if (!finite_float(previous_clip.w) || previous_clip.w <= 1e-7
+			|| any(isnan(previous_view)) || any(isinf(previous_view))
+			|| any(isnan(previous_clip)) || any(isinf(previous_clip))) {
+		previous_uv = vec2(-1.0);
+		previous_depth = 0.0;
+		return false;
+	}
+	previous_uv = previous_clip.xy / previous_clip.w * 0.5 + 0.5;
+	previous_depth = -previous_view.z;
+	return finite_vec2(previous_uv) && finite_float(previous_depth) && previous_depth > 0.0
+			&& all(greaterThanEqual(previous_uv, vec2(0.0)))
+			&& all(lessThan(previous_uv, vec2(1.0)));
+}
+
+bool reconstruct_linear_view_position(mat4 inverse_projection, vec2 uv,
+		float linear_depth, out vec3 view_position) {
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec4 first_h = inverse_projection * vec4(ndc, 0.25, 1.0);
+	vec4 second_h = inverse_projection * vec4(ndc, 0.75, 1.0);
+	if (!finite_vec4(first_h) || !finite_vec4(second_h)
+			|| abs(first_h.w) < 1e-7 || abs(second_h.w) < 1e-7) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	vec3 first = first_h.xyz / first_h.w;
+	vec3 second = second_h.xyz / second_h.w;
+	float depth_span = second.z - first.z;
+	if (!finite_vec3(first) || !finite_vec3(second) || !finite_float(depth_span)
+			|| abs(depth_span) < 1e-7 || !finite_float(linear_depth) || linear_depth <= 0.0) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	float fraction = (-linear_depth - first.z) / depth_span;
+	view_position = mix(first, second, fraction);
+	return finite_vec3(view_position) && view_position.z < 0.0
+			&& abs(-view_position.z - linear_depth) <= max(0.001, linear_depth * 0.001);
+}
+
+bool reconstruct_current_view_position(vec2 uv, float raw_depth, out vec3 view_position) {
+	vec4 view_h = params.inverse_projection * vec4(uv * 2.0 - 1.0, raw_depth, 1.0);
+	if (!finite_vec4(view_h) || abs(view_h.w) < 1e-7) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	view_position = view_h.xyz / view_h.w;
+	return finite_vec3(view_position) && view_position.z < 0.0;
+}
+
+bool read_current_depth_position(ivec2 pixel, ivec2 full_size, out vec3 view_position) {
+	if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, full_size))) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	float raw_depth = texelFetch(depth_texture, pixel, 0).r;
+	if (!finite_float(raw_depth) || raw_depth <= 0.0) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(full_size);
+	return reconstruct_current_view_position(uv, raw_depth, view_position);
+}
+
+bool current_depth_surface_normal(ivec2 center_pixel, vec3 center_position,
+		ivec2 full_size, out vec3 geometric_normal) {
+	ivec2 x_axis = ivec2(1, 0);
+	ivec2 y_axis = ivec2(0, 1);
+	vec3 x_negative = vec3(0.0);
+	vec3 x_positive = vec3(0.0);
+	vec3 y_negative = vec3(0.0);
+	vec3 y_positive = vec3(0.0);
+	bool x_negative_valid = read_current_depth_position(center_pixel - x_axis,
+			full_size, x_negative);
+	bool x_positive_valid = read_current_depth_position(center_pixel + x_axis,
+			full_size, x_positive);
+	bool y_negative_valid = read_current_depth_position(center_pixel - y_axis,
+			full_size, y_negative);
+	bool y_positive_valid = read_current_depth_position(center_pixel + y_axis,
+			full_size, y_positive);
+	return ssr_geometry_fit_local_plane(center_position,
+			x_negative, x_negative_valid, x_positive, x_positive_valid,
+			y_negative, y_negative_valid, y_positive, y_positive_valid,
+			geometric_normal);
+}
+
+float full_depth_pixel_footprint(float linear_depth, ivec2 full_size) {
+	return ssr_geometry_full_pixel_footprint(params.projection, params.inverse_projection,
+			linear_depth, full_size);
+}
+
+float hit_guide_quantization_footprint(float linear_depth, vec3 view_position) {
+	bool orthographic = abs(params.inverse_projection[3][3] - 1.0) < 1e-4;
+	float depth_scale = orthographic ? 1.0 : linear_depth;
+	const float HALF_UV_ROUNDING_ERROR = 0.000244140625;
+	const float HALF_DEPTH_RELATIVE_ROUNDING_ERROR = 0.00048828125;
+	float uv_error_x = 2.0 * depth_scale / max(abs(params.projection[0][0]), 1e-4)
+			* HALF_UV_ROUNDING_ERROR;
+	float uv_error_y = 2.0 * depth_scale / max(abs(params.projection[1][1]), 1e-4)
+			* HALF_UV_ROUNDING_ERROR;
+	float uv_position_error = length(vec2(uv_error_x, uv_error_y));
+	float depth_position_error = orthographic
+			? linear_depth * HALF_DEPTH_RELATIVE_ROUNDING_ERROR
+			: length(view_position) * HALF_DEPTH_RELATIVE_ROUNDING_ERROR;
+	return uv_position_error * (1.0 + HALF_DEPTH_RELATIVE_ROUNDING_ERROR)
+			+ depth_position_error;
+}
+
+float receiver_plane_residual_tolerance(vec3 view_position, ivec2 full_size) {
+	float linear_depth = -view_position.z;
+	if (!finite_vec3(view_position) || !finite_float(linear_depth) || linear_depth <= 0.0) {
+		return 0.0;
+	}
+	float footprint = max(max(full_depth_pixel_footprint(linear_depth, full_size),
+			hit_guide_quantization_footprint(linear_depth, view_position)), 0.001);
+	float configured_limit = finite_float(params.trace.y) ? max(params.trace.y, 0.001) : 0.001;
+	return min(footprint, configured_limit);
+}
+
+float reflected_receiver_pixel_footprint(vec3 virtual_hit_view_position, ivec2 half_size) {
+	bool orthographic = abs(params.inverse_projection[3][3] - 1.0) < 1e-4;
+	float depth_scale = orthographic ? 1.0 : max(-virtual_hit_view_position.z, 0.0);
+	float pixel_width = 2.0 * depth_scale
+			/ (max(abs(params.projection[0][0]), 1e-4) * float(half_size.x));
+	float pixel_height = 2.0 * depth_scale
+			/ (max(abs(params.projection[1][1]), 1e-4) * float(half_size.y));
+	return max(length(vec2(pixel_width, pixel_height)) * 0.75, 1e-4);
+}
+
+bool reproject_history_hit_uncertainty_bounds(vec4 history_hit, ivec2 full_size,
+		mat4 inverse_previous_projection, mat4 previous_view_to_world,
+		mat4 current_world_to_view, out vec2 pixel_min, out vec2 pixel_max) {
+	pixel_min = vec2(full_size);
+	pixel_max = vec2(0.0);
+	const float HALF_UV_ROUNDING_ERROR = 0.000244140625;
+	const float HALF_DEPTH_RELATIVE_ROUNDING_ERROR = 0.00048828125;
+	if (any(lessThanEqual(full_size, ivec2(0)))
+			|| !finite_float(history_hit.r) || history_hit.r <= 0.0
+			|| !finite_vec2(history_hit.gb)) {
+		return false;
+	}
+	for (int depth_sign = 0; depth_sign < 2; depth_sign++) {
+		float depth_scale = depth_sign == 0
+				? 1.0 - HALF_DEPTH_RELATIVE_ROUNDING_ERROR
+				: 1.0 + HALF_DEPTH_RELATIVE_ROUNDING_ERROR;
+		float corner_depth = history_hit.r * depth_scale;
+		if (!finite_float(corner_depth) || corner_depth <= 0.0) {
+			return false;
+		}
+		for (int y_sign = 0; y_sign < 2; y_sign++) {
+			for (int x_sign = 0; x_sign < 2; x_sign++) {
+				vec2 corner_uv = history_hit.gb + vec2(
+						x_sign == 0 ? -HALF_UV_ROUNDING_ERROR : HALF_UV_ROUNDING_ERROR,
+						y_sign == 0 ? -HALF_UV_ROUNDING_ERROR : HALF_UV_ROUNDING_ERROR);
+				if (!finite_vec2(corner_uv)
+						|| any(lessThan(corner_uv, vec2(0.0)))
+						|| any(greaterThanEqual(corner_uv, vec2(1.0)))) {
+					return false;
+				}
+				vec3 previous_view_position;
+				if (!reconstruct_linear_view_position(inverse_previous_projection,
+						corner_uv, corner_depth, previous_view_position)) {
+					return false;
+				}
+				vec4 previous_world_h = previous_view_to_world
+						* vec4(previous_view_position, 1.0);
+				if (!finite_vec4(previous_world_h) || abs(previous_world_h.w) < 1e-7) {
+					return false;
+				}
+				vec3 previous_world_position = previous_world_h.xyz / previous_world_h.w;
+				vec4 current_view_h = current_world_to_view
+						* vec4(previous_world_position, 1.0);
+				if (!finite_vec3(previous_world_position) || !finite_vec4(current_view_h)
+						|| abs(current_view_h.w) < 1e-7) {
+					return false;
+				}
+				vec3 current_view_position = current_view_h.xyz / current_view_h.w;
+				float current_depth = -current_view_position.z;
+				if (!finite_vec3(current_view_position) || !finite_float(current_depth)
+						|| current_depth <= 0.0) {
+					return false;
+				}
+				vec4 current_clip = params.projection * vec4(current_view_position, 1.0);
+				if (!finite_vec4(current_clip) || current_clip.w <= 1e-7) {
+					return false;
+				}
+				vec2 current_uv = current_clip.xy / current_clip.w * 0.5 + 0.5;
+				if (!finite_vec2(current_uv) || any(lessThan(current_uv, vec2(0.0)))
+						|| any(greaterThanEqual(current_uv, vec2(1.0)))) {
+					return false;
+				}
+				vec2 current_pixel = current_uv * vec2(full_size) - 0.5;
+				pixel_min = min(pixel_min, current_pixel);
+				pixel_max = max(pixel_max, current_pixel);
+			}
+		}
+	}
+	return finite_vec2(pixel_min) && finite_vec2(pixel_max)
+			&& all(lessThanEqual(pixel_min, pixel_max));
+}
+
+bool current_depth_sample_has_static_source_motion(ivec2 pixel, ivec2 full_size) {
+	if (params.temporal.w < 0.5 || any(lessThan(pixel, ivec2(0)))
+			|| any(greaterThanEqual(pixel, full_size))) {
+		return false;
+	}
+	float raw_depth = texelFetch(depth_texture, pixel, 0).r;
+	vec2 source_uv = (vec2(pixel) + 0.5) / vec2(full_size);
+	vec2 source_motion = texelFetch(motion_vectors, pixel, 0).xy;
+	if (!finite_float(raw_depth) || raw_depth <= 0.0 || !finite_vec2(source_motion)
+			|| all(lessThanEqual(source_motion, vec2(-1.0)))) {
+		return false;
+	}
+	vec2 motion_previous_uv = source_uv + source_motion + params.resolution.zw;
+	vec2 camera_previous_uv;
+	float camera_previous_depth;
+	if (!finite_vec2(motion_previous_uv)
+			|| any(lessThan(motion_previous_uv, vec2(0.0)))
+			|| any(greaterThanEqual(motion_previous_uv, vec2(1.0)))
+			|| !previous_receiver_projection(source_uv, raw_depth,
+				camera_previous_uv, camera_previous_depth)) {
+		return false;
+	}
+	float motion_tolerance = max(3.0 / float(max(full_size.x, full_size.y)), 0.006);
+	return finite_float(motion_tolerance)
+			&& distance(motion_previous_uv, camera_previous_uv) <= motion_tolerance;
+}
+
+bool history_hit_uncertainty_fits_3x3(vec2 pixel_min, vec2 pixel_max, ivec2 search_base) {
+	const float HALF_PIXEL_DIAGONAL = 0.70710678118;
+	float search_limit = 2.0 - HALF_PIXEL_DIAGONAL;
+	vec2 base = vec2(search_base);
+	// No pixel center outside the searched 3x3 may fall within the half-pixel support.
+	return all(greaterThan(pixel_min, base - vec2(search_limit)))
+			&& all(lessThan(pixel_max, base + vec2(search_limit)));
+}
+
+bool validate_reprojected_history_hit(vec4 history_hit, ivec2 full_size, ivec2 half_size,
+		mat4 inverse_previous_projection, mat4 previous_view_to_world,
+		mat4 current_world_to_view, vec3 current_receiver_view_position,
+		vec3 current_receiver_world_normal, float current_roughness,
+		out vec4 current_hit_guide) {
+	current_hit_guide = vec4(0.0);
+	if (!finite_float(history_hit.r) || history_hit.r <= 0.0
+			|| !finite_vec2(history_hit.gb)
+			|| any(lessThan(history_hit.gb, vec2(0.0)))
+			|| any(greaterThanEqual(history_hit.gb, vec2(1.0)))) {
+		return false;
+	}
+	vec3 previous_hit_view_position;
+	if (!reconstruct_linear_view_position(inverse_previous_projection,
+			history_hit.gb, history_hit.r, previous_hit_view_position)) {
+		return false;
+	}
+	vec4 previous_hit_world_h = previous_view_to_world * vec4(previous_hit_view_position, 1.0);
+	if (!finite_vec4(previous_hit_world_h) || abs(previous_hit_world_h.w) < 1e-7) {
+		return false;
+	}
+	vec3 previous_hit_world_position = previous_hit_world_h.xyz / previous_hit_world_h.w;
+	vec4 current_hit_view_h = current_world_to_view * vec4(previous_hit_world_position, 1.0);
+	if (!finite_vec4(current_hit_view_h) || abs(current_hit_view_h.w) < 1e-7) {
+		return false;
+	}
+	vec3 current_hit_view_position = current_hit_view_h.xyz / current_hit_view_h.w;
+	if (!finite_vec3(previous_hit_world_position) || !finite_vec3(current_hit_view_position)
+			|| current_hit_view_position.z >= 0.0) {
+		return false;
+	}
+	vec4 current_hit_clip = params.projection * vec4(current_hit_view_position, 1.0);
+	if (!finite_vec4(current_hit_clip) || current_hit_clip.w <= 1e-7) {
+		return false;
+	}
+	vec2 current_hit_uv = current_hit_clip.xy / current_hit_clip.w * 0.5 + 0.5;
+	float current_hit_depth = -current_hit_view_position.z;
+	if (!finite_vec2(current_hit_uv) || !finite_float(current_hit_depth)
+			|| current_hit_depth <= 0.0
+			|| any(lessThan(current_hit_uv, vec2(0.0)))
+			|| any(greaterThanEqual(current_hit_uv, vec2(1.0)))) {
+		return false;
+	}
+
+	vec3 receiver_normal_view = mat3(current_world_to_view) * current_receiver_world_normal;
+	float receiver_normal_length2 = dot(receiver_normal_view, receiver_normal_view);
+	if (!finite_float(receiver_normal_length2) || receiver_normal_length2 < 1e-8) {
+		return false;
+	}
+	receiver_normal_view *= inversesqrt(receiver_normal_length2);
+	vec3 view_direction = abs(params.inverse_projection[3][3] - 1.0) < 1e-4
+			? vec3(0.0, 0.0, 1.0)
+			: normalize(-current_receiver_view_position);
+	vec3 reflection_direction = reflect(-view_direction, receiver_normal_view);
+	float reflection_length2 = dot(reflection_direction, reflection_direction);
+	if (!finite_float(reflection_length2) || reflection_length2 < 1e-8) {
+		return false;
+	}
+	reflection_direction *= inversesqrt(reflection_length2);
+	if (dot(receiver_normal_view, reflection_direction) <= 0.0) {
+		return false;
+	}
+	if (!finite_float(params.trace.z) || !finite_float(params.trace.x)) {
+		return false;
+	}
+	float ray_bias = max(params.trace.z, 0.0);
+	float trace_max_distance = max(params.trace.x, 1.0);
+	if (!finite_float(ray_bias) || !finite_float(trace_max_distance)
+			|| trace_max_distance <= ray_bias) {
+		return false;
+	}
+	vec3 ray_origin = current_receiver_view_position + reflection_direction * ray_bias;
+	vec3 to_hit = current_hit_view_position - ray_origin;
+	float ray_distance = dot(to_hit, reflection_direction);
+	float maximum_ray_distance = trace_max_distance - ray_bias;
+	float physical_distance = ray_distance + ray_bias;
+	if (!finite_float(ray_distance) || ray_distance < 0.0
+			|| ray_distance > maximum_ray_distance || !finite_float(physical_distance)) {
+		return false;
+	}
+	vec3 closest_ray_point = ray_origin + reflection_direction * ray_distance;
+	// Ray jitter follows the hit mirrored across the receiver plane, not the real hit depth.
+	vec3 virtual_hit_view_position = closest_ray_point - 2.0 * receiver_normal_view
+			* dot(receiver_normal_view, closest_ray_point - current_receiver_view_position);
+	float ray_footprint = reflected_receiver_pixel_footprint(virtual_hit_view_position, half_size);
+	if (!finite_vec3(closest_ray_point) || !finite_vec3(virtual_hit_view_position)
+			|| virtual_hit_view_position.z >= 0.0 || !finite_float(ray_footprint)
+			|| length(to_hit - reflection_direction * ray_distance) > ray_footprint) {
+		return false;
+	}
+	float edge_distance = min(min(current_hit_uv.x, 1.0 - current_hit_uv.x),
+			min(current_hit_uv.y, 1.0 - current_hit_uv.y));
+	float edge_confidence = smoothstep(0.0, 0.045, edge_distance);
+	float distance_confidence = 1.0 - smoothstep(trace_max_distance * 0.55,
+			trace_max_distance, physical_distance);
+	float roughness_confidence = 1.0 - smoothstep(params.trace.w * 0.72,
+			max(params.trace.w, 1e-4), current_roughness);
+	float validation_confidence = clamp(edge_confidence * distance_confidence
+			* roughness_confidence, 0.0, 1.0);
+	if (!finite_float(validation_confidence) || validation_confidence <= 0.001) {
+		return false;
+	}
+
+	float depth_footprint = full_depth_pixel_footprint(current_hit_depth, full_size);
+	float guide_quantization_footprint = hit_guide_quantization_footprint(
+			current_hit_depth, current_hit_view_position);
+	float plane_residual_tolerance = max(max(depth_footprint,
+			guide_quantization_footprint), 0.001);
+	vec2 hit_pixel_position = current_hit_uv * vec2(full_size) - 0.5;
+	ivec2 hit_pixel_base = ivec2(floor(hit_pixel_position));
+	vec3 depth_positions[4];
+	bool depth_position_valid[4];
+	for (int tap = 0; tap < 4; tap++) {
+		depth_positions[tap] = vec3(0.0);
+		depth_position_valid[tap] = false;
+	}
+	bool visible = false;
+	vec3 visible_plane_point = vec3(0.0);
+	vec3 visible_plane_normal = vec3(0.0, 0.0, 1.0);
+	for (int y = 0; y < 2; y++) {
+		for (int x = 0; x < 2; x++) {
+			ivec2 depth_pixel = clamp(hit_pixel_base + ivec2(x, y),
+					ivec2(0), full_size - ivec2(1));
+			int tap_index = y * 2 + x;
+			vec3 depth_view_position;
+			if (!read_current_depth_position(depth_pixel, full_size, depth_view_position)) {
+				continue;
+			}
+			depth_positions[tap_index] = depth_view_position;
+			depth_position_valid[tap_index] = true;
+			vec3 geometric_normal;
+			if (!current_depth_surface_normal(depth_pixel, depth_view_position,
+					full_size, geometric_normal)) {
+				continue;
+			}
+			float signed_plane_residual = dot(geometric_normal,
+					current_hit_view_position - depth_view_position);
+			if (!finite_float(signed_plane_residual)) {
+				continue;
+			}
+			if (signed_plane_residual < -plane_residual_tolerance) {
+				// A closer current surface covers the reprojected history hit.
+				return false;
+			}
+			float ray_facing = dot(geometric_normal, -reflection_direction);
+			if (abs(signed_plane_residual) <= plane_residual_tolerance
+					&& finite_float(ray_facing) && ray_facing > 1e-4) {
+				visible = true;
+				visible_plane_point = depth_view_position;
+				visible_plane_normal = geometric_normal;
+			}
+		}
+	}
+	if (!visible) {
+		const float HALF_PIXEL_DIAGONAL = 0.70710678118;
+		ivec2 search_base = ivec2(floor(current_hit_uv * vec2(full_size)));
+		vec2 uncertainty_pixel_min;
+		vec2 uncertainty_pixel_max;
+		bool uncertainty_valid = reproject_history_hit_uncertainty_bounds(history_hit,
+				full_size, inverse_previous_projection, previous_view_to_world,
+				current_world_to_view, uncertainty_pixel_min, uncertainty_pixel_max);
+		if (uncertainty_valid) {
+			uncertainty_pixel_min = min(uncertainty_pixel_min, hit_pixel_position);
+			uncertainty_pixel_max = max(uncertainty_pixel_max, hit_pixel_position);
+		}
+		bool search_in_bounds = all(greaterThanEqual(search_base, ivec2(1)))
+				&& all(lessThan(search_base + ivec2(1), full_size));
+		if (uncertainty_valid && search_in_bounds
+				&& history_hit_uncertainty_fits_3x3(uncertainty_pixel_min,
+						uncertainty_pixel_max, search_base)) {
+			const int MAX_FALLBACK_CANDIDATES = 9;
+			vec3 fallback_points[MAX_FALLBACK_CANDIDATES];
+			vec3 fallback_normals[MAX_FALLBACK_CANDIDATES];
+			float fallback_screen_distance_squared[MAX_FALLBACK_CANDIDATES];
+			int fallback_candidate_count = 0;
+			bool inconsistent_source_motion = false;
+			for (int y_offset = -1; y_offset <= 1; y_offset++) {
+				for (int x_offset = -1; x_offset <= 1; x_offset++) {
+					ivec2 candidate_pixel = search_base + ivec2(x_offset, y_offset);
+					vec2 candidate_center = vec2(candidate_pixel);
+					vec2 support_distance = max(max(uncertainty_pixel_min - candidate_center,
+							candidate_center - uncertainty_pixel_max), vec2(0.0));
+					if (length(support_distance) > HALF_PIXEL_DIAGONAL) {
+						continue;
+					}
+					vec3 candidate_view_position;
+					if (!read_current_depth_position(candidate_pixel, full_size,
+							candidate_view_position)) {
+						continue;
+					}
+					vec3 candidate_normal;
+					if (!current_depth_surface_normal(candidate_pixel, candidate_view_position,
+							full_size, candidate_normal)) {
+						continue;
+					}
+					float candidate_residual = dot(candidate_normal,
+							current_hit_view_position - candidate_view_position);
+					if (!finite_float(candidate_residual)) {
+						continue;
+					}
+					if (candidate_residual < -plane_residual_tolerance) {
+						// A nearer depth surface vetoes fallback even without usable motion data.
+						return false;
+					}
+					float candidate_ray_facing = dot(candidate_normal, -reflection_direction);
+					if (abs(candidate_residual) > plane_residual_tolerance
+							|| !finite_float(candidate_ray_facing) || candidate_ray_facing <= 1e-4) {
+						continue;
+					}
+					if (!current_depth_sample_has_static_source_motion(candidate_pixel, full_size)) {
+						inconsistent_source_motion = true;
+						continue;
+					}
+					fallback_points[fallback_candidate_count] = candidate_view_position;
+					fallback_normals[fallback_candidate_count] = candidate_normal;
+					vec2 screen_delta = candidate_center - hit_pixel_position;
+					fallback_screen_distance_squared[fallback_candidate_count] = dot(screen_delta, screen_delta);
+					fallback_candidate_count++;
+				}
+			}
+			if (!inconsistent_source_motion && fallback_candidate_count > 0) {
+				int nearest_candidate = 0;
+				for (int candidate = 1; candidate < fallback_candidate_count; candidate++) {
+					if (fallback_screen_distance_squared[candidate]
+							< fallback_screen_distance_squared[nearest_candidate]) {
+						nearest_candidate = candidate;
+					}
+				}
+				bool planes_consistent = true;
+				for (int first = 0; first < fallback_candidate_count; first++) {
+					for (int second = first + 1; second < fallback_candidate_count; second++) {
+						float normal_similarity = dot(fallback_normals[first], fallback_normals[second]);
+						float first_to_second_residual = dot(fallback_normals[first],
+								fallback_points[second] - fallback_points[first]);
+						float second_to_first_residual = dot(fallback_normals[second],
+								fallback_points[first] - fallback_points[second]);
+						if (!finite_float(normal_similarity) || normal_similarity < 0.88
+								|| !finite_float(first_to_second_residual)
+								|| !finite_float(second_to_first_residual)
+								|| abs(first_to_second_residual) > plane_residual_tolerance
+								|| abs(second_to_first_residual) > plane_residual_tolerance) {
+							planes_consistent = false;
+						}
+					}
+				}
+				if (planes_consistent) {
+					visible = true;
+					visible_plane_point = fallback_points[nearest_candidate];
+					visible_plane_normal = fallback_normals[nearest_candidate];
+				}
+			}
+		}
+	}
+	if (!visible) {
+		return false;
+	}
+	for (int tap = 0; tap < 4; tap++) {
+		if (!depth_position_valid[tap]) {
+			continue;
+		}
+		float tap_plane_residual = dot(visible_plane_normal,
+				depth_positions[tap] - visible_plane_point);
+		if (!finite_float(tap_plane_residual)
+				|| tap_plane_residual > plane_residual_tolerance) {
+			// Do not reuse history if any nearby depth tap is in front of its surface.
+			return false;
+		}
+	}
+	current_hit_guide = vec4(current_hit_depth, current_hit_uv, validation_confidence);
+	return true;
+}
+
+void ensure_history_reprojection_matrices(inout bool ready, inout bool valid,
+		inout mat4 inverse_previous_projection, inout mat4 previous_view_to_world,
+		inout mat4 current_world_to_view) {
+	if (ready) {
+		return;
+	}
+	ready = true;
+	valid = false;
+	float previous_projection_determinant = determinant(params.previous_projection);
+	float previous_view_determinant = determinant(params.previous_world_to_view);
+	float current_view_determinant = determinant(params.view_to_world);
+	if (!finite_float(previous_projection_determinant)
+			|| abs(previous_projection_determinant) <= 1e-8
+			|| !finite_float(previous_view_determinant)
+			|| abs(previous_view_determinant) <= 1e-8
+			|| !finite_float(current_view_determinant)
+			|| abs(current_view_determinant) <= 1e-8) {
+		return;
+	}
+	inverse_previous_projection = inverse(params.previous_projection);
+	previous_view_to_world = inverse(params.previous_world_to_view);
+	current_world_to_view = inverse(params.view_to_world);
+	valid = finite_mat4(inverse_previous_projection)
+			&& finite_mat4(previous_view_to_world)
+			&& finite_mat4(current_world_to_view);
+}
+
+bool current_source_hit_is_static(vec4 current_hit, vec4 expected_previous_hit) {
+	if (!finite_float(current_hit.r) || current_hit.r <= 0.0
+			|| !finite_vec2(current_hit.gb)
+			|| any(lessThan(current_hit.gb, vec2(0.0)))
+			|| any(greaterThanEqual(current_hit.gb, vec2(1.0)))
+			|| !finite_vec4(expected_previous_hit) || expected_previous_hit.a != 1.0
+			|| expected_previous_hit.r <= 0.0
+			|| any(lessThan(expected_previous_hit.gb, vec2(0.0)))
+			|| any(greaterThanEqual(expected_previous_hit.gb, vec2(1.0)))) {
+		return false;
+	}
+	return true;
+}
+
+bool validate_positive_hit_witness_tap(ivec2 witness_pixel, ivec2 full_size,
+		ivec2 half_size, vec4 center_receiver, vec4 center_material,
+		vec4 old_hit, vec3 current_center_view_position,
+		vec3 current_center_geometric_normal, float current_center_plane_tolerance,
+		mat4 inverse_previous_projection, mat4 previous_view_to_world,
+		mat4 current_world_to_view, out vec4 current_hit_guide) {
+	current_hit_guide = vec4(0.0);
+	vec4 old_receiver = texelFetch(previous_receiver, witness_pixel, 0);
+	vec4 old_material = texelFetch(previous_material, witness_pixel, 0);
+	vec4 old_radiance = texelFetch(previous_reflection, witness_pixel, 0);
+	float old_count = finite_float(old_hit.a) ? clamp(old_hit.a, 0.0, 64.0) : 0.0;
+	if (!compatible_receiver(center_receiver, old_receiver, center_material,
+			old_material, old_receiver.r, false)
+			|| !finite_vec4(old_hit) || old_count <= 0.0
+			|| !finite_vec4(old_radiance) || old_radiance.a <= 1e-6
+			|| !finite_float(old_hit.r) || old_hit.r <= 0.0
+			|| !finite_vec2(old_hit.gb)
+			|| any(lessThan(old_hit.gb, vec2(0.0)))
+			|| any(greaterThanEqual(old_hit.gb, vec2(1.0)))) {
+		return false;
+	}
+	ivec2 old_full_pixel = ivec2(
+			full_pixel_for_guide(witness_pixel.x, full_size.x, half_size.x),
+			full_pixel_for_guide(witness_pixel.y, full_size.y, half_size.y));
+	vec2 old_receiver_uv = (vec2(old_full_pixel) + 0.5) / vec2(full_size);
+	vec3 old_receiver_previous_view;
+	if (!reconstruct_linear_view_position(inverse_previous_projection,
+			old_receiver_uv, old_receiver.r, old_receiver_previous_view)) {
+		return false;
+	}
+	vec4 old_receiver_world_h = previous_view_to_world
+			* vec4(old_receiver_previous_view, 1.0);
+	if (!finite_vec4(old_receiver_world_h) || abs(old_receiver_world_h.w) < 1e-7) {
+		return false;
+	}
+	vec3 old_receiver_world = old_receiver_world_h.xyz / old_receiver_world_h.w;
+	vec4 old_receiver_current_h = current_world_to_view
+			* vec4(old_receiver_world, 1.0);
+	if (!finite_vec3(old_receiver_world) || !finite_vec4(old_receiver_current_h)
+			|| abs(old_receiver_current_h.w) < 1e-7) {
+		return false;
+	}
+	vec3 old_receiver_current_view = old_receiver_current_h.xyz / old_receiver_current_h.w;
+	if (!finite_vec3(old_receiver_current_view) || old_receiver_current_view.z >= 0.0) {
+		return false;
+	}
+	float center_plane_residual = dot(current_center_geometric_normal,
+			old_receiver_current_view - current_center_view_position);
+	if (!finite_float(center_plane_residual)
+			|| abs(center_plane_residual) > current_center_plane_tolerance) {
+		return false;
+	}
+	vec4 current_clip = params.projection * vec4(old_receiver_current_view, 1.0);
+	if (!finite_vec4(current_clip) || current_clip.w <= 1e-7) {
+		return false;
+	}
+	vec2 current_uv = current_clip.xy / current_clip.w * 0.5 + 0.5;
+	if (!finite_vec2(current_uv) || any(lessThan(current_uv, vec2(0.0)))
+			|| any(greaterThanEqual(current_uv, vec2(1.0)))) {
+		return false;
+	}
+	ivec2 current_full_pixel = clamp(ivec2(current_uv * vec2(full_size)),
+			ivec2(0), full_size - ivec2(1));
+	vec3 visible_receiver_view;
+	vec3 visible_receiver_normal;
+	if (!read_current_depth_position(current_full_pixel, full_size, visible_receiver_view)
+			|| !current_depth_surface_normal(current_full_pixel, visible_receiver_view,
+				full_size, visible_receiver_normal)) {
+		return false;
+	}
+	float receiver_plane_tolerance = receiver_plane_residual_tolerance(
+			visible_receiver_view, full_size);
+	float receiver_plane_residual = dot(visible_receiver_normal,
+			old_receiver_current_view - visible_receiver_view);
+	if (!finite_float(receiver_plane_tolerance) || receiver_plane_tolerance <= 0.0
+			|| !finite_float(receiver_plane_residual)
+			|| abs(receiver_plane_residual) > receiver_plane_tolerance) {
+		return false;
+	}
+	ivec2 current_guide_pixel = clamp(ivec2(current_uv * vec2(half_size)),
+			ivec2(0), half_size - ivec2(1));
+	vec4 visible_receiver_guide = texelFetch(raw_receiver, current_guide_pixel, 0);
+	vec4 visible_material_guide = texelFetch(raw_material, current_guide_pixel, 0);
+	if (!compatible_receiver(old_receiver, visible_receiver_guide, old_material,
+			visible_material_guide, old_receiver.r, false)) {
+		return false;
+	}
+	vec3 old_receiver_world_normal = oct_decode(old_receiver.ba);
+	return finite_vec3(old_receiver_world_normal)
+			&& validate_reprojected_history_hit(old_hit, full_size, half_size,
+				inverse_previous_projection, previous_view_to_world,
+				current_world_to_view, old_receiver_current_view,
+				old_receiver_world_normal, visible_receiver_guide.g,
+				current_hit_guide);
+}
+
+float hit_history_similarity(vec4 current_hit, vec4 history_hit, vec4 expected_previous_hit,
+		ivec2 full_size, bool current_hit_valid, float strictness,
+		float receiver_motion_tolerance) {
+	if (strictness <= 0.0) {
+		return 1.0;
+	}
+	bool history_hit_valid = finite_float(history_hit.r) && history_hit.r > 0.0;
+	float similarity = 0.0;
+	if (current_hit_valid == history_hit_valid) {
+		if (!current_hit_valid) {
+			similarity = 1.0;
+		} else if ((expected_previous_hit.a == 1.0 || expected_previous_hit.a == 2.0)
+				&& finite_float(expected_previous_hit.r)
+				&& finite_vec2(expected_previous_hit.gb)) {
+			bool static_hit = expected_previous_hit.a == 1.0;
+			vec2 expected_hit_uv = expected_previous_hit.gb;
+			float expected_hit_depth = expected_previous_hit.r;
+			float hit_uv_tolerance = max(3.0 / float(max(full_size.x, full_size.y)), 0.008);
+			if (all(greaterThanEqual(expected_hit_uv, vec2(0.0)))
+					&& all(lessThan(expected_hit_uv, vec2(1.0)))
+					&& all(greaterThanEqual(history_hit.gb, vec2(0.0)))
+					&& all(lessThan(history_hit.gb, vec2(1.0)))) {
+				float uv_error = distance(expected_hit_uv, history_hit.gb);
+				float uv_similarity = 1.0 - smoothstep(hit_uv_tolerance,
+						hit_uv_tolerance * 4.0, uv_error);
+				float depth_error = abs(expected_hit_depth - history_hit.r);
+				float depth_tolerance = max(0.08, expected_hit_depth * 0.04);
+				float depth_similarity = static_hit
+						? 1.0 - smoothstep(depth_tolerance, depth_tolerance * 4.0, depth_error)
+						: 1.0;
+				similarity = uv_similarity * depth_similarity;
+			}
+		}
+	}
+	return mix(1.0, similarity, clamp(strictness, 0.0, 1.0));
+}
+
+void write_result(ivec2 pixel, vec4 radiance, vec4 receiver, vec4 hit, vec4 material) {
+	if (any(isnan(radiance)) || any(isinf(radiance)) || any(isnan(receiver)) || any(isinf(receiver))
+			|| any(isnan(hit)) || any(isinf(hit)) || any(isnan(material)) || any(isinf(material))) {
+		radiance = vec4(0.0);
+		material = vec4(0.0);
+	}
+	radiance.rgb = clamp(radiance.rgb, vec3(0.0), vec3(SSR_HALF_MAX));
+	radiance.a = clamp(radiance.a, 0.0, 1.0);
+	imageStore(next_reflection, pixel, radiance);
+	imageStore(next_receiver, pixel, receiver);
+	imageStore(next_hit, pixel, hit);
+	imageStore(next_material, pixel, material);
+}
+
+void write_current(ivec2 pixel, vec3 premultiplied_radiance, float coverage,
+		vec4 receiver, vec4 hit, vec4 material) {
+	write_result(pixel, vec4(premultiplied_radiance, coverage), receiver,
+			vec4(hit.r, hit.gb, 1.0), material);
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 half_size = imageSize(next_reflection);
+	if (any(greaterThanEqual(pixel, half_size))) {
+		return;
+	}
+	vec4 raw = texelFetch(raw_reflection, pixel, 0);
+	vec4 receiver = texelFetch(raw_receiver, pixel, 0);
+	vec4 hit = texelFetch(raw_hit, pixel, 0);
+	vec4 material = texelFetch(raw_material, pixel, 0);
+	if (any(isnan(receiver)) || any(isinf(receiver)) || receiver.r <= 0.0
+			|| any(isnan(material)) || any(isinf(material))) {
+		write_result(pixel, vec4(0.0), receiver, vec4(0.0), material);
+		return;
+	}
+	if (finite_float(hit.a) && hit.a < 0.0) {
+		// A verified back-facing blocker clears history but keeps receiver guides for upsampling.
+		write_result(pixel, vec4(0.0), receiver, vec4(0.0), material);
+		return;
+	}
+	vec3 current_rgb = finite_vec3(raw.rgb) ? clamp(raw.rgb, vec3(0.0), vec3(SSR_HALF_MAX)) : vec3(0.0);
+	float current_coverage = finite_float(raw.a) ? clamp(raw.a, 0.0, 1.0) : 0.0;
+	vec3 current_premultiplied = current_rgb * current_coverage;
+	float hit_guide_strictness = 1.0 - smoothstep(STRICT_MIRROR_ROUGHNESS,
+			LOBE_HISTORY_ROUGHNESS, receiver.g);
+	bool strict_mirror = receiver.g <= STRICT_MIRROR_ROUGHNESS;
+	bool current_hit_valid = current_coverage > 0.001 && finite_float(hit.r) && hit.r > 0.0;
+	bool strict_mirror_miss = strict_mirror && !current_hit_valid;
+	if (strict_mirror_miss) {
+		current_coverage = 0.0;
+		current_premultiplied = vec3(0.0);
+		hit = vec4(0.0);
+	}
+	if (params.temporal.z < 0.5 || params.temporal.w < 0.5) {
+		write_current(pixel, current_premultiplied, current_coverage, receiver, hit, material);
+		return;
+	}
+	ivec2 full_size = ivec2(params.resolution.xy);
+	ivec2 full_pixel = ivec2(full_pixel_for_guide(pixel.x, full_size.x, half_size.x),
+			full_pixel_for_guide(pixel.y, full_size.y, half_size.y));
+	vec2 current_uv = (vec2(full_pixel) + 0.5) / vec2(full_size);
+	vec2 velocity = texelFetch(motion_vectors, full_pixel, 0).xy;
+	if (!finite_vec2(velocity) || all(lessThanEqual(velocity, vec2(-1.0)))) {
+		write_current(pixel, current_premultiplied, current_coverage, receiver, hit, material);
+		return;
+	}
+	vec2 previous_receiver_uv = current_uv + velocity + params.resolution.zw;
+	if (any(lessThan(previous_receiver_uv, vec2(0.0))) || any(greaterThanEqual(previous_receiver_uv, vec2(1.0)))) {
+		write_current(pixel, current_premultiplied, current_coverage, receiver, hit, material);
+		return;
+	}
+	int previous_x0;
+	int previous_x1;
+	int previous_y0;
+	int previous_y1;
+	float previous_fraction_x;
+	float previous_fraction_y;
+	guide_axis_taps(previous_receiver_uv.x, full_size.x, half_size.x,
+			previous_x0, previous_x1, previous_fraction_x);
+	guide_axis_taps(previous_receiver_uv.y, full_size.y, half_size.y,
+			previous_y0, previous_y1, previous_fraction_y);
+	float raw_depth = texelFetch(depth_texture, full_pixel, 0).r;
+	vec2 projected_receiver_uv;
+	float projected_receiver_depth;
+	bool has_receiver_projection = finite_float(raw_depth)
+			&& previous_receiver_projection(current_uv, raw_depth, projected_receiver_uv, projected_receiver_depth);
+	float receiver_motion_tolerance = max(3.0 / float(max(full_size.x, full_size.y)), 0.006);
+	bool static_receiver = has_receiver_projection
+			&& distance(projected_receiver_uv, previous_receiver_uv) <= receiver_motion_tolerance;
+	vec4 expected_previous_hit = texelFetch(raw_previous_hit, pixel, 0);
+	float total_history_support = 0.0;
+	float history_weight_sum = 0.0;
+	float history_count_sum = 0.0;
+	float history_coverage_sum = 0.0;
+	vec3 history_radiance_sum = vec3(0.0);
+	float deferred_miss_weight_sum = 0.0;
+	float deferred_miss_count_sum = 0.0;
+	bool positive_history_hit_witness = false;
+	if (strict_mirror_miss && (!static_receiver || receiver.g >= params.trace.w
+			|| params.options.z <= 0.0 || dot(material.rgb, material.rgb) <= 1e-8)) {
+		write_result(pixel, vec4(0.0), receiver, vec4(0.0), material);
+		return;
+	}
+	float exposure_ratio = finite_float(params.temporal.y) && params.temporal.y > 0.0
+			? clamp(params.temporal.y, 0.05, 20.0) : 1.0;
+	bool miss_reprojection_matrices_ready = false;
+	bool miss_reprojection_matrices_valid = false;
+	mat4 inverse_previous_projection = mat4(1.0);
+	mat4 previous_view_to_world = mat4(1.0);
+	mat4 current_world_to_view = mat4(1.0);
+	bool miss_receiver_ready = false;
+	bool miss_receiver_valid = false;
+	vec3 miss_receiver_view_position = vec3(0.0);
+	vec3 miss_receiver_world_normal = vec3(0.0, 0.0, 1.0);
+	vec4 representative_history_hit = vec4(0.0);
+	float representative_history_weight = 0.0;
+	for (int y = 0; y < 2; y++) {
+		for (int x = 0; x < 2; x++) {
+			float base_weight = (x == 0 ? 1.0 - previous_fraction_x : previous_fraction_x)
+					* (y == 0 ? 1.0 - previous_fraction_y : previous_fraction_y);
+			total_history_support += base_weight;
+			ivec2 previous_pixel = ivec2(x == 0 ? previous_x0 : previous_x1,
+					y == 0 ? previous_y0 : previous_y1);
+			vec4 receiver_history = texelFetch(previous_receiver, previous_pixel, 0);
+			vec4 material_history = texelFetch(previous_material, previous_pixel, 0);
+			vec4 hit_history = texelFetch(previous_hit, previous_pixel, 0);
+			vec4 radiance_history = texelFetch(previous_reflection, previous_pixel, 0);
+			if (!compatible_receiver(receiver, receiver_history, material, material_history,
+					projected_receiver_depth, static_receiver)
+					|| any(isnan(radiance_history)) || any(isinf(radiance_history))) {
+				continue;
+			}
+			float count = finite_float(hit_history.a) ? clamp(hit_history.a, 0.0, 64.0) : 0.0;
+			if (count <= 0.0) {
+				continue;
+			}
+			float tap_coverage = clamp(radiance_history.a, 0.0, 1.0);
+			bool history_hit_valid = finite_float(hit_history.r) && hit_history.r > 0.0;
+			// A strict-mirror miss may reduce coverage only beside a covered hit witness.
+			if (strict_mirror && current_hit_valid && finite_vec4(hit_history)
+					&& hit_history.r == 0.0 && abs(radiance_history.a) <= 1e-6) {
+				deferred_miss_weight_sum += base_weight;
+				deferred_miss_count_sum += count * base_weight;
+				continue;
+			}
+			float hit_similarity = 0.0;
+			vec4 reprojected_history_hit = vec4(0.0);
+			if (strict_mirror_miss) {
+				// A zero-coverage mirror sample is usable only while its previous
+				// secondary hit still reprojects onto visible current-frame depth.
+				if (!history_hit_valid) {
+					continue;
+				}
+				ensure_history_reprojection_matrices(miss_reprojection_matrices_ready,
+						miss_reprojection_matrices_valid, inverse_previous_projection,
+						previous_view_to_world, current_world_to_view);
+				if (!miss_reprojection_matrices_valid) {
+					continue;
+				}
+				if (!miss_receiver_ready) {
+					miss_receiver_ready = true;
+					miss_receiver_valid = reconstruct_current_view_position(current_uv, raw_depth,
+							miss_receiver_view_position);
+					miss_receiver_world_normal = oct_decode(receiver.ba);
+					miss_receiver_valid = miss_receiver_valid
+							&& finite_vec3(miss_receiver_world_normal);
+				}
+				if (!miss_receiver_valid || !validate_reprojected_history_hit(hit_history,
+						full_size, half_size, inverse_previous_projection, previous_view_to_world,
+						current_world_to_view, miss_receiver_view_position,
+						miss_receiver_world_normal, receiver.g, reprojected_history_hit)) {
+					continue;
+				}
+				hit_similarity = reprojected_history_hit.a;
+			} else {
+				hit_similarity = hit_history_similarity(hit, hit_history, expected_previous_hit,
+						full_size, current_hit_valid, hit_guide_strictness, receiver_motion_tolerance);
+			}
+			float tap_weight = base_weight * hit_similarity;
+			if (!finite_float(tap_weight) || tap_weight <= 1e-6) {
+				continue;
+			}
+			if (strict_mirror_miss && tap_weight > representative_history_weight) {
+				representative_history_weight = tap_weight;
+				representative_history_hit = reprojected_history_hit;
+			}
+			if (strict_mirror && current_hit_valid && history_hit_valid
+					&& finite_vec4(hit_history) && tap_coverage > 1e-6) {
+				positive_history_hit_witness = true;
+			}
+			// History RGB is premultiplied; empty coverage cannot carry color.
+			vec3 tap_premultiplied = vec3(0.0);
+			if (tap_coverage > 1e-6) {
+				vec3 tap_straight = clamp(radiance_history.rgb * exposure_ratio
+						/ tap_coverage, vec3(0.0), vec3(SSR_HALF_MAX));
+				tap_premultiplied = tap_straight * tap_coverage;
+			}
+			history_radiance_sum += tap_premultiplied * tap_weight;
+			history_coverage_sum += tap_coverage * tap_weight;
+			history_count_sum += count * tap_weight;
+			history_weight_sum += tap_weight;
+		}
+	}
+	if (strict_mirror && current_hit_valid && static_receiver
+			&& deferred_miss_weight_sum > 1e-6 && !positive_history_hit_witness
+			&& current_source_hit_is_static(hit, expected_previous_hit)) {
+		ensure_history_reprojection_matrices(miss_reprojection_matrices_ready,
+				miss_reprojection_matrices_valid, inverse_previous_projection,
+				previous_view_to_world, current_world_to_view);
+		if (miss_reprojection_matrices_valid) {
+			vec3 current_center_view_position;
+			vec3 current_center_geometric_normal;
+			bool current_center_plane_valid = reconstruct_current_view_position(current_uv,
+					raw_depth, current_center_view_position)
+					&& current_depth_surface_normal(full_pixel, current_center_view_position,
+						full_size, current_center_geometric_normal)
+					&& finite_vec3(current_center_geometric_normal);
+			float current_center_plane_tolerance = current_center_plane_valid
+					? receiver_plane_residual_tolerance(current_center_view_position, full_size)
+					: 0.0;
+			current_center_plane_valid = current_center_plane_valid
+					&& finite_float(current_center_plane_tolerance)
+					&& current_center_plane_tolerance > 0.0;
+			if (current_center_plane_valid) {
+				for (int y_offset = -1; y_offset <= 2 && !positive_history_hit_witness; y_offset++) {
+					for (int x_offset = -1; x_offset <= 2; x_offset++) {
+						ivec2 witness_pixel = ivec2(previous_x0 + x_offset,
+								previous_y0 + y_offset);
+						if (any(lessThan(witness_pixel, ivec2(0)))
+								|| any(greaterThanEqual(witness_pixel, half_size))) {
+							continue;
+						}
+						bool nominal_x = witness_pixel.x == previous_x0
+								|| witness_pixel.x == previous_x1;
+						bool nominal_y = witness_pixel.y == previous_y0
+								|| witness_pixel.y == previous_y1;
+						if (nominal_x && nominal_y) {
+							continue;
+						}
+						vec4 witness_hit = texelFetch(previous_hit, witness_pixel, 0);
+						float source_similarity = hit_history_similarity(hit, witness_hit,
+								expected_previous_hit, full_size, current_hit_valid,
+								hit_guide_strictness, receiver_motion_tolerance);
+						if (!finite_float(source_similarity) || source_similarity <= 1e-6) {
+							continue;
+						}
+						vec4 witness_current_hit;
+						positive_history_hit_witness = validate_positive_hit_witness_tap(
+								witness_pixel, full_size, half_size, receiver, material,
+								witness_hit, current_center_view_position,
+								current_center_geometric_normal,
+								current_center_plane_tolerance,
+								inverse_previous_projection, previous_view_to_world,
+								current_world_to_view, witness_current_hit);
+						if (positive_history_hit_witness) {
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+	// Keep unwitnessed misses out of the current raw hit's history blend.
+	if (strict_mirror && current_hit_valid && positive_history_hit_witness) {
+		history_weight_sum += deferred_miss_weight_sum;
+		history_count_sum += deferred_miss_count_sum;
+	}
+	if (history_weight_sum <= 1e-6) {
+		write_current(pixel, current_premultiplied, current_coverage, receiver, hit, material);
+		return;
+	}
+	float history_coverage = clamp(history_coverage_sum / history_weight_sum, 0.0, 1.0);
+	vec3 history_straight = history_coverage_sum > 1e-6
+			? clamp(history_radiance_sum / history_coverage_sum,
+				vec3(0.0), vec3(SSR_HALF_MAX))
+			: vec3(0.0);
+	vec3 neighborhood_min = vec3(SSR_HALF_MAX);
+	vec3 neighborhood_max = vec3(0.0);
+	bool neighborhood_has_color = false;
+	if (!strict_mirror_miss) {
+		if (current_coverage > 1e-6 && finite_vec3(raw.rgb)) {
+			neighborhood_min = min(neighborhood_min, current_rgb);
+			neighborhood_max = max(neighborhood_max, current_rgb);
+			neighborhood_has_color = true;
+		}
+		for (int y = -1; y <= 1; y++) {
+			for (int x = -1; x <= 1; x++) {
+				ivec2 neighbor_pixel = pixel + ivec2(x, y);
+				if (any(lessThan(neighbor_pixel, ivec2(0))) || any(greaterThanEqual(neighbor_pixel, half_size))) {
+					continue;
+				}
+				vec4 neighbor_receiver = texelFetch(raw_receiver, neighbor_pixel, 0);
+				vec4 neighbor_raw = texelFetch(raw_reflection, neighbor_pixel, 0);
+				vec4 neighbor_material = texelFetch(raw_material, neighbor_pixel, 0);
+				if (!compatible_receiver(receiver, neighbor_receiver, material, neighbor_material, receiver.r, true)
+						|| !finite_float(neighbor_raw.a) || !finite_vec3(neighbor_raw.rgb)) {
+					continue;
+				}
+				float neighbor_coverage = clamp(neighbor_raw.a, 0.0, 1.0);
+				if (neighbor_coverage <= 1e-6) {
+					continue;
+				}
+				// Trace RGB is straight radiance; covered black hits still bound it.
+				vec3 neighbor_straight = clamp(neighbor_raw.rgb,
+						vec3(0.0), vec3(SSR_HALF_MAX));
+				neighborhood_min = min(neighborhood_min, neighbor_straight);
+				neighborhood_max = max(neighborhood_max, neighbor_straight);
+				neighborhood_has_color = true;
+			}
+		}
+	}
+	if (!strict_mirror_miss && neighborhood_has_color) {
+		vec3 margin = max((neighborhood_max - neighborhood_min) * 0.15, vec3(0.02));
+		history_straight = clamp(history_straight,
+				max(vec3(0.0), neighborhood_min - margin),
+				min(vec3(SSR_HALF_MAX), neighborhood_max + margin));
+	}
+	// Keep history color premultiplied by the same coverage that is blended below.
+	vec3 scaled_history = history_straight * history_coverage;
+	float history_count = history_count_sum / history_weight_sum;
+	float history_confidence = clamp(history_weight_sum / max(total_history_support, 1e-6), 0.0, 1.0);
+	float weight = min(clamp(params.temporal.x, 0.0, 0.95), history_count / (history_count + 1.0));
+	weight *= history_confidence;
+	vec3 result_premultiplied = mix(current_premultiplied, scaled_history, weight);
+	float result_coverage = mix(current_coverage, history_coverage, weight);
+	if (strict_mirror_miss && representative_history_weight <= 1e-6) {
+		write_result(pixel, vec4(0.0), receiver, vec4(0.0), material);
+		return;
+	}
+	vec4 next_hit_data = strict_mirror_miss
+			? vec4(representative_history_hit.rgb, min(history_count + 1.0, 64.0))
+			: vec4(hit.r, hit.gb, min(history_count + 1.0, 64.0));
+	write_result(pixel, vec4(result_premultiplied, result_coverage), receiver, next_hit_data, material);
+}

@@ -1,0 +1,18 @@
+[gd_resource type="CompositorEffect" script_class="FengReflectionResolvePass" load_steps=4 format=3]
+
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/reflection_resolve_pass.gd" id="1"]
+[ext_resource type="Script" path="res://addons/feng-render-pipeline/passes/pass_texture.gd" id="2"]
+
+[sub_resource type="Resource" id="NativeIndirectSpecular"]
+script = ExtResource("2")
+binding = 0
+source = 10
+
+[resource]
+resource_name = "Reflection Resolve"
+script = ExtResource("1")
+enabled = true
+stable_id = "library:reflection_resolve"
+inputs = Array[ExtResource("2")]([SubResource("NativeIndirectSpecular")])
+access_resolved_color = true
+access_resolved_depth = false

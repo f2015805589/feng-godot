@@ -1,0 +1,384 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depth_texture;
+layout(set = 0, binding = 1) uniform sampler2D normal_texture;
+layout(set = 0, binding = 2) uniform sampler2D albedo_texture;
+layout(set = 0, binding = 3) uniform sampler2D orm_texture;
+layout(set = 0, binding = 4) uniform sampler2D emission_texture;
+layout(set = 0, binding = 5) uniform sampler2D color_copy_texture;
+layout(set = 0, binding = 6) uniform sampler2D dfg_texture;
+layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D raw_reflection_image;
+layout(rgba16f, set = 0, binding = 8) uniform writeonly image2D raw_receiver_image;
+layout(rgba32f, set = 0, binding = 9) uniform writeonly image2D raw_hit_image;
+layout(rgba16f, set = 0, binding = 10) uniform writeonly image2D raw_material_image;
+layout(rgba16f, set = 0, binding = 11) uniform writeonly image2D raw_previous_hit_image;
+layout(set = 0, binding = 12, std140) uniform SSRParams {
+	mat4 inverse_projection;
+	mat4 projection;
+	vec4 resolution; // full width/height and previous-minus-current TAA jitter delta.
+	vec4 trace; // maximum view distance, thickness, origin bias, roughness cutoff.
+	vec4 temporal; // history weight, exposure ratio, history valid, motion available.
+	vec4 options; // step count, frame index, intensity, separate-specular flag.
+	mat4 view_to_world;
+	mat4 previous_world_to_view;
+	mat4 previous_projection;
+} params;
+layout(set = 0, binding = 13) uniform sampler2D depth_hiz_texture;
+layout(set = 0, binding = 14) uniform sampler2D motion_vectors_texture;
+layout(push_constant, std430) uniform SSRTraceClipParams {
+	vec4 near_far;
+} trace_clip;
+
+// raw_previous_hit stores previous view depth, previous UV, and source motion kind:
+// 0 invalid, 1 static, 2 dynamic. A is assigned only after sampling the exact hit pixel.
+// SSR_GEOMETRY_INCLUDE
+
+const float SSR_HALF_MAX = 65504.0;
+const int SSR_TRACE_MISS = 0;
+const int SSR_TRACE_HIT = 1;
+const int SSR_TRACE_BLOCKED = 2;
+const uint MATERIAL_MODEL_MASK = 0x0fu;
+const uint UNLIT_MATERIAL_MODEL = 0u;
+
+float sign_not_zero(float value) {
+	return value < 0.0 ? -1.0 : 1.0;
+}
+
+bool finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool finite_vec2(vec2 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 safe_normalize(vec3 value, vec3 fallback_value) {
+	float len2 = dot(value, value);
+	return finite_float(len2) && len2 > 1e-8 ? value * inversesqrt(len2) : fallback_value;
+}
+
+vec3 decode_normal(vec3 encoded) {
+	return safe_normalize(encoded * 2.0 - 1.0, vec3(0.0, 0.0, 1.0));
+}
+
+float hash12(vec2 pixel, float frame_index) {
+	vec3 p3 = fract(vec3(pixel.xyx) * 0.1031 + frame_index * vec3(0.0017, 0.0023, 0.0011));
+	p3 += dot(p3, p3.yzx + 33.33);
+	return fract((p3.x + p3.y) * p3.z);
+}
+
+vec2 oct_encode(vec3 normal) {
+	float denominator = max(abs(normal.x) + abs(normal.y) + abs(normal.z), 1e-6);
+	vec2 p = normal.xy / denominator;
+	if (normal.z < 0.0) {
+		p = (1.0 - abs(p.yx)) * vec2(sign_not_zero(p.x), sign_not_zero(p.y));
+	}
+	return p * 0.5 + 0.5;
+}
+
+bool reconstruct_view_position(vec2 uv, float raw_depth, out vec3 view_position) {
+	vec4 view_h = params.inverse_projection * vec4(uv * 2.0 - 1.0, raw_depth, 1.0);
+	if (!finite_float(view_h.w) || abs(view_h.w) < 1e-7 || any(isnan(view_h)) || any(isinf(view_h))) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	view_position = view_h.xyz / view_h.w;
+	return finite_vec3(view_position) && -view_position.z > 0.0;
+}
+
+bool read_scene_position(ivec2 pixel, ivec2 full_size, out vec3 view_position) {
+	if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, full_size))) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	float depth = texelFetch(depth_texture, pixel, 0).r;
+	if (!finite_float(depth) || depth <= 0.0) {
+		view_position = vec3(0.0);
+		return false;
+	}
+	return reconstruct_view_position((vec2(pixel) + 0.5) / vec2(full_size), depth, view_position);
+}
+
+bool project_view_position(vec3 position, out vec2 uv) {
+	vec4 clip = params.projection * vec4(position, 1.0);
+	if (!finite_float(clip.w) || clip.w <= 1e-7 || any(isnan(clip)) || any(isinf(clip))) {
+		uv = vec2(-1.0);
+		return false;
+	}
+	uv = clip.xy / clip.w * 0.5 + 0.5;
+	return finite_vec2(uv) && all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+}
+
+bool project_previous_position(vec3 view_position, out vec4 previous_guide) {
+	vec4 world = params.view_to_world * vec4(view_position, 1.0);
+	vec4 previous_view = params.previous_world_to_view * world;
+	vec4 clip = params.previous_projection * previous_view;
+	if (!finite_float(world.w) || abs(world.w) < 1e-7 || !finite_float(previous_view.w)
+			|| abs(previous_view.w) < 1e-7 || !finite_float(clip.w) || clip.w <= 1e-7
+			|| any(isnan(world)) || any(isinf(world)) || any(isnan(previous_view))
+			|| any(isinf(previous_view)) || any(isnan(clip)) || any(isinf(clip))) {
+		previous_guide = vec4(0.0);
+		return false;
+	}
+	vec3 ndc = clip.xyz / clip.w;
+	vec2 uv = ndc.xy * 0.5 + 0.5;
+	if (!finite_float(ndc.z) || !finite_vec2(uv) || -previous_view.z <= 0.0
+			|| any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) {
+		previous_guide = vec4(0.0);
+		return false;
+	}
+	previous_guide = vec4(-previous_view.z, uv, 0.0);
+	return true;
+}
+
+vec3 rough_reflection_direction(vec3 normal, vec3 view_direction, float roughness, vec2 pixel) {
+	float noise = hash12(pixel, params.options.y);
+	float angle = noise * 6.28318530718;
+	float radial = sqrt(fract(noise * 17.0 + 0.37)) * roughness * roughness * 1.6;
+	vec3 helper = abs(normal.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tangent = safe_normalize(cross(helper, normal), vec3(1.0, 0.0, 0.0));
+	vec3 bitangent = cross(normal, tangent);
+	vec3 micro_normal = safe_normalize(normal + radial * (cos(angle) * tangent + sin(angle) * bitangent), normal);
+	if (dot(micro_normal, view_direction) < 0.02) {
+		micro_normal = normal;
+	}
+	return safe_normalize(reflect(-view_direction, micro_normal), vec3(0.0, 0.0, -1.0));
+}
+
+void store_miss(ivec2 pixel, vec4 receiver, vec4 material_guide) {
+	imageStore(raw_reflection_image, pixel, vec4(0.0));
+	imageStore(raw_receiver_image, pixel, receiver);
+	imageStore(raw_hit_image, pixel, vec4(0.0));
+	imageStore(raw_material_image, pixel, material_guide);
+	imageStore(raw_previous_hit_image, pixel, vec4(0.0));
+}
+
+void store_blocked_miss(ivec2 pixel, vec4 receiver, vec4 material_guide) {
+	imageStore(raw_reflection_image, pixel, vec4(0.0));
+	imageStore(raw_receiver_image, pixel, receiver);
+	// Negative alpha marks a verified back-facing blocker; successful hits store roughness here.
+	imageStore(raw_hit_image, pixel, vec4(0.0, 0.0, 0.0, -1.0));
+	imageStore(raw_material_image, pixel, material_guide);
+	imageStore(raw_previous_hit_image, pixel, vec4(0.0));
+}
+
+void store_ineligible(ivec2 pixel) {
+	store_miss(pixel, vec4(0.0), vec4(0.0));
+}
+
+int full_pixel_for_guide(int guide_pixel, int full_size, int guide_size) {
+	return clamp(int((float(guide_pixel) + 0.5) * float(full_size) / float(guide_size)),
+			0, full_size - 1);
+}
+
+int refine_visible_surface_hit(vec3 ray_origin, vec3 ray_direction,
+		vec3 candidate_surface_position, ivec2 candidate_pixel, ivec2 source_pixel,
+		float receiver_linear_depth, float ray_origin_bias, ivec2 full_size,
+		float minimum_ray_distance, float maximum_ray_distance,
+		out ivec2 hit_pixel, out vec2 hit_uv, out float hit_depth,
+		out float hit_t, out vec3 hit_position) {
+	hit_pixel = ivec2(0);
+	hit_uv = vec2(0.0);
+	hit_depth = 0.0;
+	hit_t = 0.0;
+	hit_position = vec3(0.0);
+	vec3 x_negative = vec3(0.0);
+	vec3 x_positive = vec3(0.0);
+	vec3 y_negative = vec3(0.0);
+	vec3 y_positive = vec3(0.0);
+	bool x_negative_valid = read_scene_position(candidate_pixel - ivec2(1, 0),
+			full_size, x_negative);
+	bool x_positive_valid = read_scene_position(candidate_pixel + ivec2(1, 0),
+			full_size, x_positive);
+	bool y_negative_valid = read_scene_position(candidate_pixel - ivec2(0, 1),
+			full_size, y_negative);
+	bool y_positive_valid = read_scene_position(candidate_pixel + ivec2(0, 1),
+			full_size, y_positive);
+	vec3 geometric_normal;
+	if (!ssr_geometry_fit_local_plane(candidate_surface_position,
+			x_negative, x_negative_valid, x_positive, x_positive_valid,
+			y_negative, y_negative_valid, y_positive, y_positive_valid,
+			geometric_normal)) {
+		return 0;
+	}
+	float ray_facing;
+	vec3 plane_hit_position;
+	if (!ssr_geometry_intersect_ray_plane(ray_origin, ray_direction,
+			candidate_surface_position, geometric_normal, minimum_ray_distance,
+			maximum_ray_distance, ray_facing, hit_t, plane_hit_position)) {
+		return 0;
+	}
+	float plane_hit_depth = -plane_hit_position.z;
+	if (!finite_float(plane_hit_depth) || plane_hit_depth <= 0.0) {
+		return 0;
+	}
+	if (!project_view_position(plane_hit_position, hit_uv)) {
+		return 0;
+	}
+	hit_pixel = clamp(ivec2(hit_uv * vec2(full_size)), ivec2(0), full_size - ivec2(1));
+	vec3 visible_surface_position;
+	if (!read_scene_position(hit_pixel, full_size, visible_surface_position)) {
+		return 0;
+	}
+	float plane_residual = dot(geometric_normal, visible_surface_position - plane_hit_position);
+	float pixel_footprint_tolerance = max(ssr_geometry_full_pixel_footprint(params.projection,
+			params.inverse_projection, plane_hit_depth, full_size), 0.001);
+	float maximum_surface_residual = finite_float(params.trace.y)
+			? max(params.trace.y, 0.001) : 0.001;
+	float plane_tolerance = min(pixel_footprint_tolerance, maximum_surface_residual);
+	if (!finite_float(plane_residual) || abs(plane_residual) > plane_tolerance) {
+		return 0;
+	}
+	if (all(equal(hit_pixel, source_pixel))
+			&& hit_t + ray_origin_bias < max(0.5, receiver_linear_depth * 0.015)) {
+		return 0;
+	}
+	hit_position = plane_hit_position;
+	hit_depth = plane_hit_depth;
+	if (!finite_float(hit_t)) {
+		return 0;
+	}
+	return ray_facing > 0.03 ? SSR_TRACE_HIT : SSR_TRACE_BLOCKED;
+}
+
+// SSR_HIZ_TRAVERSAL_INCLUDE
+
+void main() {
+	ivec2 half_pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 half_size = imageSize(raw_reflection_image);
+	if (any(greaterThanEqual(half_pixel, half_size))) {
+		return;
+	}
+	ivec2 full_size = ivec2(params.resolution.xy);
+	ivec2 source_pixel = ivec2(full_pixel_for_guide(half_pixel.x, full_size.x, half_size.x),
+			full_pixel_for_guide(half_pixel.y, full_size.y, half_size.y));
+	vec2 source_uv = (vec2(source_pixel) + 0.5) / vec2(full_size);
+	float raw_depth = texelFetch(depth_texture, source_pixel, 0).r;
+	vec3 position;
+	if (!finite_float(raw_depth) || raw_depth <= 0.0 || !reconstruct_view_position(source_uv, raw_depth, position)) {
+		store_miss(half_pixel, vec4(0.0), vec4(0.0));
+		return;
+	}
+	vec3 normal = decode_normal(texelFetch(normal_texture, source_pixel, 0).rgb);
+	vec3 world_normal = safe_normalize(mat3(params.view_to_world) * normal, vec3(0.0, 0.0, 1.0));
+	vec4 orm = texelFetch(orm_texture, source_pixel, 0);
+	float roughness = orm.g;
+	vec3 albedo = texelFetch(albedo_texture, source_pixel, 0).rgb;
+	vec4 emission = texelFetch(emission_texture, source_pixel, 0);
+	float metallic = orm.b;
+	float material_specular = emission.a;
+	bool material_valid = finite_float(roughness) && finite_float(orm.a) && finite_float(metallic)
+			&& finite_vec3(albedo) && finite_float(material_specular);
+	if (material_valid) {
+		roughness = clamp(roughness, 0.0, 1.0);
+		metallic = clamp(metallic, 0.0, 1.0);
+		material_specular = clamp(material_specular, 0.0, 1.0);
+		albedo = max(albedo, vec3(0.0));
+	}
+	vec3 f0 = material_valid ? mix(vec3(0.16 * material_specular * material_specular), albedo, metallic) : vec3(0.0);
+	float f90 = material_valid ? clamp(50.0 * f0.g, metallic, 1.0) : 0.0;
+	vec4 material_guide = vec4(f0, f90);
+	uint material_model = material_valid ? uint(round(clamp(orm.a, 0.0, 1.0) * 255.0)) & MATERIAL_MODEL_MASK : UNLIT_MATERIAL_MODEL;
+	float linear_depth = -position.z;
+	vec4 receiver = vec4(linear_depth, roughness, oct_encode(world_normal));
+	if (!material_valid || material_model == UNLIT_MATERIAL_MODEL || roughness >= params.trace.w
+			|| dot(f0, f0) <= 1e-8
+			|| dot(normal, -safe_normalize(position, vec3(0.0, 0.0, -1.0))) <= 1e-4
+			|| params.options.z <= 0.0) {
+		store_ineligible(half_pixel);
+		return;
+	}
+	vec3 view_direction = abs(params.inverse_projection[3][3] - 1.0) < 1e-4
+			? vec3(0.0, 0.0, 1.0) : safe_normalize(-position, vec3(0.0, 0.0, 1.0));
+	vec3 direction = rough_reflection_direction(normal, view_direction, roughness, vec2(half_pixel));
+	if (dot(normal, direction) <= 0.0 || !finite_vec3(direction)) {
+		store_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	if (!finite_float(params.trace.x) || !finite_float(params.trace.z)) {
+		store_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	float ray_bias = max(params.trace.z, 0.0);
+	float max_distance = max(params.trace.x, 1.0);
+	if (max_distance <= ray_bias) {
+		store_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	vec3 origin = position + direction * ray_bias;
+	int max_steps = clamp(int(round(params.options.x)), 8, 128);
+	float hit_t = 0.0;
+	vec2 hit_uv = vec2(0.0);
+	ivec2 hit_pixel = ivec2(0);
+	float hit_depth = 0.0;
+	vec3 hit_surface_position = vec3(0.0);
+	int trace_result = ssr_hiz_trace_ray(origin, direction, source_pixel,
+			linear_depth, full_size, max_distance - ray_bias, ray_bias, max_steps,
+			hit_pixel, hit_uv, hit_depth, hit_t, hit_surface_position);
+	if (trace_result == SSR_TRACE_BLOCKED) {
+		store_blocked_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	if (trace_result != SSR_TRACE_HIT || hit_depth <= 0.0 || !finite_vec2(hit_uv)) {
+		store_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	float no_v = clamp(dot(normal, view_direction), 0.0001, 1.0);
+	vec2 env_brdf = textureLod(dfg_texture, vec2(no_v, 1.0 - roughness), 0.0).rg;
+	if (!finite_float(env_brdf.x) || !finite_float(env_brdf.y) || env_brdf.y <= 1e-4) {
+		store_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	vec3 energy_compensation = 1.0 + f0 * (1.0 / env_brdf.y - 1.0);
+	vec3 brdf = energy_compensation * ((f90 - f0) * env_brdf.x + f0 * env_brdf.y);
+	vec3 hit_radiance = texelFetch(color_copy_texture, hit_pixel, 0).rgb;
+	if (!finite_vec3(hit_radiance) || !finite_vec3(brdf)) {
+		store_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	float edge_distance = min(min(hit_uv.x, 1.0 - hit_uv.x), min(hit_uv.y, 1.0 - hit_uv.y));
+	float edge_confidence = smoothstep(0.0, 0.045, edge_distance);
+	float physical_distance = hit_t + ray_bias;
+	float distance_confidence = 1.0 - smoothstep(max_distance * 0.55, max_distance, physical_distance);
+	float roughness_confidence = 1.0 - smoothstep(params.trace.w * 0.72, max(params.trace.w, 1e-4), roughness);
+	float confidence = clamp(edge_confidence * distance_confidence * roughness_confidence, 0.0, 1.0);
+	vec3 reflection = clamp(hit_radiance * brdf * max(params.options.z, 0.0), vec3(0.0), vec3(SSR_HALF_MAX));
+	if (confidence <= 0.001 || !finite_vec3(reflection)) {
+		store_miss(half_pixel, receiver, material_guide);
+		return;
+	}
+	imageStore(raw_reflection_image, half_pixel, vec4(reflection, confidence));
+	imageStore(raw_receiver_image, half_pixel, receiver);
+	imageStore(raw_hit_image, half_pixel, vec4(hit_depth, hit_uv, roughness));
+	imageStore(raw_material_image, half_pixel, material_guide);
+	vec4 previous_hit_guide;
+	if (project_previous_position(hit_surface_position, previous_hit_guide)) {
+		vec2 source_motion = texelFetch(motion_vectors_texture, hit_pixel, 0).xy;
+		vec2 motion_previous_uv = hit_uv + source_motion + params.resolution.zw;
+		bool source_motion_valid = finite_float(params.temporal.w) && params.temporal.w > 0.5
+				&& finite_vec2(source_motion)
+				&& !all(lessThanEqual(source_motion, vec2(-1.0)))
+				&& finite_vec2(motion_previous_uv)
+				&& all(greaterThanEqual(motion_previous_uv, vec2(0.0)))
+				&& all(lessThan(motion_previous_uv, vec2(1.0)));
+		if (source_motion_valid) {
+			float receiver_motion_tolerance = max(3.0 / float(max(full_size.x, full_size.y)), 0.006);
+			bool static_source = distance(motion_previous_uv, previous_hit_guide.gb)
+					<= receiver_motion_tolerance;
+			if (!static_source) {
+				previous_hit_guide.gb = motion_previous_uv;
+			}
+			previous_hit_guide.a = static_source ? 1.0 : 2.0;
+			imageStore(raw_previous_hit_image, half_pixel, previous_hit_guide);
+		} else {
+			imageStore(raw_previous_hit_image, half_pixel, vec4(0.0));
+		}
+	} else {
+		imageStore(raw_previous_hit_image, half_pixel, vec4(0.0));
+	}
+}

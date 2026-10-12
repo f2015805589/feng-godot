@@ -19,6 +19,8 @@ struct GIFrameData {
 };
 ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
 RWTexture2D<float4> gi_reflection_output : register(u21, space0);
+RWTexture2D<float> gi_reflection_coverage : register(u26, space0);
+RWTexture2D<float4> gi_reflection_virtual_hit : register(u27, space0);
 
 struct GIPathPayload {
 	float3 radiance;
@@ -33,6 +35,12 @@ static const uint GI_MATERIAL_MODEL_MASK = 0x0fu;
 static const uint GI_UNLIT_MATERIAL_MODEL = 0u;
 static const float GI_PI = 3.14159265359f;
 static const float GI_HALF_MAX = 65504.0f;
+
+void gi_store_invalid(uint2 pixel) {
+	gi_reflection_output[pixel] = 0.0f;
+	gi_reflection_coverage[pixel] = 0.0f;
+	gi_reflection_virtual_hit[pixel] = 0.0f;
+}
 
 uint gi_hash(uint value) {
 	value ^= value >> 16u;
@@ -94,6 +102,12 @@ void FengGIReflectionRayGen() {
 	if (pixel.x >= output_width || pixel.y >= output_height) {
 		return;
 	}
+	uint coverage_width;
+	uint coverage_height;
+	gi_reflection_coverage.GetDimensions(coverage_width, coverage_height);
+	if (pixel.x >= coverage_width || pixel.y >= coverage_height) {
+		return;
+	}
 	uint depth_width, depth_height, normal_width, normal_height, albedo_width, albedo_height, orm_width, orm_height, emission_width, emission_height;
 	gi_depth.GetDimensions(depth_width, depth_height);
 	gi_normal_roughness.GetDimensions(normal_width, normal_height);
@@ -110,28 +124,28 @@ void FengGIReflectionRayGen() {
 	float4 orm = gi_orm.Load(int3(orm_pixel, 0));
 	uint material_model = (uint)round(saturate(orm.a) * 255.0f) & GI_MATERIAL_MODEL_MASK;
 	if (!(depth > 0.0f) || !isfinite(depth) || material_model == GI_UNLIT_MATERIAL_MODEL) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	float4 view_h = mul(gi_frame.inverse_projection, float4(uv * 2.0f - 1.0f, depth, 1.0f));
 	if (abs(view_h.w) < 1e-8f || !isfinite(view_h.w)) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	float3 view_position = view_h.xyz / view_h.w;
 	if (!all(isfinite(view_position))) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	float3 world_position = mul(gi_frame.view_to_world, float4(view_position, 1.0f)).xyz;
 	if (!all(isfinite(world_position))) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	float3 normal_encoded = gi_normal_roughness.Load(int3(normal_pixel, 0)).xyz * 2.0f - 1.0f;
 	float normal_length = length(normal_encoded);
 	if (!(normal_length > 1e-6f) || !isfinite(normal_length)) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	float3 transformed_normal = mul((float3x3)gi_frame.view_to_world, normal_encoded / normal_length);
@@ -144,7 +158,7 @@ void FengGIReflectionRayGen() {
 	float view_length = length(view_vector);
 	if (!(transformed_normal_length > 1e-6f) || !isfinite(transformed_normal_length)
 			|| !(view_length > 1e-6f) || !isfinite(view_length) || !all(isfinite(view_vector))) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	float3 normal = transformed_normal / transformed_normal_length;
@@ -158,14 +172,14 @@ void FengGIReflectionRayGen() {
 	float f90 = clamp(50.0f * f0.g, metallic, 1.0f);
 	float2 env_brdf = gi_dfg_lut.SampleLevel(gi_dfg_sampler, float2(no_v, 1.0f - roughness), 0.0f).rg;
 	if (!(env_brdf.y > 1e-4f) || !isfinite(env_brdf.y)) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	float3 energy_compensation = 1.0f + f0 * (1.0f / env_brdf.y - 1.0f);
 	float p0 = gi_frame.size_exposure.z;
 	float scene_normalization = gi_frame.size_exposure.w;
 	if (!(p0 > 0.0f) || !(scene_normalization > 0.0f) || !isfinite(p0) || !isfinite(scene_normalization)) {
-		gi_reflection_output[pixel] = 0.0f;
+		gi_store_invalid(pixel);
 		return;
 	}
 	uint sample_count = (uint)clamp(round(gi_frame.trace_parameters.z), 1.0f, 4.0f);
@@ -180,6 +194,7 @@ void FengGIReflectionRayGen() {
 	float max_distance = max(gi_frame.trace_parameters.x, 0.001f);
 	float3 result = 0.0f;
 	float hit_distance_sum = 0.0f;
+	float3 virtual_hit_sum = 0.0f;
 	uint hit_count = 0u;
 	for (uint sample_index = 0u; sample_index < sample_count; sample_index++) {
 		float2 xi = float2((float(sample_index) + temporal_sample.x) / float(sample_count),
@@ -204,13 +219,26 @@ void FengGIReflectionRayGen() {
 		ray.Direction = direction;
 		ray.TMax = max_distance;
 		TraceRay(gi_scene_tlas, RAY_FLAG_NONE, 0x01, 0, 0, 0, ray, payload);
-		result += gi_finite_nonnegative(payload.radiance) * fresnel * visibility * energy_compensation;
 		if (payload.flags != GI_RAY_MODE_MISS) {
-			hit_count++;
-			hit_distance_sum += max(payload.hit_distance, 0.0f);
+			float3 hit_position = world_position + normal * 0.001f + direction * payload.hit_distance;
+			float3 virtual_hit = hit_position - normal * (2.0f * dot(hit_position - world_position, normal));
+			if (all(isfinite(hit_position)) && all(isfinite(virtual_hit))) {
+				result += gi_finite_nonnegative(payload.radiance) * fresnel * visibility * energy_compensation;
+				hit_count++;
+				hit_distance_sum += max(payload.hit_distance, 0.0f);
+				virtual_hit_sum += virtual_hit;
+			}
 		}
 	}
 	result = min(gi_finite_nonnegative(result / float(sample_count)) * p0 * scene_normalization, GI_HALF_MAX);
 	float hit_data = hit_count * 2u >= sample_count ? max(hit_distance_sum / max(float(hit_count), 1.0f), 0.001f) : -max_distance;
 	gi_reflection_output[pixel] = float4(result, hit_data);
+	float coverage = clamp(float(hit_count) / float(sample_count), 0.0f, 1.0f);
+	gi_reflection_coverage[pixel] = isfinite(coverage) ? coverage : 0.0f;
+	float3 virtual_hit = hit_count > 0u ? virtual_hit_sum / float(hit_count) : 0.0f;
+	if (coverage > 0.0f && all(isfinite(virtual_hit))) {
+		gi_reflection_virtual_hit[pixel] = float4(virtual_hit, coverage);
+	} else {
+		gi_reflection_virtual_hit[pixel] = 0.0f;
+	}
 }

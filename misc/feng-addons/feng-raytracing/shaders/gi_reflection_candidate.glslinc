@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D reflection_candidate;
+layout(set = 0, binding = 1) uniform sampler2D traced_reflection;
+layout(set = 0, binding = 2) uniform sampler2D traced_coverage;
+layout(set = 0, binding = 3, std140) uniform ReflectionTemporal {
+	vec4 parameters;
+	vec4 thresholds;
+	uvec4 state; // Valid history, generation low, generation high, replacement-strength bits.
+} temporal;
+
+bool finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool finite_nonnegative(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value))
+			&& all(greaterThanEqual(value, vec3(0.0)));
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 output_size = imageSize(reflection_candidate);
+	if (any(greaterThanEqual(pixel, output_size))) {
+		return;
+	}
+	ivec2 reflection_size = textureSize(traced_reflection, 0);
+	ivec2 coverage_size = textureSize(traced_coverage, 0);
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(output_size);
+	ivec2 reflection_pixel = clamp(ivec2(floor(uv * vec2(reflection_size))),
+			ivec2(0), reflection_size - ivec2(1));
+	ivec2 coverage_pixel = clamp(ivec2(floor(uv * vec2(coverage_size))),
+			ivec2(0), coverage_size - ivec2(1));
+	vec4 traced = texelFetch(traced_reflection, reflection_pixel, 0);
+	float coverage = texelFetch(traced_coverage, coverage_pixel, 0).r;
+	float requested_strength = uintBitsToFloat(temporal.state.w);
+	if (traced.a < 1.0 || !finite_float(traced.a) || !finite_nonnegative(traced.rgb)
+			|| !finite_float(coverage) || !finite_float(requested_strength)) {
+		imageStore(reflection_candidate, pixel, vec4(0.0));
+		return;
+	}
+	float strength = clamp(requested_strength, 0.0, 1.0);
+	float geometry_coverage = clamp(coverage, 0.0, 1.0);
+	vec3 geometry_radiance = geometry_coverage > 1e-6
+			? clamp(traced.rgb, vec3(0.0), vec3(65504.0)) : vec3(0.0);
+	// Raygen averages hit radiance over every sample, so RGB already includes coverage.
+	// The shared resolver applies configured GI/SSR/FengReflectProbe/FengSkyLight priority.
+	imageStore(reflection_candidate, pixel,
+			vec4(geometry_radiance * strength, geometry_coverage * strength));
+}

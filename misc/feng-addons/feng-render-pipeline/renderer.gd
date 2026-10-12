@@ -5,8 +5,8 @@ extends Resource
 ##
 ## `passes` is the authored execution list. FengBuiltinPass entries are
 ## native renderer operations and FengPass entries are compositor effects.
-## The list order is the schedule order; a custom pass_entry's `stage` remains its
-## callback selector and is only an advisory legacy placement hint.
+## The list order is the FRP schedule. A custom pass's hidden `stage` storage alias
+## reflects CompositorEffect.effect_callback_type for standalone Compositor use.
 
 const PassBase = preload("passes/pass_base.gd")
 const BuiltinPass = preload("passes/builtin_pass.gd")
@@ -19,6 +19,8 @@ const ExecutionPlan = preload("pipeline/execution_plan.gd")
 const IndirectGISelection = preload("pipeline/indirect_gi_selection.gd")
 const CompositorBinding = preload("pipeline/compositor_binding.gd")
 const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
+const ReflectionResolvePass = preload("passes/reflection_resolve_pass.gd")
+const ReflectionSettings = preload("reflection_settings.gd")
 
 ## Schema 6 moved the default pass set into the addon: every native entry carries the
 ## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
@@ -26,8 +28,15 @@ const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 ## Schema 7 moved Eye Adaptation before post-tonemap library effects. Schema 8 adds
 ## native Bloom after Eye Adaptation and before Color Grade. Schema 9 originally shipped
 ## Sky/Cloud/Trace/Fog in the wrong relative order; schema 10 repairs only that exact
-## released stock sequence and keeps later authored schedules unchanged.
-const PIPELINE_SCHEMA_VERSION := 10
+## released stock sequence and keeps later authored schedules unchanged. Schema 11
+## moves the built-in reflection resolve out of authored passes and repairs only the
+## stock RTGI position next to MagicGI.
+const PIPELINE_SCHEMA_VERSION := 11
+const MAGIC_GI_SCRIPT_PATH := "res://addons/feng-render-pipeline/passes/magic_gi_pass.gd"
+const RT_GI_SCRIPT_PATH := "res://addons/feng-raytracing/passes/feng_rt_gi_pass.gd"
+const LEGACY_RESOLVE_SCRIPT_PATH := "res://addons/feng-render-pipeline/passes/reflection_resolve_pass.gd"
+const LEGACY_RESOLVE_LIBRARY_PATH := "reflection-resolve/reflection_resolve.tres"
+const OPTIONAL_PROBE_PASS_PATH := "res://addons/feng-reflect-probe/passes/feng_reflect_probe_pass.gd"
 
 ## The addon's pass script for each engine pass. A subclass of FengNativePass runs
 ## the pass through the Core primitives by default and can be replaced per entry
@@ -48,7 +57,8 @@ const NATIVE_PASS_SCRIPTS := {
 const NativePass = preload("passes/native/native_pass.gd")
 
 ## Library entries a fresh pipeline seeds at the anchors in their manifest metadata:
-## Shadow Precompute, VT, GBuffer, Cloud Shadows, GTAO, Lighting, Magic GI, Sky,
+## Shadow Precompute, VT, GBuffer, Cloud Shadows, GTAO, Lighting, Magic GI, optional RTGI, SSR,
+## the hidden reflection resolver, Sky,
 ## Volumetric Cloud, Height Fog, Cloud Trace, Transparent, Temporal AA, Eye Adaptation,
 ## Bloom, Color Grade, Post Process, Debug Buffers.
 const DEFAULT_LIBRARY_ENTRIES := LibraryManager.DEFAULT_LIBRARY_ENTRIES
@@ -64,6 +74,7 @@ const PERSISTED_STATE_FIELDS := [
 	"_deleted_library",
 	"_deleted_library_ids",
 	"_pipeline_schema_version",
+	"_legacy_reflection_source_priority",
 ]
 
 var _passes: Array[PassBase] = []
@@ -87,6 +98,9 @@ var _passes: Array[PassBase] = []
 @export_storage var _deleted_library_ids: Array[String] = []
 ## A zero version lets migration run after serialized properties are restored.
 @export_storage var _pipeline_schema_version: int = 0
+## Compatibility snapshot from the former authored Reflection Resolve resource.
+## A scene-level FengReflectionSettings node overrides it at runtime.
+@export_storage var _legacy_reflection_source_priority: Array[int] = []
 
 var _manager := TextureManager.new()
 var _observed_passes: Array[PassBase] = []
@@ -106,6 +120,12 @@ var _parameter_revision := 0
 ## full validation because they can change texture availability and native ownership.
 var _volume_binding: Dictionary = {}
 var _view_plans: Array[Dictionary] = []
+var _runtime_reflection_resolve: FengPass
+var _runtime_probe_provider: FengPass
+var _probe_provider_checked := false
+## Transient state used only by an isolated cubemap capture renderer clone.
+## Capture policy does not serialize with the authored pipeline resource.
+var _reflection_capture_mode := false
 
 func _init() -> void:
 	changed.connect(_invalidate_volume_context)
@@ -128,7 +148,7 @@ func _seed_default_passes() -> void:
 	_connect_passes()
 
 ## The default pass set: every native entry enabled in seed order, with library
-## passes inserted at their declared anchors. Only Debug Buffers starts disabled.
+## passes inserted at their declared anchors. RTGI and Debug Buffers start disabled.
 func _default_seed_list() -> Array[PassBase]:
 	var seeded: Array[PassBase] = []
 	for native_id in NativeSpec.seed_order():
@@ -266,6 +286,9 @@ func _ensure_pipeline_initialized(emit: bool) -> bool:
 	if previous_version < 10:
 		changed = PipelineMigrator.migrate_cloud_fog_order(_passes) or changed
 	if _pipeline_schema_version < PIPELINE_SCHEMA_VERSION:
+		if previous_version < 11:
+			changed = _migrate_stock_reflection_resolve() or changed
+			changed = _migrate_stock_rtgi_position() or changed
 		_pipeline_schema_version = PIPELINE_SCHEMA_VERSION
 		changed = true
 	changed = _connect_passes() or changed
@@ -448,6 +471,191 @@ func _sync_library(emit: bool) -> bool:
 		emit_changed()
 	return changed
 
+func _migrate_stock_reflection_resolve() -> bool:
+	var matches: Array[int] = []
+	for index in _passes.size():
+		if _is_exact_script(_passes[index], LEGACY_RESOLVE_SCRIPT_PATH):
+			matches.append(index)
+	if matches.size() != 1:
+		return false
+	var legacy = _passes[matches[0]]
+	var saved_priority: Variant = legacy.get("source_priority")
+	if _legacy_reflection_source_priority.is_empty() and saved_priority is Array:
+		_legacy_reflection_source_priority.assign(saved_priority)
+	_passes.remove_at(matches[0])
+	_synced_library.erase("reflection-resolve/reflection_resolve.tres")
+	_synced_library.erase("library:reflection_resolve")
+	_synced_library_ids.erase("library:reflection_resolve")
+	_deleted_library.erase("reflection-resolve/reflection_resolve.tres")
+	_deleted_library_ids.erase("library:reflection_resolve")
+	return true
+
+func _migrate_stock_rtgi_position() -> bool:
+	var magic_index := -1
+	var rtgi_index := -1
+	var magic_count := 0
+	var rtgi_count := 0
+	for index in _passes.size():
+		if _is_exact_script(_passes[index], MAGIC_GI_SCRIPT_PATH):
+			magic_index = index
+			magic_count += 1
+		if _is_exact_script(_passes[index], RT_GI_SCRIPT_PATH):
+			rtgi_index = index
+			rtgi_count += 1
+	if magic_count != 1 or rtgi_count != 1 or rtgi_index == magic_index + 1:
+		return false
+	var rtgi = _passes[rtgi_index]
+	_passes.remove_at(rtgi_index)
+	magic_index = -1
+	for index in _passes.size():
+		if _is_exact_script(_passes[index], MAGIC_GI_SCRIPT_PATH):
+			magic_index = index
+			break
+	if magic_index < 0:
+		return false
+	_passes.insert(magic_index + 1, rtgi)
+	return true
+
+func _is_exact_script(pass_entry: Variant, script_path: String) -> bool:
+	if pass_entry == null or not pass_entry is Resource:
+		return false
+	var script := pass_entry.get_script() as Script
+	return script != null and script.resource_path == script_path
+
+func _has_enabled_reflection_resolve(enabled_fn: Callable) -> bool:
+	for pass_entry in _passes:
+		if pass_entry == null or not enabled_fn.call(pass_entry):
+			continue
+		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
+		if source_pass != null and source_pass.has_method("get_reflection_source_kind") \
+				and StringName(source_pass.call("get_reflection_source_kind")) == &"resolve":
+			return true
+	return false
+
+func _get_runtime_probe_provider() -> FengPass:
+	if _probe_provider_checked:
+		return _runtime_probe_provider
+	_probe_provider_checked = true
+	if not FileAccess.file_exists(OPTIONAL_PROBE_PASS_PATH):
+		return null
+	var script := load(OPTIONAL_PROBE_PASS_PATH) as Script
+	if script == null or not script.can_instantiate():
+		push_warning("FengRenderer: optional FengReflectProbe pass could not be loaded or compiled; reflection falls back to GI/SSR/Sky.")
+		return null
+	var candidate = script.new()
+	if not candidate is PassBase or not candidate.has_method("get_reflection_source_kind") \
+			or StringName(candidate.call("get_reflection_source_kind")) != &"feng_probe":
+		push_warning("FengRenderer: optional FengReflectProbe script does not implement the feng_probe candidate contract.")
+		return null
+	candidate.resource_name = "Feng Reflect Probe"
+	candidate.stable_id = &"internal:feng_reflect_probe"
+	candidate.enabled = true
+	_runtime_probe_provider = candidate
+	return _runtime_probe_provider
+
+func _runtime_entries(enabled_fn: Callable) -> Array[PassBase]:
+	if _reflection_capture_mode:
+		var capture_entries: Array[PassBase] = []
+		for pass_entry in _passes:
+			if pass_entry == null:
+				capture_entries.append(pass_entry)
+				continue
+			var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
+			if source_pass != null and source_pass.has_method("get_reflection_source_kind"):
+				var reflection_kind := StringName(source_pass.call("get_reflection_source_kind"))
+				if reflection_kind == &"resolve" or reflection_kind == &"feng_probe":
+					continue
+			capture_entries.append(pass_entry)
+		return capture_entries
+	_publish_reflection_priority_fallback(enabled_fn)
+	var entries: Array[PassBase] = _passes.duplicate()
+	var active_probe_provider := false
+	for pass_entry in _passes:
+		if pass_entry == null or not enabled_fn.call(pass_entry):
+			continue
+		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
+		if source_pass != null and source_pass.has_method("get_reflection_source_kind") \
+				and StringName(source_pass.call("get_reflection_source_kind")) == &"feng_probe":
+			active_probe_provider = true
+			break
+	var probe_provider: FengPass
+	if not active_probe_provider:
+		probe_provider = _get_runtime_probe_provider()
+	var has_authored_resolve := _has_enabled_reflection_resolve(enabled_fn)
+	var sky_index := _native_index_in(entries, NativeSpec.PASS_SKY)
+	var resolve_index := _enabled_resolve_index(entries, enabled_fn)
+	var insertion_index := sky_index if sky_index >= 0 else entries.size()
+	if resolve_index >= 0:
+		insertion_index = mini(insertion_index, resolve_index)
+	if probe_provider != null:
+		entries.insert(clampi(insertion_index, 0, entries.size()), probe_provider)
+	if not has_authored_resolve:
+		var resolver := _get_runtime_reflection_resolve()
+		var hidden_resolve_index := _native_index_in(entries, NativeSpec.PASS_SKY)
+		if hidden_resolve_index < 0:
+			hidden_resolve_index = entries.size()
+		entries.insert(hidden_resolve_index, resolver)
+	return entries
+
+## Enables the reduced runtime plan on a private capture clone. The capture owner
+## filters other incompatible authored passes and restores the mode after rendering.
+func set_reflection_capture_mode(enabled: bool) -> void:
+	if _reflection_capture_mode == enabled:
+		return
+	_reflection_capture_mode = enabled
+	_view_plans.clear()
+	_volume_binding = {}
+
+func _get_runtime_reflection_resolve() -> FengPass:
+	if _runtime_reflection_resolve == null:
+		_runtime_reflection_resolve = ReflectionResolvePass.new() as FengPass
+		_runtime_reflection_resolve.resource_name = "Reflection Resolve (Internal)"
+		_runtime_reflection_resolve.stable_id = &"internal:reflection_resolve"
+		_runtime_reflection_resolve.enabled = true
+	return _runtime_reflection_resolve
+
+func _publish_reflection_priority_fallback(enabled_fn: Callable) -> void:
+	var priority := _legacy_priority_or_default()
+	var resolver_id := 0
+	for pass_entry in _passes:
+		if pass_entry == null or not enabled_fn.call(pass_entry):
+			continue
+		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
+		if source_pass == null or not source_pass.has_method("get_reflection_source_kind") \
+				or StringName(source_pass.call("get_reflection_source_kind")) != &"resolve":
+			continue
+		var authored_priority: Variant = source_pass.get("source_priority")
+		if authored_priority is Array:
+			priority = authored_priority.duplicate()
+		resolver_id = source_pass.get_instance_id()
+		break
+	if resolver_id == 0:
+		resolver_id = _get_runtime_reflection_resolve().get_instance_id()
+	ReflectionSettings.publish_legacy_fallback_priority(resolver_id, priority)
+
+func _legacy_priority_or_default() -> Array[int]:
+	if _legacy_reflection_source_priority.size() != 4:
+		return [0, 1, 2, 3]
+	return _legacy_reflection_source_priority.duplicate()
+
+func _native_index_in(entries: Array, native_id: int) -> int:
+	for index in entries.size():
+		var pass_entry = entries[index]
+		if pass_entry is BuiltinPass and pass_entry.native_id == native_id:
+			return index
+	return -1
+
+func _enabled_resolve_index(entries: Array, enabled_fn: Callable) -> int:
+	for index in entries.size():
+		var pass_entry = entries[index]
+		if pass_entry == null or not enabled_fn.call(pass_entry):
+			continue
+		var source_pass = pass_entry.get_parameter_source() if pass_entry.has_method("get_parameter_source") else pass_entry
+		if source_pass != null and source_pass.has_method("get_reflection_source_kind") \
+				and StringName(source_pass.call("get_reflection_source_kind")) == &"resolve":
+			return index
+	return -1
+
 ## Records a library entry as already present in this pipeline, so synchronization
 ## neither adds it again nor reads its removal as an accident. The editor menu marks the
 ## entry it just inserted; passing the stable id or the template path both work.
@@ -477,8 +685,10 @@ func apply(compositor: Compositor) -> void:
 	var parameters: Dictionary = {}
 	var context: Dictionary = {}
 	var indirect_owner: Dictionary = {"kind": &"", "key": ""}
+	var runtime_entries: Array[PassBase] = []
 	if candidate_warnings.is_empty():
-		schedule = _build_schedule()
+		runtime_entries = _runtime_entries(_is_entry_enabled)
+		schedule = ExecutionPlan.build(runtime_entries, _manager, _is_entry_enabled)
 		for native_id in _provided_native_ids():
 			provided.append(native_id)
 		provided.sort()
@@ -492,7 +702,7 @@ func apply(compositor: Compositor) -> void:
 	var result := CompositorBinding.apply(
 		compositor,
 		_manager,
-		_passes,
+		runtime_entries if candidate_warnings.is_empty() else _passes,
 		schedule,
 		candidate_warnings,
 		_is_entry_enabled,
@@ -558,7 +768,8 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 		return {"warnings": warnings}
 	# Effect slot zero belongs to each view's texture manager. Build keeps custom
 	# token indices based at one even when the manager is omitted here.
-	var schedule := ExecutionPlan.build(_passes, null, enabled_fn)
+	var runtime_entries := _runtime_entries(enabled_fn)
+	var schedule := ExecutionPlan.build(runtime_entries, null, enabled_fn)
 	var provided_ids := PackedInt32Array()
 	for native_id in provided:
 		provided_ids.append(native_id)
@@ -587,7 +798,7 @@ func is_view_shareable(entry: FengPass) -> bool:
 ## name per executed entry, in order, with the texture manager first. Both lists come
 ## from the same walk, so they cannot drift apart.
 func _build_schedule() -> Dictionary:
-	return ExecutionPlan.build(_passes, _manager, _is_entry_enabled)
+	return ExecutionPlan.build(_runtime_entries(_is_entry_enabled), _manager, _is_entry_enabled)
 
 func get_execution_tokens() -> PackedInt32Array:
 	_ensure_pipeline_initialized(false)

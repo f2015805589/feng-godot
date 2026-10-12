@@ -5,6 +5,7 @@ const SkyLightScript = preload("res://addons/feng-sky/feng_sky_light.gd")
 const RendererScript = preload("res://addons/feng-render-pipeline/renderer.gd")
 const CompositionScript = preload("res://addons/feng-render-pipeline/compositor.gd")
 const Worlds = preload("res://addons/feng-render-pipeline/passes/snapshot_worlds.gd")
+const ReflectionSettingsScript = preload("res://addons/feng-render-pipeline/reflection_settings.gd")
 const Spec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
 const ReflectionRenderer = preload("res://addons/feng-raytracing/rendering/rt_gi_reflections.gd")
 const Selection = preload("res://addons/feng-render-pipeline/pipeline/indirect_gi_selection.gd")
@@ -18,7 +19,8 @@ var hdr_test_done := false
 var hdr_test_passed := false
 var hdr_clamped_result := Color(0, 0, 0, 0)
 var hdr_jump_result := Color(0, 0, 0, 0)
-var invalid_composite_unchanged := false
+var hdr_candidate_result := Color(0, 0, 0, 0)
+var invalid_candidate_zero := false
 var duplicate_owner_unchanged := false
 
 func _initialize() -> void:
@@ -131,6 +133,7 @@ func _execute_hdr_exposure_history_test() -> void:
 		var old_material: RID = state.history[0][4]
 		var old_albedo: RID = state.history[0][5]
 		success = rd.texture_update(state.raw, 0, _color_bytes(Image.FORMAT_RGBAH, Color(60000.0, 60000.0, 60000.0, 4.0))) == OK \
+				and rd.texture_update(state.raw_coverage, 0, _color_bytes(Image.FORMAT_RH, Color(1.0, 0.0, 0.0, 0.0))) == OK \
 				and rd.texture_update(old_radiance, 0, _color_bytes(Image.FORMAT_RGBAH, Color(60000.0, 60000.0, 60000.0, 1.0))) == OK \
 				and rd.texture_update(old_depth, 0, PackedFloat32Array([1.0]).to_byte_array()) == OK \
 				and rd.texture_update(old_normal, 0, _color_bytes(Image.FORMAT_RGBAH, Color(0.0, 0.0, 1.0, 0.25))) == OK \
@@ -164,42 +167,45 @@ func _execute_hdr_exposure_history_test() -> void:
 			var jump_bytes := rd.texture_get_data(state.history[state.ping][0], 0)
 			hdr_jump_result = Image.create_from_data(1, 1, false, Image.FORMAT_RGBAH, jump_bytes).get_pixel(0, 0)
 			success = _color_is_finite_half(hdr_jump_result) and absf(hdr_jump_result.r - 100.0) < 1.0
-	var target := _make_data_texture(rd, RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
+	var candidate := _make_data_texture(rd, RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
 			_color_bytes(Image.FORMAT_RGBAH, Color(10.0, 8.0, 6.0, 0.75)),
 			RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
 			| RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT | RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT)
-	var native := _make_data_texture(rd, RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT,
-			_color_bytes(Image.FORMAT_RGBAH, Color(1.0, 2.0, 3.0, 1.0)))
-	if success and target.is_valid() and native.is_valid():
+	if success and candidate.is_valid():
 		var blocked_owner := {"kind": "rt_gi", "key": "", "blocked": true}
 		var duplicate_blocked := not Selection.is_resolved_reflection_owner(blocked_owner, "test:rt_first") \
 				and not Selection.is_resolved_reflection_owner(blocked_owner, "test:rt_second")
-		var unchanged_duplicate_target := Image.create_from_data(1, 1, false, Image.FORMAT_RGBAH,
-				rd.texture_get_data(target, 0)).get_pixel(0, 0)
-		duplicate_owner_unchanged = duplicate_blocked and _close_color(unchanged_duplicate_target,
+		var unchanged_duplicate_candidate := Image.create_from_data(1, 1, false, Image.FORMAT_RGBAH,
+				rd.texture_get_data(candidate, 0)).get_pixel(0, 0)
+		duplicate_owner_unchanged = duplicate_blocked and _close_color(unchanged_duplicate_candidate,
 				Color(10.0, 8.0, 6.0, 0.75), 0.01)
+		var valid_candidate_dispatched := backend.publish_candidate(state, candidate, Vector2i.ONE)
+		hdr_candidate_result = Image.create_from_data(1, 1, false, Image.FORMAT_RGBAH,
+				rd.texture_get_data(candidate, 0)).get_pixel(0, 0)
+		var valid_candidate_ok := valid_candidate_dispatched and _color_is_finite_half(hdr_candidate_result) \
+				and absf(hdr_candidate_result.r - hdr_jump_result.r) < 1.0 and absf(hdr_candidate_result.a - 1.0) < 0.01
 		var invalid_trace := _color_bytes(Image.FORMAT_RGBAH, Color(INF, 20.0, 30.0, 1.0))
 		var invalid_upload_ok := rd.texture_update(state.history[state.ping][0], 0, invalid_trace) == OK
-		var invalid_composite_dispatched := invalid_upload_ok and backend.composite(state, target, native,
-				sampler, Vector2i.ONE, 1.0)
-		var unchanged_after_invalid := Image.create_from_data(1, 1, false, Image.FORMAT_RGBAH,
-				rd.texture_get_data(target, 0)).get_pixel(0, 0)
-		invalid_composite_unchanged = invalid_composite_dispatched \
-				and _color_is_finite_half(unchanged_after_invalid) \
-				and _close_color(unchanged_after_invalid, Color(10.0, 8.0, 6.0, 0.75), 0.01)
-		success = success and duplicate_owner_unchanged and invalid_composite_unchanged
+		var invalid_candidate_dispatched := invalid_upload_ok \
+				and backend.publish_candidate(state, candidate, Vector2i.ONE)
+		var invalid_candidate_value := Image.create_from_data(1, 1, false, Image.FORMAT_RGBAH,
+				rd.texture_get_data(candidate, 0)).get_pixel(0, 0)
+		invalid_candidate_zero = invalid_candidate_dispatched and _color_is_finite_half(invalid_candidate_value) \
+				and _close_color(invalid_candidate_value, Color(0.0, 0.0, 0.0, 0.0), 0.01)
+		success = success and duplicate_owner_unchanged and valid_candidate_ok and invalid_candidate_zero
 	else:
 		success = false
 	if not state.is_empty():
 		backend.release_state(state)
-	for rid in [depth, normal, albedo, orm, emission, target, native, sampler]:
+	for rid in [depth, normal, albedo, orm, emission, candidate, sampler]:
 		if rid.is_valid():
 			rd.free_rid(rid)
 	backend.release()
 	hdr_test_passed = success
 	print("RTGI_REFLECTION_CASE hdr_exposure_history_safe ", success,
 			" clamped=", hdr_clamped_result, " jump_rejected=", hdr_jump_result,
-			" invalid_composite_unchanged=", invalid_composite_unchanged,
+			" valid_candidate=", hdr_candidate_result,
+			" invalid_candidate_zero=", invalid_candidate_zero,
 			" duplicate_owner_unchanged=", duplicate_owner_unchanged)
 	hdr_test_done = true
 
@@ -284,6 +290,9 @@ func run() -> void:
 
 	var renderer = RendererScript.new()
 	var passes: Array[FengPass] = []
+	var reflection_settings = ReflectionSettingsScript.new()
+	reflection_settings.source_priority = [0, 1, 2, 3]
+	root.add_child(reflection_settings)
 	gi = Pass.new()
 	gi.stable_id = &"test:rtgi_reflections"
 	gi.strength = 0.0

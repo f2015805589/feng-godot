@@ -1,0 +1,242 @@
+bool ssr_hiz_clip_halfspace(float start_value, float end_value,
+		inout float minimum_fraction, inout float maximum_fraction) {
+	if (!finite_float(start_value) || !finite_float(end_value)) {
+		return false;
+	}
+	if (start_value >= 0.0 && end_value >= 0.0) {
+		return true;
+	}
+	if (start_value < 0.0 && end_value < 0.0) {
+		return false;
+	}
+	float crossing = start_value / (start_value - end_value);
+	if (!finite_float(crossing)) {
+		return false;
+	}
+	if (start_value < 0.0) {
+		minimum_fraction = max(minimum_fraction, crossing);
+	} else {
+		maximum_fraction = min(maximum_fraction, crossing);
+	}
+	return minimum_fraction <= maximum_fraction;
+}
+
+bool ssr_hiz_point_at_screen_fraction(vec3 start_position, vec3 end_position,
+		float start_clip_w, float end_clip_w, float start_t, float end_t,
+		float screen_fraction, out vec3 view_position, out float ray_t) {
+	view_position = vec3(0.0);
+	ray_t = 0.0;
+	if (!finite_float(start_clip_w) || !finite_float(end_clip_w)
+			|| start_clip_w <= 1e-7 || end_clip_w <= 1e-7
+			|| !finite_float(screen_fraction) || !finite_float(start_t)
+			|| !finite_float(end_t)) {
+		return false;
+	}
+	float start_reciprocal_w = 1.0 / start_clip_w;
+	float end_reciprocal_w = 1.0 / end_clip_w;
+	float reciprocal_w = mix(start_reciprocal_w, end_reciprocal_w, screen_fraction);
+	if (!finite_float(reciprocal_w) || reciprocal_w <= 1e-7) {
+		return false;
+	}
+	vec3 perspective_position = mix(start_position * start_reciprocal_w,
+			end_position * end_reciprocal_w, screen_fraction);
+	view_position = perspective_position / reciprocal_w;
+	float source_fraction = screen_fraction * end_reciprocal_w / reciprocal_w;
+	ray_t = mix(start_t, end_t, source_fraction);
+	return finite_vec3(view_position) && finite_float(ray_t);
+}
+
+int ssr_hiz_cell_axis(float pixel_coordinate, float pixel_delta,
+		int mip_level, int mip_dimension) {
+	int cell_scale = 1 << mip_level;
+	float directional_coordinate = pixel_coordinate;
+	if (pixel_delta < 0.0) {
+		directional_coordinate -= 1e-4;
+	}
+	int cell = int(floor(directional_coordinate / float(cell_scale)));
+	return clamp(cell, 0, mip_dimension - 1);
+}
+
+int ssr_hiz_trace_ray(vec3 ray_origin, vec3 ray_direction,
+		ivec2 source_pixel, float receiver_linear_depth, ivec2 full_size,
+		float maximum_ray_distance, float ray_origin_bias, int maximum_visits,
+		out ivec2 hit_pixel, out vec2 hit_uv, out float hit_depth,
+		out float hit_t, out vec3 hit_position) {
+	hit_pixel = ivec2(0);
+	hit_uv = vec2(0.0);
+	hit_depth = 0.0;
+	hit_t = 0.0;
+	hit_position = vec3(0.0);
+	if (any(lessThanEqual(full_size, ivec2(0)))
+			|| !finite_float(maximum_ray_distance) || maximum_ray_distance <= 0.0
+			|| !finite_vec3(ray_origin) || !finite_vec3(ray_direction)) {
+		return 0;
+	}
+
+	float near_plane = max(trace_clip.near_far.x, 1e-5);
+	float far_plane = trace_clip.near_far.y;
+	if (!finite_float(near_plane) || !finite_float(far_plane) || far_plane <= near_plane) {
+		return 0;
+	}
+	vec3 ray_end = ray_origin + ray_direction * maximum_ray_distance;
+	vec4 start_clip = params.projection * vec4(ray_origin, 1.0);
+	vec4 end_clip = params.projection * vec4(ray_end, 1.0);
+	if (any(isnan(start_clip)) || any(isinf(start_clip))
+			|| any(isnan(end_clip)) || any(isinf(end_clip))) {
+		return 0;
+	}
+	float minimum_fraction = 0.0;
+	float maximum_fraction = 1.0;
+	if (!ssr_hiz_clip_halfspace(-ray_origin.z - near_plane,
+			-ray_end.z - near_plane, minimum_fraction, maximum_fraction)
+			|| !ssr_hiz_clip_halfspace(far_plane + ray_origin.z,
+				far_plane + ray_end.z, minimum_fraction, maximum_fraction)
+			|| !ssr_hiz_clip_halfspace(start_clip.x + start_clip.w,
+				end_clip.x + end_clip.w, minimum_fraction, maximum_fraction)
+			|| !ssr_hiz_clip_halfspace(start_clip.w - start_clip.x,
+				end_clip.w - end_clip.x, minimum_fraction, maximum_fraction)
+			|| !ssr_hiz_clip_halfspace(start_clip.y + start_clip.w,
+				end_clip.y + end_clip.w, minimum_fraction, maximum_fraction)
+			|| !ssr_hiz_clip_halfspace(start_clip.w - start_clip.y,
+				end_clip.w - end_clip.y, minimum_fraction, maximum_fraction)
+			|| !ssr_hiz_clip_halfspace(start_clip.w - 1e-7,
+				end_clip.w - 1e-7, minimum_fraction, maximum_fraction)) {
+		return 0;
+	}
+	if (maximum_fraction <= minimum_fraction) {
+		return 0;
+	}
+	vec3 clipped_start = mix(ray_origin, ray_end, minimum_fraction);
+	vec3 clipped_end = mix(ray_origin, ray_end, maximum_fraction);
+	float clipped_start_t = maximum_ray_distance * minimum_fraction;
+	float clipped_end_t = maximum_ray_distance * maximum_fraction;
+	vec4 clipped_start_clip = params.projection * vec4(clipped_start, 1.0);
+	vec4 clipped_end_clip = params.projection * vec4(clipped_end, 1.0);
+	if (!finite_float(clipped_start_clip.w) || !finite_float(clipped_end_clip.w)
+			|| clipped_start_clip.w <= 1e-7 || clipped_end_clip.w <= 1e-7) {
+		return 0;
+	}
+	vec2 start_uv = clipped_start_clip.xy / clipped_start_clip.w * 0.5 + 0.5;
+	vec2 end_uv = clipped_end_clip.xy / clipped_end_clip.w * 0.5 + 0.5;
+	if (!finite_vec2(start_uv) || !finite_vec2(end_uv)) {
+		return 0;
+	}
+	vec2 screen_start = start_uv * vec2(full_size);
+	vec2 screen_end = end_uv * vec2(full_size);
+	vec2 screen_delta = screen_end - screen_start;
+	if (!finite_vec2(screen_start) || !finite_vec2(screen_delta)) {
+		return 0;
+	}
+
+	int maximum_mip = textureQueryLevels(depth_hiz_texture) - 1;
+	if (maximum_mip < 0) {
+		return 0;
+	}
+	int mip_level = maximum_mip;
+	float screen_fraction = 0.0;
+	float screen_fraction_epsilon = 1e-3 / max(max(abs(screen_delta.x), abs(screen_delta.y)), 1.0);
+	for (int visit = 0; visit < 128; visit++) {
+		if (visit >= maximum_visits) {
+			break;
+		}
+		if (screen_fraction >= 1.0) {
+			break;
+		}
+		ivec2 mip_size = textureSize(depth_hiz_texture, mip_level);
+		int cell_scale = 1 << mip_level;
+		vec2 screen_position = mix(screen_start, screen_end, screen_fraction);
+		ivec2 cell = ivec2(
+				ssr_hiz_cell_axis(screen_position.x, screen_delta.x, mip_level, mip_size.x),
+				ssr_hiz_cell_axis(screen_position.y, screen_delta.y, mip_level, mip_size.y));
+		ivec2 cell_start = cell * cell_scale;
+		ivec2 cell_end = min(cell_start + ivec2(cell_scale), full_size);
+		// Match reduction's folded final parent bounds exactly on odd dimensions.
+		if (cell.x == mip_size.x - 1) {
+			cell_end.x = full_size.x;
+		}
+		if (cell.y == mip_size.y - 1) {
+			cell_end.y = full_size.y;
+		}
+		float next_x_fraction = 3.402823466e+38;
+		float next_y_fraction = 3.402823466e+38;
+		if (screen_delta.x > 1e-8) {
+			next_x_fraction = (float(cell_end.x) - screen_start.x) / screen_delta.x;
+		} else if (screen_delta.x < -1e-8) {
+			next_x_fraction = (float(cell_start.x) - screen_start.x) / screen_delta.x;
+		}
+		if (screen_delta.y > 1e-8) {
+			next_y_fraction = (float(cell_end.y) - screen_start.y) / screen_delta.y;
+		} else if (screen_delta.y < -1e-8) {
+			next_y_fraction = (float(cell_start.y) - screen_start.y) / screen_delta.y;
+		}
+		float cell_exit_fraction = min(1.0, min(next_x_fraction, next_y_fraction));
+		if (!finite_float(cell_exit_fraction) || cell_exit_fraction < screen_fraction) {
+			break;
+		}
+		cell_exit_fraction = max(cell_exit_fraction, screen_fraction);
+		vec3 interval_start_position;
+		vec3 interval_end_position;
+		float interval_start_t;
+		float interval_end_t;
+		if (!ssr_hiz_point_at_screen_fraction(clipped_start, clipped_end,
+				clipped_start_clip.w, clipped_end_clip.w, clipped_start_t,
+				clipped_end_t, screen_fraction, interval_start_position, interval_start_t)
+				|| !ssr_hiz_point_at_screen_fraction(clipped_start, clipped_end,
+					clipped_start_clip.w, clipped_end_clip.w, clipped_start_t,
+					clipped_end_t, cell_exit_fraction, interval_end_position, interval_end_t)) {
+			break;
+		}
+		float interval_depth_start = -interval_start_position.z;
+		float interval_depth_end = -interval_end_position.z;
+		float interval_minimum_depth = min(interval_depth_start, interval_depth_end);
+		float interval_maximum_depth = max(interval_depth_start, interval_depth_end);
+		vec2 depth_range = texelFetch(depth_hiz_texture, cell, mip_level).rg;
+		bool has_depth = !any(isnan(depth_range)) && !any(isinf(depth_range))
+				&& depth_range.x <= depth_range.y && depth_range.y > 0.0;
+		float front_reference_depth = max(interval_maximum_depth,
+				has_depth ? max(depth_range.x, 0.0) : 0.0);
+		float depth_epsilon = max(1e-4, front_reference_depth * 1e-6);
+		bool depth_interval_overlaps = has_depth
+				&& interval_minimum_depth <= depth_range.y + depth_epsilon
+				&& interval_maximum_depth >= depth_range.x - depth_epsilon;
+		if (depth_interval_overlaps && mip_level > 0) {
+			mip_level--;
+			continue;
+		}
+		if (depth_interval_overlaps) {
+			ivec2 candidate_pixel = cell;
+			vec3 candidate_surface_position;
+			if (read_scene_position(candidate_pixel, full_size, candidate_surface_position)) {
+				ivec2 refined_pixel;
+				vec2 refined_uv;
+				float refined_depth;
+				float refined_t;
+				vec3 refined_position;
+				int candidate_result = refine_visible_surface_hit(ray_origin, ray_direction,
+						candidate_surface_position, candidate_pixel, source_pixel,
+						receiver_linear_depth, ray_origin_bias, full_size,
+						interval_start_t, interval_end_t, refined_pixel, refined_uv,
+						refined_depth, refined_t, refined_position);
+				if (all(equal(refined_pixel, candidate_pixel))) {
+					if (candidate_result == SSR_TRACE_BLOCKED) {
+						return SSR_TRACE_BLOCKED;
+					}
+					if (candidate_result == SSR_TRACE_HIT) {
+						hit_pixel = refined_pixel;
+						hit_uv = refined_uv;
+						hit_depth = refined_depth;
+						hit_t = refined_t;
+						hit_position = refined_position;
+						return SSR_TRACE_HIT;
+					}
+				}
+			}
+		}
+		if (cell_exit_fraction >= 1.0) {
+			break;
+		}
+		screen_fraction = cell_exit_fraction + screen_fraction_epsilon;
+		mip_level = min(mip_level + 1, maximum_mip);
+	}
+	return 0;
+}

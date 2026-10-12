@@ -81,7 +81,8 @@ vec4 fsss_evaluate_analytic_fog(vec3 camera_to_receiver, float view_ray_cosine) 
 			fsss_analytic_parameters.parameters[2].z,
 			feng_volume_sampling.analytic_control.x,
 			feng_volume_sampling.analytic_control.y);
-	fog.rgb *= max(feng_volume_sampling.frame_control.y, 1.0e-8);
+	fog.rgb *= max(feng_volume_sampling.frame_control.y, 1.0e-8)
+			* max(feng_volume_sampling.analytic_control.w, 1.0e-8);
 	return fog;
 }
 
@@ -95,7 +96,8 @@ vec3 fsss_apply_aerial_perspective(float device_depth, vec3 camera_to_receiver,
 	frp_atmo_aerial(camera_to_receiver, vec3(0.0),
 			fsss_frame.view_to_world[3].xyz, radiance, transmission);
 	return scene_rgb * transmission
-			+ radiance * max(feng_volume_sampling.frame_control.y, 1.0e-8);
+			+ radiance * max(feng_volume_sampling.frame_control.y, 1.0e-8)
+				* max(feng_volume_sampling.analytic_control.w, 1.0e-8);
 }
 
 vec4 fsss_generate_source(vec2 uv, ivec2 pixel, float device_depth, float view_depth_m,

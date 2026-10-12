@@ -27,8 +27,9 @@ const DEFAULT_LIBRARY_ENTRIES := [
 	{"id": "library:bloom_composite", "path": "bloom-lite/bloom_composite.tres", "name": "Bloom Composite"},
 	{"id": "library:color_grade", "path": "color-grade/color_grade.tres", "name": "Color Grade", "default_enabled": true},
 	{"id": "library:gtao", "path": "gtao/gtao.tres", "name": "GTAO", "default_enabled": true, "after_native": NativeSpec.PASS_GBUFFER, "missing_anchor_warning": "GTAO was not seeded because this pipeline has no native G-buffer entry."},
-	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
-	{"id": "library:rt_gi", "path": "rt-gi/rt_gi.tres", "name": "Hardware RTGI", "default_enabled": false, "after_native": NativeSpec.PASS_LIGHTING, "missing_anchor_warning": "Hardware RTGI was not inserted because this pipeline has no native Lighting entry."},
+	{"id": "library:magic_gi", "path": "magic-gi/magic_gi.tres", "name": "Magic GI", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "anchor_order": 0, "missing_anchor_warning": "Magic GI was not seeded because this pipeline has no native Lighting entry. Add and place it after your custom lighting work."},
+	{"id": "library:rt_gi", "path": "rt-gi/rt_gi.tres", "name": "Hardware RTGI", "default_enabled": false, "after_native": NativeSpec.PASS_LIGHTING, "anchor_order": 1, "requires_script": "res://addons/feng-raytracing/passes/feng_rt_gi_pass.gd", "legacy_script_path": "res://addons/feng-raytracing/passes/feng_rt_gi_pass.gd", "missing_anchor_warning": "Hardware RTGI was not inserted because this pipeline has no native Lighting entry."},
+	{"id": "library:ssr", "path": "ssr/ssr.tres", "name": "SSR", "default_enabled": true, "after_native": NativeSpec.PASS_LIGHTING, "anchor_order": 2, "missing_anchor_warning": "SSR was not seeded because this pipeline has no native Lighting entry."},
 	{"id": "library:cloud_shadow", "path": "cloud/cloud_shadow.tres", "name": "Cloud Shadows", "default_enabled": true, "after_native": NativeSpec.PASS_GBUFFER, "missing_anchor_warning": "Cloud Shadows was not seeded because this pipeline has no native G-buffer entry."},
 	{"id": "library:cloud_trace", "path": "cloud/cloud_trace.tres", "name": "Volumetric Cloud Trace", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Volumetric Cloud Trace was not seeded because this pipeline has no native Sky entry."},
 	{"id": "library:height_fog", "path": "height-fog/height_fog.tres", "name": "Height Fog", "default_enabled": true, "after_native": NativeSpec.PASS_SKY, "missing_anchor_warning": "Height Fog was not seeded because this pipeline has no native Sky entry. Add and place it after your custom sky work."},
@@ -43,6 +44,8 @@ const DEFAULT_LIBRARY_SEEDED: Array[String] = [
 	"library:color_grade",
 	"library:gtao",
 	"library:magic_gi",
+	"library:rt_gi",
+	"library:ssr",
 	"library:height_fog",
 	"library:volumetric_cloud",
 	"library:cloud_shadow",
@@ -93,7 +96,13 @@ static func _restore_managed_placement(passes: Array, stable_id: StringName) -> 
 		passes.insert(_managed_insert_index(passes, stable_id), entry)
 
 static func load_template(entry: Dictionary) -> Variant:
-	return load(FengAddonLayout.library_dir() + "/" + entry["path"])
+	var required_script := String(entry.get("requires_script", ""))
+	if required_script != "" and not FileAccess.file_exists(required_script):
+		return null
+	var template_path := FengAddonLayout.library_dir() + "/" + String(entry["path"])
+	if not ResourceLoader.exists(template_path):
+		return null
+	return load(template_path)
 
 ## The manifest-relative path of a library template path, so a stored path and a
 ## manifest entry can be compared.
@@ -164,6 +173,9 @@ static func calculate_insert_index(passes: Array, stable_id: StringName) -> int:
 		var anchor_id := int(entry["after_native"])
 		for i in passes.size():
 			if passes[i] is BuiltinPass and passes[i].native_id == anchor_id:
+				var anchor_order := int(entry.get("anchor_order", -1))
+				if anchor_order >= 0:
+					return _anchored_group_insert_index(passes, i, anchor_id, anchor_order)
 				var cloud_rank := _cloud_composite_rank(stable_id) if anchor_id == NativeSpec.PASS_SKY else -1
 				if cloud_rank >= 0:
 					return _cloud_composite_insert_index(passes, i + 1, cloud_rank)
@@ -219,6 +231,57 @@ static func manifest_entry(stable_id: StringName) -> Variant:
 			return entry
 	return null
 
+## Stable insertion order for new effects sharing a native anchor. Existing entries are
+## never moved; this chooses only the insertion point for the new seed/library pass.
+static func _anchored_group_insert_index(passes: Array, anchor_index: int,
+		anchor_id: int, order: int) -> int:
+	var first_later := -1
+	var last_prior := -1
+	for index in range(anchor_index + 1, passes.size()):
+		var existing = passes[index]
+		if existing is BuiltinPass:
+			break
+		var existing_manifest := _manifest_for_pass(existing)
+		if existing_manifest == null or int(existing_manifest.get("after_native", -1)) != anchor_id:
+			continue
+		var existing_order := int(existing_manifest.get("anchor_order", -1))
+		if existing_order < 0:
+			continue
+		if existing_order <= order:
+			last_prior = index
+		elif first_later < 0:
+			first_later = index
+	if first_later >= 0 and (last_prior < 0 or last_prior < first_later):
+		return first_later
+	if last_prior >= 0:
+		return last_prior + 1
+	return anchor_index + 1
+
+## RTGI providers can keep project-specific IDs referenced by FengVolume resources.
+## Recognize the provider contract for placement without rewriting the key.
+static func _manifest_for_pass(pass_entry: Variant) -> Variant:
+	if pass_entry == null:
+		return null
+	var direct := manifest_entry(pass_entry.stable_id)
+	if direct != null:
+		return direct
+	if _is_rt_gi_provider(pass_entry):
+		return manifest_entry(&"library:rt_gi")
+	var pass_script := pass_entry.get_script() as Script
+	if pass_script == null:
+		return null
+	for entry in DEFAULT_LIBRARY_ENTRIES:
+		var legacy_script_path := String(entry.get("legacy_script_path", ""))
+		if legacy_script_path == pass_script.resource_path:
+			var stable_id := String(pass_entry.stable_id)
+			if stable_id.is_empty() or stable_id.begins_with("custom:"):
+				return entry
+	return null
+
+static func _is_rt_gi_provider(pass_entry: Variant) -> bool:
+	return pass_entry != null and pass_entry.has_method("get_indirect_gi_kind") \
+			and StringName(pass_entry.call("get_indirect_gi_kind")) == &"rt_gi"
+
 ## The custom pass an entry already has in the list: matched by stable id, or by the
 ## shader the template points at for a pass that predates stable ids.
 static func find_matching_library_pass(passes: Array, entry: Dictionary, template = null):
@@ -233,9 +296,20 @@ static func find_matching_library_pass(passes: Array, entry: Dictionary, templat
 			continue
 		if pass_entry.stable_id == stable_id:
 			return pass_entry
+		# A custom RTGI subclass/provider already fills this slot. Treat it as the
+		# synchronized entry instead of creating a second diffuse/reflection owner.
+		if stable_id == "library:rt_gi" and _is_rt_gi_provider(pass_entry):
+			return pass_entry
 		if shader_path != "":
 			var pass_shader = pass_entry.get("shader_file")
 			if pass_shader != null and pass_shader.resource_path == shader_path:
+				return pass_entry
+		var legacy_script_path := String(entry.get("legacy_script_path", ""))
+		if legacy_script_path != "":
+			var pass_script := pass_entry.get_script() as Script
+			var existing_id := String(pass_entry.stable_id)
+			if pass_script != null and pass_script.resource_path == legacy_script_path \
+					and (existing_id.is_empty() or existing_id.begins_with("custom:")):
 				return pass_entry
 	return null
 
@@ -281,7 +355,11 @@ static func sync(passes: Array, synced: Array, synced_ids: Array, deleted: Array
 		if is_synced(entry, synced, synced_ids):
 			var synced_existing = _find_synced_library_pass(passes, entry)
 			if synced_existing != null:
-				if synced_existing.stable_id != entry["id"]:
+				# Existing custom RTGI identities may be referenced by FengVolume
+				# parameter dictionaries. Keep their keys while recording the library
+				# entry as synchronized.
+				if synced_existing.stable_id != entry["id"] \
+						and not (entry["id"] == "library:rt_gi" and _is_rt_gi_provider(synced_existing)):
 					synced_existing.stable_id = entry["id"]
 					changed = true
 				if synced_existing.resource_name == "":

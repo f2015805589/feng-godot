@@ -100,6 +100,13 @@ class FRPPassContext : public RefCounted {
 	// Optional per-frame capture of the global SkyLight diffuse term for GI passes.
 	bool sky_light_diffuse_requested = false;
 	bool indirect_specular_requested = false;
+	bool reflection_components_requested = false;
+	bool reflection_components_available = false;
+	// Reflection candidates are borrowed, per-frame and per-view. Sources are GI,
+	// SSR and FengReflectProbe. setup() clears them before every frame.
+	RID reflection_candidates[2][3];
+	bool reflection_candidate_blocked[2][3] = { { false, false, false }, { false, false, false } };
+	bool reflection_candidate_duplicate_warned = false;
 	std::function<RID(int)> indirect_specular_target_provider;
 	RID indirect_specular_target_cache[2];
 	bool indirect_specular_target_cached[2] = { false, false };
@@ -216,6 +223,13 @@ public:
 	bool is_sky_light_diffuse_requested() const { return sky_light_diffuse_requested; }
 	void request_indirect_specular();
 	bool is_indirect_specular_requested() const { return indirect_specular_requested; }
+	void request_reflection_components();
+	bool is_reflection_components_requested() const { return reflection_components_requested; }
+	void set_reflection_components_available(bool p_available) { reflection_components_available = p_available; }
+	bool is_reflection_components_available() const { return reflection_components_requested && reflection_components_available; }
+	RID get_sky_light_specular_texture(int p_view = 0) const;
+	bool publish_reflection_candidate(const StringName &p_source, RID p_texture, int p_view = 0);
+	RID get_reflection_candidate(const StringName &p_source, int p_view = 0) const;
 	void set_indirect_specular_target_provider(const std::function<RID(int)> &p_provider) { indirect_specular_target_provider = p_provider; }
 	void begin_indirect_specular_callback();
 	RID get_indirect_specular_composite_target(int p_view = 0);
@@ -258,8 +272,10 @@ public:
 	RID get_cloud_output(int p_index) const { return p_index >= 0 && p_index < 8 ? cloud_outputs[p_index] : RID(); }
 	// Set by the renderer for each face of a reflection capture. No source Node,
 	// Environment, or Sky resource is retained by this per-frame context.
+	void set_reflection_capture_context(bool p_active, uint64_t p_batch_id, int p_face_index, int p_face_count, const Vector3 &p_origin_world_m, float p_exposure_normalization);
 	void set_cloud_capture_context(bool p_active, uint64_t p_batch_id, int p_face_index, int p_face_count, const Vector3 &p_origin_world_m, float p_exposure_normalization);
-	bool is_cloud_capture() const { return cloud_capture_active; }
+	bool is_reflection_capture() const { return cloud_capture_active; }
+	bool is_cloud_capture() const { return is_reflection_capture(); }
 	uint64_t get_cloud_capture_batch_id() const { return cloud_capture_batch_id; }
 	int get_cloud_capture_face_index() const { return cloud_capture_face_index; }
 	int get_cloud_capture_face_count() const { return cloud_capture_face_count; }

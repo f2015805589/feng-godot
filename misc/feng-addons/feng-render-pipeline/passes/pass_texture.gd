@@ -21,7 +21,8 @@ enum Source {
 	# Reading it is what makes an "after tonemap" effect a post-process effect.
 	TONEMAPPED,
 	MOTION_VECTORS,
-	# Complete DFG- and pre-exposed indirect specular term captured by deferred lighting.
+	# Complete DFG- and pre-exposed Sky-only native indirect specular captured by Lighting.
+	# FRP leaves alpha at zero; reflection candidates are published separately.
 	# Appended to preserve the serialized values of existing texture sources.
 	INDIRECT_SPECULAR,
 }

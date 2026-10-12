@@ -61,6 +61,8 @@
 #define RB_TEX_SKY_LIGHT_DIFFUSE_MSAA SNAME("sky_light_diffuse_msaa")
 #define RB_TEX_INDIRECT_SPECULAR SNAME("indirect_specular")
 #define RB_TEX_INDIRECT_SPECULAR_MSAA SNAME("indirect_specular_msaa")
+#define RB_TEX_SKY_LIGHT_SPECULAR SNAME("sky_light_specular")
+#define RB_TEX_SKY_LIGHT_SPECULAR_MSAA SNAME("sky_light_specular_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_GBUFFER_ALBEDO SNAME("gbuffer_albedo")
@@ -154,6 +156,10 @@ public:
 		RID get_indirect_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR, p_layer, 0); }
 		RID get_indirect_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_INDIRECT_SPECULAR_MSAA, p_layer, 0); }
 
+		void ensure_sky_light_specular();
+		RID get_sky_light_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_SPECULAR, p_layer, 0); }
+		RID get_sky_light_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FRP_CLUSTERED, RB_TEX_SKY_LIGHT_SPECULAR_MSAA, p_layer, 0); }
+
 		void ensure_normal_roughness_texture();
 		bool has_normal_roughness() const { return render_buffers->has_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
 		RID get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_FRP_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
@@ -226,6 +232,7 @@ private:
 	RID current_atmosphere_multiple_texture;
 	bool current_eye_adaptation_enabled = false;
 	RID current_eye_adaptation_texture;
+	bool reflection_components_limit_warned = false;
 
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
@@ -284,7 +291,8 @@ private:
 		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
 		FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
 		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
-		FRP_LIGHTING_MODE_MAX
+		FRP_LIGHTING_MODE_REFLECTION_COMPONENTS = 16,
+		FRP_LIGHTING_MODE_MAX = 32
 	};
 
 	struct FrpLighting {

@@ -1,0 +1,49 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D source_depth_ranges;
+layout(rg32f, set = 0, binding = 1) uniform writeonly image2D destination_depth_ranges;
+layout(push_constant, std430) uniform SSRHiZReduceParams {
+	ivec4 source_level;
+} params;
+
+const float SSR_HIZ_EMPTY_MIN = 3.402823466e+38;
+
+void main() {
+	ivec2 destination_pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 destination_size = imageSize(destination_depth_ranges);
+	if (any(greaterThanEqual(destination_pixel, destination_size))) {
+		return;
+	}
+	ivec2 source_size = textureSize(source_depth_ranges, params.source_level.x);
+	ivec2 source_begin = destination_pixel * 2;
+	ivec2 source_end = min(source_begin + ivec2(2), source_size);
+	// The final parent folds all trailing children so odd dimensions stay covered.
+	if (destination_pixel.x == destination_size.x - 1) {
+		source_end.x = source_size.x;
+	}
+	if (destination_pixel.y == destination_size.y - 1) {
+		source_end.y = source_size.y;
+	}
+	float minimum_depth = SSR_HIZ_EMPTY_MIN;
+	float maximum_depth = 0.0;
+	for (int y = source_begin.y; y < source_end.y; y++) {
+		for (int x = source_begin.x; x < source_end.x; x++) {
+			vec2 child_range = texelFetch(source_depth_ranges, ivec2(x, y),
+					params.source_level.x).rg;
+			if (any(isnan(child_range)) || any(isinf(child_range))
+					|| child_range.x > child_range.y || child_range.y <= 0.0) {
+				continue;
+			}
+			minimum_depth = min(minimum_depth, child_range.x);
+			maximum_depth = max(maximum_depth, child_range.y);
+		}
+	}
+	if (maximum_depth <= 0.0) {
+		imageStore(destination_depth_ranges, destination_pixel,
+				vec4(SSR_HIZ_EMPTY_MIN, 0.0, 0.0, 0.0));
+	} else {
+		imageStore(destination_depth_ranges, destination_pixel,
+				vec4(minimum_depth, maximum_depth, 0.0, 0.0));
+	}
+}

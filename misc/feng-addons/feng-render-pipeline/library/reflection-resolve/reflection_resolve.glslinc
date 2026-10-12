@@ -1,0 +1,96 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D scene_or_specular_target;
+layout(set = 0, binding = 1) uniform sampler2D native_combined_specular;
+layout(set = 0, binding = 2) uniform sampler2D sky_specular;
+layout(set = 0, binding = 3) uniform sampler2D gi_candidate;
+layout(set = 0, binding = 4) uniform sampler2D ssr_candidate;
+layout(set = 0, binding = 5) uniform sampler2D feng_probe_candidate;
+
+layout(push_constant, std430) uniform ResolveParameters {
+	ivec4 source_priority;
+} params;
+
+bool finite_rgb(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool finite_rgba(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec4 candidate_at(sampler2D candidate, ivec2 pixel, ivec2 target_size) {
+	ivec2 candidate_size = textureSize(candidate, 0);
+	if (all(equal(candidate_size, ivec2(1)))) {
+		return texelFetch(candidate, ivec2(0), 0);
+	}
+	if (any(notEqual(candidate_size, target_size))) {
+		return vec4(0.0);
+	}
+	return texelFetch(candidate, pixel, 0);
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 target_size = imageSize(scene_or_specular_target);
+	if (any(greaterThanEqual(pixel, target_size))) {
+		return;
+	}
+	if (any(notEqual(textureSize(native_combined_specular, 0), target_size)) ||
+			any(notEqual(textureSize(sky_specular, 0), target_size))) {
+		return;
+	}
+
+	vec4 native_value = texelFetch(native_combined_specular, pixel, 0);
+	vec4 sky_value = texelFetch(sky_specular, pixel, 0);
+	vec4 gi_value = candidate_at(gi_candidate, pixel, target_size);
+	vec4 ssr_value = candidate_at(ssr_candidate, pixel, target_size);
+	vec4 probe_value = candidate_at(feng_probe_candidate, pixel, target_size);
+	vec4 target_value = imageLoad(scene_or_specular_target, pixel);
+	// Invalid native sidecars make the decomposition ambiguous. Leave the already
+	// rendered scene untouched for this pixel instead of manufacturing a dark delta.
+	if (!finite_rgba(native_value) || !finite_rgba(sky_value) || !finite_rgba(target_value)) {
+		return;
+	}
+	if (!finite_rgba(gi_value)) {
+		gi_value = vec4(0.0);
+	}
+	if (!finite_rgba(ssr_value)) {
+		ssr_value = vec4(0.0);
+	}
+	if (!finite_rgba(probe_value)) {
+		probe_value = vec4(0.0);
+	}
+
+	vec4 layers[4];
+	layers[0] = vec4(max(gi_value.rgb, vec3(0.0)), clamp(gi_value.a, 0.0, 1.0));
+	layers[1] = vec4(max(ssr_value.rgb, vec3(0.0)), clamp(ssr_value.a, 0.0, 1.0));
+	layers[2] = vec4(max(probe_value.rgb, vec3(0.0)), clamp(probe_value.a, 0.0, 1.0));
+	layers[3] = vec4(max(sky_value.rgb, vec3(0.0)), clamp(sky_value.a, 0.0, 1.0));
+
+	vec3 resolved_specular = vec3(0.0);
+	float remaining = 1.0;
+	for (int layer_index = 0; layer_index < 4; layer_index++) {
+		int source_index = params.source_priority[layer_index];
+		if (source_index < 0 || source_index > 3) {
+			return;
+		}
+		vec4 layer = layers[source_index];
+		resolved_specular += layer.rgb * remaining;
+		remaining *= 1.0 - layer.a;
+	}
+	if (!finite_rgb(resolved_specular)) {
+		return;
+	}
+	// The native indirect term is already present in this scene/specular target.
+	// Replace it with the resolved source stack while preserving direct specular,
+	// diffuse, emission, and the target alpha.
+	vec3 updated_target = target_value.rgb + resolved_specular - native_value.rgb;
+	if (!finite_rgb(updated_target)) {
+		return;
+	}
+	updated_target = clamp(updated_target, vec3(0.0), vec3(65504.0));
+	imageStore(scene_or_specular_target, pixel, vec4(updated_target, target_value.a));
+}
