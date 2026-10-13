@@ -14,9 +14,13 @@ var identity := ""
 var payload := PackedFloat32Array()
 var revision := 0
 var _source_values := PackedFloat32Array()
+
 var _static_signature_cache: Dictionary = {}
 var _data_cache_token := ""
 var _current_keys: Dictionary = {}
+
+func source_values() -> PackedFloat32Array:
+	return _source_values
 
 ## Source diagnostics may refresh independently; only publication changes the payload.
 func update_snapshot(volume: Node3D, data: Data) -> bool:

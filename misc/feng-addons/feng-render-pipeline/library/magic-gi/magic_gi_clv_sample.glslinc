@@ -1,0 +1,182 @@
+layout(set = 0, binding = 18, std430) readonly buffer DirectionalLighting { vec4 values[]; } directional_lighting;
+layout(set = 0, binding = 19) uniform sampler3D clv_texture;
+layout(set = 0, binding = 20) uniform isampler3D clv_tags;
+layout(set = 0, binding = 21, std140) uniform ClipmapParameters {
+	ivec4 origins[3]; vec4 spacing; ivec4 control;
+} clv;
+
+const int CLV_SAMPLE_EXACT = 0;
+const int CLV_SAMPLE_FULL = 1;
+const int CLV_SAMPLE_PARTIAL = 2;
+const int CLV_REJECT_NONE = 0;
+const int CLV_REJECT_DISABLED = 1;
+const int CLV_REJECT_OUTSIDE = 2;
+const int CLV_REJECT_NO_VALID_CORNERS = 3;
+const int CLV_REJECT_GEOMETRY_BLOCKED = 4;
+const int CLV_REJECT_NO_EXACT_SUPPORT = 5;
+const int CLV_REJECT_NO_EXACT_CANDIDATE = 6;
+const int CLV_REJECT_OUTSIDE_BAKE_GRID = 7;
+
+bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
+		bool collect_diagnostics,
+		out vec3 secondary, out vec3 primary, out float cache_weight,
+		out bool complete_support, out int selected_level, out int sample_status,
+		out int reject_reason, out vec3 cell_fraction) {
+	secondary = vec3(0.0); primary = vec3(0.0);
+	cache_weight = 0.0; complete_support = false;
+	selected_level = -1; sample_status = CLV_SAMPLE_EXACT;
+	reject_reason = CLV_REJECT_NONE; cell_fraction = vec3(0.0);
+	if (clv.control.w == 0) {
+		if (collect_diagnostics) { reject_reason = CLV_REJECT_DISABLED; }
+		return false;
+	}
+	int resolution = clv.control.x;
+	float y[9]; diffuse_basis(normal, y);
+	bool found_in_bounds = false;
+	bool found_valid_corner = false;
+	bool found_blocked_geometry = false;
+	for (int level = 0; level < clv.control.y; level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		// Sample on the receiving side. Every interpolation corner must have a
+		// clear connection to the actual surface; thin walls cannot be skipped.
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
+		ivec3 base = ivec3(floor(position));
+		ivec3 relative = base - clv.origins[level].xyz;
+		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		if (collect_diagnostics) { found_in_bounds = true; }
+		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		bool seam = any(equal(physical, ivec3(resolution - 1)));
+		vec3 fraction = fract(position);
+		int valid_mask = 0;
+		bool all_metadata_valid = true;
+		float coverage = 0.0;
+		for (int z = 0; z < 2; z++) for (int yy = 0; yy < 2; yy++) for (int x = 0; x < 2; x++) {
+			ivec3 offset = ivec3(x, yy, z);
+			ivec3 logical_cell = base + offset;
+			ivec3 wrapped = ((logical_cell % resolution) + resolution) % resolution;
+			ivec3 slot = wrapped + ivec3(0, 0, level * resolution);
+			ivec4 tag = texelFetch(clv_tags, slot, 0);
+			vec4 metadata = texelFetch(clv_texture, slot + ivec3(18 * resolution, 0, 0), 0);
+			int surface_patch = int(metadata.w);
+			bool corner_valid;
+			// Keep every validity term explicit: a positive valid weight contributes to
+			// coverage, while missing metadata never aliases a radiance coefficient.
+			corner_valid = !any(notEqual(tag.xyz, logical_cell)) && tag.w == clv.control.z
+					&& surface_patch >= 0
+					&& !(receiver_patch > 0 && surface_patch != receiver_patch)
+					&& !(surface_patch > 0 && dot(metadata.xyz, normal) < 0.9);
+			all_metadata_valid = all_metadata_valid && corner_valid;
+			if (corner_valid) {
+				valid_mask |= 1 << (x | (yy << 1) | (z << 2));
+				coverage += (x == 0 ? 1.0 - fraction.x : fraction.x)
+						* (yy == 0 ? 1.0 - fraction.y : fraction.y)
+						* (z == 0 ? 1.0 - fraction.z : fraction.z);
+			}
+		}
+		if (coverage <= 0.0) { continue; }
+		if (collect_diagnostics) { found_valid_corner = true; }
+		// Geometry ownership remains all-corner: invalid or zero-weight metadata
+		// cannot hide a thin blocker between any logical corner and the receiver.
+		bool geometry_clear = true;
+		for (int z = 0; z < 2 && geometry_clear; z++)
+		for (int yy = 0; yy < 2 && geometry_clear; yy++)
+		for (int x = 0; x < 2; x++) {
+			ivec3 corner_cell = base + ivec3(x, yy, z);
+			vec3 corner = (vec3(corner_cell) + 0.5) * step_size;
+			bool blocked = segment_blocked(corner, world, receiver_triangle, 0);
+			if (blocked) { geometry_clear = false; break; }
+		}
+		if (!geometry_clear) {
+			if (collect_diagnostics) { found_blocked_geometry = true; }
+			continue;
+		}
+		if (collect_diagnostics) {
+			selected_level = level;
+			cell_fraction = fraction;
+		}
+		if (all_metadata_valid && !seam) {
+			vec3 coordinate = vec3(physical) + fraction + 0.5;
+			coordinate.z += float(level * resolution);
+			vec3 extent = vec3(textureSize(clv_texture, 0));
+			for (int k = 0; k < 9; k++) {
+				secondary += textureLod(clv_texture, (coordinate + vec3(k * resolution, 0, 0)) / extent, 0.0).rgb * y[k];
+				primary += textureLod(clv_texture, (coordinate + vec3((k + 9) * resolution, 0, 0)) / extent, 0.0).rgb * y[k];
+			}
+			cache_weight = 1.0;
+			complete_support = true;
+		} else {
+			for (int z = 0; z < 2; z++) for (int yy = 0; yy < 2; yy++) for (int x = 0; x < 2; x++) {
+				int corner_index = x | (yy << 1) | (z << 2);
+				if ((valid_mask & (1 << corner_index)) == 0) { continue; }
+				ivec3 offset = ivec3(x, yy, z);
+				ivec3 logical_cell = base + offset;
+				ivec3 wrapped = ((logical_cell % resolution) + resolution) % resolution;
+				ivec3 slot = wrapped + ivec3(0, 0, level * resolution);
+				float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+						* (yy == 0 ? 1.0 - fraction.y : fraction.y)
+						* (z == 0 ? 1.0 - fraction.z : fraction.z);
+				if (weight <= 0.0) { continue; }
+				vec3 corner_secondary = vec3(0.0);
+				vec3 corner_primary = vec3(0.0);
+				for (int k = 0; k < 9; k++) {
+					corner_secondary += texelFetch(clv_texture, slot + ivec3(k * resolution, 0, 0), 0).rgb * y[k];
+					corner_primary += texelFetch(clv_texture, slot + ivec3((k + 9) * resolution, 0, 0), 0).rgb * y[k];
+				}
+				secondary += corner_secondary * weight;
+				primary += corner_primary * weight;
+			}
+			cache_weight = all_metadata_valid ? 1.0 : clamp(coverage, 0.0, 1.0);
+			complete_support = all_metadata_valid;
+		}
+		if (collect_diagnostics) {
+			sample_status = complete_support ? CLV_SAMPLE_FULL : CLV_SAMPLE_PARTIAL;
+		}
+		secondary = max(secondary, vec3(0.0)); primary = max(primary, vec3(0.0));
+		return cache_weight > 0.0;
+	}
+	if (collect_diagnostics) {
+		if (found_blocked_geometry) {
+			reject_reason = CLV_REJECT_GEOMETRY_BLOCKED;
+		} else if (found_in_bounds && !found_valid_corner) {
+			reject_reason = CLV_REJECT_NO_VALID_CORNERS;
+		} else if (!found_in_bounds) {
+			reject_reason = CLV_REJECT_OUTSIDE;
+		} else {
+			reject_reason = CLV_REJECT_NO_VALID_CORNERS;
+		}
+	}
+	return false;
+}
+
+bool sample_clv_diagnostic(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
+		out vec3 secondary, out vec3 primary, out float cache_weight,
+		out bool complete_support, out int selected_level, out int sample_status,
+		out int reject_reason, out vec3 cell_fraction) {
+	return sample_clv_core(world, normal, receiver_triangle, receiver_patch, true,
+			secondary, primary, cache_weight, complete_support, selected_level,
+			sample_status, reject_reason, cell_fraction);
+}
+
+// Keep the established production/test call shape; optimized shaders discard
+// the diagnostic outputs when the caller does not request them.
+bool sample_clv(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
+		out vec3 secondary, out vec3 primary, out float cache_weight,
+		out bool complete_support) {
+	int selected_level; int sample_status; int reject_reason; vec3 cell_fraction;
+	return sample_clv_core(world, normal, receiver_triangle, receiver_patch, false,
+			secondary, primary, cache_weight, complete_support, selected_level,
+			sample_status, reject_reason, cell_fraction);
+}
+
+void complete_partial_clv(vec3 cached_secondary, vec3 cached_primary, float cache_weight,
+		vec3 exact_secondary, vec3 exact_primary, float exact_visible_support_weight,
+		out vec3 secondary, out vec3 primary) {
+	if (exact_visible_support_weight <= 1e-10) {
+		secondary = max(exact_secondary, vec3(0.0));
+		primary = max(exact_primary, vec3(0.0));
+		return;
+	}
+	float exact_weight = 1.0 - clamp(cache_weight, 0.0, 1.0);
+	secondary = max(cached_secondary + exact_secondary * exact_weight, vec3(0.0));
+	primary = max(cached_primary + exact_primary * exact_weight, vec3(0.0));
+}

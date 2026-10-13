@@ -9,8 +9,11 @@ const Runtime = preload("res://addons/feng-magic-gi/feng_magic_gi_runtime.gd")
 const Viz = preload("res://addons/feng-magic-gi/feng_magic_gi_viz.gd")
 const ProbeLayout = preload("res://addons/feng-magic-gi/feng_magic_gi_probe_layout.gd")
 const Volume = preload("res://addons/feng-magic-gi/feng_magic_gi_volume.gd")
+const AdaptiveLayout = preload("res://addons/feng-magic-gi/feng_magic_gi_adaptive_layout.gd")
 const SceneTracker = preload("res://addons/feng-magic-gi/feng_magic_gi_scene_tracker.gd")
 const InspectorPlugin = preload("res://addons/feng-magic-gi/editor/magic_gi_inspector_plugin.gd")
+const TraceScene = preload("res://addons/feng-magic-gi/feng_magic_gi_trace_scene.gd")
+const MaterialSampler = preload("res://addons/feng-magic-gi/feng_magic_gi_material_sampler.gd")
 
 class FakeTerrainData extends Object:
 	signal maps_changed
@@ -24,6 +27,24 @@ class ValidationCountingData:
 		validation_count += 1
 		return super.is_valid()
 
+class CountingMaterialSampler extends RefCounted:
+	var source: RefCounted
+	var sample_calls := 0
+
+	func sample(index: int, uv: Vector2) -> Vector3:
+		sample_calls += 1
+		return source.call("sample", index, uv)
+
+class AdaptiveFeatureFaceStub extends RefCounted:
+	var faces := PackedVector3Array()
+
+class AdaptiveFeatureGeometryStub extends RefCounted:
+	var query_count := 0
+
+	func trace(_origin: Vector3, _direction: Vector3, _distance: float) -> Dictionary:
+		query_count += 1
+		return {}
+
 var _failures := 0
 
 func _initialize() -> void:
@@ -31,15 +52,17 @@ func _initialize() -> void:
 
 func _run() -> void:
 	_test_pure_contracts()
+	await _test_adaptive_default_scene_compatibility()
 	_test_probe_viz_contracts()
 	await _test_small_triangle_centroid_sampling()
 	await _test_centered_seam_clearance()
 	_test_coplanar_crossing_topology()
 	await _test_corner_center_separation()
 	await _test_world_spacing_variants()
+	_test_adaptive_feature_edge_budget()
 	var scene := Node3D.new()
 	root.add_child(scene)
-	var density_volume := Volume.new()
+	var density_volume := _new_uniform_test_volume()
 	density_volume.size = Vector3(10.0, 10.0, 10.0)
 	density_volume.probe_spacing = 1.0
 	scene.add_child(density_volume)
@@ -56,7 +79,10 @@ func _run() -> void:
 	var fine_mesh := _make_horizontal_plane(10.0, 20, white)
 	coarse.mesh = fine_mesh
 	var fine_placement := Placement.new()
-	_check(fine_placement.collect(density_volume, false), "fine plane placement collection succeeds")
+	var fine_collect_start_usec := Time.get_ticks_usec()
+	var fine_collected: bool = fine_placement.collect(density_volume, false)
+	var fine_collect_ms := float(Time.get_ticks_usec() - fine_collect_start_usec) / 1000.0
+	_check(fine_collected, "fine plane placement collection succeeds")
 	var fine_count := fine_placement.positions.size()
 	_check(absf(float(fine_count - coarse_count)) <= maxf(12.0, coarse_count * 0.3),
 			"probe count remains stable when plane tessellation changes (%d vs %d)" % [coarse_count, fine_count])
@@ -74,14 +100,29 @@ func _run() -> void:
 			+ fine_placement._fallback_candidate_count
 	var fallback_ratio := float(fine_placement._fallback_candidate_count) \
 			/ maxf(1.0, float(fine_candidate_total))
-	print("MAGIC_GI_CANONICAL_PLANE coarse=%d fine=%d fine_canonical=%d fine_fallback=%d fallback_ratio=%.5f seam_rejections=%d" % [
-		coarse_count, fine_count, fine_placement._canonical_candidate_count,
+	print("MAGIC_GI_CANONICAL_PLANE coarse=%d fine=%d collect_ms=%.3f raw=%d staged=%d selected=%d pruned=%d fine_canonical=%d fine_fallback=%d fallback_ratio=%.5f seam_rejections=%d" % [
+		coarse_count, fine_count, fine_collect_ms, fine_placement._valid_candidate_count,
+		fine_placement._staged_candidate_count, fine_placement.positions.size(),
+		fine_placement._bounded_candidate_pruned_count,
+		fine_placement._canonical_candidate_count,
 		fine_placement._fallback_candidate_count, fallback_ratio,
 		fine_placement.rejected_foreign_surface_center_count])
+	density_volume.adaptive_placement = true
+	var adaptive_fine_placement := Placement.new()
+	var adaptive_fine_start_usec := Time.get_ticks_usec()
+	var adaptive_fine_collected: bool = adaptive_fine_placement.collect(
+			density_volume, false, false)
+	var adaptive_fine_ms := float(Time.get_ticks_usec() - adaptive_fine_start_usec) / 1000.0
+	_check(adaptive_fine_collected, "adaptive fine-plane candidate profile collects")
+	_print_adaptive_profile("plane", adaptive_fine_placement, adaptive_fine_ms)
+	_check(adaptive_fine_placement.probe_spacings.size() == adaptive_fine_placement.positions.size()
+			and adaptive_fine_placement._refined_valid_candidate_count == 0
+			and _adaptive_spacing_violation_pair_count(adaptive_fine_placement) == 0,
+			"a smooth plane keeps coarse density and records its local spacing without fine overgeneration")
 	coarse.queue_free()
 	density_volume.queue_free()
 	await process_frame
-	var zero_volume := Volume.new()
+	var zero_volume := _new_uniform_test_volume()
 	zero_volume.size = Vector3(4.0, 4.0, 4.0)
 	zero_volume.probe_spacing = 1.0
 	zero_volume.bake_samples = 64
@@ -159,7 +200,7 @@ func _run() -> void:
 	zero_volume.queue_free()
 	await process_frame
 
-	var boundary_volume := Volume.new()
+	var boundary_volume := _new_uniform_test_volume()
 	boundary_volume.size = Vector3.ONE * 2.0
 	boundary_volume.probe_spacing = 1.0
 	scene.add_child(boundary_volume)
@@ -192,7 +233,7 @@ func _run() -> void:
 	boundary_volume.queue_free()
 	await process_frame
 
-	var box_volume := Volume.new()
+	var box_volume := _new_uniform_test_volume()
 	box_volume.size = Vector3.ONE * 2.2
 	box_volume.probe_spacing = 1.0
 	scene.add_child(box_volume)
@@ -224,7 +265,7 @@ func _run() -> void:
 	box_instance.queue_free()
 	await process_frame
 
-	var embedded_volume := Volume.new()
+	var embedded_volume := _new_uniform_test_volume()
 	embedded_volume.size = Vector3(6.0, 4.0, 4.0)
 	embedded_volume.probe_spacing = 1.0
 	scene.add_child(embedded_volume)
@@ -271,7 +312,7 @@ func _run() -> void:
 	transparent_receiver.queue_free()
 	await process_frame
 
-	var thin_wall_volume := Volume.new()
+	var thin_wall_volume := _new_uniform_test_volume()
 	thin_wall_volume.size = Vector3.ONE * 2.2
 	thin_wall_volume.probe_spacing = 1.0
 	scene.add_child(thin_wall_volume)
@@ -332,6 +373,27 @@ func _run() -> void:
 		thin_wall_placement.rejected_center_overlap_count,
 		thin_wall_placement.rejected_occluded_count,
 		thin_wall_placement._bounded_candidate_pruned_count])
+	thin_wall_volume.adaptive_placement = true
+	var thin_wall_adaptive_placement := Placement.new()
+	var thin_wall_adaptive_start_usec := Time.get_ticks_usec()
+	var thin_wall_adaptive_collected: bool = thin_wall_adaptive_placement.collect(
+			thin_wall_volume, false, false)
+	var thin_wall_adaptive_ms := float(Time.get_ticks_usec() - thin_wall_adaptive_start_usec) / 1000.0
+	_check(thin_wall_adaptive_collected,
+			"adaptive opposing-wall candidate profile collects")
+	_print_adaptive_profile("thin_wall", thin_wall_adaptive_placement, thin_wall_adaptive_ms)
+	var adaptive_thin_left := 0
+	var adaptive_thin_right := 0
+	for index in thin_wall_adaptive_placement.positions.size():
+		var anchor: Vector3 = thin_wall_adaptive_placement.surface_positions[index]
+		var normal: Vector3 = thin_wall_adaptive_placement.normals[index]
+		if anchor.x < -0.029 and normal.dot(Vector3.RIGHT) > 0.95:
+			adaptive_thin_left += 1
+		elif anchor.x > 0.029 and normal.dot(Vector3.LEFT) > 0.95:
+			adaptive_thin_right += 1
+	_check(adaptive_thin_left > 0 and adaptive_thin_right > 0
+			and _adaptive_spacing_violation_pair_count(thin_wall_adaptive_placement) == 0,
+			"adaptive refinement preserves valid probe coverage on both faces of the 6cm thin-wall pair")
 	thin_wall_volume.queue_free()
 	thin_wall_left.queue_free()
 	thin_wall_right.queue_free()
@@ -342,7 +404,7 @@ func _run() -> void:
 	translated_root.rotation = Vector3(0.23, -0.17, 0.31)
 	translated_root.scale = Vector3(2.0, 0.5, 1.5)
 	scene.add_child(translated_root)
-	var translated_volume := Volume.new()
+	var translated_volume := _new_uniform_test_volume()
 	translated_volume.size = Vector3.ONE * 4.0
 	translated_volume.probe_spacing = 1.0
 	translated_volume.surface_offset = 0.001
@@ -413,7 +475,7 @@ func _run() -> void:
 	translated_root.queue_free()
 	await process_frame
 
-	var layered_volume := Volume.new()
+	var layered_volume := _new_uniform_test_volume()
 	layered_volume.size = Vector3(4.0, 2.0, 4.0)
 	layered_volume.probe_spacing = 1.0
 	scene.add_child(layered_volume)
@@ -444,7 +506,7 @@ func _run() -> void:
 	upper_plane.queue_free()
 	await process_frame
 
-	var coplanar_volume := Volume.new()
+	var coplanar_volume := _new_uniform_test_volume()
 	coplanar_volume.size = Vector3(4.0, 2.0, 4.0)
 	coplanar_volume.probe_spacing = 1.0
 	scene.add_child(coplanar_volume)
@@ -504,7 +566,7 @@ func _run() -> void:
 	coplanar_b.queue_free()
 	await process_frame
 
-	var curved_volume := Volume.new()
+	var curved_volume := _new_uniform_test_volume()
 	curved_volume.size = Vector3(6.0, 4.0, 6.0)
 	curved_volume.probe_spacing = 1.0
 	scene.add_child(curved_volume)
@@ -573,6 +635,26 @@ func _run() -> void:
 	print("PRIMITIVE_MESH_COMPAT faces=%d probes=%d signature=%d equivalent_signature=%d" % [
 		primitive_faces.size(), primitive_positions.size(), primitive_signature,
 		equivalent_placement.scene_signature])
+	curved_volume.adaptive_placement = true
+	var adaptive_curved_placement := Placement.new()
+	var adaptive_curved_start_usec := Time.get_ticks_usec()
+	var adaptive_curved_collected: bool = adaptive_curved_placement.collect(
+			curved_volume, false, false)
+	var adaptive_curved_ms := float(Time.get_ticks_usec() - adaptive_curved_start_usec) / 1000.0
+	var adaptive_sphere_samples := 0
+	var adaptive_cone_samples := 0
+	for anchor in adaptive_curved_placement.surface_positions:
+		if anchor.x < 0.0:
+			adaptive_sphere_samples += 1
+		else:
+			adaptive_cone_samples += 1
+	_print_adaptive_profile("sphere_cone", adaptive_curved_placement, adaptive_curved_ms)
+	_check(adaptive_curved_collected and adaptive_sphere_samples > 0
+			and adaptive_cone_samples > 0
+			and adaptive_curved_placement.probe_spacings.size() \
+				== adaptive_curved_placement.positions.size()
+			and _adaptive_spacing_violation_pair_count(adaptive_curved_placement) == 0,
+			"adaptive feature refinement retains curved sphere and cone coverage with valid local spacing")
 	curved_volume.queue_free()
 	sphere_instance.queue_free()
 	cone_instance.queue_free()
@@ -620,8 +702,15 @@ func _run() -> void:
 		_check(cornell_collected and cornell_placement.positions.size() >= 100
 				and all_cornell_axes_covered,
 				"full Cornell room and props retain one-meter-spaced samples across all six axes")
-		_check(_max_cell_load(cornell_placement) <= Data.CELL_CAPACITY,
-				"Cornell room corner cells stay within eight lookup slots")
+		var cornell_spacing_violations := _adaptive_spacing_violation_pair_count(
+				cornell_placement) if cornell_volume.get("adaptive_placement") \
+				else _world_spacing_violation_pair_count(cornell_placement.positions,
+				cornell_volume.probe_spacing)
+		var cornell_lookup_valid := cornell_placement.probe_spacings.size() \
+				== cornell_placement.positions.size() if cornell_volume.get("adaptive_placement") \
+				else _max_cell_load(cornell_placement) <= Data.CELL_CAPACITY
+		_check(cornell_lookup_valid,
+				"Cornell layout uses the sparse adaptive index or respects the uniform eight-slot limit")
 		var cornell_data: Resource = cornell_volume.get("bake_data")
 		var old_probe_positions: PackedVector3Array = cornell_data.get("positions") \
 				if cornell_data != null else PackedVector3Array()
@@ -640,15 +729,23 @@ func _run() -> void:
 				cornell_volume.probe_spacing)
 		var new_world_occupancy := _world_max_occupancy(cornell_placement.positions,
 				cornell_volume.probe_spacing)
-		var new_spacing_violations := _world_spacing_violation_pair_count(
-				cornell_placement.positions, cornell_volume.probe_spacing)
-		print("MAGIC_GI_CORNELL_LAYOUT collect_ms=%.3f old_probes=%d old_max_world_cell=%d old_occupied_cells=%d new_probes=%d new_max_world_cell=%d min_spacing=%.6f spacing_violations=%d pruned_candidates=%d world_cell_competition=%d rejected_spacing_cells=%d rejected_clearance=%d rejected_inside=%d rejected_outside=%d rejected_lookup=%d ambiguous=%d" % [
+		var new_spacing_violations := cornell_spacing_violations
+		print("MAGIC_GI_CORNELL_LAYOUT adaptive=%s collect_ms=%.3f old_probes=%d coarse_candidates=%d fine_candidates=%d raw_candidates=%d staged_candidates=%d selected=%d staged_pruned=%d feature_cells=%d cell_visits=%d old_max_world_cell=%d old_occupied_cells=%d new_probes=%d new_max_world_cell=%d min_spacing=%.6f spacing_violations=%d world_cell_competition=%d rejected_spacing_cells=%d rejected_clearance=%d rejected_inside=%d rejected_outside=%d rejected_lookup=%d ambiguous=%d" % [
+			str(cornell_volume.get("adaptive_placement")),
 			cornell_collect_ms,
-			old_probe_positions.size(), old_world_occupancy,
+		old_probe_positions.size(),
+			cornell_placement._coarse_valid_candidate_count,
+			cornell_placement._refined_valid_candidate_count,
+			cornell_placement._valid_candidate_count,
+			cornell_placement._staged_candidate_count,
+			cornell_placement.positions.size(),
+			cornell_placement._bounded_candidate_pruned_count,
+			cornell_placement._refinement_cell_count,
+			cornell_placement._refinement_cell_visit_count,
+		old_world_occupancy,
 			_world_cell_counts(old_probe_positions, cornell_volume.probe_spacing).size(),
 			cornell_placement.positions.size(), new_world_occupancy,
 			_minimum_world_spacing(cornell_placement.positions), new_spacing_violations,
-			cornell_placement._bounded_candidate_pruned_count,
 			cornell_placement.rejected_world_cell_competition_count,
 			cornell_placement.rejected_center_overlap_count,
 			cornell_placement.rejected_no_safe_offset_count,
@@ -656,8 +753,9 @@ func _run() -> void:
 			cornell_placement.rejected_center_outside_count,
 			cornell_placement.rejected_lookup_capacity_count,
 			cornell_placement.rejected_ambiguous_side_count])
-		_check(new_world_occupancy <= 1 and new_spacing_violations == 0,
-				"collected Cornell layout enforces one probe per world cell and minimum world spacing")
+		_check((bool(cornell_volume.get("adaptive_placement")) or new_world_occupancy <= 1)
+				and new_spacing_violations == 0,
+				"collected Cornell layout honors its per-probe adaptive spacing or uniform world-cell spacing")
 		var old_bake_is_stale := not bool(cornell_volume.call("has_bake"))
 		_check(cornell_data != null and cornell_data.call("is_valid")
 				and old_probe_bytes == old_probe_positions.to_byte_array()
@@ -696,7 +794,7 @@ func _run() -> void:
 		cornell_scene.queue_free()
 		await process_frame
 
-	var volume := Volume.new()
+	var volume := _new_uniform_test_volume()
 	volume.size = Vector3(4.0, 4.0, 4.0)
 	volume.probe_spacing = 1.0
 	volume.surface_offset = 0.03
@@ -725,7 +823,7 @@ func _run() -> void:
 	var has_ground_normal := _normal_count(actual_placement, Vector3.UP) > 0
 	var has_wall_normal := _normal_count(actual_placement, Vector3.LEFT) > 0
 	_check(has_ground_normal and has_wall_normal, "ground and red wall samples retain distinct normals")
-	var empty_volume := Volume.new()
+	var empty_volume := _new_uniform_test_volume()
 	empty_volume.position = Vector3(100.0, 0.0, 0.0)
 	empty_volume.size = Vector3.ONE * 2.0
 	scene.add_child(empty_volume)
@@ -790,7 +888,7 @@ func _run() -> void:
 	_check(data.transfer.to_byte_array() == before_transfer.to_byte_array(),
 			"dynamic sunlight color changes lighting SH without modifying baked transfer")
 	volume.show_sh_probes = true
-	var transport_viz: Node3D = FMagicGIViz.build(volume)
+	var transport_viz: Node3D = FMagicGIViz.build(volume, Runtime.preview_snapshot(volume))
 	_check(transport_viz.get_node_or_null("_Transport") != null,
 			"editor transport visualization builds from the world-space SH data")
 	transport_viz.free()
@@ -824,7 +922,7 @@ func _run() -> void:
 	var clone_wall_material := _make_material(Color.RED)
 	clone_wall.mesh = _make_red_wall(4.0, 3.0, clone_wall_material)
 	scene_copy.add_child(clone_wall)
-	var clone_volume := Volume.new()
+	var clone_volume := _new_uniform_test_volume()
 	clone_volume.size = loaded.volume_size
 	clone_volume.probe_spacing = loaded.spacing
 	clone_volume.surface_offset = loaded.surface_offset
@@ -869,6 +967,11 @@ func _test_pure_contracts() -> void:
 	var default_volume := Volume.new()
 	_check(is_equal_approx(default_volume.probe_spacing, 1.0),
 			"new Magic GI volumes default to one-meter probe spacing")
+	_check(default_volume.adaptive_placement and default_volume.use_clv,
+			"new Magic GI volumes enable adaptive placement and CLV independently")
+	default_volume.adaptive_placement = false
+	_check(not default_volume.adaptive_placement and default_volume.use_clv,
+			"an explicit uniform-placement choice does not disable CLV")
 	default_volume.probe_spacing = 2.0
 	_check(is_equal_approx(default_volume.probe_spacing, 2.0),
 			"probe spacing remains author-configurable after changing the default")
@@ -878,6 +981,7 @@ func _test_pure_contracts() -> void:
 			and Baker.signature_for_geometry(12345) != 12345,
 			"sampler signature is persistent and distinguishes old raw geometry signatures")
 	_test_qmc_variance()
+	_test_trace_geometry_sampler_contracts()
 	var max_cell: Vector3i = Data.cell_coordinates(Vector3(10.0, 10.0, 10.0), Vector3i(10, 10, 10))
 	_check(max_cell == Vector3i(9, 9, 9), "exact positive volume face maps to final cell")
 	var legacy := Data.new()
@@ -898,7 +1002,7 @@ func _test_pure_contracts() -> void:
 	var world_environment := WorldEnvironment.new()
 	world_environment.environment = env
 	no_provider_scene.add_child(world_environment)
-	var no_provider_volume := Volume.new()
+	var no_provider_volume := _new_uniform_test_volume()
 	no_provider_volume.lighting_environment = env
 	no_provider_scene.add_child(no_provider_volume)
 	var lighting := Lighting.new()
@@ -916,6 +1020,125 @@ func _test_pure_contracts() -> void:
 	_check(SceneTracker.resource_revision(fake_data) == revision_before + 2,
 			"Terrain3DData Object signals invalidate the lightweight scene fingerprint")
 	fake_data.free()
+
+func _test_trace_geometry_sampler_contracts() -> void:
+	var faces := PackedVector3Array([
+		Vector3(-1.0, -1.0, 0.0), Vector3(1.0, -1.0, 0.0),
+		Vector3(0.0, 1.0, 0.0)])
+	var bvh := TriangleMesh.new()
+	var bvh_created: bool = bvh.create_from_faces(faces)
+	_check(bvh_created, "geometry-only trace fixture builds a native triangle BVH")
+	if not bvh_created:
+		return
+	var image := Image.create(2, 2, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.25, 0.5, 0.75, 1.0))
+	var material_sampler := MaterialSampler.new()
+	material_sampler.records.append({
+		"image": image,
+		"scale": Vector3.ONE,
+		"offset": Vector3.ZERO,
+		"repeat": true,
+		"filter": BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	})
+	var counting_sampler := CountingMaterialSampler.new()
+	counting_sampler.source = material_sampler
+	var trace_scene := TraceScene.new()
+	trace_scene.bvh = bvh
+	trace_scene.faces = faces
+	trace_scene.reflectance = PackedVector3Array([Vector3.ONE])
+	trace_scene.face_materials = PackedInt32Array([0])
+	trace_scene.face_emitter_indices = PackedInt32Array([-1])
+	trace_scene.face_uv = PackedVector2Array([Vector2.ZERO, Vector2.ONE, Vector2(0.5, 1.0)])
+	trace_scene.face_uv2 = PackedVector2Array([Vector2.ZERO, Vector2.ONE, Vector2(0.5, 1.0)])
+	trace_scene.material_sampler = counting_sampler
+	var placement := Placement.new()
+	placement.bvh_ready = true
+	placement.trace_scene = trace_scene
+	var origin := Vector3(0.0, 0.0, 1.0)
+	var direction := Vector3(0.0, 0.0, -1.0)
+	var full_hit: Dictionary = placement.trace(origin, direction, 2.0)
+	var full_sample_calls := counting_sampler.sample_calls
+	counting_sampler.sample_calls = 0
+	var geometry_hit: Dictionary = placement.trace_geometry(origin, direction, 2.0)
+	_check(not full_hit.is_empty() and not geometry_hit.is_empty()
+			and full_hit.face_index == geometry_hit.face_index
+			and full_hit.position == geometry_hit.position
+			and full_hit.normal == geometry_hit.normal,
+			"geometry-only trace preserves the full query face, hit point, and face-forward normal")
+	_check(full_hit.has("albedo") and not geometry_hit.has("albedo")
+			and full_sample_calls == 1 and counting_sampler.sample_calls == 0,
+			"geometry-only placement queries skip textured albedo sampling while full trace samples once")
+
+func _test_adaptive_default_scene_compatibility() -> void:
+	var omitted := _load_adaptive_compatibility_scene(false)
+	var omitted_scene: PackedScene = omitted.get("packed")
+	if omitted_scene == null:
+		return
+	var omitted_root := omitted_scene.instantiate()
+	var omitted_volume := omitted_root.get_node("Volume") as Volume
+	_check(omitted_volume != null and omitted_volume.adaptive_placement,
+			"a scene with no serialized adaptive_placement loads with the new true default")
+	_erase_adaptive_compatibility_scene(String(omitted["path"]))
+	omitted_root.free()
+
+	var explicit := _load_adaptive_compatibility_scene(true)
+	var explicit_scene: PackedScene = explicit.get("packed")
+	if explicit_scene == null:
+		return
+	var explicit_root := explicit_scene.instantiate()
+	var explicit_volume := explicit_root.get_node("Volume") as Volume
+	_check(explicit_volume != null and not explicit_volume.adaptive_placement,
+			"a scene with adaptive_placement=false keeps its explicit choice")
+	_erase_adaptive_compatibility_scene(String(explicit["path"]))
+	explicit_root.free()
+
+	var legacy_scene := Node3D.new()
+	root.add_child(legacy_scene)
+	var legacy_volume := Volume.new()
+	legacy_volume.size = Vector3(2.0, 1.0, 1.0)
+	var legacy_bake: Resource = _make_emission_contract_data()
+	legacy_bake.adaptive_placement = false
+	legacy_volume.bake_data = legacy_bake
+	legacy_scene.add_child(legacy_volume)
+	await process_frame
+	await process_frame
+	Runtime.publish(legacy_volume)
+	var old_bake_published := false
+	for snapshot in Runtime.snapshots():
+		if int(snapshot.get("volume_id", 0)) == legacy_volume.get_instance_id():
+			old_bake_published = snapshot.get("data") == legacy_bake \
+					and bool(snapshot.get("replacement_enabled", false))
+	_check(legacy_volume.adaptive_placement and legacy_volume.needs_rebake()
+			and legacy_volume.has_usable_bake() and legacy_volume.bake_data == legacy_bake
+			and legacy_bake.is_valid() and old_bake_published,
+			"a valid uniform bake remains published and untouched while the default adaptive layout is stale")
+	legacy_scene.queue_free()
+	await process_frame
+
+func _load_adaptive_compatibility_scene(explicit_false: bool) -> Dictionary:
+	var path := "res://_adaptive_default_explicit_false.tscn" if explicit_false \
+			else "res://_adaptive_default_omitted.tscn"
+	var source := "[gd_scene load_steps=2 format=3]\n\n" \
+			+ "[ext_resource type=\"Script\" path=\"res://addons/feng-magic-gi/feng_magic_gi_volume.gd\" id=\"1_volume\"]\n\n" \
+			+ "[node name=\"Root\" type=\"Node3D\"]\n\n" \
+			+ "[node name=\"Volume\" type=\"Node3D\" parent=\".\"]\n" \
+			+ "script = ExtResource(\"1_volume\")\n"
+	if explicit_false:
+		source += "adaptive_placement = false\n"
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		_check(false, "adaptive compatibility scene fixture can be written in the scratch project")
+		return {"path": path, "packed": null}
+	file.store_string(source)
+	file.close()
+	var packed := ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE) as PackedScene
+	_check(packed != null, "adaptive compatibility scene fixture parses")
+	return {"path": path, "packed": packed}
+
+func _erase_adaptive_compatibility_scene(path: String) -> void:
+	var absolute_path := ProjectSettings.globalize_path(path)
+	if FileAccess.file_exists(absolute_path):
+		DirAccess.remove_absolute(absolute_path)
 
 func _test_directional_visibility_contracts() -> void:
 	_check(Data.fold_visibility_texel(Vector2i(-1, 3)) == Vector2i(0, 4)
@@ -1095,11 +1318,11 @@ func _test_emission_data_contracts() -> void:
 func _test_render_upload_package(data: Resource) -> void:
 	var upload: Dictionary = data.make_render_upload()
 	var expected_keys := ["transfer_image", "primary_sky_image", "geometry_image", "visibility_moment_image",
-			"visibility_node_bytes", "visibility_triangle_bytes", "index_bytes", "emission_image"]
+			"visibility_node_bytes", "visibility_triangle_bytes", "index_bytes", "emission_image", "sparse_indices", "index_entries"]
 	var has_contract_fields := upload.size() == expected_keys.size()
 	for key in expected_keys:
 		has_contract_fields = has_contract_fields and upload.has(key)
-	_check(has_contract_fields, "render upload returns the atomic eight-field package")
+	_check(has_contract_fields, "render upload returns the atomic transport and lookup package")
 	if not has_contract_fields:
 		return
 	var transfer_image: Image = upload["transfer_image"]
@@ -1174,7 +1397,7 @@ func _run_emission_bake_contracts() -> void:
 	emitter.rotation.x = PI
 	emitter.position = Vector3(-0.75, 2.4, 0.4)
 	fixture.add_child(emitter)
-	var volume := Volume.new()
+	var volume := _new_uniform_test_volume()
 	volume.name = "FMagicGIVolume"
 	volume.position = Vector3(0.0, 1.5, 0.0)
 	volume.size = Vector3(4.0, 3.6, 4.0)
@@ -1736,6 +1959,11 @@ func _make_material(color: Color) -> StandardMaterial3D:
 	material.albedo_color = color
 	return material
 
+func _new_uniform_test_volume() -> FMagicGIVolume:
+	var volume := Volume.new()
+	volume.adaptive_placement = false
+	return volume
+
 func _minimum_same_normal_spacing(placement: RefCounted) -> float:
 	var minimum := INF
 	for i in placement.positions.size():
@@ -1754,6 +1982,95 @@ func _world_spacing_violation_pair_count(positions: PackedVector3Array,
 			if positions[i].distance_squared_to(positions[j]) < minimum_distance_squared:
 				violations += 1
 	return violations
+
+func _adaptive_spacing_violation_pair_count(placement: RefCounted) -> int:
+	if placement.probe_spacings.size() != placement.positions.size():
+		return -1
+	var violations := 0
+	for first in placement.positions.size():
+		for second in range(first + 1, placement.positions.size()):
+			var required_distance: float = 0.5 * (placement.probe_spacings[first]
+					+ placement.probe_spacings[second])
+			if placement.positions[first].distance_squared_to(placement.positions[second]) \
+					< required_distance * required_distance * 0.99999:
+				violations += 1
+	return violations
+
+func _print_adaptive_profile(label: String, placement: RefCounted,
+		collect_ms: float) -> void:
+	var min_spacing: float = placement._arbitration_spacing
+	var spacing_metrics := _adaptive_pair_spacing_metrics(placement)
+	print("MAGIC_GI_ADAPTIVE_PROFILE case=%s collect_ms=%.3f attempted=%d coarse_valid=%d refined_valid=%d raw_candidates=%d staged_candidates=%d selected=%d staged_pruned=%d feature_cells=%d cell_visits=%d world_cells=%d min_spacing=%.6f min_grid_max_occupancy=%d duplicate_centers=%d nearest_pair_m=%.6f nearest_pair_spacing=%.6f nearest_pair_ratio=%.6f marker_diameter_spacing_ratio=0.240000 spacing_violations=%d clearance_rejected=%d inside_rejected=%d" % [
+		label, collect_ms, placement._candidate_count,
+		placement._coarse_valid_candidate_count, placement._refined_valid_candidate_count,
+		placement._valid_candidate_count,
+		placement._staged_candidate_count, placement.positions.size(),
+		placement._bounded_candidate_pruned_count, placement._refinement_cell_count,
+		placement._refinement_cell_visit_count,
+		_world_cell_counts(placement.positions, 1.0).size(),
+		_minimum_world_spacing(placement.positions),
+		_world_max_occupancy(placement.positions, min_spacing),
+		_duplicate_probe_center_count(placement.positions),
+		spacing_metrics.x, spacing_metrics.y, spacing_metrics.z,
+		_adaptive_spacing_violation_pair_count(placement),
+		placement.rejected_no_safe_offset_count,
+		placement.rejected_inside_or_indeterminate_center_count])
+
+func _adaptive_pair_spacing_metrics(placement: RefCounted) -> Vector3:
+	if placement.positions.size() != placement.probe_spacings.size() \
+			or placement.positions.size() < 2:
+		return Vector3(INF, INF, INF)
+	var minimum_distance := INF
+	var required_spacing := INF
+	var minimum_ratio := INF
+	for first in placement.positions.size():
+		for second in range(first + 1, placement.positions.size()):
+			var average_spacing: float = 0.5 * (placement.probe_spacings[first]
+					+ placement.probe_spacings[second])
+			var distance: float = placement.positions[first].distance_to(
+					placement.positions[second])
+			var ratio := distance / maxf(average_spacing, 0.000001)
+			if ratio < minimum_ratio:
+				minimum_ratio = ratio
+				minimum_distance = distance
+				required_spacing = average_spacing
+	return Vector3(minimum_distance, required_spacing, minimum_ratio)
+
+func _duplicate_probe_center_count(positions: PackedVector3Array) -> int:
+	var seen: Dictionary = {}
+	var duplicates := 0
+	for position in positions:
+		var key := "%d,%d,%d" % [roundi(position.x * 1000000.0),
+				roundi(position.y * 1000000.0), roundi(position.z * 1000000.0)]
+		if seen.has(key):
+			duplicates += 1
+		else:
+			seen[key] = true
+	return duplicates
+
+func _test_adaptive_feature_edge_budget() -> void:
+	var geometry := AdaptiveFeatureGeometryStub.new()
+	var source := AdaptiveFeatureFaceStub.new()
+	var far := 1000000.0
+	# Two faces share a sharp edge that spans two million world meters, while the
+	# placement bounds intersect only its two-meter middle section.
+	source.faces = PackedVector3Array([
+		Vector3(-far, 0.0, 0.0), Vector3(far, 0.0, 0.0), Vector3(0.0, 1.0, 0.0),
+		Vector3(far, 0.0, 0.0), Vector3(-far, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)])
+	var placement_bounds := AABB(Vector3(-1.0, -1.0, -1.0), Vector3.ONE * 2.0)
+	var clipped := AdaptiveLayout._clip_segment_to_aabb(source.faces[0],
+		source.faces[1], placement_bounds.grow(1.0))
+	var clipped_samples := ceili(clipped[0].distance_to(clipped[1]) / 0.5) + 1 \
+			if clipped.size() == 2 else 0
+	var result: Dictionary = AdaptiveLayout.mark_refinement_cells({},
+			Callable(geometry, "trace"), source, placement_bounds, 1.0, 0.25)
+	var marked: Dictionary = result["cells"]
+	_check(clipped_samples <= 9 and String(result["error"]).is_empty()
+			and marked.size() <= clipped_samples * 27,
+			"a long sharp edge is clipped to bounded placement support before refinement marking")
+	print("MAGIC_GI_ADAPTIVE_EDGE_BUDGET original_m=%.1f clipped_samples=%d marked_cells=%d error=%s" % [
+		source.faces[0].distance_to(source.faces[1]), clipped_samples,
+		marked.size(), result["error"]])
 
 func _minimum_world_spacing(positions: PackedVector3Array) -> float:
 	var minimum_distance := INF
@@ -1813,7 +2130,7 @@ func _surface_height_count(placement: RefCounted, volume: Node3D, y: float,
 	return count
 
 func _test_probe_viz_contracts() -> void:
-	var volume := Volume.new()
+	var volume := _new_uniform_test_volume()
 	volume.position = Vector3(3.0, -2.0, 1.0)
 	volume.rotation = Vector3(0.2, -0.35, 0.4)
 	volume.scale = Vector3(2.0, 1.0, 0.5)
@@ -1830,13 +2147,18 @@ func _test_probe_viz_contracts() -> void:
 	data.normals = PackedVector3Array([surface_normal])
 	data.transfer.resize(27)
 	data.transfer.fill(0.0)
-	var zero_color: Color = Viz._baked_probe_color(data, 0)
+	var lighting := PackedFloat32Array()
+	lighting.resize(27)
+	lighting.fill(1.0)
+	var preview := {"data": data, "data_valid": true, "layout_matches": true,
+		"current_available": true, "lighting": lighting}
+	var zero_color: Color = Viz._probe_color_state(preview, 0).color
 	_check(zero_color.b > 0.8 and zero_color.g > 0.5,
 			"valid zero-response probes have a visible diagnostic tint rather than appearing invalid")
 	data.transfer[0] = 0.001
-	var low_color: Color = Viz._baked_probe_color(data, 0)
-	_check(low_color == Viz.LOW_RESPONSE_COLOR and low_color != zero_color,
-			"weak positive transport has a distinct low-response tint")
+	var low_state: Dictionary = Viz._probe_color_state(preview, 0)
+	_check(is_equal_approx(low_state.color.r, 0.001) and not low_state.compensate,
+			"weak positive transport retains physical response without diagnostic exposure compensation")
 	volume.probe_positions = PackedVector3Array([single_center])
 	volume.probe_surface_positions = PackedVector3Array([single_surface])
 	volume.probe_normals = PackedVector3Array([surface_normal])
@@ -1844,15 +2166,15 @@ func _test_probe_viz_contracts() -> void:
 	var single_viz_root := Node3D.new()
 	volume.add_child(single_viz_root)
 	Viz._build_box(volume, single_viz_root)
-	Viz._build_probes(volume, single_viz_root)
-	Viz._build_sh(volume, single_viz_root)
+	Viz._build_probes(volume, single_viz_root, preview)
+	Viz._build_sh(volume, single_viz_root, preview)
 	var off := GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	var box := single_viz_root.get_node("_Box") as MeshInstance3D
 	var probes := single_viz_root.get_node("_Probes") as MultiMeshInstance3D
 	var transport := single_viz_root.get_node("_Transport") as Node3D
 	var transport_mesh := transport.get_child(0) as MeshInstance3D
 	var sphere := probes.multimesh.mesh as SphereMesh
-	var probe_material := sphere.material as StandardMaterial3D
+	var probe_material := sphere.material as ShaderMaterial
 	_check(box.cast_shadow == off and probes.cast_shadow == off and transport_mesh.cast_shadow == off,
 			"volume box, MultiMesh probes, and transport meshes do not cast shadows")
 	_check(probes.visible and probes.multimesh.use_colors,
@@ -1866,10 +2188,9 @@ func _test_probe_viz_contracts() -> void:
 	_check(probes.multimesh.transform_format == MultiMesh.TRANSFORM_3D,
 			"probe markers use 3D instance transforms; headless Dummy does not expose their values")
 	_check(probe_material != null
-			and probe_material.shading_mode == BaseMaterial3D.SHADING_MODE_UNSHADED
-			and probe_material.albedo_color == Color.WHITE
-			and probe_material.vertex_color_use_as_albedo,
-			"probe sphere material shows vertex colors without scene lighting")
+			and probe_material.shader == Viz.PreviewShader
+			and not probe_material.get_shader_parameter("preview_unit_transport"),
+			"probe sphere material uses the exposure-aware physical response preview")
 	single_viz_root.free()
 	data = null
 	volume.free()
@@ -1878,7 +2199,7 @@ func _test_small_triangle_centroid_sampling() -> void:
 	var fixture := Node3D.new()
 	fixture.name = "SmallTriangleFixture"
 	root.add_child(fixture)
-	var volume := Volume.new()
+	var volume := _new_uniform_test_volume()
 	volume.size = Vector3.ONE * 2.0
 	volume.probe_spacing = 1.0
 	volume.surface_offset = 0.03
@@ -1910,6 +2231,19 @@ func _test_small_triangle_centroid_sampling() -> void:
 				placement.rejected_inside_or_indeterminate_center_count,
 				placement.rejected_center_outside_count,
 				str(placement.positions), str(placement.surface_positions)])
+	volume.adaptive_placement = true
+	var adaptive_placement := Placement.new()
+	var adaptive_collected: bool = adaptive_placement.collect(volume, false, false)
+	var adaptive_centroid_found := false
+	for anchor in adaptive_placement.surface_positions:
+		if anchor.distance_to(centroid) < 0.00001:
+			adaptive_centroid_found = true
+	_check(adaptive_collected and adaptive_centroid_found
+			and adaptive_placement.probe_spacings.size() == adaptive_placement.positions.size()
+			and adaptive_placement.positions.size() > 0
+			and _adaptive_spacing_violation_pair_count(adaptive_placement) == 0,
+			"adaptive refinement preserves the small isolated triangle through safe centroid fallback")
+	_print_adaptive_profile("small_triangle", adaptive_placement, 0.0)
 	fixture.queue_free()
 	await process_frame
 
@@ -1917,7 +2251,7 @@ func _test_centered_seam_clearance() -> void:
 	var fixture := Node3D.new()
 	fixture.name = "ProbeCenteredClearanceFixture"
 	root.add_child(fixture)
-	var volume := Volume.new()
+	var volume := _new_uniform_test_volume()
 	volume.size = Vector3.ONE * 4.0
 	volume.probe_spacing = 1.0
 	fixture.add_child(volume)
@@ -1980,7 +2314,7 @@ func _test_centered_seam_clearance() -> void:
 	far_fixture.rotation = Vector3(0.23, -0.17, 0.31)
 	far_fixture.scale = Vector3(2.0, 0.5, 1.5)
 	root.add_child(far_fixture)
-	var far_volume := Volume.new()
+	var far_volume := _new_uniform_test_volume()
 	far_volume.size = Vector3.ONE * 4.0
 	far_volume.probe_spacing = 1.0
 	far_fixture.add_child(far_volume)
@@ -2053,7 +2387,7 @@ func _test_corner_center_separation() -> void:
 	var fixture := Node3D.new()
 	fixture.name = "ProbeCornerFixture"
 	root.add_child(fixture)
-	var volume := Volume.new()
+	var volume := _new_uniform_test_volume()
 	volume.size = Vector3.ONE * 4.0
 	volume.probe_spacing = 1.0
 	fixture.add_child(volume)
@@ -2097,6 +2431,14 @@ func _test_corner_center_separation() -> void:
 	print("MAGIC_GI_CORNER_LAYOUT floor=%d wall=%d adjusted=%d rejected_spacing_cells=%d spacing_violations=%d" % [
 		floor_count, wall_count, placement.adjusted_center_count,
 		placement.rejected_center_overlap_count, spacing_violations])
+	volume.adaptive_placement = true
+	var adaptive_corner_placement := Placement.new()
+	var adaptive_corner_start_usec := Time.get_ticks_usec()
+	var adaptive_corner_collected: bool = adaptive_corner_placement.collect(
+			volume, false, false)
+	var adaptive_corner_ms := float(Time.get_ticks_usec() - adaptive_corner_start_usec) / 1000.0
+	_check(adaptive_corner_collected, "adaptive corner candidate profile collects")
+	_print_adaptive_profile("corner", adaptive_corner_placement, adaptive_corner_ms)
 	fixture.queue_free()
 	await process_frame
 
@@ -2111,7 +2453,7 @@ func _test_world_spacing_variants() -> void:
 		fixture.rotation = Vector3(0.23, -0.17, 0.31)
 		fixture.scale = Vector3(1.8, 0.65, 1.2)
 		root.add_child(fixture)
-		var volume := Volume.new()
+		var volume := _new_uniform_test_volume()
 		volume.size = Vector3(8.0, 6.0, 8.0)
 		volume.probe_spacing = spacing
 		fixture.add_child(volume)
@@ -2152,7 +2494,7 @@ func _test_world_spacing_variants() -> void:
 		var fixture := Node3D.new()
 		fixture.name = "TraversalOrderFixture"
 		root.add_child(fixture)
-		var volume := Volume.new()
+		var volume := _new_uniform_test_volume()
 		volume.name = "Volume"
 		volume.size = Vector3(4.0, 2.0, 4.0)
 		volume.probe_spacing = 1.0

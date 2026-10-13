@@ -6,6 +6,7 @@ extends "pass_base.gd"
 
 const HISTOGRAM_SHADER := "res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation_histogram.glsl"
 const ADAPT_SHADER := "res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation.glsl"
+const PreviewExposure = preload("editor_preview_exposure_cache.gd")
 const NUM_BINS := 64
 const PARAMS_BYTES := NUM_BINS * 8 + 16 # 64 low/overflow histogram pairs and exposure state
 const STATE_PRUNE_LIMIT := 16
@@ -348,6 +349,9 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	rd.compute_list_dispatch(list, 1, 1, 1)
 
 	rd.compute_list_end()
+	var render_target := buffers.get_render_target()
+	if PreviewExposure.should_sample(render_target, view):
+		PreviewExposure.request_scale_readback(rd, params, render_target, view, self)
 	if _frame_context != null and view == 0:
 		_frame_context.set_tonemap_exposure_texture(exposure_texture)
 	if use_pre_exposure and _frame_context != null:
@@ -367,6 +371,11 @@ func _image_uniform(texture: RID) -> RDUniform:
 
 func _take_owned_rids() -> Array[RID]:
 	var rids := super._take_owned_rids()
+	# PREDELETE can null the script's direct Object method dispatch. PassBase
+	# already uses this native identity route for its shutdown cleanup.
+	var producer_id := int(super.call("get_instance_id"))
+	if producer_id != 0:
+		PreviewExposure.retire_producer(producer_id)
 	for entry in _state.values():
 		for view_state in entry["views"].values():
 			rids.append(view_state["params"])

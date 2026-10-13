@@ -91,6 +91,10 @@ run("visibility", ["--script", "res://addons/feng-magic-gi/tests/test_visibility
     "MAGIC_GI_VISIBILITY_RESULT failures=0")
 run("prt", ["--script", str(ROOT / "misc/scripts/tests/magic_gi_prt.gd")],
     "MAGIC_GI_PRT_RESULT failures=0")
+run("relight", ["--script", str(ROOT / "misc/scripts/tests/magic_gi_relight.gd")],
+    "failures=0")
+run("directional", ["--script", str(ROOT / "misc/scripts/tests/magic_gi_directional.gd")],
+    "MAGIC_GI_DIRECTIONAL_RESULT failures=0")
 run("gpu", ["--script", str(ROOT / "misc/scripts/tests/frp_magic_gi.gd")],
     "PASS Magic GI dynamic lighting, camera transform, seven debug channels and viewport routing")
 print("Logs:", project)

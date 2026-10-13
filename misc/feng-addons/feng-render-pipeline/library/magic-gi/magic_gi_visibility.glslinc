@@ -1,0 +1,134 @@
+// Shared static visibility traversal for the surface gather and CLV fill.
+bool segment_hits_bounds(vec3 origin, vec3 direction, vec3 inverse_direction, float distance, vec3 lower, vec3 upper) {
+	float near_distance = 0.00001;
+	float far_distance = distance - 0.00001;
+	for (int axis = 0; axis < 3; axis++) {
+		if (abs(direction[axis]) < 1e-8) {
+			if (origin[axis] < lower[axis] - 0.00001 || origin[axis] > upper[axis] + 0.00001) {
+				return false;
+			}
+		} else {
+			float a = (lower[axis] - 0.00001 - origin[axis]) * inverse_direction[axis];
+			float b = (upper[axis] + 0.00001 - origin[axis]) * inverse_direction[axis];
+			near_distance = max(near_distance, min(a, b));
+			far_distance = min(far_distance, max(a, b));
+		}
+	}
+	return near_distance <= far_distance;
+}
+
+vec3 nearest_surface(vec3 world, vec3 view_direction, float radius, int ignored_triangle, out int receiver_triangle) {
+	vec3 origin = world - view_direction * radius;
+	vec3 inverse_direction = 1.0 / mix(view_direction, vec3(1.0), lessThan(abs(view_direction), vec3(1e-8)));
+	float nearest = radius * 2.0;
+	vec3 resolved = world;
+	receiver_triangle = -1;
+	int node_count = visibility_bvh.nodes.length() / 2;
+	int node = 0;
+	for (int visit = 0; visit < 256 && node < node_count; visit++) {
+		vec4 lower = visibility_bvh.nodes[node * 2];
+		vec4 upper = visibility_bvh.nodes[node * 2 + 1];
+		if (!segment_hits_bounds(origin, view_direction, inverse_direction, nearest, lower.xyz, upper.xyz)) {
+			node = int(lower.w);
+			continue;
+		}
+		int leaf_range = int(upper.w);
+		if (leaf_range > 0) {
+			int first = leaf_range / 8 - 1;
+			int count = leaf_range % 8;
+			for (int leaf = 0; leaf < count; leaf++) {
+				if (first + leaf == ignored_triangle) {
+					continue;
+				}
+				int triangle = (first + leaf) * 3;
+				vec3 a = visibility_geometry.triangles[triangle].xyz;
+				vec3 edge1 = visibility_geometry.triangles[triangle + 1].xyz;
+				vec3 edge2 = visibility_geometry.triangles[triangle + 2].xyz;
+				vec3 p = cross(view_direction, edge2);
+				float determinant = dot(edge1, p);
+				if (abs(determinant) < visibility_geometry.triangles[triangle + 1].w) {
+					continue;
+				}
+				vec3 from_a = origin - a;
+				float u = dot(from_a, p) / determinant;
+				vec3 q = cross(from_a, edge1);
+				float v = dot(view_direction, q) / determinant;
+				float distance = dot(edge2, q) / determinant;
+				if (u >= -1e-6 && v >= -1e-6 && u + v <= 1.000001
+						&& distance > 0.00001 && distance < nearest) {
+					nearest = distance;
+					resolved = a + edge1 * u + edge2 * v;
+					receiver_triangle = first + leaf;
+				}
+			}
+		}
+		node++;
+	}
+	if (node < node_count) {
+		receiver_triangle = -2;
+		return world; // An incomplete search cannot identify the receiving face.
+	}
+	return resolved;
+}
+
+bool segment_blocked(vec3 origin, vec3 target, int receiver_triangle, int receiver_patch) {
+	vec3 delta = target - origin;
+	float distance = length(delta);
+	if (distance <= 0.00002) {
+		return false;
+	}
+	vec3 direction = delta / distance;
+	vec3 inverse_direction = 1.0 / mix(direction, vec3(1.0), lessThan(abs(direction), vec3(1e-8)));
+	int node_count = visibility_bvh.nodes.length() / 2;
+	int node = 0;
+	// Keep work bounded on very dense geometry. Exhaustion rejects the candidate;
+	// neither an incomplete traversal nor an averaged moment can grant visibility.
+	for (int visit = 0; visit < 256 && node < node_count; visit++) {
+		vec4 lower = visibility_bvh.nodes[node * 2];
+		vec4 upper = visibility_bvh.nodes[node * 2 + 1];
+		if (!segment_hits_bounds(origin, direction, inverse_direction, distance, lower.xyz, upper.xyz)) {
+			node = int(lower.w);
+			continue;
+		}
+		int leaf_range = int(upper.w);
+		if (leaf_range > 0) {
+			int first = leaf_range / 8 - 1;
+			int count = leaf_range % 8;
+			for (int leaf = 0; leaf < count; leaf++) {
+				if (first + leaf == receiver_triangle) {
+					continue;
+				}
+				int triangle = (first + leaf) * 3;
+				if (receiver_patch > 0 && int(visibility_geometry.triangles[triangle + 2].w) == receiver_patch) {
+					continue;
+				}
+				vec3 a = visibility_geometry.triangles[triangle].xyz;
+				vec3 edge1 = visibility_geometry.triangles[triangle + 1].xyz;
+				vec3 edge2 = visibility_geometry.triangles[triangle + 2].xyz;
+				vec3 p = cross(direction, edge2);
+				float determinant = dot(edge1, p);
+				if (abs(determinant) < visibility_geometry.triangles[triangle + 1].w) {
+					continue;
+				}
+				vec3 from_a = origin - a;
+				float u = dot(from_a, p) / determinant;
+				vec3 q = cross(from_a, edge1);
+				float v = dot(direction, q) / determinant;
+				float hit_distance = dot(edge2, q) / determinant;
+				// Exclude the receiver's own plane in normal distance, so grazing
+				// rays do not amplify depth reconstruction error into false blockers.
+				if (abs(distance - hit_distance) * abs(determinant)
+						<= 0.00001 * visibility_geometry.triangles[triangle].w) {
+					continue;
+				}
+				if (u >= -1e-6 && v >= -1e-6 && u + v <= 1.000001
+						&& hit_distance > 0.00001 && hit_distance < distance - 0.00001) {
+					return true;
+				}
+			}
+		}
+		node++;
+	}
+	return node < node_count;
+}
+

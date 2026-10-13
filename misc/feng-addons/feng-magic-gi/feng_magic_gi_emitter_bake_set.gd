@@ -4,7 +4,9 @@ extends RefCounted
 ## Ordered static source geometry and CPU next-event sampling for one bake.
 
 const Data = preload("feng_magic_gi_data.gd")
+const TextureSampler = preload("feng_magic_gi_texture_sampler.gd")
 const Binding = preload("feng_magic_gi_emitter_binding.gd")
+const NATIVE_TRIANGLE_GRID := 0.0001
 
 var keys := PackedStringArray()
 var static_signatures := PackedInt64Array()
@@ -62,29 +64,78 @@ func register_surface(root: Node, node: MeshInstance3D, surface: int,
 	})
 	return index
 
+static func canonical_vertex(point: Vector3) -> Vector3:
+	return point.snappedf(NATIVE_TRIANGLE_GRID)
+
 func append_triangle(emitter_index: int, a: Vector3, b: Vector3, c: Vector3,
-		normal: Vector3, uv1_a: Vector2, uv1_b: Vector2, uv1_c: Vector2,
-		uv2_a: Vector2, uv2_b: Vector2, uv2_c: Vector2) -> void:
+		uv1_a: Vector2, uv1_b: Vector2, uv1_c: Vector2,
+		uv2_a: Vector2, uv2_b: Vector2, uv2_c: Vector2,
+		native_face_index: int) -> bool:
 	if emitter_index < 0 or emitter_index >= groups.size():
-		return
+		return false
 	var source: Dictionary = groups[emitter_index]
-	var area := 0.5 * (b - a).cross(c - a).length()
+	# TriangleMesh canonicalizes each input vertex to this grid before building
+	# its BVH. Sample the identical geometry so area PDFs and first-hit endpoints
+	# describe the same surface, including transformed PrimitiveMesh vertices.
+	var canonical_a := canonical_vertex(a)
+	var canonical_b := canonical_vertex(b)
+	var canonical_c := canonical_vertex(c)
+	var area := 0.5 * (canonical_b - canonical_a).cross(canonical_c - canonical_a).length()
 	if area <= 0.0000001:
-		return
+		return false
+	var normal := (canonical_c - canonical_a).cross(canonical_b - canonical_a).normalized()
 	source["area"] = float(source["area"]) + area
 	var source_triangles: Array = source["triangles"]
 	source_triangles.append({
-		"a": a, "b": b, "c": c, "normal": normal,
+		"a": canonical_a, "b": canonical_b, "c": canonical_c, "normal": normal,
+		"native_face_index": native_face_index,
 		"cumulative_area": source["area"],
 		"uv1_a": uv1_a, "uv1_b": uv1_b, "uv1_c": uv1_c,
 		"uv2_a": uv2_a, "uv2_b": uv2_b, "uv2_c": uv2_c
 	})
+	return true
+
+func solid_angle_pdf(emitter_index: int, receiver: Vector3, target: Vector3,
+		geometric_normal: Vector3) -> float:
+	if emitter_index < 0 or emitter_index >= groups.size():
+		return 0.0
+	var source: Dictionary = groups[emitter_index]
+	var area := float(source["area"])
+	if not is_finite(area) or area <= 0.0000001:
+		return 0.0
+	var delta := target - receiver
+	var distance_squared := delta.length_squared()
+	if not is_finite(distance_squared) or distance_squared <= 0.000000000001:
+		return 0.0
+	var direction := delta / sqrt(distance_squared)
+	var source_normal := geometric_normal.normalized()
+	var cull_mode := int(source["cull_mode"])
+	if cull_mode == BaseMaterial3D.CULL_FRONT:
+		source_normal = -source_normal
+	var cosine_source := source_normal.dot(-direction)
+	if cull_mode == BaseMaterial3D.CULL_DISABLED:
+		cosine_source = absf(cosine_source)
+	if cosine_source <= 0.0:
+		return 0.0
+	var pdf := distance_squared / (area * cosine_source)
+	return pdf if is_finite(pdf) and pdf > 0.0 else 0.0
+
+static func power_heuristic(pdf_a: float, pdf_b: float) -> float:
+	if not is_finite(pdf_a) or pdf_a <= 0.0:
+		return 0.0
+	if not is_finite(pdf_b) or pdf_b <= 0.0:
+		return 1.0
+	if pdf_a >= pdf_b:
+		var ratio := pdf_b / pdf_a
+		return 1.0 / (1.0 + ratio * ratio)
+	var inverse_ratio := pdf_a / pdf_b
+	return inverse_ratio * inverse_ratio / (1.0 + inverse_ratio * inverse_ratio)
 
 ## Uniform-area next-event sample for one fixed emissive surface binding.
 ## Returns the geometric estimator weight and texture sample, but no live color.
 func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: Vector3,
 		u_triangle: float, u_barycentric: float, u_edge: float,
-		max_distance: float, receiver_offset: float) -> Dictionary:
+		max_distance: float, spherical_receiver := false) -> Dictionary:
 	if emitter_index < 0 or emitter_index >= groups.size():
 		return {}
 	var source: Dictionary = groups[emitter_index]
@@ -111,42 +162,105 @@ func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: V
 	var target: Vector3 = chosen["a"] * w0 + chosen["b"] * w1 + chosen["c"] * w2
 	var delta := target - receiver
 	var distance := delta.length()
-	if distance <= 0.0001 or distance > max_distance:
+	if not is_finite(distance) or distance <= 0.0000001 or distance > max_distance:
 		return {}
-	var direction := delta / distance
-	var cosine_receiver := receiver_normal.normalized().dot(direction)
+	var sample_direction := delta / distance
+	var cosine_receiver := 1.0 if spherical_receiver else receiver_normal.normalized().dot(sample_direction)
 	if cosine_receiver <= 0.0:
 		return {}
 	var source_normal: Vector3 = chosen["normal"]
 	var cull_mode := int(source["cull_mode"])
 	if cull_mode == BaseMaterial3D.CULL_FRONT:
 		source_normal = -source_normal
-	var cosine_source := source_normal.dot(-direction)
+	var cosine_source := source_normal.dot(-sample_direction)
 	if cull_mode == BaseMaterial3D.CULL_DISABLED:
 		cosine_source = absf(cosine_source)
 	if cosine_source <= 0.0:
 		return {}
-	var ray_origin: Vector3 = receiver + receiver_normal.normalized() * maxf(receiver_offset, 0.0)
-	var shadow_delta := target - ray_origin
-	var shadow_distance := shadow_delta.length()
-	var endpoint_epsilon := maxf(0.0001, shadow_distance * 0.00001)
-	var ray_distance := shadow_distance - endpoint_epsilon
-	if ray_distance <= 0.0:
-		return {}
-	var estimator_weight := total_area * cosine_receiver * cosine_source / (PI * distance * distance)
+	# Visibility uses the exact same physical line and origin as the MIS endpoint.
+	# This small tolerance is for selected-point and shared-edge identity checks;
+	# it does not guarantee that every bounded TriangleMesh segment reaches its
+	# endpoint. Emitter NEE uses a native first-hit ray retry only when that
+	# bounded segment has no hit, then still checks the selected source face.
+	var endpoint_tolerance := maxf(ray_epsilon(receiver), ray_epsilon(target)) * 8.0
+	var visibility_distance := distance + endpoint_tolerance
+	var compatible_hit_faces := _compatible_boundary_faces(triangles, chosen,
+			target, endpoint_tolerance)
+	var estimator_weight := total_area * cosine_receiver * cosine_source / (distance * distance)
+	if not spherical_receiver:
+		estimator_weight /= PI
 	if not is_finite(estimator_weight) or estimator_weight <= 0.0:
 		return {}
 	var uv1: Vector2 = chosen["uv1_a"] * w0 + chosen["uv1_b"] * w1 + chosen["uv1_c"] * w2
 	var uv2: Vector2 = chosen["uv2_a"] * w0 + chosen["uv2_b"] * w1 + chosen["uv2_c"] * w2
 	var texture_rgb := _sample_texture(source, uv1, uv2)
+	var light_pdf := distance * distance / (total_area * cosine_source)
+	if not is_finite(light_pdf) or light_pdf <= 0.0:
+		return {}
 	return {
-		"direction": shadow_delta / shadow_distance,
+		"sample_direction": sample_direction,
+		"shadow_direction": sample_direction,
+		"shadow_origin": receiver,
+		"sample_position": target,
+		"sample_face_index": int(chosen.get("native_face_index", -1)),
+		"compatible_hit_faces": compatible_hit_faces,
 		"distance": distance,
-		"ray_origin": ray_origin,
-		"ray_distance": ray_distance,
+		"visibility_distance": visibility_distance,
+		"endpoint_tolerance": endpoint_tolerance,
+		"light_pdf": light_pdf,
 		"weight": estimator_weight,
 		"texture_rgb": texture_rgb
 	}
+
+static func ray_epsilon(point: Vector3) -> float:
+	var scale := maxf(absf(point.x), maxf(absf(point.y), absf(point.z)))
+	return maxf(0.000000001, scale * 0.0000001)
+
+static func _compatible_boundary_faces(triangles: Array, chosen: Dictionary,
+		target: Vector3, tolerance: float) -> PackedInt32Array:
+	var compatible := PackedInt32Array()
+	var chosen_face := int(chosen.get("native_face_index", -1))
+	if chosen_face >= 0:
+		compatible.append(chosen_face)
+	var a: Vector3 = chosen["a"]
+	var b: Vector3 = chosen["b"]
+	var c: Vector3 = chosen["c"]
+	var near_vertices: Array[Vector3] = []
+	for vertex in [a, b, c]:
+		if target.distance_to(vertex) <= tolerance:
+			near_vertices.append(vertex)
+	var near_edges: Array = []
+	for edge in [[a, b], [b, c], [c, a]]:
+		if _point_segment_distance(target, edge[0], edge[1]) <= tolerance:
+			near_edges.append(edge)
+	if near_vertices.is_empty() and near_edges.is_empty():
+		return compatible
+	for triangle in triangles:
+		var candidate_face := int(triangle.get("native_face_index", -1))
+		if candidate_face < 0 or candidate_face == chosen_face:
+			continue
+		var candidate_vertices: Array[Vector3] = [triangle["a"], triangle["b"], triangle["c"]]
+		var shares_boundary := false
+		for vertex in near_vertices:
+			if candidate_vertices.has(vertex):
+				shares_boundary = true
+				break
+		if not shares_boundary:
+			for edge in near_edges:
+				if candidate_vertices.has(edge[0]) and candidate_vertices.has(edge[1]):
+					shares_boundary = true
+					break
+		if shares_boundary and not compatible.has(candidate_face):
+			compatible.append(candidate_face)
+	return compatible
+
+static func _point_segment_distance(point: Vector3, a: Vector3, b: Vector3) -> float:
+	var edge := b - a
+	var length_squared := edge.length_squared()
+	if length_squared <= 0.000000000001:
+		return point.distance_to(a)
+	var fraction := clampf((point - a).dot(edge) / length_squared, 0.0, 1.0)
+	return point.distance_to(a + edge * fraction)
 
 func _sample_texture(source: Dictionary, uv1: Vector2, uv2: Vector2) -> Vector3:
 	var image: Image = source["texture_image"]
@@ -156,45 +270,9 @@ func _sample_texture(source: Dictionary, uv1: Vector2, uv2: Vector2) -> Vector3:
 	var scale: Vector3 = source["uv_scale"]
 	var offset: Vector3 = source["uv_offset"]
 	uv = uv * Vector2(scale.x, scale.y) + Vector2(offset.x, offset.y)
-	var repeat := bool(source["repeat"])
-	if repeat:
-		uv = Vector2(fposmod(uv.x, 1.0), fposmod(uv.y, 1.0))
-	else:
-		uv = uv.clamp(Vector2.ZERO, Vector2.ONE)
-	var width := image.get_width()
-	var height := image.get_height()
-	if width <= 0 or height <= 0:
+	return TextureSampler.sample(image, uv, bool(source["repeat"]), int(source["filter"]))
+
+func sample_texture(emitter_index: int, uv1: Vector2, uv2: Vector2) -> Vector3:
+	if emitter_index < 0 or emitter_index >= groups.size():
 		return Vector3.ZERO
-	var nearest := int(source["filter"]) in [BaseMaterial3D.TEXTURE_FILTER_NEAREST,
-			BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS,
-			BaseMaterial3D.TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC]
-	if nearest:
-		var px := int(floor(uv.x * width))
-		var py := int(floor(uv.y * height))
-		return _emission_pixel_linear(image, _wrap_texel(px, width, repeat), _wrap_texel(py, height, repeat))
-	var fx := uv.x * width - 0.5
-	var fy := uv.y * height - 0.5
-	var x0 := floori(fx)
-	var y0 := floori(fy)
-	var tx: float = fx - floor(fx)
-	var ty: float = fy - floor(fy)
-	var c00 := _emission_pixel_linear(image, _wrap_texel(x0, width, repeat), _wrap_texel(y0, height, repeat))
-	var c10 := _emission_pixel_linear(image, _wrap_texel(x0 + 1, width, repeat), _wrap_texel(y0, height, repeat))
-	var c01 := _emission_pixel_linear(image, _wrap_texel(x0, width, repeat), _wrap_texel(y0 + 1, height, repeat))
-	var c11 := _emission_pixel_linear(image, _wrap_texel(x0 + 1, width, repeat), _wrap_texel(y0 + 1, height, repeat))
-	return c00.lerp(c10, tx).lerp(c01.lerp(c11, tx), ty)
-
-static func _wrap_texel(value: int, extent: int, repeat: bool) -> int:
-	return posmod(value, extent) if repeat else clampi(value, 0, extent - 1)
-
-static func _emission_pixel_linear(image: Image, x: int, y: int) -> Vector3:
-	var color := image.get_pixel(x, y)
-	var format := image.get_format()
-	var linear_format := format in [Image.FORMAT_RF, Image.FORMAT_RGF, Image.FORMAT_RGBF,
-			Image.FORMAT_RGBAF, Image.FORMAT_RH, Image.FORMAT_RGH, Image.FORMAT_RGBH,
-			Image.FORMAT_RGBAH, Image.FORMAT_RGBE9995, Image.FORMAT_BPTC_RGBF,
-			Image.FORMAT_BPTC_RGBFU, Image.FORMAT_ASTC_4x4_HDR, Image.FORMAT_ASTC_8x8_HDR]
-	if not linear_format:
-		color = color.srgb_to_linear()
-	var linear_rgb := Vector3(color.r, color.g, color.b)
-	return linear_rgb.max(Vector3.ZERO) if linear_rgb.is_finite() else Vector3.ZERO
+	return _sample_texture(groups[emitter_index], uv1, uv2)

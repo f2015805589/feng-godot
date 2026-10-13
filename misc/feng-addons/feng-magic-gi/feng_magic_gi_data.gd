@@ -7,12 +7,13 @@ extends Resource
 
 const Visibility = preload("feng_magic_gi_visibility.gd")
 const SHFilter = preload("feng_magic_gi_sh_filter.gd")
+const DirectionalData = preload("feng_magic_gi_directional_data.gd")
 const FORMAT_VERSION := 6
 const MOMENT_FORMAT_VERSION := 5
 const PRIMARY_SKY_FORMAT_VERSION := 4
 const EMITTER_FORMAT_VERSION := 3
 const LEGACY_FORMAT_VERSION := 2
-const SAMPLER_REVISION := 3
+const SAMPLER_REVISION := 5
 const MAX_GRID_AXIS := 64
 const MAX_EMITTERS := 32
 const ATLAS_COLUMNS := 32
@@ -33,6 +34,11 @@ const SH_Y00 := 0.2820947918
 @export_storage var volume_size := Vector3.ZERO
 # Keep the legacy storage default: older 1 m bakes omit this field in .tscn files.
 @export_storage var spacing := 1.0
+@export_storage var adaptive_placement := false
+@export_storage var minimum_probe_spacing := 0.25
+@export_storage var probe_spacings := PackedFloat32Array()
+## Adaptive cells store [offset, count] into the packed cell_indices list.
+@export_storage var cell_ranges := PackedInt32Array()
 @export_storage var surface_offset := 0.03
 @export_storage var bake_samples := 0
 @export_storage var bake_bounces := 0
@@ -62,6 +68,9 @@ const SH_Y00 := 0.2820947918
 @export_storage var emitter_transport := PackedFloat32Array()
 @export_storage var cell_indices := PackedInt32Array()
 @export_storage var bake_version := 0
+## Optional independently versioned spherical transfer. Absent in saved surface
+## bakes; those keep their exact surface gather instead of fabricated SH data.
+@export_storage var directional: Resource
 
 # Old names are retained only so legacy .tres files still deserialize. Their
 # radiance values never masquerade as geometry-only transport.
@@ -112,6 +121,9 @@ func supports_format() -> bool:
 ## resource identity and bake_version; render-frame layout checks stay O(1).
 func is_valid() -> bool:
 	if not supports_format() or bake_version <= 0:
+		return false
+	if directional != null and (not directional is DirectionalData \
+			or not directional.is_valid(probe_count(), emitter_count())):
 		return false
 	if probe_count() == 0 or normals.size() != probe_count():
 		return false
@@ -173,7 +185,24 @@ func is_valid() -> bool:
 		return false
 	if grid_dims.x > MAX_GRID_AXIS or grid_dims.y > MAX_GRID_AXIS or grid_dims.z > MAX_GRID_AXIS:
 		return false
-	if cell_indices.size() != grid_dims.x * grid_dims.y * grid_dims.z * CELL_CAPACITY:
+	var cells := grid_dims.x * grid_dims.y * grid_dims.z
+	if adaptive_placement:
+		if cell_ranges.size() != cells * 2 or cell_indices.size() != probe_count() \
+				or probe_spacings.size() != probe_count() or not is_finite(minimum_probe_spacing) \
+				or minimum_probe_spacing < 0.1 or minimum_probe_spacing > spacing:
+			return false
+		var offset := 0
+		for cell in cells:
+			if cell_ranges[cell * 2] != offset or cell_ranges[cell * 2 + 1] < 0:
+				return false
+			offset += cell_ranges[cell * 2 + 1]
+		if offset != probe_count():
+			return false
+		for value in probe_spacings:
+			if not is_finite(value) or value < minimum_probe_spacing or value > spacing:
+				return false
+	elif cell_indices.size() != cells * CELL_CAPACITY or not cell_ranges.is_empty() \
+			or not probe_spacings.is_empty():
 		return false
 	if not volume_size.is_finite() or minf(volume_size.x, minf(volume_size.y, volume_size.z)) <= 0.0:
 		return false
@@ -251,6 +280,8 @@ func build_cell_indices() -> bool:
 			or grid_dims.x > MAX_GRID_AXIS or grid_dims.y > MAX_GRID_AXIS or grid_dims.z > MAX_GRID_AXIS:
 		cell_indices.clear()
 		return false
+	if adaptive_placement:
+		return _build_adaptive_indices()
 	cell_indices.resize(grid_dims.x * grid_dims.y * grid_dims.z * CELL_CAPACITY)
 	cell_indices.fill(-1)
 	var cell_counts := PackedByteArray()
@@ -271,6 +302,27 @@ func build_cell_indices() -> bool:
 			return false
 		cell_indices[cell * CELL_CAPACITY + slot] = i
 		cell_counts[cell] = slot + 1
+	return true
+
+func _build_adaptive_indices() -> bool:
+	var count := grid_dims.x * grid_dims.y * grid_dims.z
+	var buckets: Dictionary = {}
+	for probe in probe_count():
+		var cell := cell_coordinates(world_to_grid * surface_positions[probe], grid_dims)
+		if cell.x < 0:
+			return false
+		var key := cell.x + cell.y * grid_dims.x + cell.z * grid_dims.x * grid_dims.y
+		var entries: Array = buckets.get(key, [])
+		entries.append(probe)
+		buckets[key] = entries
+	cell_ranges.resize(count * 2)
+	cell_indices.clear()
+	for cell in count:
+		var entries: Array = buckets.get(cell, [])
+		cell_ranges[cell * 2] = cell_indices.size()
+		cell_ranges[cell * 2 + 1] = entries.size()
+		for probe: int in entries:
+			cell_indices.append(probe)
 	return true
 
 func evaluate(index: int, lighting: PackedFloat32Array,
@@ -416,7 +468,7 @@ func make_render_upload() -> Dictionary:
 	var primary_sky_image := _pack_primary_sky_image()
 	var geometry_image := _pack_geometry_image()
 	var visibility_moment_image := _pack_visibility_moment_image()
-	var index_bytes := cell_indices.to_byte_array()
+	var index_bytes := cell_ranges.to_byte_array() if adaptive_placement else cell_indices.to_byte_array()
 	var emission_image := make_emission_atlas_image(PackedFloat32Array())
 	if transfer_image == null or primary_sky_image == null or geometry_image == null \
 			or visibility_moment_image == null or index_bytes.is_empty() \
@@ -430,6 +482,8 @@ func make_render_upload() -> Dictionary:
 		"visibility_node_bytes": node_bytes,
 		"visibility_triangle_bytes": triangle_bytes,
 		"index_bytes": index_bytes,
+		"sparse_indices": adaptive_placement,
+		"index_entries": cell_indices.to_byte_array() if adaptive_placement else PackedInt32Array([0]).to_byte_array(),
 		"emission_image": emission_image
 	}
 
@@ -545,7 +599,7 @@ func _pack_geometry_image() -> Image:
 				if format_version >= FORMAT_VERSION else 0
 		image.set_pixel(x, y, Color(surface.x, surface.y, surface.z, float(patch)))
 		image.set_pixel(x + 1, y, Color(position.x, position.y, position.z, 1.0))
-		image.set_pixel(x + 2, y, Color(normal.x, normal.y, normal.z, 0.0))
+		image.set_pixel(x + 2, y, Color(normal.x, normal.y, normal.z, probe_spacings[p] if adaptive_placement else spacing))
 	return image
 
 func make_visibility_moment_image() -> Image:

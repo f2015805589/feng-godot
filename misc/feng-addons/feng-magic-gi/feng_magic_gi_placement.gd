@@ -7,6 +7,9 @@ const Data = preload("feng_magic_gi_data.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const EmitterBakeSet = preload("feng_magic_gi_emitter_bake_set.gd")
 const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
+const MaterialSampler = preload("feng_magic_gi_material_sampler.gd")
+const AdaptiveLayout = preload("feng_magic_gi_adaptive_layout.gd")
+const TraceScene = preload("feng_magic_gi_trace_scene.gd")
 const MAX_PROBES := 65536
 const MAX_GEOMETRY_TRIANGLES := 250000
 const MAX_TERRAIN_CELLS := 500000
@@ -14,6 +17,7 @@ const MAX_SAMPLE_CANDIDATES := 2000000
 const MAX_STAGED_WORLD_CELLS := MAX_PROBES
 const MAX_STAGED_CANDIDATE_RECORDS := MAX_STAGED_WORLD_CELLS \
 		* ProbeLayout.MAX_DOMAINS_PER_WORLD_CELL * ProbeLayout.CANDIDATES_PER_DOMAIN
+const MAX_REFINEMENT_CELL_VISITS := 2000000
 const MAX_TRIANGLE_STEPS := 512
 const MAX_OCCLUSION_TRIANGLES := 250000
 const OCCLUSION_MAX_CROSSINGS := 256
@@ -27,14 +31,22 @@ const BROADPHASE_EPSILON := SceneTracker.BROADPHASE_EPSILON
 
 var faces := PackedVector3Array()
 var reflectance := PackedVector3Array()
+var material_sampler := MaterialSampler.new()
+var face_materials := PackedInt32Array()
+var face_uv := PackedVector2Array()
+var face_uv2 := PackedVector2Array()
+var face_emitter_indices := PackedInt32Array()
+var _triangle_material := -1
 var face_source_ids := PackedInt64Array()
 var face_surface_indices := PackedInt32Array()
 var face_domain_sources := PackedStringArray()
 var emitters := EmitterBakeSet.new()
 var bvh: TriangleMesh
+var trace_scene: RefCounted
 var positions := PackedVector3Array()
 var surface_positions := PackedVector3Array()
 var normals := PackedVector3Array()
+var probe_spacings := PackedFloat32Array()
 var scene_signature := 0
 var error_message := ""
 var warning_message := ""
@@ -54,8 +66,14 @@ var _bake_world_bounds: AABB
 var _inverse := Transform3D.IDENTITY
 var _dimensions := Vector3i.ONE
 var _probe_spacing := 1.0
+var _active_candidate_spacing := 1.0
+var _arbitration_spacing := 1.0
 var _material_cache: Dictionary = {}
 var _candidate_count := 0
+var _coarse_valid_candidate_count := 0
+var _refined_valid_candidate_count := 0
+var _refinement_cell_count := 0
+var _refinement_cell_visit_count := 0
 var _canonical_candidate_count := 0
 var _fallback_candidate_count := 0
 var _fallback_triangle_count := 0
@@ -113,6 +131,9 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_inverse = volume.global_transform.affine_inverse()
 	_dimensions = volume.grid_dimensions()
 	_probe_spacing = maxf(float(volume.get("probe_spacing")), 0.1)
+	_active_candidate_spacing = _probe_spacing
+	_arbitration_spacing = minf(_probe_spacing, volume.minimum_probe_spacing) \
+			if volume.adaptive_placement else _probe_spacing
 	error_message = ""
 	warning_message = ""
 	_world_bounds = volume.global_transform * AABB(-volume.size * 0.5, volume.size)
@@ -124,12 +145,18 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 			else _world_bounds.grow(max_probe_offset + BROADPHASE_EPSILON)
 	faces.clear()
 	reflectance.clear()
+	material_sampler = MaterialSampler.new()
+	face_materials.clear()
+	face_uv.clear()
+	face_uv2.clear()
+	face_emitter_indices.clear()
 	face_source_ids.clear()
 	face_surface_indices.clear()
 	face_domain_sources.clear()
 	positions.clear()
 	surface_positions.clear()
 	normals.clear()
+	probe_spacings.clear()
 	_world_candidate_cells.clear()
 	_cell_counts.clear()
 	_occlusion_volumes.clear()
@@ -138,6 +165,10 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	_face_outward_signs.clear()
 	_material_cache.clear()
 	_candidate_count = 0
+	_coarse_valid_candidate_count = 0
+	_refined_valid_candidate_count = 0
+	_refinement_cell_count = 0
+	_refinement_cell_visit_count = 0
 	_terrain_work = 0
 	_triangle_emitter_index = -1
 	_triangle_source_id = 0
@@ -181,6 +212,7 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	rejected_world_cell_limit_count = 0
 	adjusted_center_count = 0
 	bvh = null
+	trace_scene = null
 	bvh_ready = false
 	if _dimensions.x <= 0 or _dimensions.y <= 0 or _dimensions.z <= 0 \
 			or _dimensions.x > Data.MAX_GRID_AXIS or _dimensions.y > Data.MAX_GRID_AXIS \
@@ -200,12 +232,30 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 		if not bvh_ready:
 			error_message = "Godot could not create the static PRT triangle BVH."
 			return false
+	trace_scene = TraceScene.new()
+	trace_scene.initialize(self, volume, max_probe_offset)
 	_build_occlusion_broadphase()
 	if not _sample_collected_geometry():
 		positions.clear()
 		surface_positions.clear()
 		normals.clear()
 		return false
+	_coarse_valid_candidate_count = _valid_candidate_count
+	if volume.adaptive_placement:
+		var refinement_result: Dictionary = AdaptiveLayout.mark_refinement_cells(
+				_world_candidate_cells, Callable(self, "trace_geometry"), trace_scene,
+				_world_bounds, _probe_spacing, _arbitration_spacing)
+		var refinement_cells: Dictionary = refinement_result["cells"]
+		_refinement_cell_count = refinement_cells.size()
+		var refinement_error := String(refinement_result["error"])
+		if not refinement_error.is_empty():
+			error_message = refinement_error
+		if not error_message.is_empty() or not _sample_refined_geometry(refinement_cells):
+			positions.clear()
+			surface_positions.clear()
+			normals.clear()
+			return false
+		_refined_valid_candidate_count = _valid_candidate_count - _coarse_valid_candidate_count
 	if not _finalize_world_candidates():
 		positions.clear()
 		surface_positions.clear()
@@ -225,9 +275,29 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 			rejected_center_outside_count,
 			rejected_lookup_capacity_count, rejected_ambiguous_side_count]
 	scene_signature = hash([faces, reflectance, surface_positions, positions, normals])
+	if not material_sampler.records.is_empty():
+		scene_signature = hash([scene_signature, face_uv, material_sampler.fingerprint()])
 	return true
 
 func _sample_collected_geometry() -> bool:
+	_active_candidate_spacing = _probe_spacing
+	if not _sample_geometry_triangles(false, {}):
+		_clear_fallback_triangle_queue()
+		return false
+	if not _sample_fallback_triangles():
+		return false
+	return true
+
+func _sample_refined_geometry(refinement_cells: Dictionary) -> bool:
+	if refinement_cells.is_empty():
+		return true
+	_active_candidate_spacing = _arbitration_spacing
+	var sampled := _sample_geometry_triangles(true, refinement_cells)
+	_active_candidate_spacing = _probe_spacing
+	return sampled
+
+func _sample_geometry_triangles(refined: bool,
+		refinement_cells: Dictionary) -> bool:
 	for face_offset in range(0, faces.size(), 3):
 		var source_face_index := int(face_offset / 3)
 		_sample_source_id = int(face_source_ids[source_face_index])
@@ -257,15 +327,137 @@ func _sample_collected_geometry() -> bool:
 			var source_normal_sign := _source_face_outward_sign(
 					_sample_source_id, source_face_index, p0, p1, p2, clipped_normal)
 			if source_normal_sign == 0.0:
-				rejected_ambiguous_side_count += 1
+				if not refined:
+					rejected_ambiguous_side_count += 1
 				continue
 			clipped_normal *= source_normal_sign
-			if not _sample_triangle(p0, p1, p2, clipped_normal, source_face_index):
-				_clear_fallback_triangle_queue()
+			var sampled := _sample_triangle_in_refinement_cells(p0, p1, p2,
+					clipped_normal, source_face_index, refinement_cells) if refined \
+					else _sample_triangle(p0, p1, p2, clipped_normal, source_face_index)
+			if not sampled:
 				return false
-	if not _sample_fallback_triangles():
-		return false
 	return true
+
+func _sample_triangle_in_refinement_cells(a: Vector3, b: Vector3, c: Vector3,
+		normal: Vector3, owner_face_index: int, refinement_cells: Dictionary) -> bool:
+	var triangle_centroid := (a + b + c) / 3.0
+	if not _world_point_coordinates_are_supported(a) \
+			or not _world_point_coordinates_are_supported(b) \
+			or not _world_point_coordinates_are_supported(c):
+		error_message = "Probe centers exceed the supported signed world-cell coordinate range."
+		return false
+	var dominant_axis := _dominant_normal_axis(normal)
+	var projected_axes := _projected_axes(dominant_axis)
+	var axis_u := projected_axes.x
+	var axis_v := projected_axes.y
+	var dominant_normal := normal[dominant_axis]
+	if absf(dominant_normal) < 0.000001:
+		return true
+	var minimum := a.min(b).min(c)
+	var maximum := a.max(b).max(c)
+	var cell_min := Vector3i((minimum / _probe_spacing).floor())
+	var cell_max := Vector3i((maximum / _probe_spacing).floor())
+	var low_u := minf(a[axis_u], minf(b[axis_u], c[axis_u]))
+	var high_u := maxf(a[axis_u], maxf(b[axis_u], c[axis_u]))
+	var low_v := minf(a[axis_v], minf(b[axis_v], c[axis_v]))
+	var high_v := maxf(a[axis_v], maxf(b[axis_v], c[axis_v]))
+	var generated := 0
+	var cell_count_x: int = int(cell_max.x) - int(cell_min.x) + 1
+	var cell_count_y: int = int(cell_max.y) - int(cell_min.y) + 1
+	var cell_count_z: int = int(cell_max.z) - int(cell_min.z) + 1
+	var bounds_cell_count := 1
+	var bounds_exceeds_budget := false
+	for extent in [cell_count_x, cell_count_y, cell_count_z]:
+		if extent <= 0 or extent > MAX_REFINEMENT_CELL_VISITS \
+				or bounds_cell_count * extent > MAX_REFINEMENT_CELL_VISITS:
+			bounds_exceeds_budget = true
+			break
+		bounds_cell_count *= extent
+	var scan_marked_cells := bounds_exceeds_budget \
+			or bounds_cell_count > refinement_cells.size()
+	var scan_count := refinement_cells.size() if scan_marked_cells else bounds_cell_count
+	if scan_count > MAX_REFINEMENT_CELL_VISITS - _refinement_cell_visit_count:
+		error_message = "Adaptive triangle-to-feature matching exceeds its bounded cell-query budget."
+		return false
+	if scan_marked_cells:
+		for cell_value in refinement_cells:
+			_refinement_cell_visit_count += 1
+			var world_cell: Vector3i = cell_value
+			if world_cell.x < cell_min.x or world_cell.x > cell_max.x \
+					or world_cell.y < cell_min.y or world_cell.y > cell_max.y \
+					or world_cell.z < cell_min.z or world_cell.z > cell_max.z:
+				continue
+			var cell_generated := _sample_refinement_cell(a, b, c, normal,
+					triangle_centroid, owner_face_index, world_cell, axis_u, axis_v,
+					dominant_axis, dominant_normal, low_u, high_u, low_v, high_v)
+			if cell_generated < 0:
+				return false
+			generated += cell_generated
+	else:
+		for z in range(cell_min.z, cell_max.z + 1):
+			for y in range(cell_min.y, cell_max.y + 1):
+				for x in range(cell_min.x, cell_max.x + 1):
+					_refinement_cell_visit_count += 1
+					var world_cell := Vector3i(x, y, z)
+					if not refinement_cells.has(world_cell):
+						continue
+					var cell_generated := _sample_refinement_cell(a, b, c, normal,
+							triangle_centroid, owner_face_index, world_cell, axis_u, axis_v,
+							dominant_axis, dominant_normal, low_u, high_u, low_v, high_v)
+					if cell_generated < 0:
+						return false
+					generated += cell_generated
+	# Preserve tiny isolated geometry that has no centered min-spacing sample.
+	var area := (b - a).cross(c - a).length() * 0.5
+	if generated == 0 and area <= _active_candidate_spacing * _active_candidate_spacing * 0.25 \
+			and refinement_cells.has(ProbeLayout.world_cell(triangle_centroid, _probe_spacing)):
+		_candidate_count += 1
+		if _candidate_count > MAX_SAMPLE_CANDIDATES:
+			error_message = "Adaptive surface refinement exceeds the 2,000,000-candidate work budget."
+			return false
+		_fallback_candidate_count += 1
+		_add_surface(triangle_centroid, normal, triangle_centroid, owner_face_index, false,
+				a, b, c)
+		if not error_message.is_empty():
+			return false
+	return true
+
+func _sample_refinement_cell(a: Vector3, b: Vector3, c: Vector3,
+		normal: Vector3, triangle_centroid: Vector3, owner_face_index: int,
+		world_cell: Vector3i, axis_u: int, axis_v: int, dominant_axis: int,
+		dominant_normal: float, low_u: float, high_u: float,
+		low_v: float, high_v: float) -> int:
+	var cell_low_u := maxf(low_u, float(world_cell[axis_u]) * _probe_spacing)
+	var cell_high_u := minf(high_u, float(world_cell[axis_u] + 1) * _probe_spacing)
+	var cell_low_v := maxf(low_v, float(world_cell[axis_v]) * _probe_spacing)
+	var cell_high_v := minf(high_v, float(world_cell[axis_v] + 1) * _probe_spacing)
+	var first_u := ceili(cell_low_u / _active_candidate_spacing - 0.5 - 0.000001)
+	var last_u := floori(cell_high_u / _active_candidate_spacing - 0.5 + 0.000001)
+	var first_v := ceili(cell_low_v / _active_candidate_spacing - 0.5 - 0.000001)
+	var last_v := floori(cell_high_v / _active_candidate_spacing - 0.5 + 0.000001)
+	var generated := 0
+	for fine_v in range(first_v, last_v + 1):
+		for fine_u in range(first_u, last_u + 1):
+			_candidate_count += 1
+			if _candidate_count > MAX_SAMPLE_CANDIDATES:
+				error_message = "Adaptive surface refinement exceeds the 2,000,000-candidate work budget."
+				return -1
+			var point := Vector3.ZERO
+			point[axis_u] = (float(fine_u) + 0.5) * _active_candidate_spacing
+			point[axis_v] = (float(fine_v) + 0.5) * _active_candidate_spacing
+			point[dominant_axis] = a[dominant_axis] - (
+				normal[axis_u] * (point[axis_u] - a[axis_u])
+					+ normal[axis_v] * (point[axis_v] - a[axis_v])) / dominant_normal
+			if ProbeLayout.world_cell(point, _probe_spacing) != world_cell \
+					or not _point_is_in_triangle(point, a, b, c):
+				continue
+			generated += 1
+			_canonical_candidate_count += 1
+			_add_surface(point, normal, triangle_centroid, owner_face_index, true,
+					a, b, c)
+			if not error_message.is_empty():
+				return -1
+	return generated
 
 func _collect_node(node: Node) -> void:
 	if not error_message.is_empty():
@@ -439,6 +631,12 @@ func _prepare_surface(node: MeshInstance3D, surface: int,
 		uv1 := PackedVector2Array(), uv2 := PackedVector2Array(), vertex_count := 0) -> bool:
 	_triangle_emitter_index = -1
 	var material := node.get_active_material(surface)
+	_triangle_material = -1
+	if material is BaseMaterial3D:
+		_triangle_material = material_sampler.register(material, vertex_count > 0 and uv1.size() == vertex_count)
+		if not material_sampler.error_message.is_empty():
+			error_message = material_sampler.error_message
+			return false
 	if material is BaseMaterial3D and material.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
 		if _collect_emission and material.emission_enabled:
 			error_message = "Transparent emissive surfaces are not supported by the static area-source baker."
@@ -459,8 +657,6 @@ func _material_reflectance(material: Material) -> Vector3:
 	if material is BaseMaterial3D:
 		var linear: Color = material.albedo_color.srgb_to_linear()
 		color = Vector3(linear.r, linear.g, linear.b) * (1.0 - material.metallic)
-		if material.albedo_texture != null:
-			push_warning("FMagicGI: albedo textures are not sampled by the offline PRT baker; only the material tint is used.")
 	elif material is ShaderMaterial:
 		push_warning("FMagicGI: ShaderMaterial reflectance is not evaluated offline; using Fallback Material Reflectance.")
 	if material != null:
@@ -469,6 +665,7 @@ func _material_reflectance(material: Material) -> Vector3:
 
 func _collect_terrain(terrain: Node3D) -> void:
 	_triangle_emitter_index = -1
+	_triangle_material = -1
 	_triangle_source_id = terrain.get_instance_id()
 	_triangle_surface_index = -1
 	_triangle_domain_source = _terrain_domain_source(terrain)
@@ -527,12 +724,17 @@ func _triangle(a: Vector3, b: Vector3, c: Vector3,
 		return false
 	faces.append_array([a, b, c])
 	reflectance.append(_triangle_reflectance)
+	face_materials.append(_triangle_material)
+	face_uv.append_array([uv1_a, uv1_b, uv1_c])
+	face_uv2.append_array([uv2_a, uv2_b, uv2_c])
 	face_source_ids.append(_triangle_source_id)
 	face_surface_indices.append(_triangle_surface_index)
 	face_domain_sources.append(_triangle_domain_source)
-	if _triangle_emitter_index >= 0:
-		emitters.append_triangle(_triangle_emitter_index, a, b, c, normal,
-				uv1_a, uv1_b, uv1_c, uv2_a, uv2_b, uv2_c)
+	var face_emitter_index := -1
+	if _triangle_emitter_index >= 0 and emitters.append_triangle(_triangle_emitter_index, a, b, c,
+			uv1_a, uv1_b, uv1_c, uv2_a, uv2_b, uv2_c, face_emitter_indices.size()):
+		face_emitter_index = _triangle_emitter_index
+	face_emitter_indices.append(face_emitter_index)
 	return true
 
 func _sample_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector3,
@@ -556,10 +758,10 @@ func _sample_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector3,
 	var high_u := maxf(a[axis_u], maxf(b[axis_u], c[axis_u]))
 	var low_v := minf(a[axis_v], minf(b[axis_v], c[axis_v]))
 	var high_v := maxf(a[axis_v], maxf(b[axis_v], c[axis_v]))
-	var first_u := ceili(low_u / _probe_spacing - 0.5 - 0.000001)
-	var last_u := floori(high_u / _probe_spacing - 0.5 + 0.000001)
-	var first_v := ceili(low_v / _probe_spacing - 0.5 - 0.000001)
-	var last_v := floori(high_v / _probe_spacing - 0.5 + 0.000001)
+	var first_u := ceili(low_u / _active_candidate_spacing - 0.5 - 0.000001)
+	var last_u := floori(high_u / _active_candidate_spacing - 0.5 + 0.000001)
+	var first_v := ceili(low_v / _active_candidate_spacing - 0.5 - 0.000001)
+	var last_v := floori(high_v / _active_candidate_spacing - 0.5 + 0.000001)
 	var canonical_points_inside := 0
 	var dominant_normal := normal[dominant_axis]
 	if absf(dominant_normal) > 0.000001 and first_u <= last_u and first_v <= last_v:
@@ -570,8 +772,8 @@ func _sample_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector3,
 					error_message = "Surface sampling exceeds the 2,000,000-candidate work budget."
 					return false
 				var point := Vector3.ZERO
-				point[axis_u] = (float(cell_u) + 0.5) * _probe_spacing
-				point[axis_v] = (float(cell_v) + 0.5) * _probe_spacing
+				point[axis_u] = (float(cell_u) + 0.5) * _active_candidate_spacing
+				point[axis_v] = (float(cell_v) + 0.5) * _active_candidate_spacing
 				point[dominant_axis] = a[dominant_axis] - (
 					normal[axis_u] * (point[axis_u] - a[axis_u])
 						+ normal[axis_v] * (point[axis_v] - a[axis_v])) / dominant_normal
@@ -593,9 +795,9 @@ func _sample_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector3,
 func _triangle_fallback_steps(longest: float) -> int:
 	# Retain the bounded barycentric lattice only for triangles without a
 	# canonical projected grid point. Large faces use a half-spacing fallback.
-	var candidate_step := _probe_spacing
-	if longest > _probe_spacing * 8.0:
-		candidate_step = maxf(0.05, _probe_spacing * 0.5)
+	var candidate_step := _active_candidate_spacing
+	if longest > _active_candidate_spacing * 8.0:
+		candidate_step = maxf(0.05, _active_candidate_spacing * 0.5)
 	return maxi(1, ceili(longest / candidate_step))
 
 func _queue_fallback_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector3,
@@ -669,6 +871,12 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 			_fallback_candidate_count += 1
 			var point := a + (b - a) * (float(u) / steps) \
 					+ (c - a) * (float(v) / steps)
+			if _volume.adaptive_placement:
+				var estimated_center := point + normal * _preferred_probe_offset(_volume)
+				var estimated_cell := ProbeLayout.world_cell(estimated_center, _probe_spacing)
+				var domain_key := _candidate_domain_key(normal, triangle_centroid)
+				if _has_staged_candidate_for_world_cell(domain_key, estimated_cell):
+					continue
 			_add_surface(point, normal, triangle_centroid, owner_face_index, false,
 					a, b, c)
 			if not error_message.is_empty():
@@ -676,16 +884,27 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 	# Retain the small-triangle centroid rescue, but only after all canonical grid
 	# opportunities and the bounded raw fallback have been considered.
 	if steps == 1 and _valid_candidate_count == accepted_before:
-		_candidate_count += 1
-		if _candidate_count > MAX_SAMPLE_CANDIDATES:
-			error_message = "Surface sampling exceeds the 2,000,000-candidate work budget."
-			return false
-		_fallback_candidate_count += 1
-		_add_surface(triangle_centroid, normal, triangle_centroid, owner_face_index, false,
-				a, b, c)
-		if not error_message.is_empty():
-			return false
+		var estimated_center := triangle_centroid + normal * _preferred_probe_offset(_volume)
+		var estimated_cell := ProbeLayout.world_cell(estimated_center, _probe_spacing)
+		var domain_key := _candidate_domain_key(normal, triangle_centroid)
+		if not _volume.adaptive_placement \
+				or not _has_staged_candidate_for_world_cell(domain_key, estimated_cell):
+			_candidate_count += 1
+			if _candidate_count > MAX_SAMPLE_CANDIDATES:
+				error_message = "Surface sampling exceeds the 2,000,000-candidate work budget."
+				return false
+			_fallback_candidate_count += 1
+			_add_surface(triangle_centroid, normal, triangle_centroid, owner_face_index, false,
+					a, b, c)
+			if not error_message.is_empty():
+				return false
 	return true
+
+func _has_staged_candidate_for_world_cell(domain_key: String,
+		world_cell: Vector3i) -> bool:
+	var cell_bucket: Dictionary = _world_candidate_cells.get(world_cell, {})
+	var domains: Dictionary = cell_bucket.get("domains", {})
+	return domains.has(domain_key) and not domains[domain_key]["candidates"].is_empty()
 
 func _dominant_normal_axis(normal: Vector3) -> int:
 	var axis := 0
@@ -916,6 +1135,8 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		rejected_inside_or_indeterminate_center_count += 1
 		return
 	var world_cell := ProbeLayout.world_cell(probe_center, _probe_spacing)
+	var arbitration_key := _world_spacing_cell_key(probe_center, _arbitration_spacing)
+	var arbitration_center := _world_spacing_cell_center(probe_center, _arbitration_spacing)
 	_valid_candidate_count += 1
 	var candidate := {
 		"surface": surface,
@@ -926,10 +1147,27 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		"canonical": canonical,
 		"face_index": owner_face_index,
 		"world_cell": world_cell,
+		"arbitration_key": arbitration_key,
+		"spacing": _active_candidate_spacing,
 		"score": probe_center.distance_squared_to(
-				ProbeLayout.world_cell_center(world_cell, _probe_spacing)),
+				arbitration_center),
 	}
 	_stage_world_candidate(world_cell, domain_key, candidate)
+
+func _candidate_capacity_per_domain() -> int:
+	if not _volume.adaptive_placement:
+		return ProbeLayout.CANDIDATES_PER_DOMAIN
+	var refinement_ratio := ceili(_probe_spacing / maxf(_arbitration_spacing, 0.000001))
+	return mini(MAX_PROBES, maxi(ProbeLayout.CANDIDATES_PER_DOMAIN,
+			refinement_ratio * refinement_ratio * 2))
+
+func _world_spacing_cell_key(point: Vector3, spacing: float) -> String:
+	var scaled := point / spacing
+	return "%d,%d,%d" % [floori(scaled.x), floori(scaled.y), floori(scaled.z)]
+
+func _world_spacing_cell_center(point: Vector3, spacing: float) -> Vector3:
+	var lower := (point / spacing).floor() * spacing
+	return lower + Vector3.ONE * spacing * 0.5
 
 func _stage_world_candidate(world_cell: Vector3i, domain_key: String,
 		candidate: Dictionary) -> void:
@@ -952,7 +1190,7 @@ func _stage_world_candidate(world_cell: Vector3i, domain_key: String,
 			var anchor_epsilon := maxf(0.000001, _probe_spacing * 0.000001)
 			if existing_surface.distance_squared_to(candidate["surface"]) \
 					<= anchor_epsilon * anchor_epsilon:
-				if bool(candidate["canonical"]) and not bool(existing["canonical"]):
+				if _candidate_less(candidate, existing):
 					candidates[candidate_index] = candidate
 					candidates.sort_custom(Callable(self, "_candidate_less"))
 					domain_bucket["canonical"] = true
@@ -961,12 +1199,24 @@ func _stage_world_candidate(world_cell: Vector3i, domain_key: String,
 					cell_bucket["domains"] = domains
 					_world_candidate_cells[world_cell] = cell_bucket
 				return
+			if candidate["arbitration_key"] == existing["arbitration_key"]:
+				if _candidate_less(candidate, existing):
+					candidates[candidate_index] = candidate
+					candidates.sort_custom(Callable(self, "_candidate_less"))
+					domain_bucket["candidates"] = candidates
+					domains[domain_key] = domain_bucket
+					cell_bucket["domains"] = domains
+					_world_candidate_cells[world_cell] = cell_bucket
+				return
+		var previous_candidate_count := candidates.size()
 		candidates.append(candidate)
 		candidates.sort_custom(Callable(self, "_candidate_less"))
-		if candidates.size() > ProbeLayout.CANDIDATES_PER_DOMAIN:
-			candidates.resize(ProbeLayout.CANDIDATES_PER_DOMAIN)
-		else:
-			_staged_candidate_count += 1
+		var capacity := _candidate_capacity_per_domain()
+		if candidates.size() > capacity:
+			candidates.resize(capacity)
+		_staged_candidate_count += candidates.size() - previous_candidate_count
+		if _staged_candidate_count > MAX_STAGED_CANDIDATE_RECORDS:
+			error_message = "World-space probe candidate staging exceeds its bounded record limit."
 		domain_bucket["canonical"] = bool(domain_bucket.get("canonical", false)) \
 				or bool(candidate["canonical"])
 		domain_bucket["candidates"] = candidates
@@ -1042,6 +1292,10 @@ func _candidate_less(a: Dictionary, b: Dictionary) -> bool:
 	var canonical_b := bool(b["canonical"])
 	if canonical_a != canonical_b:
 		return canonical_a
+	var spacing_a := float(a.get("spacing", _probe_spacing))
+	var spacing_b := float(b.get("spacing", _probe_spacing))
+	if spacing_a != spacing_b:
+		return spacing_a < spacing_b
 	var score_a := float(a["score"])
 	var score_b := float(b["score"])
 	if score_a != score_b:
@@ -1064,76 +1318,95 @@ func _candidate_less(a: Dictionary, b: Dictionary) -> bool:
 
 func _finalize_world_candidates() -> bool:
 	_bounded_candidate_pruned_count = maxi(0, _valid_candidate_count - _staged_candidate_count)
-	var canonical_domain_entries: Dictionary = {}
-	var fallback_domain_entries: Dictionary = {}
-	var minimum_world_cell := Vector3i(2147483647, 2147483647, 2147483647)
+	var candidate_groups := [{}, {}]
+	var minimum_base_cell := Vector3i(2147483647, 2147483647, 2147483647)
 	for cell_value in _world_candidate_cells:
-		var world_cell: Vector3i = cell_value
-		minimum_world_cell.x = mini(minimum_world_cell.x, world_cell.x)
-		minimum_world_cell.y = mini(minimum_world_cell.y, world_cell.y)
-		minimum_world_cell.z = mini(minimum_world_cell.z, world_cell.z)
-	for cell_value in _world_candidate_cells:
-		var world_cell: Vector3i = cell_value
-		var domains: Dictionary = _world_candidate_cells[world_cell]["domains"]
-		# Shift only arbitration order to a nonnegative local range. Occupancy and
-		# spacing remain anchored to world origin.
-		var order_cell := world_cell - minimum_world_cell
-		var morton := ProbeLayout.morton_words(order_cell)
+		var base_world_cell: Vector3i = cell_value
+		minimum_base_cell.x = mini(minimum_base_cell.x, base_world_cell.x)
+		minimum_base_cell.y = mini(minimum_base_cell.y, base_world_cell.y)
+		minimum_base_cell.z = mini(minimum_base_cell.z, base_world_cell.z)
+		var domains: Dictionary = _world_candidate_cells[base_world_cell]["domains"]
 		for domain_key in domains:
 			var domain_bucket: Dictionary = domains[domain_key]
-			var canonical_candidates: Array = []
-			var fallback_candidates: Array = []
 			for candidate in domain_bucket["candidates"]:
-				if bool(candidate["canonical"]):
-					canonical_candidates.append(candidate)
-				else:
-					fallback_candidates.append(candidate)
-			if not canonical_candidates.is_empty():
-				var entries: Array = canonical_domain_entries.get(domain_key, [])
-				entries.append({"cell": world_cell, "morton": morton,
-						"candidates": canonical_candidates})
-				canonical_domain_entries[domain_key] = entries
-			if not fallback_candidates.is_empty():
-				var fallback_entries: Array = fallback_domain_entries.get(domain_key, [])
-				fallback_entries.append({"cell": world_cell, "morton": morton,
-						"candidates": fallback_candidates})
-				fallback_domain_entries[domain_key] = fallback_entries
+				var arbitration_key := String(candidate.get("arbitration_key",
+						_world_spacing_cell_key(candidate["center"], _arbitration_spacing)))
+				var phase_index := 0 if bool(candidate["canonical"]) else 1
+				var phase_groups: Dictionary = candidate_groups[phase_index]
+				var domain_groups: Dictionary = phase_groups.get(String(domain_key), {})
+				var cell_candidates: Array = domain_groups.get(arbitration_key, [])
+				cell_candidates.append(candidate)
+				domain_groups[arbitration_key] = cell_candidates
+				phase_groups[String(domain_key)] = domain_groups
+				candidate_groups[phase_index] = phase_groups
+	if minimum_base_cell.x == 2147483647:
+		minimum_base_cell = Vector3i.ZERO
+	var canonical_domain_entries: Dictionary = _make_domain_entries(candidate_groups[0],
+			minimum_base_cell)
+	var fallback_domain_entries: Dictionary = _make_domain_entries(candidate_groups[1],
+			minimum_base_cell)
 	var accepted_world_centers: Dictionary = {}
 	var accepted_cells: Dictionary = {}
+	var accepted_base_cells: Dictionary = {}
 	var spacing_blocked_cells: Dictionary = {}
 	var lookup_blocked_cells: Dictionary = {}
-	var minimum_separation_squared := ProbeLayout.world_center_separation_squared(_probe_spacing)
 	# Canonical projected world-grid points own the first complete fairness pass.
 	# Only after it finishes can small-face barycentric/centroid fallback points
-	# compete for cells that remain available.
+	# compete for local arbitration cells that remain available.
 	if not _run_candidate_phase(canonical_domain_entries, accepted_world_centers,
-			accepted_cells, spacing_blocked_cells, lookup_blocked_cells,
-			minimum_separation_squared):
+			accepted_cells, accepted_base_cells, spacing_blocked_cells,
+			lookup_blocked_cells):
 		return false
 	if not _run_candidate_phase(fallback_domain_entries, accepted_world_centers,
-			accepted_cells, spacing_blocked_cells, lookup_blocked_cells,
-			minimum_separation_squared):
+			accepted_cells, accepted_base_cells, spacing_blocked_cells,
+			lookup_blocked_cells):
 		return false
 	for cell_value in _world_candidate_cells:
-		var world_cell: Vector3i = cell_value
-		var domains: Dictionary = _world_candidate_cells[world_cell]["domains"]
+		var base_world_cell: Vector3i = cell_value
+		var domains: Dictionary = _world_candidate_cells[base_world_cell]["domains"]
 		var staged_for_cell := 0
 		for domain_bucket_value in domains.values():
 			staged_for_cell += domain_bucket_value["candidates"].size()
-		if accepted_cells.has(world_cell):
-			rejected_world_cell_competition_count += maxi(0, staged_for_cell - 1)
+		var accepted_in_cell := int(accepted_base_cells.get(base_world_cell, 0))
+		if accepted_in_cell > 0:
+			rejected_world_cell_competition_count += maxi(0, staged_for_cell - accepted_in_cell)
 		else:
 			rejected_world_cell_competition_count += staged_for_cell
-			if spacing_blocked_cells.has(world_cell):
+			if spacing_blocked_cells.has(base_world_cell):
 				rejected_center_overlap_count += 1
-			if lookup_blocked_cells.has(world_cell):
+			if lookup_blocked_cells.has(base_world_cell):
 				rejected_lookup_capacity_count += 1
 	return true
 
+func _make_domain_entries(grouped_candidates: Dictionary,
+		minimum_base_cell: Vector3i) -> Dictionary:
+	var result: Dictionary = {}
+	for domain_key_value in grouped_candidates:
+		var domain_key := String(domain_key_value)
+		var domain_groups: Dictionary = grouped_candidates[domain_key]
+		var entries: Array = []
+		for arbitration_key_value in domain_groups:
+			var arbitration_key := String(arbitration_key_value)
+			var candidates: Array = domain_groups[arbitration_key]
+			candidates.sort_custom(Callable(self, "_candidate_less"))
+			var order_cell: Vector3i = candidates[0].get("world_cell", Vector3i.ZERO)
+			for candidate in candidates:
+				var candidate_cell: Vector3i = candidate.get("world_cell", order_cell)
+				if _world_cell_less(candidate_cell, order_cell):
+					order_cell = candidate_cell
+			entries.append({
+				"cell": order_cell,
+				"arbitration_key": arbitration_key,
+				"morton": ProbeLayout.morton_words(order_cell - minimum_base_cell),
+				"candidates": candidates,
+			})
+		result[domain_key] = entries
+	return result
+
 func _run_candidate_phase(domain_entries: Dictionary,
 		accepted_world_centers: Dictionary, accepted_cells: Dictionary,
-		spacing_blocked_cells: Dictionary, lookup_blocked_cells: Dictionary,
-		minimum_separation_squared: float) -> bool:
+		accepted_base_cells: Dictionary, spacing_blocked_cells: Dictionary,
+		lookup_blocked_cells: Dictionary) -> bool:
 	var domain_states: Dictionary = {}
 	var scheduler: Array[Dictionary] = []
 	for domain_key_value in domain_entries:
@@ -1165,10 +1438,10 @@ func _run_candidate_phase(domain_entries: Dictionary,
 			domain_states.erase(domain_key)
 			continue
 		var opportunity: Dictionary = entries[cursor]
-		var world_cell: Vector3i = opportunity["cell"]
+		var arbitration_key := String(opportunity["arbitration_key"])
 		state["cursor"] = cursor + 1
 		state["attempted"] = int(state["attempted"]) + 1
-		if accepted_world_centers.has(world_cell):
+		if accepted_cells.has(arbitration_key):
 			domain_states[domain_key] = state
 			if int(state["cursor"]) < entries.size():
 				_coverage_heap_push(scheduler, _coverage_heap_item(domain_key, state))
@@ -1179,31 +1452,40 @@ func _run_candidate_phase(domain_entries: Dictionary,
 		var candidates: Array = opportunity["candidates"]
 		for candidate in candidates:
 			var lookup_cell := int(candidate["lookup_cell"])
-			if int(_cell_counts.get(lookup_cell, 0)) >= Data.CELL_CAPACITY:
+			if not _volume.adaptive_placement and int(_cell_counts.get(lookup_cell, 0)) >= Data.CELL_CAPACITY:
 				lookup_blocked = true
 				continue
 			if positions.size() >= MAX_PROBES:
 				error_message = "Surface sampling exceeds the 65,536-probe limit; increase Probe Spacing or reduce the volume."
 				return false
 			var center: Vector3 = candidate["center"]
-			if _accepted_world_center_conflict(world_cell, center,
-						accepted_world_centers, minimum_separation_squared):
+			var candidate_spacing := float(candidate.get("spacing", _probe_spacing))
+			var base_world_cell: Vector3i = candidate.get("world_cell", opportunity["cell"])
+			if _accepted_world_center_conflict(base_world_cell, center,
+						candidate_spacing, accepted_world_centers):
 				spacing_blocked = true
 				continue
 			positions.append(center)
 			surface_positions.append(candidate["surface"])
 			normals.append(candidate["normal"])
+			if _volume.adaptive_placement:
+				probe_spacings.append(candidate_spacing)
 			_cell_counts[lookup_cell] = int(_cell_counts.get(lookup_cell, 0)) + 1
-			accepted_world_centers[world_cell] = center
-			accepted_cells[world_cell] = true
+			var accepted_bucket: Array = accepted_world_centers.get(base_world_cell, [])
+			accepted_bucket.append({"center": center, "spacing": candidate_spacing})
+			accepted_world_centers[base_world_cell] = accepted_bucket
+			accepted_cells[arbitration_key] = true
+			accepted_base_cells[base_world_cell] = int(accepted_base_cells.get(base_world_cell, 0)) + 1
 			state["accepted"] = int(state["accepted"]) + 1
 			cell_accepted = true
 			break
 		if not cell_accepted:
 			if spacing_blocked:
-				spacing_blocked_cells[world_cell] = true
+				var base_world_cell: Vector3i = candidates[0].get("world_cell", opportunity["cell"])
+				spacing_blocked_cells[base_world_cell] = true
 			if lookup_blocked:
-				lookup_blocked_cells[world_cell] = true
+				var base_world_cell: Vector3i = candidates[0].get("world_cell", opportunity["cell"])
+				lookup_blocked_cells[base_world_cell] = true
 		domain_states[domain_key] = state
 		if int(state["cursor"]) < entries.size():
 			_coverage_heap_push(scheduler, _coverage_heap_item(domain_key, state))
@@ -1222,7 +1504,16 @@ func _domain_opportunity_less(a: Dictionary, b: Dictionary) -> bool:
 		return cell_a.x < cell_b.x
 	if cell_a.y != cell_b.y:
 		return cell_a.y < cell_b.y
-	return cell_a.z < cell_b.z
+	if cell_a.z != cell_b.z:
+		return cell_a.z < cell_b.z
+	return String(a["arbitration_key"]) < String(b["arbitration_key"])
+
+func _world_cell_less(a: Vector3i, b: Vector3i) -> bool:
+	if a.x != b.x:
+		return a.x < b.x
+	if a.y != b.y:
+		return a.y < b.y
+	return a.z < b.z
 
 func _coverage_heap_item(domain_key: String, state: Dictionary) -> Dictionary:
 	return {
@@ -1287,15 +1578,19 @@ func _coverage_heap_pop(heap: Array[Dictionary]) -> Dictionary:
 	return result
 
 func _accepted_world_center_conflict(world_cell: Vector3i, center: Vector3,
-		accepted: Dictionary, minimum_separation_squared: float) -> bool:
+		candidate_spacing: float, accepted: Dictionary) -> bool:
 	for dz in range(-1, 2):
 		for dy in range(-1, 2):
 			for dx in range(-1, 2):
 				var neighbor := world_cell + Vector3i(dx, dy, dz)
-				if accepted.has(neighbor) \
-						and center.distance_squared_to(accepted[neighbor]) \
-						< minimum_separation_squared:
-					return true
+				for other_value in accepted.get(neighbor, []):
+					var other: Dictionary = other_value
+					var average_spacing := 0.5 * (candidate_spacing + float(other["spacing"]))
+					var minimum_distance := maxf(0.0, average_spacing -
+							maxf(0.000001, average_spacing * 0.000001))
+					if center.distance_squared_to(other["center"]) \
+							< minimum_distance * minimum_distance:
+						return true
 	return false
 
 func _world_point_coordinates_are_supported(point: Vector3) -> bool:
@@ -1649,13 +1944,21 @@ func _clip_polygon(polygon: Array, axis: int, boundary: float, keep_greater: boo
 	return output
 
 func trace(origin: Vector3, direction: Vector3, max_distance: float) -> Dictionary:
-	if not bvh_ready:
+	return trace_scene.trace(origin, direction, max_distance) if bvh_ready and trace_scene != null else {}
+
+func trace_geometry(origin: Vector3, direction: Vector3,
+		max_distance: float) -> Dictionary:
+	if not bvh_ready or trace_scene == null:
 		return {}
-	var hit := bvh.intersect_segment(origin, origin + direction * max_distance)
-	if not hit.is_empty():
-		var face_index := int(hit["face_index"])
-		hit["albedo"] = reflectance[face_index]
-	return hit
+	return trace_scene.trace_geometry(origin, direction, max_distance)
+
+func trace_path(origin: Vector3, direction: Vector3, max_distance: float,
+		start_face_index := -1) -> Dictionary:
+	return trace_scene.trace_path(origin, direction, max_distance, start_face_index) if bvh_ready and trace_scene != null else {}
+
+func trace_emitter_connection(origin: Vector3, direction: Vector3, max_distance: float,
+		start_face_index := -1) -> Dictionary:
+	return trace_scene.trace_emitter_connection(origin, direction, max_distance, start_face_index) if bvh_ready and trace_scene != null else {}
 
 func safe_surface_offset(surface: Vector3, normal: Vector3) -> float:
-	return _safe_probe_offset(surface, normal, _preferred_probe_offset(_volume))
+	return trace_scene.safe_surface_offset(surface, normal) if trace_scene != null else 0.0

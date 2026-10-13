@@ -28,6 +28,15 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 	set(value):
 		surface_offset = clampf(value, 0.001, 0.2)
 		_settings_changed()
+## Refine near nearby surfaces, corners and thin walls; smooth areas retain Probe Spacing.
+@export var adaptive_placement := true:
+	set(value):
+		adaptive_placement = value
+		_settings_changed()
+@export_range(0.1, 1.0, 0.025, "suffix:m") var minimum_probe_spacing := 0.25:
+	set(value):
+		minimum_probe_spacing = clampf(value, 0.1, 1.0) if is_finite(value) else 0.25
+		_settings_changed()
 @export_range(1, 4096, 1, "or_greater") var bake_samples := 256:
 	set(value):
 		var clamped := clampi(value, 1, 65536)
@@ -54,6 +63,15 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 		fallback_material_reflectance = clampf(value, 0.0, 1.0)
 		_settings_changed()
 @export_range(0.0, 8.0, 0.01) var gi_strength := 1.0
+@export_group("Runtime Cache")
+@export var use_clv := true
+@export_range(0.1, 2.0, 0.025, "suffix:m") var clv_cell_size := 0.5:
+	set(value):
+		clv_cell_size = clampf(value, 0.1, 2.0) if is_finite(value) else 0.5
+@export_range(32, 512, 32) var clv_cells_per_frame := 256:
+	set(value):
+		clv_cells_per_frame = clampi(value, 32, 512)
+@export_group("")
 ## Optional explicit distant light/environment; otherwise the matching World3D is scanned.
 @export var sun: DirectionalLight3D
 ## Legacy scene compatibility. Sky diffuse is supplied by FengSkyLight; this
@@ -62,10 +80,12 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 @export var show_probes := true:
 	set(value):
 		show_probes = value
+		_sync_preview_exposure_request()
 		_refresh_viz()
 @export var show_sh_probes := false:
 	set(value):
 		show_sh_probes = value
+		_sync_preview_exposure_request()
 		_refresh_viz()
 @export var enabled := true:
 	set(value):
@@ -88,8 +108,11 @@ const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 var probe_positions := PackedVector3Array()
 var probe_surface_positions := PackedVector3Array()
 var probe_normals := PackedVector3Array()
+var probe_spacings := PackedFloat32Array()
 var _viz: Node3D
 var _viz_queued := false
+var _viz_preview_revision := -1
+var _viz_view_revision := -1
 var _layout_queued := false
 var _baking := false
 var _bake_assigning_data := false
@@ -111,14 +134,18 @@ var _visibility_upgrade_attempt := 0
 func _enter_tree() -> void:
 	set_notify_transform(true)
 	Runtime.register(self)
+	_sync_preview_exposure_request()
 	_rebuild_probes()
 
 func _exit_tree() -> void:
 	_bake_generation += 1
+	Runtime.set_preview_requested(self, false)
 	Runtime.unregister(self)
 
 func _process(_delta: float) -> void:
 	Runtime.tick()
+	if Engine.is_editor_hint() and (show_probes or show_sh_probes):
+		_update_preview_if_changed()
 	var now := Time.get_ticks_msec()
 	if now >= _next_geometry_check and not _baking:
 		_next_geometry_check = now + 1000
@@ -145,6 +172,8 @@ func has_bake() -> bool:
 		return false
 	return bake_data.matches_layout(size, probe_spacing, surface_offset, global_transform,
 			bake_samples, bake_bounces, bake_distance, terrain_reflectance, fallback_material_reflectance) \
+		and bake_data.adaptive_placement == adaptive_placement \
+		and (not adaptive_placement or is_equal_approx(bake_data.minimum_probe_spacing, minf(minimum_probe_spacing, probe_spacing))) \
 		and bake_data.scene_signature == Data.signature_for_geometry(_current_scene_signature)
 
 ## True when the saved resource is structurally sound and can still be sampled,
@@ -246,6 +275,7 @@ func refresh_surface_points() -> void:
 		probe_positions.clear()
 		probe_surface_positions.clear()
 		probe_normals.clear()
+		probe_spacings.clear()
 		_placement_warning_message = ""
 		_current_scene_signature = 0
 		_scene_signature_checked = true
@@ -253,6 +283,7 @@ func refresh_surface_points() -> void:
 		probe_positions = placement.positions
 		probe_surface_positions = placement.surface_positions
 		probe_normals = placement.normals
+		probe_spacings = placement.probe_spacings
 		_placement_warning_message = placement.warning_message
 		_current_scene_signature = placement.scene_signature
 		_scene_signature_checked = true
@@ -346,8 +377,30 @@ func _apply_viz() -> void:
 	_viz_queued = false
 	if not is_inside_tree() or not Engine.is_editor_hint() or _baking:
 		return
+	var preview_snapshot := Runtime.preview_snapshot(self) if show_probes or show_sh_probes else {}
 	if _viz == null:
-		_viz = Viz.build(self)
+		_viz = Viz.build(self, preview_snapshot)
 		add_child(_viz, false, INTERNAL_MODE_BACK)
 	else:
-		Viz.rebuild(self, _viz)
+		Viz.rebuild(self, _viz, preview_snapshot)
+	_viz_preview_revision = int(preview_snapshot.get("revision", -1))
+	_viz_view_revision = int(preview_snapshot.get("view_revision", -1))
+
+func _update_preview_if_changed() -> void:
+	if not is_inside_tree() or not Engine.is_editor_hint() or _baking or _viz == null:
+		return
+	var preview_snapshot := Runtime.preview_snapshot(self)
+	if preview_snapshot.is_empty():
+		return
+	var revision := int(preview_snapshot.get("revision", -1))
+	if revision != _viz_preview_revision:
+		_viz_preview_revision = revision
+		Viz.update_preview(self, _viz, preview_snapshot)
+	var view_revision := int(preview_snapshot.get("view_revision", -1))
+	if view_revision != _viz_view_revision:
+		_viz_view_revision = view_revision
+		Viz.update_preview_exposure(self, _viz, preview_snapshot)
+
+func _sync_preview_exposure_request() -> void:
+	if is_inside_tree() and Engine.is_editor_hint():
+		Runtime.set_preview_requested(self, show_probes or show_sh_probes)

@@ -436,7 +436,7 @@ RID RenderSceneBuffersRD::get_texture_slice_view(const StringName &p_context, co
 	NTKey key(p_context, p_texture_name);
 
 	// check if this is a known texture
-	ERR_FAIL_COND_V(!named_textures.has(key), RID());
+	ERR_FAIL_COND_V_MSG(!named_textures.has(key), RID(), vformat("Render texture '%s/%s' is not allocated.", p_context, p_texture_name));
 	NamedTexture &named_texture = named_textures[key];
 	ERR_FAIL_COND_V(named_texture.texture.is_null(), RID());
 

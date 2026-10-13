@@ -29,7 +29,7 @@ static func should_skip_world_boundary(node: Node, root: Node, world: World3D) -
 static func quick_signature(volume: Node3D) -> int:
 	var values: Array = [volume.global_transform, volume.size, volume.probe_spacing,
 			volume.surface_offset, volume.bake_distance, volume.terrain_reflectance,
-			volume.fallback_material_reflectance]
+			volume.fallback_material_reflectance, volume.adaptive_placement, volume.minimum_probe_spacing]
 	values.append(_scene_scan_signature(volume))
 	return hash(values)
 
@@ -68,6 +68,7 @@ static func _append_quick_signature(node: Node, root: Node, world: World3D, valu
 						material.transparency, material.albedo_texture.get_instance_id() if material.albedo_texture != null else 0])
 				if material.albedo_texture != null:
 					watch_resource(material.albedo_texture)
+					properties.append(resource_revision(material.albedo_texture))
 				var emission_texture: Texture2D = material.emission_texture
 				if emission_texture != null:
 					watch_resource(emission_texture)

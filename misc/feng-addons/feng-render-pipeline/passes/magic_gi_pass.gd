@@ -4,8 +4,11 @@ extends FengRuntimeSnapshotPass
 ## Applies the current lighting to a baked surface PRT field.
 ##
 ## Bake textures are cached by the immutable data identity and bake version. The
-## per-frame work only refreshes the camera and live-lighting uniform buffer.
+## Lighting is cached per bake and refreshed only when its sources change.
 
+const U = preload("../rd/uniforms.gd")
+const DirectionalCache = preload("magic_gi_directional_cache.gd")
+const ClipmapCache = preload("magic_gi_clv_cache.gd")
 const MAGIC_GI_OUTPUT: StringName = &"magic_gi"
 const IndirectGISelection = preload("../pipeline/indirect_gi_selection.gd")
 const UBO_BINDING := 9
@@ -15,6 +18,27 @@ const RUNTIME_SCRIPT_PATH := "res://addons/feng-magic-gi/feng_magic_gi_runtime.g
 const SKY_DIFFUSE_TEXTURE: StringName = &"sky_light_diffuse"
 const DIFFUSE_AO_BINDING := 16
 const DIFFUSE_AO_VIEW_CACHE_LIMIT := 32
+const RELIGHT_SHADER: RDShaderFile = preload("../library/magic-gi/magic_gi_relight.glsl")
+
+enum CLVDebugView { OFF, CASCADE_LEVELS, CACHE_VALIDITY, CELLS, RECONSTRUCTED_LIGHTING }
+
+## Choose Magic GI in Debug Buffers to view this. Set GI Exposure to 0 EV for
+## color-coded views. Reconstructed Lighting follows current exposure but omits
+## receiver albedo, AO, and GI strength.
+@export_enum("Off", "Cascade Levels", "Cache Validity", "Cells", "Reconstructed Lighting")
+var clv_debug_view: int = CLVDebugView.OFF:
+	set(value):
+		var next := clampi(value, CLVDebugView.OFF, CLVDebugView.RECONSTRUCTED_LIGHTING)
+		if clv_debug_view == next:
+			return
+		clv_debug_view = next
+		emit_changed()
+
+var _relight_shader := RID()
+var _relight_pipeline := RID()
+var _clipmaps: Dictionary = {}
+var _frame_clipmap: RefCounted
+var _clv_fallback: Dictionary = {}
 
 var _bake_resources: Dictionary = {}
 var _cache_clock := 0
@@ -109,7 +133,8 @@ func _warn_missing_replacement_bridge() -> void:
 
 func _parameter_bytes() -> PackedByteArray:
 	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
-	return PackedFloat32Array([value.x, _pre_exposure * _scene_exposure_normalization, value.z, value.w]).to_byte_array()
+	return PackedFloat32Array([value.x, _pre_exposure * _scene_exposure_normalization,
+		value.z, float(clv_debug_view)]).to_byte_array()
 
 func _init() -> void:
 	inputs = _make_inputs()
@@ -197,10 +222,36 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	if _frame_scene_data == null or cache_key.is_empty() or not is_instance_valid(data) \
 			or not _ensure_bake_resources(cache_key, data, version, rd) \
 			or not _update_emission_texture(cache_key, _frame_snapshot, data, rd) \
-			or not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
+			or not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd) \
+			or not _update_probe_lighting(cache_key, _frame_snapshot, rd):
 		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		return
 	var cached: Dictionary = _bake_resources[cache_key]
+	_frame_clipmap = null
+	var directional: RefCounted = cached.get("directional")
+	if directional != null and bool(_frame_snapshot.get("use_clv", true)):
+		var clip_key := "%d:%d:%s" % [buffers.get_instance_id(), view, cache_key]
+		if not _clipmaps.has(clip_key):
+			var clipmap := ClipmapCache.new()
+			if not clipmap.create(rd):
+				_free_rids(rd, clipmap.owned_rids())
+				return
+			_clipmaps[clip_key] = {"cache": clipmap, "owner": weakref(buffers), "last_used": _cache_clock, "bake": cache_key}
+			_sync_owned_rid_snapshot()
+		var entry: Dictionary = _clipmaps[clip_key]
+		entry.last_used = _cache_clock
+		var spacing := float(_frame_snapshot.get("clv_cell_size", 0.5))
+		# Keep the trilinear-safe span over useful source geometry, centering bounds
+		# that are smaller than the finest clipmap footprint.
+		var source_bounds: AABB = cached.source_bounds
+		var focus := ClipmapCache.focus_for_bounds(
+				_frame_scene_data.get_cam_transform().origin, source_bounds, spacing)
+		if not entry.cache.update(rd, focus, spacing,
+				directional.epoch, cached, directional, _ubo, _sampler,
+				int(_frame_snapshot.get("clv_cells_per_frame", 256))):
+			return
+		_frame_clipmap = entry.cache
+	_prune_clipmaps(rd)
 	_cache_clock += 1
 	cached["last_used"] = _cache_clock
 	_bake_resources[cache_key] = cached
@@ -209,6 +260,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var sampler_before := _sampler
 	var raster_count_before := _raster_pipelines.size()
 	super._render(buffers, view, rd)
+	_frame_clipmap = null
 	if shader_before != _shader or compute_before != _compute_pipeline \
 			or sampler_before != _sampler or raster_count_before != _raster_pipelines.size():
 		_sync_owned_rid_snapshot()
@@ -225,6 +277,8 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 				and cached.get("visibility_nodes", RID()).is_valid() \
 				and cached.get("visibility_triangles", RID()).is_valid() \
 				and cached.get("indices", RID()).is_valid() \
+				and cached.get("index_entries", RID()).is_valid() \
+				and cached.get("probe_lighting", RID()).is_valid() \
 				and cached.get("emission", RID()).is_valid():
 			return true
 		_release_bake_resources(cache_key, rd)
@@ -275,15 +329,32 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 	var node_rid := rd.storage_buffer_create(node_bytes.size(), node_bytes)
 	var triangle_rid := rd.storage_buffer_create(triangle_bytes.size(), triangle_bytes)
 	var dims: Vector3i = data.get("grid_dims")
-	var index_rid := _create_index_texture(rd, dims, index_bytes)
+	var index_rid := _create_index_texture(rd, dims, index_bytes, bool(upload.get("sparse_indices", false)))
+	var index_entries: PackedByteArray = upload.get("index_entries", PackedInt32Array([0]).to_byte_array())
+	var entries_rid := rd.storage_buffer_create(index_entries.size(), index_entries)
 	var emission_rid := _create_image_texture(rd, emission_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT,
 			RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT)
+	var lighting_rid := rd.storage_buffer_create(int(data.call("probe_count")) * 32)
+	var source_positions: PackedVector3Array = data.get("positions")
+	var source_bounds := AABB(source_positions[0], Vector3.ZERO)
+	for position in source_positions:
+		source_bounds = source_bounds.expand(position)
+	var directional: RefCounted
+	if data.get("directional") != null:
+		directional = DirectionalCache.new()
+		if not directional.create(rd, data):
+			_free_rids(rd, directional.owned_rids())
+			_free_rids(rd, [transfer_rid, primary_sky_rid, geometry_rid, visibility_rid,
+				node_rid, triangle_rid, index_rid, entries_rid, emission_rid, lighting_rid])
+			return false
 	if not transfer_rid.is_valid() or not primary_sky_rid.is_valid() or not geometry_rid.is_valid() \
 			or not visibility_rid.is_valid() \
 			or not node_rid.is_valid() or not triangle_rid.is_valid() \
-			or not index_rid.is_valid() or not emission_rid.is_valid():
+			or not index_rid.is_valid() or not entries_rid.is_valid() or not emission_rid.is_valid() or not lighting_rid.is_valid():
+		if directional != null:
+			_free_rids(rd, directional.owned_rids())
 		for rid in [transfer_rid, primary_sky_rid, geometry_rid, visibility_rid,
-				node_rid, triangle_rid, index_rid, emission_rid]:
+				node_rid, triangle_rid, index_rid, entries_rid, emission_rid, lighting_rid]:
 			if rid.is_valid():
 				rd.free_rid(rid)
 		_report("RenderingDevice could not upload the Magic GI PRT atlas, emission atlas, or index grid.")
@@ -298,7 +369,11 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 		"visibility_nodes": node_rid,
 		"visibility_triangles": triangle_rid,
 		"indices": index_rid,
+		"index_entries": entries_rid,
 		"emission": emission_rid,
+		"probe_lighting": lighting_rid,
+		"directional": directional,
+		"source_bounds": source_bounds,
 		"emission_identity": "",
 		"emission_revision": -1,
 		"grid_dims": dims,
@@ -309,6 +384,48 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 	}
 	_prune_bake_cache(rd)
 	_sync_owned_rid_snapshot()
+	return true
+
+## Relight each probe only when its sources change. Geometry filtering remains in
+## the surface gather; this cache is independent of camera, exposure and material.
+func _update_probe_lighting(cache_key: String, snapshot: Dictionary, rd: RenderingDevice) -> bool:
+	var cached: Dictionary = _bake_resources[cache_key]
+	var sources := [snapshot.get("lighting", PackedFloat32Array()),
+		snapshot.get("sky_lighting", PackedFloat32Array()),
+		cached["emission_identity"], cached["emission_revision"]]
+	if cached.get("lighting_sources", []) == sources:
+		return true
+	if not _ensure_sampler(rd):
+		return false
+	if not _relight_shader.is_valid():
+		_relight_shader = rd.shader_create_from_spirv(RELIGHT_SHADER.get_spirv(), "Magic GI Relight")
+		_sync_owned_rid_snapshot()
+		if not _relight_shader.is_valid():
+			return false
+	if not _relight_pipeline.is_valid():
+		_relight_pipeline = rd.compute_pipeline_create(_relight_shader)
+		_sync_owned_rid_snapshot()
+		if not _relight_pipeline.is_valid():
+			return false
+	var uniform_set := UniformSetCacheRD.get_cache(_relight_shader, 0, [
+		U.sampled(0, _sampler, cached["transfer"]),
+		U.sampled(1, _sampler, cached["primary_sky"]),
+		U.sampled(2, _sampler, cached["emission"]),
+		U.uniform_buffer(3, _ubo), U.storage_buffer(4, cached["probe_lighting"]),
+	])
+	if not uniform_set.is_valid():
+		return false
+	rd.draw_command_begin_label("Magic GI Relight", Color(0.4, 0.8, 0.3))
+	var list := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(list, _relight_pipeline)
+	rd.compute_list_bind_uniform_set(list, uniform_set, 0)
+	rd.compute_list_dispatch(list, (int(cached["probe_count"]) + 63) / 64, 1, 1)
+	rd.compute_list_end()
+	rd.draw_command_end_label()
+	var directional: RefCounted = cached.get("directional")
+	if directional != null and not directional.update(rd, _ubo, snapshot, cached["probe_lighting"]):
+		return false
+	cached["lighting_sources"] = sources.duplicate(true)
 	return true
 
 func _make_emission_image(data: Resource, snapshot: Dictionary) -> Image:
@@ -350,8 +467,9 @@ func _update_emission_texture(cache_key: String, snapshot: Dictionary, data: Res
 func _create_image_texture(rd: RenderingDevice, image: Image, data_format: int, extra_usage_bits := 0) -> RID:
 	return _create_texture(rd, image.get_size(), data_format, image.get_data(), extra_usage_bits)
 
-func _create_index_texture(rd: RenderingDevice, dims: Vector3i, bytes: PackedByteArray) -> RID:
-	return _create_texture(rd, Vector2i(dims.x * 8, dims.y * dims.z), RenderingDevice.DATA_FORMAT_R32_SINT, bytes)
+func _create_index_texture(rd: RenderingDevice, dims: Vector3i, bytes: PackedByteArray, sparse := false) -> RID:
+	return _create_texture(rd, Vector2i(dims.x * (1 if sparse else 8), dims.y * dims.z),
+		RenderingDevice.DATA_FORMAT_R32G32_SINT if sparse else RenderingDevice.DATA_FORMAT_R32_SINT, bytes)
 
 func _create_texture(rd: RenderingDevice, size: Vector2i, data_format: int, bytes: PackedByteArray,
 		extra_usage_bits := 0) -> RID:
@@ -386,8 +504,15 @@ func _take_bake_rids(cache_key: String) -> Array[RID]:
 		return rids
 	var cached: Dictionary = _bake_resources[cache_key]
 	_bake_resources.erase(cache_key)
+	var directional: RefCounted = cached.get("directional")
+	if directional != null:
+		rids.append_array(directional.owned_rids())
+	for key in _clipmaps.keys():
+		if _clipmaps[key].bake == cache_key:
+			rids.append_array(_clipmaps[key].cache.owned_rids())
+			_clipmaps.erase(key)
 	for name in ["transfer", "primary_sky", "geometry", "visibility_moments",
-			"visibility_nodes", "visibility_triangles", "indices", "emission"]:
+			"visibility_nodes", "visibility_triangles", "indices", "index_entries", "emission", "probe_lighting"]:
 		var rid: RID = cached.get(name, RID())
 		if rid.is_valid():
 			rids.append(rid)
@@ -452,11 +577,8 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		_report("Cannot create the zero SkyLight diffuse fallback texture.")
 		return binding_data
 	for spec in [
-		{"binding": 6, "texture": cached["transfer"]},
 		{"binding": 7, "texture": cached["geometry"]},
 		{"binding": 8, "texture": cached["indices"]},
-		{"binding": 10, "texture": cached["emission"]},
-		{"binding": 11, "texture": cached["primary_sky"]},
 		{"binding": 12, "texture": sky_diffuse},
 		{"binding": 13, "texture": cached["visibility_moments"]},
 	]:
@@ -482,6 +604,8 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	for spec in [
 		{"binding": 14, "buffer": cached["visibility_nodes"]},
 		{"binding": 15, "buffer": cached["visibility_triangles"]},
+		{"binding": 17, "buffer": cached["probe_lighting"]},
+		{"binding": 22, "buffer": cached["index_entries"]},
 	]:
 		var uniform := RDUniform.new()
 		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
@@ -489,8 +613,70 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		uniform.add_id(spec["buffer"])
 		uniforms.append(uniform)
 	uniforms.append(_ubo_uniform(UBO_BINDING))
+	if not _ensure_clv_fallback(rd):
+		_binding_error = true
+		return binding_data
+	var directional: RefCounted = cached.get("directional")
+	if _frame_clipmap == null:
+		var mode := PackedInt32Array([1 if directional != null else 0]).to_byte_array()
+		rd.buffer_update(_clv_fallback.parameters, 76, 4, mode)
+	uniforms.append(U.storage_buffer(18, directional.lighting if directional != null else _clv_fallback.lighting))
+	uniforms.append(U.sampled(19, _frame_clipmap.sampler if _frame_clipmap != null else _sampler,
+		_frame_clipmap.texture if _frame_clipmap != null else _clv_fallback.texture))
+	uniforms.append(U.sampled(20, _sampler, _frame_clipmap.tags if _frame_clipmap != null else _clv_fallback.tags))
+	uniforms.append(U.uniform_buffer(21, _frame_clipmap.parameters if _frame_clipmap != null else _clv_fallback.parameters))
 	binding_data["uniforms"] = uniforms
 	return binding_data
+
+func _ensure_clv_fallback(rd: RenderingDevice) -> bool:
+	if not _clv_fallback.is_empty():
+		return true
+	var format := RDTextureFormat.new()
+	format.texture_type = RenderingDevice.TEXTURE_TYPE_3D
+	format.width = 1
+	format.height = 1
+	format.depth = 1
+	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
+	var zero := PackedByteArray()
+	zero.resize(16)
+	var texture := rd.texture_create(format, RDTextureView.new(), [zero])
+	format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SINT
+	var tags := rd.texture_create(format, RDTextureView.new(), [zero])
+	zero.resize(80)
+	_clv_fallback = {"texture": texture, "tags": tags,
+		"parameters": rd.uniform_buffer_create(80, zero), "lighting": rd.storage_buffer_create(320)}
+	for rid: RID in _clv_fallback.values():
+		if not rid.is_valid():
+			for allocated: RID in _clv_fallback.values():
+				if allocated.is_valid():
+					rd.free_rid(allocated)
+			_clv_fallback.clear()
+			return false
+	_sync_owned_rid_snapshot()
+	return true
+
+func _prune_clipmaps(rd: RenderingDevice) -> void:
+	var removed := false
+	for key in _clipmaps.keys():
+		if _clipmaps[key].owner.get_ref() == null:
+			_free_rids(rd, _clipmaps[key].cache.owned_rids())
+			_clipmaps.erase(key)
+			removed = true
+	while _clipmaps.size() > 4:
+		var oldest_key := ""
+		var oldest := 0x7fffffff
+		for key in _clipmaps:
+			if _clipmaps[key].cache != _frame_clipmap and int(_clipmaps[key].last_used) < oldest:
+				oldest = int(_clipmaps[key].last_used)
+				oldest_key = key
+		if oldest_key.is_empty():
+			break
+		_free_rids(rd, _clipmaps[oldest_key].cache.owned_rids())
+		_clipmaps.erase(oldest_key)
+		removed = true
+	if removed:
+		_sync_owned_rid_snapshot()
 
 func _get_diffuse_ao_view(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> RID:
 	var texture := _frame_diffuse_ao_texture
@@ -597,10 +783,18 @@ func _current_owned_rids() -> Array[RID]:
 	var rids: Array[RID] = []
 	rids.append_array(_raster_pipelines.values())
 	rids.append_array([_compute_pipeline, _shader, _sampler, _ubo])
+	rids.append_array([_relight_pipeline, _relight_shader])
+	for rid: RID in _clv_fallback.values():
+		rids.append(rid)
+	for entry: Dictionary in _clipmaps.values():
+		rids.append_array(entry.cache.owned_rids())
+	for bake: Dictionary in _bake_resources.values():
+		if bake.get("directional") != null:
+			rids.append_array(bake.directional.owned_rids())
 	rids.append_array([_zero_sky_diffuse, _diffuse_ao_white])
 	for cached in _bake_resources.values():
 		for name in ["transfer", "primary_sky", "geometry", "visibility_moments",
-				"visibility_nodes", "visibility_triangles", "indices", "emission"]:
+				"visibility_nodes", "visibility_triangles", "indices", "index_entries", "emission", "probe_lighting"]:
 			var rid: RID = cached.get(name, RID())
 			if rid.is_valid():
 				rids.append(rid)
@@ -620,6 +814,11 @@ func _take_owned_rids() -> Array[RID]:
 	# and clear our fields first; only append the detached snapshot afterwards.
 	var owned_rids: Array[RID] = super.call("_current_owned_rids")
 	_bake_resources.clear()
+	_clipmaps.clear()
+	_clv_fallback.clear()
+	_frame_clipmap = null
+	_relight_shader = RID()
+	_relight_pipeline = RID()
 	_zero_sky_diffuse = RID()
 	_diffuse_ao_white = RID()
 	_frame_diffuse_ao_texture = RID()

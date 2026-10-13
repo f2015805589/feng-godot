@@ -41,8 +41,18 @@ static func update_probe_targets(targets: Array, owner_id: int, metadata: Dictio
 		var snapshot: Dictionary = previous.duplicate(true) if previous is Dictionary else {}
 		if String(metadata.get("source_mode", "")) == "scene_capture":
 			var completed: Variant = _completed_capture_snapshots.get(owner_id, {})
-			if completed is Dictionary:
+			if _is_completed_scene_capture(completed):
 				snapshot.merge(completed, true)
+			else:
+				# A previous external source may still be present in this target's
+				# snapshot. Scene mode may use only a completed scene capture or its
+				# separately tagged saved seed, never that stale RID.
+				for key in ["radiance_rid", "ready_generation", "source_faces", "source_size",
+						"capture_position", "source_basis"]:
+					snapshot.erase(key)
+		if not bool(metadata.get("has_saved_seed", false)):
+			snapshot.erase("saved_seed_size")
+			snapshot.erase("saved_seed_revision")
 		snapshot.merge(metadata, true)
 		probes[owner_id] = snapshot
 		_probes_by_target[target_value] = probes
@@ -123,6 +133,22 @@ static func remove_completed_capture(owner_id: int) -> void:
 	_completed_capture_snapshots.erase(owner_id)
 	_mutex.unlock()
 
+static func completed_scene_capture_for_owner(owner_id: int) -> Dictionary:
+	if owner_id <= 0:
+		return {}
+	_mutex.lock()
+	var value: Variant = _completed_capture_snapshots.get(owner_id, {})
+	var result: Dictionary = value.duplicate(true) if _is_completed_scene_capture(value) else {}
+	_mutex.unlock()
+	return result
+
+static func _is_completed_scene_capture(value: Variant) -> bool:
+	if not value is Dictionary or String(value.get("source_mode", "")) != "scene_capture" \
+			or int(value.get("ready_generation", 0)) <= 0:
+		return false
+	var radiance: Variant = value.get("radiance_rid", RID())
+	return radiance is RID and radiance.is_valid()
+
 static func create_external_source_lease(source: Resource) -> RefCounted:
 	if source == null or not is_instance_valid(source):
 		return null
@@ -141,7 +167,9 @@ static func publish_external_source(owner_id: int, packet: Dictionary) -> bool:
 		return false
 	_mutex.lock()
 	var previous: Variant = _external_sources.get(owner_id, {})
-	if previous is Dictionary and int(previous.get("revision", -1)) == revision:
+	if previous is Dictionary and int(previous.get("revision", -1)) == revision \
+			and String(previous.get("source_kind", "external_cubemap")) \
+			== String(packet.get("source_kind", "external_cubemap")):
 		_mutex.unlock()
 		return true
 	_external_sources[owner_id] = packet.duplicate(false)

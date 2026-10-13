@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://d3exj2q7h76ds"
+path="res://.godot/imported/magic_gi_clv_fill.glsl-9570b21aff375aa1262823ebea5783d1.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_fill.glsl"
+dest_files=["res://.godot/imported/magic_gi_clv_fill.glsl-9570b21aff375aa1262823ebea5783d1.res"]
+
+[params]
+

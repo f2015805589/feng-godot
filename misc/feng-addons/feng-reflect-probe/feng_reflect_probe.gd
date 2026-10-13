@@ -8,6 +8,7 @@ extends Node3D
 signal capture_completed(generation: int)
 signal capture_failed(message: String)
 signal bake_completed(data: FengReflectProbeData)
+signal bake_save_failed(path: String, error: int)
 
 enum SourceMode { SCENE_CAPTURE, EXTERNAL_CUBEMAP }
 enum UpdateMode { ON_READY, REALTIME, MANUAL }
@@ -90,10 +91,9 @@ const CUBE_UPS := [Vector3(0, -1, 0), Vector3(0, -1, 0), Vector3(0, 0, -1),
 		_published_external_revision = -1
 		_metadata_signature = {}
 		if is_inside_tree():
+			_refresh_probe_routes()
 			if source_mode == SourceMode.SCENE_CAPTURE:
 				request_update()
-			else:
-				_refresh_probe_routes()
 		_mark_gizmo_dirty()
 @export var box_size := Vector3(10.0, 10.0, 10.0):
 	set(value):
@@ -178,6 +178,7 @@ var _batch_capture_origin := Vector3.ZERO
 var _batch_capture_basis := Basis.IDENTITY
 var _batch_probe_snapshot: Dictionary = {}
 var _bake_requested := false
+var _writing_bake_payload := false
 var _next_realtime_capture_msec := 0
 var _published_external_revision := -1
 var _metadata_signature: Dictionary = {}
@@ -287,7 +288,8 @@ func request_update() -> void:
 	_schedule_capture_step()
 
 ## Captures the scene source and also requests async RGBAH readback for a portable
-## Cubemap resource. Call save_bake(path) after bake_completed to persist it.
+## Cubemap resource. The editor persists the assigned standalone resource; embedded
+## data is stored when the edited scene is saved. save_bake(path) remains an explicit export.
 func request_bake() -> void:
 	if not enabled:
 		push_warning("FengReflectProbe: enable the probe before requesting a bake.")
@@ -422,15 +424,19 @@ func _poll_bake_payload() -> void:
 		return
 	if probe_data == null:
 		probe_data = DataScript.new()
+	_writing_bake_payload = true
 	probe_data.radiance = cube
 	probe_data.capture_position = _batch_capture_origin
 	probe_data.capture_basis = _batch_capture_basis
 	probe_data.capture_resolution = resolution
 	probe_data.capture_generation += 1
 	probe_data.source_description = "FengReflectProbe scene bake"
+	_writing_bake_payload = false
 	_source_revision += 1
 	_published_external_revision = -1
 	_metadata_signature = {}
+	_refresh_probe_routes()
+	_save_assigned_bake_resource()
 	bake_completed.emit(probe_data)
 
 func _ensure_capture_rig() -> bool:
@@ -623,6 +629,7 @@ func _make_probe_snapshot() -> Dictionary:
 		"source_basis": source_basis,
 		"source_revision": _source_revision,
 		"prefilter_mips_per_frame": prefilter_mips_per_frame,
+		"has_saved_seed": source_mode == SourceMode.SCENE_CAPTURE and _has_saved_scene_seed(),
 	}
 
 func _refresh_probe_routes() -> void:
@@ -644,10 +651,20 @@ func _refresh_probe_routes() -> void:
 		Runtime.remove_probe_targets(removed, _owner_id)
 	_registered_targets = targets
 	var metadata := _make_probe_snapshot()
+	if source_mode == SourceMode.SCENE_CAPTURE:
+		# Scene capture pose/revision comes only from a completed capture. A saved
+		# seed carries its own pose in the separately tagged source packet.
+		for key in ["capture_position", "source_basis", "source_revision", "source_faces", "source_size"]:
+			metadata.erase(key)
+	var packet_kind := ""
 	if source_mode == SourceMode.EXTERNAL_CUBEMAP:
+		packet_kind = "external_cubemap"
+	elif source_mode == SourceMode.SCENE_CAPTURE and _has_saved_scene_seed():
+		packet_kind = "saved_scene_seed"
+	if not packet_kind.is_empty():
 		var source_size := 0
 		if _published_external_revision != _source_revision:
-			var packet := _make_external_source_packet()
+			var packet := _make_external_source_packet(packet_kind)
 			if not packet.is_empty() and Runtime.publish_external_source(_owner_id, packet):
 				source_size = int(packet.get("size", 0))
 			else:
@@ -656,17 +673,16 @@ func _refresh_probe_routes() -> void:
 		else:
 			var packet := Runtime.external_source_for_owner(_owner_id)
 			source_size = int(packet.get("size", 0))
-		metadata["source_size"] = source_size
-		metadata["source_revision"] = _source_revision
-		metadata["radiance_rid"] = RID()
+		if packet_kind == "external_cubemap":
+			metadata["source_size"] = source_size
+			metadata["source_revision"] = _source_revision
+			metadata["radiance_rid"] = RID()
+		else:
+			metadata["saved_seed_size"] = source_size
+			metadata["saved_seed_revision"] = _source_revision
 	else:
-		# The source position/orientation belongs to the last complete scene cube.
-		# Leave those values and its RID intact while a new capture is in flight.
-		metadata.erase("capture_position")
-		metadata.erase("source_basis")
-		metadata.erase("source_revision")
-		metadata.erase("source_faces")
-		metadata.erase("source_size")
+		Runtime.remove_external_source(_owner_id)
+		_published_external_revision = -1
 	if targets != _metadata_signature.get("targets", []) or metadata != _metadata_signature.get("metadata", {}):
 		if not targets.is_empty():
 			Runtime.update_probe_targets(targets, _owner_id, metadata)
@@ -678,7 +694,7 @@ func _probe_targets() -> Array[RID]:
 		return []
 	return SnapshotWorlds.targets_for(world).duplicate()
 
-func _make_external_source_packet() -> Dictionary:
+func _make_external_source_packet(source_kind: String = "external_cubemap") -> Dictionary:
 	if probe_data == null or not probe_data.is_valid():
 		return {}
 	var source: Cubemap = probe_data.radiance
@@ -693,6 +709,7 @@ func _make_external_source_packet() -> Dictionary:
 		return {}
 	return {
 		"revision": _source_revision,
+		"source_kind": source_kind,
 		"size": size,
 		"source_width": width,
 		"source_height": height,
@@ -720,11 +737,15 @@ func _disconnect_data() -> void:
 
 func _on_data_changed() -> void:
 	var radiance_changed := _bind_radiance_signal()
-	if source_mode == SourceMode.EXTERNAL_CUBEMAP or radiance_changed:
+	if _writing_bake_payload:
+		_metadata_signature.clear()
+		return
+	var has_scene_seed := source_mode == SourceMode.SCENE_CAPTURE and _has_saved_scene_seed()
+	if source_mode == SourceMode.EXTERNAL_CUBEMAP or radiance_changed or has_scene_seed:
 		_source_revision += 1
 		_published_external_revision = -1
 	_metadata_signature = {}
-	if is_inside_tree() and source_mode == SourceMode.EXTERNAL_CUBEMAP:
+	if is_inside_tree() and (source_mode == SourceMode.EXTERNAL_CUBEMAP or has_scene_seed):
 		_refresh_probe_routes()
 	else:
 		_mark_gizmo_dirty()
@@ -743,13 +764,41 @@ func _bind_radiance_signal() -> bool:
 	return true
 
 func _on_radiance_changed() -> void:
+	if _writing_bake_payload:
+		_metadata_signature.clear()
+		return
 	_source_revision += 1
 	_published_external_revision = -1
 	_metadata_signature.clear()
-	if is_inside_tree() and source_mode == SourceMode.EXTERNAL_CUBEMAP:
+	if is_inside_tree() and (source_mode == SourceMode.EXTERNAL_CUBEMAP \
+			or (source_mode == SourceMode.SCENE_CAPTURE and _has_saved_scene_seed())):
 		_refresh_probe_routes()
 	else:
 		_mark_gizmo_dirty()
+
+func _has_saved_scene_seed() -> bool:
+	if probe_data == null or not is_instance_valid(probe_data) \
+			or probe_data.capture_generation <= 0 or not probe_data.is_valid():
+		return false
+	var source: Cubemap = probe_data.radiance
+	return source.get_width() == source.get_height() and source.get_rid().is_valid()
+
+func _save_assigned_bake_resource() -> void:
+	if not Engine.is_editor_hint() or probe_data == null:
+		return
+	var path := probe_data.resource_path.strip_edges()
+	if path.is_empty() or path.contains("::"):
+		return
+	if not path.begins_with("res://") and not path.begins_with("user://") \
+			and not path.is_absolute_path():
+		var invalid_path_error := ERR_INVALID_PARAMETER
+		bake_save_failed.emit(path, invalid_path_error)
+		push_warning("FengReflectProbe: could not save baked Probe Data at '%s' (invalid resource path)." % path)
+		return
+	var error := ResourceSaver.save(probe_data, path)
+	if error != OK:
+		bake_save_failed.emit(path, error)
+		push_warning("FengReflectProbe: could not save baked Probe Data at '%s' (error %d)." % [path, error])
 
 func _mark_metadata_dirty() -> void:
 	_metadata_signature.clear()

@@ -17,6 +17,7 @@ func _enter_tree() -> void:
 
 func _exit_tree() -> void:
 	if _inspector_plugin != null:
+		_inspector_plugin.call("shutdown")
 		remove_inspector_plugin(_inspector_plugin)
 		_inspector_plugin = null
 	if _gizmo_plugin != null:

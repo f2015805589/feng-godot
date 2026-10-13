@@ -124,6 +124,7 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 		var radiance: Variant = snapshot.get("radiance_rid", RID())
 		if (String(snapshot.get("source_mode", "")) == "external_cubemap" \
 				and int(snapshot.get("source_size", 0)) > 0) \
+				or bool(snapshot.get("has_saved_seed", false)) \
 				or (radiance is RID and radiance.is_valid()):
 			ctx.request_reflection_components()
 			break
@@ -285,19 +286,32 @@ func _ready_probes(rd: RenderingDevice, snapshots: Array[Dictionary]) -> Array[D
 	for snapshot in snapshots:
 		if result.size() >= MAX_PROBES:
 			break
-		var texture_value: Variant = snapshot.get("radiance_rid", RID())
 		var texture: RID = RID()
 		var ready_snapshot := snapshot.duplicate(true)
-		if String(snapshot.get("source_mode", "")) == "external_cubemap":
-			var state := _ensure_external_probe(rd, snapshot)
+		var owner_id := int(snapshot.get("owner_id", 0))
+		var source_mode := String(snapshot.get("source_mode", ""))
+		if source_mode == "external_cubemap":
+			var state := _ensure_external_probe(rd, snapshot, "external_cubemap")
 			if not state.is_empty() and bool(state.get("ready", false)):
 				texture = state.get("filtered", RID())
 				ready_snapshot["source_revision"] = int(state.get("revision", -1))
 				ready_snapshot["source_size"] = int(state.get("source_size", 0))
 				ready_snapshot["capture_position"] = state.get("capture_position", Vector3.ZERO)
 				ready_snapshot["source_basis"] = state.get("source_basis", Basis.IDENTITY)
-		elif texture_value is RID and texture_value.is_valid():
-			texture = texture_value
+		elif source_mode == "scene_capture":
+			var completed := Runtime.completed_scene_capture_for_owner(owner_id)
+			if not completed.is_empty():
+				var texture_value: Variant = completed.get("radiance_rid", RID())
+				if texture_value is RID and rd.texture_is_valid(texture_value):
+					texture = texture_value
+				ready_snapshot.merge(completed, true)
+			if not texture.is_valid() and bool(snapshot.get("has_saved_seed", false)):
+				var state := _ensure_external_probe(rd, snapshot, "saved_scene_seed")
+				if not state.is_empty() and bool(state.get("ready", false)):
+					texture = state.get("filtered", RID())
+					ready_snapshot["source_revision"] = int(state.get("revision", -1))
+					ready_snapshot["capture_position"] = state.get("capture_position", Vector3.ZERO)
+					ready_snapshot["source_basis"] = state.get("source_basis", Basis.IDENTITY)
 		if not texture.is_valid() or not rd.texture_is_valid(texture):
 			continue
 		var format := rd.texture_get_format(texture)
@@ -313,9 +327,15 @@ func _ready_probes(rd: RenderingDevice, snapshots: Array[Dictionary]) -> Array[D
 func _sweep_external_states(rd: RenderingDevice, live_probes: Array[Dictionary]) -> void:
 	var active_external := {}
 	for snapshot in live_probes:
-		if String(snapshot.get("source_mode", "")) == "external_cubemap" \
-				and int(snapshot.get("source_size", 0)) > 0:
-			active_external[int(snapshot.get("owner_id", 0))] = true
+		var owner_id := int(snapshot.get("owner_id", 0))
+		var source_mode := String(snapshot.get("source_mode", ""))
+		if source_mode == "external_cubemap" and int(snapshot.get("source_size", 0)) > 0:
+			active_external[owner_id] = true
+		elif source_mode == "scene_capture" and bool(snapshot.get("has_saved_seed", false)):
+			var completed := Runtime.completed_scene_capture_for_owner(owner_id)
+			var completed_rid: Variant = completed.get("radiance_rid", RID())
+			if completed_rid is not RID or not rd.texture_is_valid(completed_rid):
+				active_external[owner_id] = true
 	var changed := false
 	for owner_id in _external_states.keys():
 		if active_external.has(int(owner_id)):
@@ -341,14 +361,15 @@ func _release_atlas(rd: RenderingDevice) -> void:
 	if changed:
 		_sync_owned_rids()
 
-func _ensure_external_probe(rd: RenderingDevice, snapshot: Dictionary) -> Dictionary:
+func _ensure_external_probe(rd: RenderingDevice, snapshot: Dictionary,
+		expected_source_kind: String) -> Dictionary:
 	var owner_id := int(snapshot.get("owner_id", 0))
 	if owner_id <= 0:
 		return {}
 	var state: Dictionary = _external_states.get(owner_id, {})
 	if state.is_empty():
 		state = {"owner_id": owner_id, "active": {}, "pending": {},
-				"rejected_revision": -1, "last_advance_frame": -1}
+				"rejected_revision": -1, "rejected_kind": "", "last_advance_frame": -1}
 	var active: Dictionary = state.get("active", {})
 	var pending: Dictionary = state.get("pending", {})
 	if not pending.is_empty():
@@ -360,14 +381,19 @@ func _ensure_external_probe(rd: RenderingDevice, snapshot: Dictionary) -> Dictio
 			state["pending"] = pending
 	var latest := Runtime.external_source_for_owner(owner_id)
 	var latest_revision := int(latest.get("revision", -1))
+	var latest_kind := String(latest.get("source_kind", "external_cubemap"))
+	var active_kind := String(active.get("source_kind", ""))
 	if pending.is_empty() and not latest.is_empty() \
-			and int(active.get("revision", -1)) != latest_revision \
-			and int(state.get("rejected_revision", -1)) != latest_revision \
+			and latest_kind == expected_source_kind \
+			and (int(active.get("revision", -1)) != latest_revision or active_kind != latest_kind) \
+			and (int(state.get("rejected_revision", -1)) != latest_revision \
+				or String(state.get("rejected_kind", "")) != latest_kind) \
 			and int(state.get("last_advance_frame", -1)) != Engine.get_process_frames():
 		pending = _begin_external_pending(rd, owner_id, latest,
 				int(snapshot.get("prefilter_mips_per_frame", 1)))
 		if pending.is_empty():
 			state["rejected_revision"] = latest_revision
+			state["rejected_kind"] = latest_kind
 		else:
 			state["pending"] = pending
 			_advance_external_pending_for_frame(rd, state, pending)
@@ -381,7 +407,7 @@ func _ensure_external_probe(rd: RenderingDevice, snapshot: Dictionary) -> Dictio
 	state["pending"] = pending
 	_external_states[owner_id] = state
 	_sync_owned_rids()
-	return active
+	return active if String(active.get("source_kind", "")) == expected_source_kind else {}
 
 func _advance_external_pending_for_frame(rd: RenderingDevice, owner_state: Dictionary,
 			pending: Dictionary) -> void:
@@ -457,6 +483,7 @@ func _begin_external_pending(rd: RenderingDevice, owner_id: int, packet: Diction
 			ceili(float(source_size) / WORKGROUP_SIZE), 6)
 	rd.compute_list_end()
 	return {"owner_id": owner_id, "revision": revision, "source_size": source_size,
+			"source_kind": String(packet.get("source_kind", "external_cubemap")),
 			"capture_position": capture_position, "source_basis": source_basis,
 			"prefilter_mips_per_frame": clampi(mips_per_frame, 1, MIP_COUNT),
 			"source_lease": source_lease, "raw": raw, "filtered": filtered,
@@ -475,6 +502,7 @@ func _promote_external_pending(rd: RenderingDevice, active: Dictionary,
 	_free_external_state(rd, pending)
 	return {"owner_id": owner_id,
 			"revision": revision,
+			"source_kind": String(pending.get("source_kind", "external_cubemap")),
 			"source_size": source_size,
 			"capture_position": capture_position,
 			"source_basis": source_basis,

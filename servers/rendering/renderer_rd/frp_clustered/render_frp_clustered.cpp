@@ -4097,7 +4097,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 				arguments.push_back(p_render_data);
 				callback.callv(arguments);
 			}
-			if (use_msaa && rb_data.is_valid() && pass_context->is_indirect_specular_requested()) {
+			if (use_msaa && using_separate_specular && rb_data.is_valid() && pass_context->is_indirect_specular_requested()) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 					if (!pass_context->is_indirect_specular_modified(v)) {
 						continue;
