@@ -4249,6 +4249,17 @@ void EditorInspector::update_tree() {
 
 	List<PropertyInfo> plist;
 	object->get_property_list(&plist, true);
+	if (!visible_properties.is_empty()) {
+		for (List<PropertyInfo>::Element *E = plist.front(); E; E = E->next()) {
+			PropertyInfo &property = E->get();
+			if (property.usage & (PROPERTY_USAGE_CATEGORY | PROPERTY_USAGE_GROUP | PROPERTY_USAGE_SUBGROUP)) {
+				continue;
+			}
+			if (!visible_properties.has(property.name)) {
+				property.usage &= ~PROPERTY_USAGE_EDITOR;
+			}
+		}
+	}
 
 	HashMap<VBoxContainer *, HashMap<String, VBoxContainer *>> vbox_per_path;
 	HashMap<String, EditorInspectorArray *> editor_inspector_array_per_prefix;
@@ -5530,7 +5541,32 @@ void EditorInspector::_edit_set(const String &p_name, const Variant &p_value, bo
 		_edit_request_change(object, p_name);
 		emit_signal(_prop_edited, p_name);
 	} else {
-		undo_redo->create_action(vformat(TTR("Set %s"), p_name), UndoRedo::MERGE_ENDS, nullptr, false, mark_unsaved);
+		Object *undo_context = nullptr;
+		Resource *edited_resource = Object::cast_to<Resource>(object);
+		if (edited_resource && edited_resource->is_built_in() &&
+				undo_redo->get_history_id_for_object(edited_resource) == EditorUndoRedoManager::GLOBAL_HISTORY) {
+		EditorInspector *root_context_inspector = get_root_inspector();
+		Node *context_node = root_context_inspector ? Object::cast_to<Node>(root_context_inspector->get_edited_object()) : nullptr;
+			Node *edited_scene = EditorNode::get_singleton()->get_edited_scene();
+			int scene_history_id = EditorNode::get_editor_data().get_current_edited_scene_history_id();
+			bool context_is_in_edited_scene = edited_scene && context_node &&
+					(context_node == edited_scene || edited_scene->is_ancestor_of(context_node));
+			bool context_has_scene_history = scene_history_id > 0 && context_node &&
+					undo_redo->get_history_id_for_object(context_node) == scene_history_id;
+			String resource_path = edited_resource->get_path();
+			String scene_path = edited_scene ? edited_scene->get_scene_file_path() : String();
+			bool resource_belongs_to_scene = resource_path.is_empty() ||
+					(!scene_path.is_empty() && resource_path.get_slice("::", 0) == scene_path);
+			if (context_is_in_edited_scene && context_has_scene_history && resource_belongs_to_scene) {
+				undo_context = context_node;
+			}
+		}
+
+		undo_redo->create_action(vformat(TTR("Set %s"), p_name), UndoRedo::MERGE_ENDS, undo_context, false, mark_unsaved);
+		if (undo_context) {
+			// The resource may resolve to the global history even though this built-in belongs to the inspected scene.
+			undo_redo->force_fixed_history();
+		}
 		undo_redo->add_do_property(object, p_name, p_value);
 		bool valid = false;
 		Variant value = object->get(p_name, &valid);
@@ -6222,6 +6258,8 @@ EditorInspector *EditorInspector::_get_control_parent_inspector(Control *p_contr
 
 void EditorInspector::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("edit", "object"), &EditorInspector::edit);
+	ClassDB::bind_method(D_METHOD("set_visible_properties", "properties"), &EditorInspector::set_visible_properties);
+	ClassDB::bind_method(D_METHOD("get_visible_properties"), &EditorInspector::get_visible_properties);
 	ClassDB::bind_method("_edit_request_change", &EditorInspector::_edit_request_change);
 	ClassDB::bind_method("get_selected_path", &EditorInspector::get_selected_path);
 	ClassDB::bind_method("get_edited_object", &EditorInspector::get_edited_object);
@@ -6241,6 +6279,21 @@ void EditorInspector::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("property_toggled", PropertyInfo(Variant::STRING, "property"), PropertyInfo(Variant::BOOL, "checked")));
 	ADD_SIGNAL(MethodInfo("edited_object_changed"));
 	ADD_SIGNAL(MethodInfo("restart_requested"));
+}
+
+void EditorInspector::set_visible_properties(const PackedStringArray &p_properties) {
+	if (visible_properties_list == p_properties) {
+		return;
+	}
+
+	visible_properties_list = p_properties;
+	visible_properties.clear();
+	for (const String &property : visible_properties_list) {
+		visible_properties.insert(property);
+	}
+	if (object) {
+		update_tree();
+	}
 }
 
 EditorInspector::EditorInspector() {

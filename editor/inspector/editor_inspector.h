@@ -777,6 +777,8 @@ private:
 	HashMap<StringName, List<EditorProperty *>> editor_property_map;
 	List<EditorInspectorSection *> sections;
 	HashSet<StringName> pending;
+	PackedStringArray visible_properties_list;
+	HashSet<StringName> visible_properties;
 
 	void _clear(bool p_hide_plugins = true);
 	Object *object = nullptr;
@@ -908,6 +910,9 @@ public:
 	void edit(Object *p_object);
 	Object *get_edited_object();
 	Object *get_next_edited_object();
+
+	void set_visible_properties(const PackedStringArray &p_properties);
+	PackedStringArray get_visible_properties() const { return visible_properties_list; }
 
 	void set_keying(bool p_active);
 	void set_read_only(bool p_read_only);

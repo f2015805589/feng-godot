@@ -17,6 +17,10 @@ const FengVolumeInspectorPlugin = preload("editor/volume_inspector_plugin.gd")
 const FengVolumeGizmoPlugin = preload("volume/feng_volume_gizmo.gd")
 const VolumePreview = preload("editor/volume_preview.gd")
 const PassLibraryController = preload("editor/pass_library_controller.gd")
+const EnvironmentMixerService = preload("editor/environment_mixer_service.gd")
+const EnvironmentMixerWindow = preload("editor/environment_mixer_window.gd")
+
+const ENVIRONMENT_MIXER_MENU_LABEL := "环境光混合器"
 
 
 var _inspector_plugin
@@ -25,6 +29,8 @@ var _volume_gizmo_plugin
 var _volume_preview: Node
 var _library_controller
 var _project_pipeline: WorldEnvironment = null
+var _environment_mixer_service: Node
+var _environment_mixer_window: Window
 
 ## Compatibility view for regression tests. The
 ## Library state itself lives in PassLibraryController.
@@ -46,6 +52,15 @@ func _enter_tree() -> void:
 	_library_controller = PassLibraryController.new(self)
 	add_child(_library_controller)
 	_library_controller.setup()
+	_environment_mixer_service = EnvironmentMixerService.new()
+	_environment_mixer_service.name = "EnvironmentMixerService"
+	add_child(_environment_mixer_service)
+	_environment_mixer_service.start(self)
+	_environment_mixer_window = EnvironmentMixerWindow.new()
+	_environment_mixer_window.name = "EnvironmentMixerWindow"
+	add_child(_environment_mixer_window)
+	_environment_mixer_window.setup(_environment_mixer_service)
+	add_window_menu_item(ENVIRONMENT_MIXER_MENU_LABEL, _open_environment_mixer)
 
 	_register_project_pipeline_setting()
 	_ensure_pipeline_autoload()
@@ -78,6 +93,15 @@ func _exit_tree() -> void:
 		_library_controller.shutdown()
 		_library_controller.free()
 		_library_controller = null
+	remove_window_menu_item(ENVIRONMENT_MIXER_MENU_LABEL)
+	if is_instance_valid(_environment_mixer_window):
+		_environment_mixer_window.hide()
+		_environment_mixer_window.free()
+		_environment_mixer_window = null
+	if is_instance_valid(_environment_mixer_service):
+		_environment_mixer_service.stop()
+		_environment_mixer_service.free()
+		_environment_mixer_service = null
 	_detach_project_pipeline()
 	# The autoload is deliberately left in place: _exit_tree also runs when the editor
 	# shuts down, and rewriting project.godot on every exit would be churn for a node that
@@ -160,6 +184,15 @@ func _detach_project_pipeline() -> void:
 func _on_library_item(id: int) -> void:
 	if is_instance_valid(_library_controller):
 		_library_controller.on_library_item(id)
+
+
+func _open_environment_mixer() -> void:
+	if not is_instance_valid(_environment_mixer_window):
+		return
+	if is_instance_valid(_environment_mixer_service):
+		_environment_mixer_service.refresh()
+	var host_size := Vector2i(get_viewport().get_visible_rect().size)
+	_environment_mixer_window.popup_in_host(host_size)
 
 ## Move an authored pass using the same whole-array transaction as the library
 ## menu. This is used by editor controls and keeps reordering undoable even

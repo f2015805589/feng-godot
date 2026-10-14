@@ -4382,6 +4382,7 @@ void EditorNode::remove_editor_plugin(EditorPlugin *p_editor, bool p_config_chan
 	if (p_config_changed) {
 		p_editor->disable_plugin();
 	}
+	singleton->remove_window_menu_items(p_editor);
 	singleton->editor_plugins_over->remove_plugin(p_editor);
 	singleton->editor_plugins_force_over->remove_plugin(p_editor);
 	singleton->editor_plugins_force_input_forwarding->remove_plugin(p_editor);
@@ -7036,6 +7037,74 @@ void EditorNode::remove_tool_menu_item(const String &p_name) {
 	}
 }
 
+void EditorNode::add_window_menu_item(EditorPlugin *p_owner, const String &p_name, const Callable &p_callback) {
+	ERR_FAIL_NULL(p_owner);
+	ERR_FAIL_COND_MSG(p_name.is_empty(), "Window menu item name cannot be empty.");
+	ERR_FAIL_COND_MSG(!p_callback.is_valid(), "Window menu item callback must be valid.");
+	ERR_FAIL_NULL(window_menu);
+
+	const ObjectID owner_id = p_owner->get_instance_id();
+	for (int i = 0; i < window_menu_items.size(); i++) {
+		WindowMenuItem &item = window_menu_items.write[i];
+		if (item.owner_id == owner_id && item.name == p_name) {
+			item.callback = p_callback;
+			return;
+		}
+		ERR_FAIL_COND_MSG(item.name == p_name, vformat("Window menu item '%s' is already registered by another editor plugin.", p_name));
+	}
+
+	WindowMenuItem item;
+	item.owner_id = owner_id;
+	item.name = p_name;
+	item.callback = p_callback;
+	window_menu_items.push_back(item);
+	window_menu->add_item(p_name);
+}
+
+void EditorNode::remove_window_menu_item(EditorPlugin *p_owner, const String &p_name) {
+	ERR_FAIL_NULL(p_owner);
+	const ObjectID owner_id = p_owner->get_instance_id();
+	bool removed = false;
+	for (int i = window_menu_items.size() - 1; i >= 0; i--) {
+		if (window_menu_items[i].owner_id == owner_id && window_menu_items[i].name == p_name) {
+			window_menu_items.remove_at(i);
+			window_menu->remove_item(i);
+			removed = true;
+		}
+	}
+	if (removed) {
+		window_menu->reset_size();
+	}
+}
+
+void EditorNode::remove_window_menu_items(EditorPlugin *p_owner) {
+	ERR_FAIL_NULL(p_owner);
+	const ObjectID owner_id = p_owner->get_instance_id();
+	bool removed = false;
+	for (int i = window_menu_items.size() - 1; i >= 0; i--) {
+		if (window_menu_items[i].owner_id == owner_id) {
+			window_menu_items.remove_at(i);
+			window_menu->remove_item(i);
+			removed = true;
+		}
+	}
+	if (removed) {
+		window_menu->reset_size();
+	}
+}
+
+void EditorNode::_window_menu_option(int p_index) {
+	ERR_FAIL_INDEX(p_index, window_menu_items.size());
+	Callable callback = window_menu_items[p_index].callback;
+	Callable::CallError ce;
+	Variant result;
+	callback.callp(nullptr, 0, result, ce);
+	if (ce.error != Callable::CallError::CALL_OK) {
+		String err = Variant::get_callable_error_text(callback, nullptr, 0, ce);
+		ERR_PRINT("Error calling function from window menu: " + err);
+	}
+}
+
 PopupMenu *EditorNode::get_export_as_menu() {
 	return export_as_menu;
 }
@@ -9058,6 +9127,10 @@ EditorNode::EditorNode() {
 	help_menu = memnew(PopupMenu);
 	help_menu->connect(SceneStringName(id_pressed), callable_mp(this, &EditorNode::_menu_option));
 	_add_to_main_menu(TTRC("Help"), help_menu);
+
+	window_menu = memnew(PopupMenu);
+	window_menu->connect("index_pressed", callable_mp(this, &EditorNode::_window_menu_option));
+	_add_to_main_menu(TTRC("Window"), window_menu);
 
 	_update_main_menu_type();
 

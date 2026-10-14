@@ -345,9 +345,16 @@ private:
 	PopupMenu *debug_menu = nullptr;
 	PopupMenu *settings_menu = nullptr;
 	PopupMenu *help_menu = nullptr;
+	PopupMenu *window_menu = nullptr;
 	PopupMenu *tool_menu = nullptr;
 	PopupMenu *export_as_menu = nullptr;
 	Button *export_button = nullptr;
+	struct WindowMenuItem {
+		ObjectID owner_id;
+		String name;
+		Callable callback;
+	};
+	Vector<WindowMenuItem> window_menu_items;
 
 	Timer *screenshot_timer = nullptr;
 
@@ -720,6 +727,7 @@ private:
 	void _build_project_menu();
 	void _build_settings_menu();
 	void _build_help_menu();
+	void _window_menu_option(int p_index);
 
 	void _update_main_menu_type();
 	void _add_to_main_menu(const String &p_name, PopupMenu *p_menu);
@@ -1011,6 +1019,9 @@ public:
 	void add_tool_menu_item(const String &p_name, const Callable &p_callback);
 	void add_tool_submenu_item(const String &p_name, PopupMenu *p_submenu);
 	void remove_tool_menu_item(const String &p_name);
+	void add_window_menu_item(EditorPlugin *p_owner, const String &p_name, const Callable &p_callback);
+	void remove_window_menu_item(EditorPlugin *p_owner, const String &p_name);
+	void remove_window_menu_items(EditorPlugin *p_owner);
 
 	PopupMenu *get_export_as_menu();
 

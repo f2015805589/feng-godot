@@ -59,6 +59,12 @@
 				Gets the path of the currently selected property.
 			</description>
 		</method>
+		<method name="get_visible_properties" qualifiers="const">
+			<return type="PackedStringArray" />
+			<description>
+				Returns the property paths shown by this inspector, or an empty array if all properties are shown.
+			</description>
+		</method>
 		<method name="instantiate_property_editor" qualifiers="static">
 			<return type="EditorProperty" />
 			<param index="0" name="object" type="Object" />
@@ -70,6 +76,13 @@
 			<param index="6" name="wide" type="bool" default="false" />
 			<description>
 				Creates a property editor that can be used by plugin UI to edit the specified property of an [param object].
+			</description>
+		</method>
+		<method name="set_visible_properties">
+			<return type="void" />
+			<param index="0" name="properties" type="PackedStringArray" />
+			<description>
+				Limits this inspector instance to the specified property paths. An empty array restores the default behavior and displays all properties. This setting does not affect the object or other inspectors of the same object.
 			</description>
 		</method>
 	</methods>

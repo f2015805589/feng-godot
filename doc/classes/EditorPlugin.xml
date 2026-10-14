@@ -583,6 +583,14 @@
 				Adds a custom [PopupMenu] submenu under [b]Project &gt; Tools &gt;[/b] [param name]. Use [method remove_tool_menu_item] on plugin clean up to remove the menu.
 			</description>
 		</method>
+		<method name="add_window_menu_item">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<param index="1" name="callable" type="Callable" />
+			<description>
+				Adds a custom menu item to the editor's [b]Window[/b] menu. When clicked, the provided [param callable] will be called. Registering the same [param name] again from this plugin updates the callback. The item is removed automatically when the plugin is disabled or removed.
+			</description>
+		</method>
 		<method name="add_translation_parser_plugin">
 			<return type="void" />
 			<param index="0" name="parser" type="EditorTranslationParserPlugin" />
@@ -767,6 +775,13 @@
 			<param index="0" name="name" type="String" />
 			<description>
 				Removes a menu [param name] from [b]Project &gt; Tools[/b].
+			</description>
+		</method>
+		<method name="remove_window_menu_item">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<description>
+				Removes the custom item with the specified [param name] from the editor's [b]Window[/b] menu.
 			</description>
 		</method>
 		<method name="remove_translation_parser_plugin">

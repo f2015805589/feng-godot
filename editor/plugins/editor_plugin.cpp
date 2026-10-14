@@ -250,6 +250,14 @@ void EditorPlugin::remove_tool_menu_item(const String &p_name) {
 	EditorNode::get_singleton()->remove_tool_menu_item(p_name);
 }
 
+void EditorPlugin::add_window_menu_item(const String &p_name, const Callable &p_callable) {
+	EditorNode::get_singleton()->add_window_menu_item(this, p_name, p_callable);
+}
+
+void EditorPlugin::remove_window_menu_item(const String &p_name) {
+	EditorNode::get_singleton()->remove_window_menu_item(this, p_name);
+}
+
 PopupMenu *EditorPlugin::get_export_as_menu() {
 	return EditorNode::get_singleton()->get_export_as_menu();
 }
@@ -633,6 +641,8 @@ void EditorPlugin::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("add_tool_menu_item", "name", "callable"), &EditorPlugin::add_tool_menu_item);
 	ClassDB::bind_method(D_METHOD("add_tool_submenu_item", "name", "submenu"), &EditorPlugin::add_tool_submenu_item);
 	ClassDB::bind_method(D_METHOD("remove_tool_menu_item", "name"), &EditorPlugin::remove_tool_menu_item);
+	ClassDB::bind_method(D_METHOD("add_window_menu_item", "name", "callable"), &EditorPlugin::add_window_menu_item);
+	ClassDB::bind_method(D_METHOD("remove_window_menu_item", "name"), &EditorPlugin::remove_window_menu_item);
 	ClassDB::bind_method(D_METHOD("get_export_as_menu"), &EditorPlugin::get_export_as_menu);
 	ClassDB::bind_method(D_METHOD("add_custom_type", "type", "base", "script", "icon"), &EditorPlugin::add_custom_type);
 	ClassDB::bind_method(D_METHOD("remove_custom_type", "type"), &EditorPlugin::remove_custom_type);
