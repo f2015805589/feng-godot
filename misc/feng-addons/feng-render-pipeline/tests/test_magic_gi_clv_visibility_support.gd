@@ -32,7 +32,7 @@ func run() -> void:
 	var nearest_blocked := _fill_cell(rd, true, "nearest_blocked")
 	var nearest_blocked_old_pool := _fill_cell(rd, true, "nearest_blocked_old_pool")
 	var all_blocked := _fill_cell(rd, true, "all_blocked")
-	var nearest_clear := _fill_cell(rd, false, "nearest_clear")
+	var nearest_clear := _fill_cell(rd, false, "nearest_clear", true)
 	var nearest_clear_old_pool := _fill_cell(rd, false, "nearest_clear_old_pool")
 	var visible_cap := _fill_cell(rd, false, "visible_cap")
 	if not blocked.is_empty() and not unblocked.is_empty() \
@@ -113,7 +113,8 @@ func run() -> void:
 		visible_cap.get("cell0_g", NAN), ",", visible_cap.get("cell0_b", NAN))
 	_finish()
 
-func _fill_cell(rd: RenderingDevice, include_wall: bool, shader_variant: String) -> Dictionary:
+func _fill_cell(rd: RenderingDevice, include_wall: bool, shader_variant: String,
+		exercise_spacing_reset := false) -> Dictionary:
 	var faces := PackedVector3Array()
 	var same_patch_fixture := shader_variant in ["nearest_blocked", "nearest_blocked_old_pool",
 			"all_blocked", "nearest_clear", "nearest_clear_old_pool", "visible_cap"]
@@ -297,6 +298,8 @@ func _fill_cell(rd: RenderingDevice, include_wall: bool, shader_variant: String)
 						Vector3(0.56, 0.3, 0.5), Vector3(0.5, 0.1, 0.5))
 				result["far_segment_blocked"] = Visibility.segment_blocked(bvh.nodes, bvh.triangles,
 						Vector3(0.1, 0.3, 0.5), Vector3(0.5, 0.1, 0.5))
+	if exercise_spacing_reset and cache.texture.is_valid():
+		_test_spacing_reset(rd, cache, bake, directional, ubo, nearest_sampler)
 	for rid in cache.owned_rids():
 		if rid.is_valid():
 			rd.free_rid(rid)
@@ -305,6 +308,91 @@ func _fill_cell(rd: RenderingDevice, include_wall: bool, shader_variant: String)
 		if rid.is_valid():
 			rd.free_rid(rid)
 	return result
+
+func _test_spacing_reset(rd: RenderingDevice, cache: RefCounted, bake: Dictionary,
+		directional: RefCounted, ubo: RID, nearest_sampler: RID) -> void:
+	const EPOCH := 1
+	const NEW_SPACING := 0.5
+	var old_tags := rd.texture_get_data(cache.tags, 0).to_int32_array()
+	var new_origins := _origins_for(Vector3.ZERO, NEW_SPACING)
+	var overlapping_old_corners := _count_valid_tags_for_origins(old_tags, new_origins, EPOCH)
+	check(overlapping_old_corners > 0,
+			"The spacing-change fixture must have old-epoch tag coordinates that would alias new-grid corners.")
+	check(cache.update(rd, Vector3.ZERO, NEW_SPACING, EPOCH, bake, directional, ubo,
+			nearest_sampler, 1), "A spacing change must start a one-job partial cache refill.")
+	var partial_tags := rd.texture_get_data(cache.tags, 0).to_int32_array()
+	check(_count_valid_tags_for_origins(partial_tags, new_origins, EPOCH) == 1,
+			"After a spacing change, only the newly filled job may validate; overlapping old corners must be invalid.")
+	check(cache._spacing == NEW_SPACING and cache._cursor == 1 and not cache._pending.is_empty(),
+			"The spacing reset must preserve the scheduler's partial-budget state.")
+	var dispatches := 0
+	while (cache._cursor != 0 or not cache._pending.is_empty()) and dispatches < 32:
+		check(cache.update(rd, Vector3.ZERO, NEW_SPACING, EPOCH, bake, directional, ubo,
+				nearest_sampler, 512), "The remaining spacing-reset jobs must dispatch successfully.")
+		dispatches += 1
+	check(cache._cursor == 0 and cache._pending.is_empty(),
+			"The spacing-reset fixture must become fully warm within its fixed test budget.")
+	var warmed_tags := rd.texture_get_data(cache.tags, 0).to_int32_array()
+	check(_count_valid_tags_for_origins(warmed_tags, cache._origins, EPOCH)
+			== Clipmap.RESOLUTION * Clipmap.RESOLUTION * Clipmap.RESOLUTION * Clipmap.LEVELS,
+			"A fully warmed new-spacing cache must publish all logical cell tags normally.")
+	check(_all_active_tags_match(warmed_tags, cache._origins, EPOCH),
+			"Every warmed physical slot must carry its new-spacing logical coordinate and epoch.")
+	var values := rd.texture_get_data(cache.texture, 0).to_float32_array()
+	var width := Clipmap.RESOLUTION * 19
+	var supported_cells := 0
+	for level in Clipmap.LEVELS:
+		var origin: Vector3i = cache._origins[level]
+		for z in range(origin.z, origin.z + Clipmap.RESOLUTION):
+			for y in range(origin.y, origin.y + Clipmap.RESOLUTION):
+				for x in range(origin.x, origin.x + Clipmap.RESOLUTION):
+					var slot_x := _positive_mod(x, Clipmap.RESOLUTION)
+					var slot_y := _positive_mod(y, Clipmap.RESOLUTION)
+					var slot_z := level * Clipmap.RESOLUTION + _positive_mod(z, Clipmap.RESOLUTION)
+					var metadata_index := ((slot_z * Clipmap.RESOLUTION + slot_y) * width
+							+ 18 * Clipmap.RESOLUTION + slot_x) * 4 + 3
+					if values[metadata_index] >= 0.0:
+						supported_cells += 1
+	check(supported_cells > 0,
+			"A fully warmed new-spacing cache must publish at least one real surface-supported cell.")
+	print("MAGIC_GI_CLV_SPACING_RESET old_overlap=", overlapping_old_corners,
+			" partial_valid=", _count_valid_tags_for_origins(partial_tags, new_origins, EPOCH),
+			" warmed_valid=", _count_valid_tags_for_origins(warmed_tags, cache._origins, EPOCH),
+			" supported_cells=", supported_cells, " dispatches=", dispatches)
+
+func _origins_for(camera: Vector3, spacing: float) -> Array[Vector3i]:
+	var result: Array[Vector3i] = []
+	for level in Clipmap.LEVELS:
+		var step := spacing * float(1 << level)
+		result.append(Vector3i((camera / step).floor()) - Vector3i.ONE * (Clipmap.RESOLUTION / 2))
+	return result
+
+func _count_valid_tags_for_origins(values: PackedInt32Array, origins: Array,
+		epoch: int) -> int:
+	var count := 0
+	for level in origins.size():
+		var origin: Vector3i = origins[level]
+		for z in range(origin.z, origin.z + Clipmap.RESOLUTION):
+			for y in range(origin.y, origin.y + Clipmap.RESOLUTION):
+				for x in range(origin.x, origin.x + Clipmap.RESOLUTION):
+					var index := _tag_index(Vector3i(x, y, z), level)
+					if values[index] == x and values[index + 1] == y and values[index + 2] == z \
+							and values[index + 3] == epoch:
+						count += 1
+	return count
+
+func _all_active_tags_match(values: PackedInt32Array, origins: Array, epoch: int) -> bool:
+	return _count_valid_tags_for_origins(values, origins, epoch) \
+			== Clipmap.RESOLUTION * Clipmap.RESOLUTION * Clipmap.RESOLUTION * Clipmap.LEVELS
+
+func _tag_index(cell: Vector3i, level: int) -> int:
+	var x := _positive_mod(cell.x, Clipmap.RESOLUTION)
+	var y := _positive_mod(cell.y, Clipmap.RESOLUTION)
+	var z := level * Clipmap.RESOLUTION + _positive_mod(cell.z, Clipmap.RESOLUTION)
+	return (z * Clipmap.RESOLUTION * Clipmap.RESOLUTION + y * Clipmap.RESOLUTION + x) * 4
+
+func _positive_mod(value: int, modulus: int) -> int:
+	return ((value % modulus) + modulus) % modulus
 
 func _append_quad(faces: PackedVector3Array, lower_x: float, upper_x: float) -> void:
 	var a := Vector3(lower_x, 0.1, 0.0)

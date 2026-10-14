@@ -257,7 +257,8 @@ void main() {
 	int reject_reason = CLV_REJECT_NONE;
 	vec3 cell_fraction = vec3(0.0);
 	int receiver_patch = receiver_triangle >= 0 ? int(visibility_geometry.triangles[receiver_triangle * 3 + 2].w) : 0;
-	// Partial CLV support is completed from the exact path; blocked geometry already rejected that cache level.
+	// CLV moves its query to an exterior cell from the receiver triangle's geometric plane when needed.
+	// It still checks all eight corner connections; partial radiance is completed from the exact path below.
 	bool cached_light;
 	if (debug_enabled) {
 		cached_light = sample_clv_diagnostic(world, normal_world, receiver_triangle, receiver_patch,

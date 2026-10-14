@@ -43,6 +43,11 @@ func create(rd: RenderingDevice) -> bool:
 func update(rd: RenderingDevice, camera: Vector3, base_spacing: float, epoch: int,
 		bake: Dictionary, directional: RefCounted, ubo: RID, nearest_sampler: RID,
 		budget := 256) -> bool:
+	# Tags bind each physical cell to its logical world-cell coordinates and
+	# lighting epoch. A spacing change reinterprets those same coordinates, so
+	# invalidate old tags before the partial refill can expose stale coefficients.
+	if not _origins.is_empty() and not is_equal_approx(_spacing, base_spacing) and tags.is_valid():
+		rd.texture_clear(tags, Color(0, 0, 0, 0), 0, 1, 0, 1)
 	queue_updates(camera, base_spacing, epoch)
 	var selected := take_jobs(clampi(budget, 1, MAX_JOBS))
 	var bytes := PackedByteArray()

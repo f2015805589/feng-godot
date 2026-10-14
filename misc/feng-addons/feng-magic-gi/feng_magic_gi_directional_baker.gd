@@ -44,7 +44,7 @@ static func bake_probe(output: Resource, geometry: RefCounted, probe: int,
 					fposmod(coordinates[0][sample_index] + emitter_shifts[shift_index], 1.0),
 					fposmod(coordinates[1][sample_index] + emitter_shifts[shift_index + 1], 1.0),
 					fposmod(coordinates[2][sample_index] + emitter_shifts[shift_index + 2], 1.0),
-					distance, bounce == 0)
+					distance, bounce == 0, true)
 				if source.is_empty():
 					continue
 				var visibility_hit: Dictionary = geometry.trace_emitter_connection(
@@ -52,13 +52,16 @@ static func bake_probe(output: Resource, geometry: RefCounted, probe: int,
 					source.visibility_distance, path_start_face)
 				if not _matches_sampled_emitter_hit(visibility_hit, emitter, source):
 					continue
+				var texture_rgb: Vector3 = source.texture_rgb
+				if source.has("texture_uv1") and source.has("texture_uv2"):
+					texture_rgb = geometry.emitters.sample_texture(emitter,
+							source.texture_uv1, source.texture_uv2)
 				var bsdf_pdf := _path_direction_pdf(bounce, normal, source.sample_direction)
 				var light_weight := EmitterBakeSet.power_heuristic(float(source.light_pdf), bsdf_pdf)
 				# SH and cosine use the original physical sample direction. The
 				# collinear shadow ray exists only to query visibility.
 				var source_basis := DirectionalData.basis(source.sample_direction) if bounce == 0 else outgoing
 				var factor := float(source.weight) * light_weight / rays * (1.0 if bounce == 0 else 4.0 * PI)
-				var texture_rgb: Vector3 = source.texture_rgb
 				var surface_factor := float(source.weight) * (maxf(receiver_normal.dot(source.sample_direction), 0.0) / (PI * rays) if bounce == 0 else receiver_weight) * light_weight
 				for channel in 3:
 					surface_emission[emitter * 6 + channel] += throughput[channel] * surface_factor
@@ -71,7 +74,7 @@ static func bake_probe(output: Resource, geometry: RefCounted, probe: int,
 						angular_emission[base + 3 + channel] += weight * texture_rgb[channel]
 			var hit: Dictionary = geometry.trace_path(vertex, direction, distance, path_start_face)
 			if hit.is_empty():
-				var incoming := DirectionalData.basis(direction)
+				var incoming := outgoing if bounce == 0 else DirectionalData.basis(direction)
 				for k in 9:
 					if bounce == 0:
 						surface_sky[k] += PI * receiver_weight * incoming[k]

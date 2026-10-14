@@ -17,6 +17,103 @@ const int CLV_REJECT_NO_EXACT_SUPPORT = 5;
 const int CLV_REJECT_NO_EXACT_CANDIDATE = 6;
 const int CLV_REJECT_OUTSIDE_BAKE_GRID = 7;
 
+const float CLV_QUERY_PLANE_EPSILON = 1e-4;
+const float CLV_QUERY_AXIS_EPSILON = 1e-4;
+const int CLV_QUERY_MAX_BOUNDARY_STEPS = 8;
+
+bool clv_finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+float clv_min_corner_plane_distance(ivec3 base, float step_size,
+		vec3 world, vec3 geometric_normal) {
+	vec3 minimum_offset = vec3(
+			geometric_normal.x < 0.0 ? 1.0 : 0.0,
+			geometric_normal.y < 0.0 ? 1.0 : 0.0,
+			geometric_normal.z < 0.0 ? 1.0 : 0.0);
+	vec3 corner = (vec3(base) + minimum_offset + 0.5) * step_size;
+	return dot(corner - world, geometric_normal);
+}
+
+// Move the interpolation cell outward only when its nearest corner falls behind
+// a known receiver plane. The returned grid position remains the query used for
+// cache addressing; all radiance projection still uses the shading normal.
+bool clv_surface_query_position(vec3 world, vec3 normal, int receiver_triangle,
+		float step_size, out vec3 position, out ivec3 base, out vec3 fraction) {
+	position = vec3(0.0);
+	base = ivec3(0);
+	fraction = vec3(0.0);
+	if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)
+			|| !clv_finite_vec3(world) || !clv_finite_vec3(normal)) {
+		return false;
+	}
+	float shading_length_squared = dot(normal, normal);
+	if (!(shading_length_squared > 1e-12)
+			|| isnan(shading_length_squared) || isinf(shading_length_squared)) { return false; }
+	vec3 query_world = world + normal * step_size * 0.75;
+	if (!clv_finite_vec3(query_world)) { return false; }
+	position = query_world / step_size - 0.5;
+	if (!clv_finite_vec3(position)) { return false; }
+	base = ivec3(floor(position));
+	fraction = fract(position);
+	if (receiver_triangle < 0
+			|| receiver_triangle * 3 + 2 >= visibility_geometry.triangles.length()) {
+		return true;
+	}
+	vec3 edge1 = visibility_geometry.triangles[receiver_triangle * 3 + 1].xyz;
+	vec3 edge2 = visibility_geometry.triangles[receiver_triangle * 3 + 2].xyz;
+	vec3 geometric_normal = cross(edge2, edge1);
+	float geometric_length_squared = dot(geometric_normal, geometric_normal);
+	if (!clv_finite_vec3(geometric_normal) || !(geometric_length_squared > 1e-12)
+			|| isnan(geometric_length_squared) || isinf(geometric_length_squared)) {
+		return true;
+	}
+	geometric_normal *= inversesqrt(geometric_length_squared);
+	float normal_alignment = dot(geometric_normal, normal);
+	if (isnan(normal_alignment) || isinf(normal_alignment) || abs(normal_alignment) < 1e-5) {
+		return true;
+	}
+	if (normal_alignment < 0.0) { geometric_normal = -geometric_normal; }
+	float plane_epsilon = step_size * CLV_QUERY_PLANE_EPSILON;
+	if (clv_min_corner_plane_distance(base, step_size, world, geometric_normal) >= plane_epsilon) {
+		return true;
+	}
+	float maximum_movement = step_size * (1.7320508075688772 + 0.001);
+	float movement = 0.0;
+	for (int attempt = 0; attempt < CLV_QUERY_MAX_BOUNDARY_STEPS; attempt++) {
+		float nearest_distance = 1e30;
+		int crossing_axis = -1;
+		for (int axis = 0; axis < 3; axis++) {
+			float direction = geometric_normal[axis];
+			if (abs(direction) < 1e-7) { continue; }
+			float boundary = direction > 0.0 ? float(base[axis] + 1) : float(base[axis]);
+			float distance = step_size * (boundary - position[axis]) / direction;
+			if (distance >= 0.0 && distance < nearest_distance) {
+				nearest_distance = distance;
+				crossing_axis = axis;
+			}
+		}
+		if (crossing_axis < 0 || isnan(nearest_distance) || isinf(nearest_distance)) {
+			return false;
+		}
+		float axis_epsilon = step_size * CLV_QUERY_AXIS_EPSILON;
+		float step_movement = nearest_distance + axis_epsilon;
+		if (movement + step_movement > maximum_movement) { return false; }
+		ivec3 previous_base = base;
+		position += geometric_normal * (nearest_distance / step_size);
+		position[crossing_axis] += geometric_normal[crossing_axis] > 0.0
+				? CLV_QUERY_AXIS_EPSILON : -CLV_QUERY_AXIS_EPSILON;
+		base = ivec3(floor(position));
+		fraction = fract(position);
+		if (base[crossing_axis] == previous_base[crossing_axis]) { return false; }
+		movement += step_movement;
+		if (clv_min_corner_plane_distance(base, step_size, world, geometric_normal) >= plane_epsilon) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
 		bool collect_diagnostics,
 		out vec3 secondary, out vec3 primary, out float cache_weight,
@@ -39,14 +136,19 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 		float step_size = clv.spacing.x * float(1 << level);
 		// Sample on the receiving side. Every interpolation corner must have a
 		// clear connection to the actual surface; thin walls cannot be skipped.
-		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
-		ivec3 base = ivec3(floor(position));
+		vec3 position;
+		ivec3 base;
+		vec3 fraction;
+		if (!clv_surface_query_position(world, normal, receiver_triangle,
+				step_size, position, base, fraction)) {
+			if (collect_diagnostics) { found_blocked_geometry = true; }
+			continue;
+		}
 		ivec3 relative = base - clv.origins[level].xyz;
 		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
 		if (collect_diagnostics) { found_in_bounds = true; }
 		ivec3 physical = ((base % resolution) + resolution) % resolution;
 		bool seam = any(equal(physical, ivec3(resolution - 1)));
-		vec3 fraction = fract(position);
 		int valid_mask = 0;
 		bool all_metadata_valid = true;
 		float coverage = 0.0;

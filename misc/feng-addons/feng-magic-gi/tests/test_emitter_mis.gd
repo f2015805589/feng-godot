@@ -5,16 +5,81 @@ const Baker = preload("../feng_magic_gi_directional_baker.gd")
 const BakeSet = preload("../feng_magic_gi_emitter_bake_set.gd")
 const TraceScene = preload("../feng_magic_gi_trace_scene.gd")
 const DirectionalData = preload("../feng_magic_gi_directional_data.gd")
+const MomentBaker = preload("../feng_magic_gi_moment_baker.gd")
 const TextureSampler = preload("../feng_magic_gi_texture_sampler.gd")
 const MaterialSampler = preload("../feng_magic_gi_material_sampler.gd")
 const BakeJob = preload("../feng_magic_gi_bake_job.gd")
 const Data = preload("../feng_magic_gi_data.gd")
 const Placement = preload("../feng_magic_gi_placement.gd")
+const ProbeBaker = preload("../feng_magic_gi_baker.gd")
 
 class TestVolume:
 	extends Node3D
 	var size := Vector3.ONE * 100000.0
 	var probe_spacing := 1.0
+	var bake_request_current := true
+
+	func is_bake_request_current(generation: int) -> bool:
+		return bake_request_current and generation == 17
+
+class ProbeJobTracker:
+	extends RefCounted
+	var mutex := Mutex.new()
+	var started := 0
+	var finished_probes := PackedInt32Array()
+
+	func record_started() -> void:
+		mutex.lock()
+		started += 1
+		mutex.unlock()
+
+	func record_finished(probe: int) -> void:
+		mutex.lock()
+		finished_probes.append(probe)
+		mutex.unlock()
+
+	func snapshot() -> Dictionary:
+		mutex.lock()
+		var result := {"started": started, "finished_probes": finished_probes.duplicate()}
+		mutex.unlock()
+		return result
+
+class ControlledBakeJob:
+	extends "../feng_magic_gi_bake_job.gd"
+	var tracker: ProbeJobTracker
+	var probe_index := -1
+	var delay_usec := 0
+	var force_failure := false
+
+	func run(geometry: RefCounted, signature: int, probe: int,
+			coordinates: Array[PackedFloat64Array], minimum_coordinates: Array[PackedFloat64Array],
+			extra_coordinates: Array[PackedFloat64Array], visibility_rays: int) -> void:
+		tracker.record_started()
+		if delay_usec > 0:
+			OS.delay_usec(delay_usec)
+		super.run(geometry, signature, probe, coordinates, minimum_coordinates,
+			extra_coordinates, visibility_rays)
+		if force_failure:
+			valid = false
+		tracker.record_finished(probe_index)
+
+class ControlledBaker:
+	extends "../feng_magic_gi_baker.gd"
+	var tracker: ProbeJobTracker
+	var failure_probe := -1
+	var slow_probe_delay_usec := 50000
+
+	func _probe_worker_limit() -> int:
+		return 2
+
+	func _create_bake_job(data: Data, probe: int) -> BakeJob:
+		var job := ControlledBakeJob.new()
+		job.initialize(data, probe)
+		job.tracker = tracker
+		job.probe_index = probe
+		job.delay_usec = slow_probe_delay_usec if probe == 0 else 1000
+		job.force_failure = probe == failure_probe
+		return job
 
 class TestGeometry:
 	extends RefCounted
@@ -31,6 +96,10 @@ class TestGeometry:
 
 	func trace(origin: Vector3, direction: Vector3, max_distance: float) -> Dictionary:
 		return trace_scene.trace(origin, direction, max_distance)
+
+	func trace_geometry(origin: Vector3, direction: Vector3,
+			max_distance: float) -> Dictionary:
+		return trace_scene.trace_geometry(origin, direction, max_distance)
 
 	func trace_path(origin: Vector3, direction: Vector3, max_distance: float,
 			start_face_index := -1) -> Dictionary:
@@ -49,6 +118,10 @@ class ReferenceGeometry:
 	func trace_path(origin: Vector3, direction: Vector3, max_distance: float,
 			start_face_index := -1) -> Dictionary:
 		return source.trace_path(origin, direction, max_distance, start_face_index)
+
+	func trace_geometry(origin: Vector3, direction: Vector3,
+			max_distance: float) -> Dictionary:
+		return source.trace(origin, direction, max_distance)
 
 	func trace_emitter_connection(origin: Vector3, direction: Vector3,
 			max_distance: float, start_face_index := -1) -> Dictionary:
@@ -74,6 +147,7 @@ class CountingEmitterLookup:
 	var source: RefCounted
 	var groups: Array = []
 	var sample_texture_calls := 0
+	var honor_deferred_sampling := true
 
 	func bind(source_set: RefCounted) -> void:
 		source = source_set
@@ -83,6 +157,25 @@ class CountingEmitterLookup:
 		sample_texture_calls += 1
 		var sampled: Vector3 = source.call("sample_texture", emitter_index, uv1, uv2)
 		return sampled
+
+	func sample_connection(emitter_index: int, receiver: Vector3,
+			receiver_normal: Vector3, u_triangle: float, u_barycentric: float,
+			u_edge: float, max_distance: float, spherical_receiver := false,
+			defer_texture_sampling := false) -> Dictionary:
+		var deferred := defer_texture_sampling and honor_deferred_sampling
+		var sampled: Dictionary = source.call("sample_connection", emitter_index,
+			receiver, receiver_normal, u_triangle, u_barycentric, u_edge,
+			max_distance, spherical_receiver, deferred)
+		if not sampled.is_empty() and not deferred and emitter_index >= 0 \
+				and emitter_index < groups.size() \
+				and groups[emitter_index].get("texture_image") != null:
+			sample_texture_calls += 1
+		return sampled
+
+	func solid_angle_pdf(emitter_index: int, receiver: Vector3, target: Vector3,
+			geometric_normal: Vector3) -> float:
+		return float(source.call("solid_angle_pdf", emitter_index, receiver,
+			target, geometric_normal))
 
 class TestOutput:
 	extends Resource
@@ -108,6 +201,7 @@ func _run() -> void:
 	_test_canonical_face_metadata()
 	_test_physical_first_hit_and_texture()
 	_test_nee_visibility_skips_shading_work()
+	_test_moment_baker_uses_geometry_only()
 	_test_culling()
 	_test_actual_baker(0.0012, 1.0, 1.0, 1024, false)
 	_test_actual_baker(0.03, 1.0, 1.0, 1024, false)
@@ -115,6 +209,7 @@ func _run() -> void:
 	_test_actual_baker(0.1, 0.2, 0.2, 4096, true)
 	_test_actual_baker_bounces1()
 	_test_affine_endpoint_native_ray_retry()
+	await _test_rolling_probe_window()
 	if failures == 0:
 		print("EMITTER_MIS_TESTS_OK")
 		quit(0)
@@ -183,6 +278,13 @@ func _test_canonical_face_metadata() -> void:
 		0.2, 0.3, 0.7, 2.0, true)
 	_check(not sampled.is_empty() and int(sampled.get("sample_face_index", -1)) == 1,
 			"area sample carries the stable native face id after a collapsed face")
+	var deferred_without_texture: Dictionary = emitters.sample_connection(0,
+		Vector3.ZERO, Vector3.ZERO, 0.2, 0.3, 0.7, 2.0, true, true)
+	_check(sampled.get("texture_rgb", Vector3.ONE) == Vector3.ZERO
+			and deferred_without_texture.get("texture_rgb", Vector3.ONE) == Vector3.ZERO
+			and not deferred_without_texture.has("texture_uv1")
+			and not deferred_without_texture.has("texture_uv2"),
+			"image-less emitters keep black texture radiance without interpolating or returning deferred UVs")
 	if sampled.is_empty():
 		return
 	var faces := PackedVector3Array([
@@ -226,6 +328,13 @@ func _test_physical_first_hit_and_texture() -> void:
 	_check(not sample.is_empty(), "nearby rectangle area sample exists")
 	if sample.is_empty():
 		return
+	var deferred_sample: Dictionary = geometry.emitters.sample_connection(0, receiver,
+		Vector3.ZERO, 0.41, 0.37, 0.63, 2.0, true, true)
+	var deferred_texture: Vector3 = geometry.emitters.sample_texture(0,
+		deferred_sample.texture_uv1, deferred_sample.texture_uv2)
+	_check(deferred_sample.get("texture_rgb", Vector3.ONE) == Vector3.ZERO
+			and deferred_texture == sample.texture_rgb,
+		"deferred UV texture sample exactly matches the legacy eager public sample")
 	var hit: Dictionary = geometry.trace_path(receiver, sample.sample_direction, 2.0, 0)
 	_check(not hit.is_empty() and int(hit.get("emitter_index", -1)) == 0,
 			"physical BSDF ray and sampled rectangle resolve to the same emitter group")
@@ -398,6 +507,7 @@ func _compare_reference_and_fast_nee(geometry: TestGeometry, rays: int,
 	reference.emitters = geometry.emitters
 	var emitter_lookup: CountingEmitterLookup = geometry.trace_scene.emitters
 	var material_lookup: CountingMaterialSampler = geometry.trace_scene.material_sampler
+	emitter_lookup.honor_deferred_sampling = false
 	var coordinates := _coordinates(4, rays)
 	var shifts := PackedFloat32Array([0.17, 0.61, 0.29, 0.83])
 	var emitter_shifts := PackedFloat32Array()
@@ -409,6 +519,7 @@ func _compare_reference_and_fast_nee(geometry: TestGeometry, rays: int,
 	var reference_emitter_texture_calls := emitter_lookup.sample_texture_calls
 	material_lookup.sample_calls = 0
 	emitter_lookup.sample_texture_calls = 0
+	emitter_lookup.honor_deferred_sampling = true
 	var fast_output := _make_transport_output(geometry.emitters.groups.size())
 	Baker.bake_probe(fast_output, geometry, 0, rays, 1, 4.0,
 		coordinates, shifts, emitter_shifts)
@@ -439,6 +550,44 @@ func _compare_reference_and_fast_nee(geometry: TestGeometry, rays: int,
 				label + " NEE skips blocker-texture sampling while path hits still sample it; old=%d fast=%d"
 				% [reference_material_calls, fast_material_calls])
 
+func _test_moment_baker_uses_geometry_only() -> void:
+	var geometry: TestGeometry = _make_counted_textured_geometry(false, true)
+	var reference := ReferenceGeometry.new()
+	reference.source = geometry
+	var minimum_coordinates := _coordinates(2,
+		Data.VISIBILITY_TEXELS_PER_PROBE * 4)
+	var extra_coordinates: Array[PackedFloat64Array] = []
+	var visibility_rays := Data.VISIBILITY_TEXELS_PER_PROBE * 4
+	var reference_data := _make_moment_test_data()
+	var reference_ok := MomentBaker.bake(reference_data, reference, 0,
+		Vector2(0.17, 0.61), visibility_rays,
+		minimum_coordinates, extra_coordinates)
+	var material_lookup: CountingMaterialSampler = geometry.trace_scene.material_sampler
+	var emitter_lookup: CountingEmitterLookup = geometry.trace_scene.emitters
+	var reference_material_calls := material_lookup.sample_calls
+	var reference_emitter_calls := emitter_lookup.sample_texture_calls
+	material_lookup.sample_calls = 0
+	emitter_lookup.sample_texture_calls = 0
+	var fast_data := _make_moment_test_data()
+	var fast_ok := MomentBaker.bake(fast_data, geometry, 0,
+		Vector2(0.17, 0.61), visibility_rays,
+		minimum_coordinates, extra_coordinates)
+	_check(reference_ok and fast_ok
+			and reference_data.visibility_moments.to_byte_array()
+				== fast_data.visibility_moments.to_byte_array(),
+			"geometry-only visibility moments preserve every packed output value")
+	_check(reference_material_calls > 0 and reference_emitter_calls > 0
+			and material_lookup.sample_calls == 0 and emitter_lookup.sample_texture_calls == 0,
+			"geometry-only moment tracing skips receiver albedo and emitter texture evaluation")
+
+func _make_moment_test_data() -> Data:
+	var data := Data.new()
+	data.positions = PackedVector3Array([Vector3.ZERO])
+	data.bake_distance = 4.0
+	data.visibility_moments.resize(Data.VISIBILITY_TEXELS_PER_PROBE
+			* Data.VISIBILITY_MOMENT_CHANNELS)
+	return data
+
 func _make_transport_output(source_count: int) -> TestOutput:
 	var output := TestOutput.new()
 	output.positions = PackedVector3Array([Vector3.ZERO])
@@ -466,6 +615,7 @@ func _make_counted_textured_geometry(use_uv2: bool, with_blocker: bool) -> TestG
 		geometry = _add_textured_blocker(geometry, 0.4, Vector2(0.2, 0.2))
 	var emitter_lookup := CountingEmitterLookup.new()
 	emitter_lookup.bind(geometry.emitters)
+	geometry.emitters = emitter_lookup
 	geometry.trace_scene.emitters = emitter_lookup
 	var material_source := MaterialSampler.new()
 	material_source.records.append({
@@ -722,6 +872,117 @@ func _test_affine_endpoint_native_ray_retry() -> void:
 	_check(job.valid and is_finite(baked_response) and baked_response > 0.0,
 			"actual BakeJob→TraceScene call path returns finite positive emitter response; value="
 			+ str(baked_response))
+
+func _test_rolling_probe_window() -> void:
+	var fixture: Dictionary = _make_geometry(1.0, 1.0, 0.03,
+			BaseMaterial3D.CULL_BACK, null, false, false)
+	var geometry: TestGeometry = fixture.geometry
+	geometry.trace_scene.material_sampler = MaterialSampler.new()
+	var positions := PackedVector3Array([
+		Vector3.ZERO, Vector3(0.2, 0.0, 0.0), Vector3(1.1, 0.0, 0.0), Vector3(-0.4, 0.1, 0.0)])
+	var scheduler_emitter_keys := PackedStringArray(["test-panel"])
+	var data := _make_scheduler_data(positions, scheduler_emitter_keys)
+	var reference := _make_scheduler_data(positions, scheduler_emitter_keys)
+	var qmc_coordinates := ProbeBaker._build_qmc_base_coordinates(data.bake_samples,
+			(data.bake_bounces + 1) * 2)
+	var visibility_rays := Data.VISIBILITY_TEXELS_PER_PROBE * 4
+	var minimum_coordinates := ProbeBaker._build_qmc_base_coordinates(visibility_rays, 2)
+	var extra_coordinates := ProbeBaker._build_qmc_base_coordinates(0, 2)
+	var tracker := ProbeJobTracker.new()
+	var baker := ControlledBaker.new()
+	baker.tracker = tracker
+	var volume := TestVolume.new()
+	get_root().add_child(volume)
+	var succeeded: bool = await baker._run_probe_jobs(data, volume, 17,
+		geometry.trace_scene, 8271, qmc_coordinates, minimum_coordinates,
+		extra_coordinates, visibility_rays)
+	_check(succeeded, "rolling worker window completes the full probe set")
+	var tracked: Dictionary = tracker.snapshot()
+	_check(tracked.started == positions.size()
+			and tracked.finished_probes.size() == positions.size(),
+			"rolling window joins every submitted probe job")
+	_check(tracked.finished_probes.size() > 1
+			and tracked.finished_probes[0] != 0,
+			"controlled workload completes out of probe order")
+	var reference_ok := true
+	for probe in positions.size():
+		var job := BakeJob.new()
+		job.initialize(reference, probe)
+		job.run(geometry.trace_scene, 8271, probe, qmc_coordinates,
+			minimum_coordinates, extra_coordinates, visibility_rays)
+		if not job.valid:
+			reference_ok = false
+			break
+		job.merge(reference, probe)
+	_check(reference_ok and _scheduler_payload_bytes_equal(data, reference),
+			"out-of-order worker completion preserves every per-probe output byte")
+
+	var failing_tracker := ProbeJobTracker.new()
+	var failing_baker := ControlledBaker.new()
+	failing_baker.tracker = failing_tracker
+	failing_baker.failure_probe = 1
+	var failed_data := _make_scheduler_data(positions, scheduler_emitter_keys)
+	var failed: bool = await failing_baker._run_probe_jobs(failed_data, volume, 17,
+		geometry.trace_scene, 8271, qmc_coordinates, minimum_coordinates,
+		extra_coordinates, visibility_rays)
+	var failed_jobs: Dictionary = failing_tracker.snapshot()
+	_check(not failed and failed_jobs.started == failed_jobs.finished_probes.size()
+			and failed_jobs.started <= 2
+			and _scheduler_payload_bytes_equal(failed_data,
+				_make_scheduler_data(positions, scheduler_emitter_keys)),
+			"worker failure stops refill, joins every in-flight job, and skips discarded payloads")
+	get_root().remove_child(volume)
+	volume.free()
+
+	var cancelled_tracker := ProbeJobTracker.new()
+	var cancelled_baker := ControlledBaker.new()
+	cancelled_baker.tracker = cancelled_tracker
+	var cancelled_data := _make_scheduler_data(positions, scheduler_emitter_keys)
+	var cancelled_volume := TestVolume.new()
+	get_root().add_child(cancelled_volume)
+	call_deferred("_invalidate_bake_request", cancelled_volume)
+	var cancelled: bool = await cancelled_baker._run_probe_jobs(cancelled_data,
+		cancelled_volume, 17, geometry.trace_scene, 8271, qmc_coordinates,
+		minimum_coordinates, extra_coordinates, visibility_rays)
+	var cancelled_jobs: Dictionary = cancelled_tracker.snapshot()
+	_check(not cancelled and cancelled_jobs.started == cancelled_jobs.finished_probes.size()
+			and cancelled_jobs.started <= 2
+			and _scheduler_payload_bytes_equal(cancelled_data,
+				_make_scheduler_data(positions, scheduler_emitter_keys)),
+			"cancellation stops refill, joins every in-flight job, and skips discarded payloads")
+	get_root().remove_child(cancelled_volume)
+	cancelled_volume.free()
+
+func _invalidate_bake_request(volume: TestVolume) -> void:
+	volume.bake_request_current = false
+
+func _make_scheduler_data(positions: PackedVector3Array,
+		emitter_keys: PackedStringArray) -> Data:
+	var data := Data.new()
+	data.positions = positions.duplicate()
+	data.normals.resize(positions.size())
+	data.normals.fill(Vector3(0.0, 0.0, 1.0))
+	data.emitter_keys = emitter_keys
+	data.bake_samples = 8
+	data.bake_bounces = 1
+	data.bake_distance = 4.0
+	data.transfer.resize(positions.size() * 27)
+	data.primary_sky_visibility.resize(positions.size() * 9)
+	data.visibility_moments.resize(positions.size() * Data.VISIBILITY_TEXELS_PER_PROBE
+			* Data.VISIBILITY_MOMENT_CHANNELS)
+	data.emitter_transport.resize(positions.size() * emitter_keys.size() * 6)
+	data.directional = Data.DirectionalData.new()
+	data.directional.allocate(positions.size(), emitter_keys.size())
+	return data
+
+func _scheduler_payload_bytes_equal(a: Data, b: Data) -> bool:
+	return a.transfer.to_byte_array() == b.transfer.to_byte_array() \
+		and a.primary_sky_visibility.to_byte_array() == b.primary_sky_visibility.to_byte_array() \
+		and a.visibility_moments.to_byte_array() == b.visibility_moments.to_byte_array() \
+		and a.emitter_transport.to_byte_array() == b.emitter_transport.to_byte_array() \
+		and a.directional.transfer.to_byte_array() == b.directional.transfer.to_byte_array() \
+		and a.directional.sky.to_byte_array() == b.directional.sky.to_byte_array() \
+		and a.directional.emission.to_byte_array() == b.directional.emission.to_byte_array()
 
 func _make_geometry(half_width: float, half_height: float, height: float,
 		cull_mode: int, texture_image: Image, use_uv2: bool,

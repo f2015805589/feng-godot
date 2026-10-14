@@ -135,7 +135,8 @@ static func power_heuristic(pdf_a: float, pdf_b: float) -> float:
 ## Returns the geometric estimator weight and texture sample, but no live color.
 func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: Vector3,
 		u_triangle: float, u_barycentric: float, u_edge: float,
-		max_distance: float, spherical_receiver := false) -> Dictionary:
+		max_distance: float, spherical_receiver := false,
+		defer_texture_sampling := false) -> Dictionary:
 	if emitter_index < 0 or emitter_index >= groups.size():
 		return {}
 	var source: Dictionary = groups[emitter_index]
@@ -191,13 +192,19 @@ func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: V
 		estimator_weight /= PI
 	if not is_finite(estimator_weight) or estimator_weight <= 0.0:
 		return {}
-	var uv1: Vector2 = chosen["uv1_a"] * w0 + chosen["uv1_b"] * w1 + chosen["uv1_c"] * w2
-	var uv2: Vector2 = chosen["uv2_a"] * w0 + chosen["uv2_b"] * w1 + chosen["uv2_c"] * w2
-	var texture_rgb := _sample_texture(source, uv1, uv2)
+	var texture_rgb := Vector3.ZERO
+	var has_texture_image: bool = source.get("texture_image") != null
+	var texture_uv1 := Vector2.ZERO
+	var texture_uv2 := Vector2.ZERO
+	if has_texture_image:
+		texture_uv1 = chosen["uv1_a"] * w0 + chosen["uv1_b"] * w1 + chosen["uv1_c"] * w2
+		texture_uv2 = chosen["uv2_a"] * w0 + chosen["uv2_b"] * w1 + chosen["uv2_c"] * w2
+		if not defer_texture_sampling:
+			texture_rgb = _sample_texture(source, texture_uv1, texture_uv2)
 	var light_pdf := distance * distance / (total_area * cosine_source)
 	if not is_finite(light_pdf) or light_pdf <= 0.0:
 		return {}
-	return {
+	var result := {
 		"sample_direction": sample_direction,
 		"shadow_direction": sample_direction,
 		"shadow_origin": receiver,
@@ -211,6 +218,12 @@ func sample_connection(emitter_index: int, receiver: Vector3, receiver_normal: V
 		"weight": estimator_weight,
 		"texture_rgb": texture_rgb
 	}
+	if defer_texture_sampling and has_texture_image:
+		# Texture color affects radiance, never the area or solid-angle PDF. The
+		# baker fills this only after visibility confirms the selected first hit.
+		result["texture_uv1"] = texture_uv1
+		result["texture_uv2"] = texture_uv2
+	return result
 
 static func ray_epsilon(point: Vector3) -> float:
 	var scale := maxf(absf(point.x), maxf(absf(point.y), absf(point.z)))

@@ -111,38 +111,11 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	var extra_visibility_qmc_coordinates := _build_qmc_base_coordinates(
 			visibility_rays - minimum_visibility_rays, 2)
 	var trace_scene: RefCounted = geometry.trace_scene
-	var workers := clampi(OS.get_processor_count() - 2, 1, 8)
-	for first in range(0, data.probe_count(), workers):
-		var jobs: Array[RefCounted] = []
-		var tasks := PackedInt64Array()
-		for probe in range(first, mini(first + workers, data.probe_count())):
-			var job := BakeJob.new()
-			job.initialize(data, probe)
-			jobs.append(job)
-			tasks.append(WorkerThreadPool.add_task(job.run.bind(trace_scene, geometry_signature, probe,
-				qmc_base_coordinates, minimum_visibility_qmc_coordinates, extra_visibility_qmc_coordinates,
-				visibility_rays), false, "Magic GI Bake"))
-		var cancelled := false
-		while true:
-			var complete := true
-			for task in tasks:
-				complete = complete and WorkerThreadPool.is_task_completed(task)
-			if complete:
-				break
-			await Engine.get_main_loop().process_frame
-			cancelled = cancelled or not is_instance_valid(volume) or not volume.is_inside_tree() \
-				or not volume.is_bake_request_current(generation)
-		# Always join before dropping snapshots, including scene-close/cancel paths.
-		for task in tasks:
-			WorkerThreadPool.wait_for_task_completion(task)
-		if cancelled or not is_instance_valid(volume) or not volume.is_inside_tree() \
-			or not volume.is_bake_request_current(generation):
-			return null
-		for index in jobs.size():
-			if not jobs[index].valid:
-				push_warning("FMagicGI: incomplete directional visibility; discarded the bake.")
-				return null
-			jobs[index].merge(data, first + index)
+	var jobs_completed: bool = await _run_probe_jobs(data, volume, generation, trace_scene, geometry_signature,
+			qmc_base_coordinates, minimum_visibility_qmc_coordinates,
+			extra_visibility_qmc_coordinates, visibility_rays)
+	if not jobs_completed:
+		return null
 	# Recollect after yielding so edits to static scene content invalidate this
 	# result even if the volume transform did not change.
 	var verification := Placement.new()
@@ -168,6 +141,81 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if not data.has_nonzero_transfer():
 		push_warning("FMagicGI: " + volume.ZERO_TRANSFER_DIAGNOSTIC)
 	return data
+
+## Keep at most one worker window in flight. Completing and merging each probe
+## immediately lets a fast worker take the next slot without waiting for the
+## slowest probe in an arbitrary batch.
+func _run_probe_jobs(data: Data, volume: Node3D, generation: int,
+		trace_scene: RefCounted, geometry_signature: int,
+		qmc_base_coordinates: Array[PackedFloat64Array],
+		minimum_visibility_qmc_coordinates: Array[PackedFloat64Array],
+		extra_visibility_qmc_coordinates: Array[PackedFloat64Array],
+		visibility_rays: int) -> bool:
+	var worker_limit := clampi(_probe_worker_limit(), 1, 8)
+	var next_probe := 0
+	# One record owns each outstanding task's job and destination probe slot.
+	var pending: Dictionary = {}
+	var cancelled := false
+	var failed := false
+	while next_probe < data.probe_count() or not pending.is_empty():
+		cancelled = cancelled or not _bake_request_current(volume, generation)
+		var completed_tasks := PackedInt64Array()
+		for task_id in pending:
+			if WorkerThreadPool.is_task_completed(task_id):
+				completed_tasks.append(task_id)
+		if not completed_tasks.is_empty():
+			var completed_records: Array[Dictionary] = []
+			for task_id in completed_tasks:
+				# Join before releasing the task's job or its immutable geometry snapshot.
+				WorkerThreadPool.wait_for_task_completion(task_id)
+				var record: Dictionary = pending[task_id]
+				pending.erase(task_id)
+				var job: BakeJob = record.job
+				if not job.valid:
+					failed = true
+				completed_records.append(record)
+			# Merge only after all newly completed jobs are known to be valid. Once a
+			# cancellation or failure is known, remaining results are only joined.
+			if not cancelled and not failed:
+				for record in completed_records:
+					var completed_job: BakeJob = record.job
+					completed_job.merge(data, int(record.probe))
+		if not cancelled and not failed:
+			while next_probe < data.probe_count() and pending.size() < worker_limit:
+				if not _bake_request_current(volume, generation):
+					cancelled = true
+					break
+				var probe := next_probe
+				var job := _create_bake_job(data, probe)
+				var task_id := WorkerThreadPool.add_task(Callable(job, "run").bind(trace_scene,
+					geometry_signature, probe, qmc_base_coordinates,
+					minimum_visibility_qmc_coordinates, extra_visibility_qmc_coordinates,
+					visibility_rays), false, "Magic GI Bake")
+				if task_id < 0:
+					failed = true
+					break
+				pending[task_id] = {"job": job, "probe": probe}
+				next_probe += 1
+		if (cancelled or failed) and pending.is_empty():
+			break
+		if not pending.is_empty():
+			await Engine.get_main_loop().process_frame
+	if failed:
+		push_warning("FMagicGI: incomplete directional visibility; discarded the bake.")
+	return not cancelled and not failed and next_probe == data.probe_count() \
+		and _bake_request_current(volume, generation)
+
+func _probe_worker_limit() -> int:
+	return clampi(OS.get_processor_count() - 2, 1, 8)
+
+func _create_bake_job(data: Data, probe: int) -> BakeJob:
+	var job := BakeJob.new()
+	job.initialize(data, probe)
+	return job
+
+func _bake_request_current(volume: Node3D, generation: int) -> bool:
+	return is_instance_valid(volume) and volume.is_inside_tree() \
+		and bool(volume.call("is_bake_request_current", generation))
 
 ## Randomized Hammersley sequence: the first coordinate is stratified over N
 ## samples and later coordinates use radical inverses in distinct prime bases.

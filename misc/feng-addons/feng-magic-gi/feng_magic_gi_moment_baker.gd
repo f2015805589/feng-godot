@@ -46,7 +46,7 @@ static func bake(data: Data, geometry: RefCounted, probe: int,
 			var radius := sqrt(maxf(0.0, 1.0 - y * y))
 			var phi := TAU * v
 			direction = Vector3(radius * cos(phi), y, radius * sin(phi))
-		var hit: Dictionary = geometry.trace(data.positions[probe], direction, data.bake_distance)
+		var hit: Dictionary = geometry.trace_geometry(data.positions[probe], direction, data.bake_distance)
 		var distance := data.bake_distance
 		if not hit.is_empty():
 			distance = clampf((hit.position - data.positions[probe]).dot(direction), 0.0, data.bake_distance)

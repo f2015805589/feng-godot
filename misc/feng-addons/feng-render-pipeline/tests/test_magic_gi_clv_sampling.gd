@@ -72,10 +72,11 @@ func run() -> void:
 	_run_zero_coverage_rejection()
 	_run_black_primary()
 	_run_thin_blocker()
+	_run_geometric_query_position()
 	_run_clv_disabled_reason()
 	_run_outside_reason()
 	print("MAGIC_GI_CLV_SAMPLING checks=", checks, " failures=", failures,
-			" cases=interior,x,y,z,xyz,level1,level2 gates=partial_tag,epoch,patch,support,normal,zero_weight,thin_wall,exact_support,focus_bounds,diagnostics")
+			" cases=interior,x,y,z,xyz,level1,level2,geometric_query,negative_world,known_wall gates=partial_tag,epoch,patch,support,normal,zero_weight,thin_wall,exact_support,focus_bounds,diagnostics")
 	_finish()
 
 func _test_focus_for_bounds() -> void:
@@ -209,6 +210,15 @@ void main() {
 			blended_secondary, blended_primary);
 	results.values[index * 9 + 7] = vec4(blended_secondary, 0.0);
 	results.values[index * 9 + 8] = vec4(blended_primary, 0.0);
+	if (normal_and_patch.w == -1.0) {
+		vec3 query_position;
+		ivec3 query_base;
+		vec3 query_fraction;
+		bool query_valid = clv_surface_query_position(world_and_triangle.xyz,
+				normal_and_patch.xyz, int(world_and_triangle.w), clv.spacing.x,
+				query_position, query_base, query_fraction);
+		results.values[index * 9 + 7] = vec4(query_position, query_valid ? 1.0 : 0.0);
+	}
 }
 """
 
@@ -219,7 +229,8 @@ func _case(label: String, base: Vector3i, fraction: Vector3, level: int,
 	var world := (Vector3(base) + fraction + Vector3.ONE * 0.5) * step_size \
 			- normal * step_size * 0.75
 	return {"label": label, "base": base, "fraction": fraction, "level": level,
-			"world": world, "normal": normal, "receiver_patch": receiver_patch}
+			"world": world, "normal": normal, "receiver_patch": receiver_patch,
+			"receiver_triangle": -1}
 
 func _run_cases(cases: Array, tag_texture: RID, node_buffer: RID, triangle_buffer: RID,
 		zero_primary: bool) -> bool:
@@ -228,7 +239,7 @@ func _run_cases(cases: Array, tag_texture: RID, node_buffer: RID, triangle_buffe
 		var world: Vector3 = query.world
 		var normal: Vector3 = query.normal
 		query_values.append_array(PackedFloat32Array([
-			world.x, world.y, world.z, -1.0,
+			world.x, world.y, world.z, float(query.get("receiver_triangle", -1)),
 			normal.x, normal.y, normal.z, float(query.receiver_patch),
 		]))
 	var query_bytes := query_values.to_byte_array()
@@ -393,6 +404,232 @@ func _run_thin_blocker() -> void:
 	_rd_free(wall_nodes)
 	_rd_free(wall_triangles)
 
+func _run_geometric_query_position() -> void:
+	var geometric_normal := Vector3(0.28, 0.92, 0.28).normalized()
+	var shading_normal := Vector3(0.20, 0.96, 0.15).normalized()
+	var world := Vector3.ONE * 0.95 + Vector3.ONE * 0.5 - shading_normal * 0.75
+	var plane_bvh := _plane_bvh(world, geometric_normal)
+	check(not plane_bvh.is_empty(), "Receiver-plane fixture must build a valid BVH.")
+	if plane_bvh.is_empty():
+		return
+	var plane_nodes := rd.storage_buffer_create(plane_bvh.nodes.size() * 4,
+			plane_bvh.nodes.to_byte_array())
+	var plane_triangles := rd.storage_buffer_create(plane_bvh.triangles.size() * 4,
+			plane_bvh.triangles.to_byte_array())
+	var tags := _create_tag_texture("")
+	var oblique_query := {"label": "oblique phase", "world": world,
+			"normal": shading_normal, "receiver_triangle": 0, "receiver_patch": -1}
+	var oblique := _run_single_with_values(oblique_query, tags, plane_nodes, plane_triangles)
+	var adjusted_position: Vector3 = oblique.query_position
+	var adjusted_base := _floor_vec3i(adjusted_position)
+	check(oblique.query_position_valid,
+			"Known, finite receiver geometry must produce a bounded safe query position.")
+	check(adjusted_base != _floor_vec3i(_legacy_query_position(world, shading_normal, 1.0)),
+			"An oblique near-corner query must advance to a geometrically safe interpolation cell.")
+	check(_min_corner_plane_distance(adjusted_base, 1.0, world, geometric_normal) >= 0.00009,
+			"Every adjusted oblique cell corner must lie outside the receiver tangent plane.")
+	check(oblique.valid and oblique.complete and oblique.selected_level == 0,
+			"A safe adjusted query must still use the production CLV sampler and preserve full support.")
+
+	var negative_world := world - Vector3.ONE * 4.0
+	var negative_bvh := _plane_bvh(negative_world, geometric_normal)
+	var negative_nodes := rd.storage_buffer_create(negative_bvh.nodes.size() * 4,
+			negative_bvh.nodes.to_byte_array())
+	var negative_triangles := rd.storage_buffer_create(negative_bvh.triangles.size() * 4,
+			negative_bvh.triangles.to_byte_array())
+	var negative_query := {"label": "negative oblique phase", "world": negative_world,
+			"normal": shading_normal, "receiver_triangle": 0, "receiver_patch": -1}
+	var negative_result := _run_single_with_values(negative_query, tags,
+			negative_nodes, negative_triangles)
+	var negative_base := _floor_vec3i(negative_result.query_position)
+	check(negative_result.query_position_valid
+			and _min_corner_plane_distance(negative_base, 1.0, negative_world,
+			geometric_normal) >= 0.00009,
+			"The safe-cell arithmetic must handle negative world and logical coordinates.")
+	var down_normal := Vector3.DOWN
+	var down_world := Vector3(1.45, 1.4, 1.45)
+	var down_bvh := _plane_bvh(down_world, down_normal)
+	var down_nodes := rd.storage_buffer_create(down_bvh.nodes.size() * 4,
+			down_bvh.nodes.to_byte_array())
+	var down_triangles := rd.storage_buffer_create(down_bvh.triangles.size() * 4,
+			down_bvh.triangles.to_byte_array())
+	var original_coefficient_texture := coefficient_texture
+	coefficient_texture = _create_coefficient_texture(false, "", Vector3i(15, 2, 3),
+			false, down_normal)
+	var down_query := {"label": "negative-axis unsafe phase", "world": down_world,
+			"normal": down_normal, "receiver_triangle": 0, "receiver_patch": -1}
+	var down_result := _run_single_with_values(down_query, tags, down_nodes, down_triangles)
+	var down_base := _floor_vec3i(down_result.query_position)
+	var down_legacy_base := _floor_vec3i(_legacy_query_position(down_world, down_normal, 1.0))
+	check(down_result.query_position_valid and down_base.y < down_legacy_base.y
+			and _min_corner_plane_distance(down_base, 1.0, down_world, down_normal) >= 0.00009,
+			"A DOWN-facing unsafe cell must advance across a negative-axis boundary to the safe exterior cell.")
+	var down_corner := Vector3(down_base) + Vector3(0.0, 1.0, 0.0) + Vector3.ONE * 0.5
+	var down_faces := _plane_faces(down_world, down_normal)
+	down_faces.append_array(_wall_faces(down_corner, down_world))
+	var down_wall_bvh: Dictionary = Visibility.build(down_faces)
+	check(not down_wall_bvh.is_empty() and Visibility.validate(down_wall_bvh.nodes,
+			down_wall_bvh.triangles), "Negative-axis adjusted-query wall fixture must be a valid BVH.")
+	if not down_wall_bvh.is_empty():
+		check(Visibility.segment_blocked(down_wall_bvh.nodes, down_wall_bvh.triangles,
+				down_corner, down_world),
+			"A thin wall must still block the DOWN-facing adjusted corner-to-receiver connection.")
+		var down_wall_nodes := rd.storage_buffer_create(down_wall_bvh.nodes.size() * 4,
+				down_wall_bvh.nodes.to_byte_array())
+		var down_wall_triangles := rd.storage_buffer_create(down_wall_bvh.triangles.size() * 4,
+				down_wall_bvh.triangles.to_byte_array())
+		check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters(true, 1)) == OK,
+				"Negative-axis wall gate test must limit sampling to the adjusted fine level.")
+		down_query.receiver_patch = 0
+		var down_blocked := _run_single_with_values(down_query, tags,
+				down_wall_nodes, down_wall_triangles)
+		print("CLV_DOWN_WALL_RESULT valid=", down_blocked.valid,
+				" cache_weight=", down_blocked.cache_weight,
+				" complete=", down_blocked.complete,
+				" level=", down_blocked.selected_level,
+				" status=", down_blocked.sample_status,
+				" reason=", down_blocked.reject_reason)
+		check(not down_blocked.valid and down_blocked.cache_weight == 0.0
+				and down_blocked.reject_reason == 4,
+				"The production sampler must preserve the all-corner blocker gate for a DOWN-facing query.")
+		check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters()) == OK,
+				"All clipmap levels must be restored after the negative-axis wall gate test.")
+		_rd_free(down_wall_nodes)
+		_rd_free(down_wall_triangles)
+	_rd_free(coefficient_texture)
+	coefficient_texture = original_coefficient_texture
+
+	var safe_world := Vector3.ZERO
+	var safe_bvh := _plane_bvh(safe_world, Vector3.UP)
+	var safe_nodes := rd.storage_buffer_create(safe_bvh.nodes.size() * 4,
+			safe_bvh.nodes.to_byte_array())
+	var safe_triangles := rd.storage_buffer_create(safe_bvh.triangles.size() * 4,
+			safe_bvh.triangles.to_byte_array())
+	var safe_query := {"label": "already safe axis cell", "world": safe_world,
+			"normal": Vector3.UP, "receiver_triangle": 0, "receiver_patch": -1}
+	var safe_result := _run_single_with_values(safe_query, tags, safe_nodes, safe_triangles)
+	check(safe_result.query_position_valid
+			and safe_result.query_position.distance_to(_legacy_query_position(
+				safe_world, Vector3.UP, 1.0)) < 0.000001,
+			"An already-safe axis-aligned cell must keep its original query address.")
+
+	var unknown_query := {"label": "unknown receiver", "world": world,
+			"normal": shading_normal, "receiver_triangle": -1, "receiver_patch": -1}
+	var unknown_result := _run_single_with_values(unknown_query, tags, plane_nodes, plane_triangles)
+	check(unknown_result.query_position_valid
+			and unknown_result.query_position.distance_to(_legacy_query_position(
+				world, shading_normal, 1.0)) < 0.000001,
+			"An unknown receiver triangle must preserve the legacy query position.")
+	var degenerate_bvh := Visibility.build(PackedVector3Array([world, world, world]))
+	check(not degenerate_bvh.is_empty(), "Degenerate receiver fallback fixture must build.")
+	if not degenerate_bvh.is_empty():
+		var degenerate_nodes := rd.storage_buffer_create(degenerate_bvh.nodes.size() * 4,
+				degenerate_bvh.nodes.to_byte_array())
+		var degenerate_triangles := rd.storage_buffer_create(degenerate_bvh.triangles.size() * 4,
+				degenerate_bvh.triangles.to_byte_array())
+		var degenerate_query := {"label": "degenerate receiver normal", "world": world,
+				"normal": shading_normal, "receiver_triangle": 0, "receiver_patch": -1}
+		var degenerate_result := _run_single_with_values(degenerate_query, tags,
+				degenerate_nodes, degenerate_triangles)
+		check(degenerate_result.query_position_valid
+					and degenerate_result.query_position.distance_to(_legacy_query_position(
+						world, shading_normal, 1.0)) < 0.000001,
+				"A degenerate geometric normal must keep the old finite query position.")
+		_rd_free(degenerate_nodes)
+		_rd_free(degenerate_triangles)
+	var tiny_normal_query := {"label": "invalid tiny shading normal", "world": world,
+			"normal": Vector3.ZERO, "receiver_triangle": 0, "receiver_patch": -1}
+	var tiny_normal_result := _run_single_with_values(tiny_normal_query, tags,
+			plane_nodes, plane_triangles)
+	check(not tiny_normal_result.query_position_valid
+				and tiny_normal_result.query_position == Vector3.ZERO,
+			"An unusable shading normal must reject safely with initialized zero outputs.")
+
+	# Put a separate thin wall across the adjusted cell's first corner ray. The
+	# production sampler must still reject that level after moving the query.
+	var blocked_corner := (Vector3(adjusted_base) + Vector3.ONE * 0.5)
+	var wall_faces := _wall_faces(blocked_corner, world)
+	var blocker_faces := _plane_faces(world, geometric_normal)
+	blocker_faces.append_array(wall_faces)
+	var blocker_bvh: Dictionary = Visibility.build(blocker_faces)
+	check(not blocker_bvh.is_empty() and Visibility.validate(blocker_bvh.nodes,
+			blocker_bvh.triangles), "Adjusted-query thin-wall fixture must be a valid BVH.")
+	if not blocker_bvh.is_empty():
+		var receiver_edge1 := Vector3(blocker_bvh.triangles[4],
+				blocker_bvh.triangles[5], blocker_bvh.triangles[6])
+		var receiver_edge2 := Vector3(blocker_bvh.triangles[8],
+				blocker_bvh.triangles[9], blocker_bvh.triangles[10])
+		check(absf(receiver_edge1.cross(receiver_edge2).normalized().dot(geometric_normal)) > 0.999,
+				"The BVH's first leaf triangle must remain the intended receiver plane at index 0.")
+		check(Visibility.segment_blocked(blocker_bvh.nodes, blocker_bvh.triangles,
+				blocked_corner, world),
+				"The separate wall must block the adjusted corner-to-receiver segment.")
+		var blocker_nodes := rd.storage_buffer_create(blocker_bvh.nodes.size() * 4,
+				blocker_bvh.nodes.to_byte_array())
+		var blocker_triangles := rd.storage_buffer_create(blocker_bvh.triangles.size() * 4,
+				blocker_bvh.triangles.to_byte_array())
+		check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters(true, 1)) == OK,
+				"Single-level wall gate test must limit sampling to the adjusted fine level.")
+		var blocked_query := {"label": "wall after geometric adjustment", "world": world,
+				"normal": shading_normal, "receiver_triangle": 0, "receiver_patch": 0}
+		var blocked := _run_single_with_values(blocked_query, tags,
+				blocker_nodes, blocker_triangles)
+		check(not blocked.valid and blocked.cache_weight == 0.0
+					and blocked.reject_reason == 4,
+				"Geometric adjustment must not bypass the production all-corner thin-wall gate.")
+		check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters()) == OK,
+				"All clipmap levels must be restored after the geometric safety test.")
+		_rd_free(blocker_nodes)
+		_rd_free(blocker_triangles)
+
+	for buffer in [plane_nodes, plane_triangles, negative_nodes, negative_triangles,
+			down_nodes, down_triangles,
+			safe_nodes, safe_triangles, tags]:
+		_rd_free(buffer)
+
+func _plane_bvh(world: Vector3, normal: Vector3) -> Dictionary:
+	return Visibility.build(_plane_faces(world, normal))
+
+func _plane_faces(world: Vector3, normal: Vector3) -> PackedVector3Array:
+	var tangent := normal.cross(Vector3.UP)
+	if tangent.length_squared() < 1e-8:
+		tangent = normal.cross(Vector3.RIGHT)
+	tangent = tangent.normalized()
+	var bitangent := normal.cross(tangent).normalized()
+	return PackedVector3Array([
+		world + tangent * 100.0,
+		world + bitangent * 100.0,
+		world - tangent * 100.0 - bitangent * 100.0,
+	])
+
+func _wall_faces(corner: Vector3, world: Vector3) -> PackedVector3Array:
+	var ray := (world - corner).normalized()
+	var tangent := ray.cross(Vector3.UP)
+	if tangent.length_squared() < 1e-8:
+		tangent = ray.cross(Vector3.RIGHT)
+	tangent = tangent.normalized() * 0.4
+	var bitangent := ray.cross(tangent).normalized() * 0.4
+	var center := (corner + world) * 0.5
+	var a := center - tangent - bitangent
+	var b := center + tangent - bitangent
+	var c := center + tangent + bitangent
+	var d := center - tangent + bitangent
+	return PackedVector3Array([a, b, c, a, c, d])
+
+func _legacy_query_position(world: Vector3, normal: Vector3, step_size: float) -> Vector3:
+	return (world + normal * step_size * 0.75) / step_size - Vector3.ONE * 0.5
+
+func _floor_vec3i(value: Vector3) -> Vector3i:
+	return Vector3i(floori(value.x), floori(value.y), floori(value.z))
+
+func _min_corner_plane_distance(base: Vector3i, step_size: float,
+		world: Vector3, normal: Vector3) -> float:
+	var offset := Vector3(1.0 if normal.x < 0.0 else 0.0,
+			1.0 if normal.y < 0.0 else 0.0,
+			1.0 if normal.z < 0.0 else 0.0)
+	var corner := (Vector3(base) + offset + Vector3.ONE * 0.5) * step_size
+	return (corner - world).dot(normal)
+
 func _run_clv_disabled_reason() -> void:
 	var tags := _create_tag_texture("")
 	var query := _case("CLV disabled", Vector3i(2, 2, 2), Vector3(0.2, 0.3, 0.4), 0)
@@ -425,7 +662,8 @@ func _run_single_with_values(query: Dictionary, tag_texture: RID, node_buffer: R
 	var values := PackedFloat32Array()
 	var world: Vector3 = query.world
 	var normal: Vector3 = query.normal
-	values.append_array(PackedFloat32Array([world.x, world.y, world.z, -1.0,
+	values.append_array(PackedFloat32Array([world.x, world.y, world.z,
+		float(query.get("receiver_triangle", -1)),
 		normal.x, normal.y, normal.z, float(query.receiver_patch)]))
 	var bytes := values.to_byte_array()
 	rd.buffer_update(input_buffer, 0, bytes.size(), bytes)
@@ -438,7 +676,8 @@ func _run_single_with_values(query: Dictionary, tag_texture: RID, node_buffer: R
 		return {"valid": false, "complete": false, "cache_weight": 0.0,
 				"secondary": Vector3.ZERO, "primary": Vector3.ZERO,
 				"selected_level": -1, "sample_status": 0, "reject_reason": -1,
-				"cell_fraction": Vector3.ZERO}
+				"cell_fraction": Vector3.ZERO, "query_position": Vector3.ZERO,
+				"query_position_valid": false}
 	var list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, pipeline)
 	rd.compute_list_bind_uniform_set(list, set, 0)
@@ -458,7 +697,9 @@ func _run_single_with_values(query: Dictionary, tag_texture: RID, node_buffer: R
 		"supported_secondary": Vector3(output[12], output[13], output[14]),
 		"supported_primary": Vector3(output[16], output[17], output[18]),
 		"unsupported_secondary": Vector3(output[20], output[21], output[22]),
-		"unsupported_primary": Vector3(output[24], output[25], output[26])}
+		"unsupported_primary": Vector3(output[24], output[25], output[26]),
+		"query_position": Vector3(output[28], output[29], output[30]),
+		"query_position_valid": output[31] > 0.5}
 
 func _uniform_set(tag_texture: RID, node_buffer: RID, triangle_buffer: RID) -> RID:
 	var uniforms: Array[RDUniform] = []
@@ -494,7 +735,8 @@ func _storage(binding: int, buffer: RID) -> RDUniform:
 	return uniform
 
 func _create_coefficient_texture(zero_primary: bool, mutation := "",
-		target := Vector3i(15, 2, 3), bright_invalid := false) -> RID:
+		target := Vector3i(15, 2, 3), bright_invalid := false,
+		metadata_normal := Vector3.UP) -> RID:
 	var width := RESOLUTION * 19
 	var height := RESOLUTION
 	var depth := RESOLUTION * LEVELS
@@ -508,9 +750,9 @@ func _create_coefficient_texture(zero_primary: bool, mutation := "",
 					var px := x % RESOLUTION
 					var index := _index4(x, y, z + level * RESOLUTION, width, height)
 					if slab == 18:
-						data[index] = 0.0
-						data[index + 1] = 1.0
-						data[index + 2] = 0.0
+						data[index] = metadata_normal.x
+						data[index + 1] = metadata_normal.y
+						data[index + 2] = metadata_normal.z
 						data[index + 3] = float(PATCH)
 						if level == 0 and px == target.x and y == target.y and z == target.z:
 							if mutation == "invalid_patch": data[index + 3] = -1.0
@@ -606,12 +848,12 @@ func _expected(base: Vector3i, fraction: Vector3, level: int, primary: bool,
 		result += coefficient * basis[k]
 	return Vector3(maxf(result.x, 0.0), maxf(result.y, 0.0), maxf(result.z, 0.0))
 
-func _clipmap_parameters(clv_enabled := true) -> PackedByteArray:
+func _clipmap_parameters(clv_enabled := true, level_count := LEVELS) -> PackedByteArray:
 	var bytes := PackedByteArray()
 	for origin in origins:
 		bytes.append_array(PackedInt32Array([origin.x, origin.y, origin.z, 0]).to_byte_array())
 	bytes.append_array(PackedFloat32Array([1.0, 0.0, 0.0, 0.0]).to_byte_array())
-	bytes.append_array(PackedInt32Array([RESOLUTION, LEVELS, EPOCH, 1 if clv_enabled else 0]).to_byte_array())
+	bytes.append_array(PackedInt32Array([RESOLUTION, level_count, EPOCH, 1 if clv_enabled else 0]).to_byte_array())
 	return bytes
 
 func _expand_includes(path: String) -> String:
