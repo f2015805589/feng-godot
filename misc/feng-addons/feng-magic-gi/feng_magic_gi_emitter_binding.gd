@@ -9,12 +9,28 @@ static func make_key(root: Node, node: Node, surface: int) -> String:
 	return "%s#surface=%d" % [str(root.get_path_to(node)), surface]
 
 static func resolve_binding(root: Node, key: String) -> Dictionary:
+	if root == null or not is_instance_valid(root):
+		return {}
 	var marker := key.rfind("#surface=")
 	if marker < 0:
 		return {}
 	var node_path := NodePath(key.substr(0, marker))
 	var surface := key.substr(marker + 9).to_int()
-	var node := root.get_node_or_null(node_path)
+	var node: Node
+	if node_path.is_absolute():
+		# Legacy data can contain paths captured while an editor scene was nested
+		# below its SubViewport. Absolute lookup is only valid from the active tree
+		# root; using the detached/nested scene root emits an engine error.
+		if not root.is_inside_tree():
+			return {}
+		var tree := root.get_tree()
+		if tree == null or not is_instance_valid(tree.root):
+			return {}
+		node = tree.root.get_node_or_null(node_path)
+		if node == null or (node != root and not root.is_ancestor_of(node)):
+			return {}
+	else:
+		node = root.get_node_or_null(node_path)
 	if not node is MeshInstance3D or node.mesh == null \
 			or surface < 0 or surface >= node.mesh.get_surface_count():
 		return {}

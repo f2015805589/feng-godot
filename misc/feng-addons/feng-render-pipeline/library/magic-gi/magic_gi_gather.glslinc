@@ -138,120 +138,139 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 					continue;
 				}
 				int cell_count = cell_probe_count(cell, grid_dims);
-				for (int slot = 0; slot < cell_count; slot++) {
-					int probe = cell_probe(cell, slot, grid_dims);
-					if (probe < 0) {
-						break; // Build slots are dense; the remaining slots in this cell are empty.
-					}
-					if (float(probe) >= params.grid.w) {
+				if (cell_count <= 0) { continue; }
+				uint first_cluster = 0u;
+				uint cluster_count = 0u;
+				bool clustered = probe_cluster_cell_range(cell, grid_dims, cell_count,
+						first_cluster, cluster_count);
+				int group_count = clustered ? int(cluster_count) : 1;
+				bool cell_has_missing_probe = false;
+				for (int group = 0; group < group_count; group++) {
+					if (clustered && probe_cluster_is_prunable(first_cluster + uint(group),
+							uint(group), cell_count, world, normal_world, spacing,
+							directional_source, wide_surface_fallback)) {
 						continue;
 					}
-					ivec2 geometry_xy = ivec2((probe % 32) * 3, probe / 32);
-					vec4 surface_record = texelFetch(geometry_atlas, geometry_xy, 0);
-					vec3 sample_surface = surface_record.xyz;
-					vec3 sample_position = texelFetch(geometry_atlas, geometry_xy + ivec2(1, 0), 0).xyz;
-					vec4 normal_record = texelFetch(geometry_atlas, geometry_xy + ivec2(2, 0), 0);
-					vec3 sample_normal = normalize(normal_record.xyz);
-					float normal_match = dot(normal_world, sample_normal);
-					if (same_patch_only && (receiver_patch <= 0 || int(surface_record.w) != receiver_patch)) { continue; }
-					vec3 surface_delta = world - sample_surface;
-					// Fine probes describe local detail. Their support must shrink with
-					// placement density, otherwise every pixel traces hundreds of distant
-					// fine candidates and their light is blurred across the whole room.
-					float local_spacing = directional_source ? max(normal_record.w, 0.001) : spacing;
-					float density_window = 1.0;
-					if (local_spacing < spacing * 0.999 && !wide_surface_fallback) {
-						float support = local_spacing * 2.5;
-						float surface_distance_squared = dot(surface_delta, surface_delta);
-						if (surface_distance_squared >= support * support) { continue; }
-						density_window = 1.0 - smoothstep(local_spacing * 1.5, support, sqrt(surface_distance_squared));
-					}
-					// Curved same-surface samples have opposite signed planes that cancel;
-					// parallel samples behind the receiver keep negative same-sign distances.
-					float sample_plane_distance = dot(surface_delta, sample_normal);
-					float receiver_signed_plane_distance = dot(surface_delta, normal_world);
-					float symmetric_plane_distance = 0.5 * (sample_plane_distance + receiver_signed_plane_distance);
-					float plane_residual = abs(sample_plane_distance + receiver_signed_plane_distance);
-					float gate = smoothstep(-back_tolerance, -back_tolerance * 0.3, symmetric_plane_distance)
-							* (1.0 - smoothstep(spacing * 0.55, spacing * 0.85, symmetric_plane_distance))
-							* smoothstep(0.15, 0.5, normal_match);
-					if (gate <= 0.0) {
-						continue;
-					}
-					float normalized_residual = plane_residual / (0.25 * spacing);
-					// Flat/parallel candidates always need a direct visible segment.
-					// Only a convex continuation of this connected smooth patch may use
-					// the checked outward endpoint to avoid sparse curved self-shadowing.
-					bool curved_patch = params.control.w > 0.5 && receiver_patch > 0
-							&& int(surface_record.w) == receiver_patch && normal_match < 0.95
-							&& sample_plane_distance < -0.00001 && receiver_signed_plane_distance > 0.00001
-							&& plane_residual < spacing * 0.15;
-					if (curved_patch && !clearance_resolved && !wide_surface_fallback) {
-						// Curved receivers may interpolate around their own continuous patch.
-						// This endpoint is only used after a direct check against other patches.
-						float clearance = spacing * 0.3;
-						int clearance_triangle;
-						vec3 clearance_hit = nearest_surface(world + normal_world * clearance * 0.5,
-								normal_world, clearance * 0.5, receiver_triangle, clearance_triangle);
-						if (clearance_triangle >= 0) {
-							clearance = max(0.0, dot(clearance_hit - world, normal_world) * 0.5 - 0.00001);
-						} else if (clearance_triangle == -2) {
-							clearance = 0.0;
+					int slot_start = clustered ? group * int(MAGIC_GI_PROBE_CLUSTER_SLOTS) : 0;
+					int slot_end = clustered ? min(cell_count,
+							slot_start + int(MAGIC_GI_PROBE_CLUSTER_SLOTS)) : cell_count;
+					for (int slot = slot_start; slot < slot_end; slot++) {
+						int probe = cell_probe(cell, slot, grid_dims);
+						if (probe < 0) {
+							cell_has_missing_probe = true;
+							break; // Build slots are dense; the remaining slots in this cell are empty.
 						}
-						biased_world = world + normal_world * clearance;
-						endpoint_triangle = clearance > 0.00001 ? -1 : receiver_triangle;
-						clearance_resolved = true;
-					}
-					vec3 candidate_target = params.control.w > 0.5 && !curved_patch ? world : biased_world;
-					vec3 visibility_delta = candidate_target - sample_position;
-					float distance_squared = dot(visibility_delta, visibility_delta);
-					float score = distance_squared
-							+ symmetric_plane_distance * symmetric_plane_distance * 4.0
-							+ (1.0 - normal_match) * (1.0 - normal_match) * spacing * spacing
-							+ normalized_residual * normalized_residual * spacing * spacing;
-					float weight = gate * cell_window * density_window * inversesqrt(kernel_epsilon + score);
-					if (directional_source) { weight *= max(normal_record.w * normal_record.w, 1e-6); }
-					candidate_weight += weight;
-					if (wide_surface_fallback) {
-						int insert_at = MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT;
-						for (int selected = 0; selected < MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT; selected++) {
-							if (score < selected_score[selected]) {
-								insert_at = selected;
-								break;
+						if (float(probe) >= params.grid.w) {
+							continue;
+						}
+						ivec2 geometry_xy = ivec2((probe % 32) * 3, probe / 32);
+						vec4 surface_record = texelFetch(geometry_atlas, geometry_xy, 0);
+						vec3 sample_surface = surface_record.xyz;
+						vec3 sample_position = texelFetch(geometry_atlas, geometry_xy + ivec2(1, 0), 0).xyz;
+						vec4 normal_record = texelFetch(geometry_atlas, geometry_xy + ivec2(2, 0), 0);
+						vec3 sample_normal = normalize(normal_record.xyz);
+						float normal_match = dot(normal_world, sample_normal);
+						if (same_patch_only && (receiver_patch <= 0 || int(surface_record.w) != receiver_patch)) { continue; }
+						vec3 surface_delta = world - sample_surface;
+						// Fine probes describe local detail. Their support must shrink with
+						// placement density, otherwise every pixel traces hundreds of distant
+						// fine candidates and their light is blurred across the whole room.
+						float local_spacing = directional_source ? max(normal_record.w, 0.001) : spacing;
+						float density_window = 1.0;
+						if (local_spacing < spacing * 0.999 && !wide_surface_fallback) {
+							float support = local_spacing * 2.5;
+							float surface_distance_squared = dot(surface_delta, surface_delta);
+							if (surface_distance_squared >= support * support) { continue; }
+							density_window = 1.0 - smoothstep(local_spacing * 1.5, support, sqrt(surface_distance_squared));
+						}
+						// Curved same-surface samples have opposite signed planes that cancel;
+						// parallel samples behind the receiver keep negative same-sign distances.
+						float sample_plane_distance = dot(surface_delta, sample_normal);
+						float receiver_signed_plane_distance = dot(surface_delta, normal_world);
+						float symmetric_plane_distance = 0.5 * (sample_plane_distance + receiver_signed_plane_distance);
+						float plane_residual = abs(sample_plane_distance + receiver_signed_plane_distance);
+						float gate = smoothstep(-back_tolerance, -back_tolerance * 0.3, symmetric_plane_distance)
+								* (1.0 - smoothstep(spacing * 0.55, spacing * 0.85, symmetric_plane_distance))
+								* smoothstep(0.15, 0.5, normal_match);
+						if (gate <= 0.0) {
+							continue;
+						}
+						float normalized_residual = plane_residual / (0.25 * spacing);
+						// Flat/parallel candidates always need a direct visible segment.
+						// Only a convex continuation of this connected smooth patch may use
+						// the checked outward endpoint to avoid sparse curved self-shadowing.
+						bool curved_patch = params.control.w > 0.5 && receiver_patch > 0
+								&& int(surface_record.w) == receiver_patch && normal_match < 0.95
+								&& sample_plane_distance < -0.00001 && receiver_signed_plane_distance > 0.00001
+								&& plane_residual < spacing * 0.15;
+						if (curved_patch && !clearance_resolved && !wide_surface_fallback) {
+							// Curved receivers may interpolate around their own continuous patch.
+							// This endpoint is only used after a direct check against other patches.
+							float clearance = spacing * 0.3;
+							int clearance_triangle;
+							vec3 clearance_hit = nearest_surface(world + normal_world * clearance * 0.5,
+									normal_world, clearance * 0.5, receiver_triangle, clearance_triangle);
+							if (clearance_triangle >= 0) {
+								clearance = max(0.0, dot(clearance_hit - world, normal_world) * 0.5 - 0.00001);
+							} else if (clearance_triangle == -2) {
+								clearance = 0.0;
 							}
+							biased_world = world + normal_world * clearance;
+							endpoint_triangle = clearance > 0.00001 ? -1 : receiver_triangle;
+							clearance_resolved = true;
 						}
-						if (insert_at < MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT) {
-							for (int shift = MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT - 1; shift > insert_at; shift--) {
-								selected_probe[shift] = selected_probe[shift - 1];
-								selected_score[shift] = selected_score[shift - 1];
-								selected_weight[shift] = selected_weight[shift - 1];
-								selected_coverage[shift] = selected_coverage[shift - 1];
+						vec3 candidate_target = params.control.w > 0.5 && !curved_patch ? world : biased_world;
+						vec3 visibility_delta = candidate_target - sample_position;
+						float distance_squared = dot(visibility_delta, visibility_delta);
+						float score = distance_squared
+								+ symmetric_plane_distance * symmetric_plane_distance * 4.0
+								+ (1.0 - normal_match) * (1.0 - normal_match) * spacing * spacing
+								+ normalized_residual * normalized_residual * spacing * spacing;
+						float weight = gate * cell_window * density_window * inversesqrt(kernel_epsilon + score);
+						if (directional_source) { weight *= max(normal_record.w * normal_record.w, 1e-6); }
+						candidate_weight += weight;
+						if (wide_surface_fallback) {
+							int insert_at = MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT;
+							for (int selected = 0; selected < MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT; selected++) {
+								if (score < selected_score[selected]) {
+									insert_at = selected;
+									break;
+								}
 							}
-							selected_probe[insert_at] = probe;
-							selected_score[insert_at] = score;
-							selected_weight[insert_at] = weight;
-							selected_coverage[insert_at] = gate * cell_window;
+							if (insert_at < MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT) {
+								for (int shift = MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT - 1; shift > insert_at; shift--) {
+									selected_probe[shift] = selected_probe[shift - 1];
+									selected_score[shift] = selected_score[shift - 1];
+									selected_weight[shift] = selected_weight[shift - 1];
+									selected_coverage[shift] = selected_coverage[shift - 1];
+								}
+								selected_probe[insert_at] = probe;
+								selected_score[insert_at] = score;
+								selected_weight[insert_at] = weight;
+								selected_coverage[insert_at] = gate * cell_window;
+							}
+							continue;
 						}
-						continue;
-					}
-					// A complete geometry query supersedes the coarse directional moments.
-					// Near corners their angular footprint includes an adjacent wall even
-					// when this connection is visible, producing dark probe-shaped patches.
-					if (!probe_connection_visible(sample_position, world, receiver_triangle,
-							receiver_patch, curved_patch, biased_world, endpoint_triangle)) {
-						continue;
-					}
-					float visibility_distance = length(visibility_delta);
-					float visibility = 1.0;
-					if (params.control.w < 0.5 && visibility_distance > 1e-6) {
-						vec2 moments = sample_visibility_moments(probe, visibility_delta / visibility_distance);
-						visibility = chebyshev_visibility(moments, visibility_distance, variance_floor);
-					}
-					accumulate_probe_lighting(probe, normal_match, weight, visibility, score,
-							kernel_epsilon, gate * cell_window * density_window, angular,
-							directional_source, receiving_basis, coefficients, indirect,
-							unoccluded_weight, primary_sky_indirect, primary_sky_weight,
-							visible_support_weight, coverage_confidence);
+						// A complete geometry query supersedes the coarse directional moments.
+						// Near corners their angular footprint includes an adjacent wall even
+						// when this connection is visible, producing dark probe-shaped patches.
+						if (!probe_connection_visible(sample_position, world, receiver_triangle,
+								receiver_patch, curved_patch, biased_world, endpoint_triangle)) {
+							continue;
+						}
+						float visibility_distance = length(visibility_delta);
+						float visibility = 1.0;
+						if (params.control.w < 0.5 && visibility_distance > 1e-6) {
+							vec2 moments = sample_visibility_moments(probe, visibility_delta / visibility_distance);
+							visibility = chebyshev_visibility(moments, visibility_distance, variance_floor);
+						}
+						accumulate_probe_lighting(probe, normal_match, weight, visibility, score,
+								kernel_epsilon, gate * cell_window * density_window, angular,
+								directional_source, receiving_basis, coefficients, indirect,
+								unoccluded_weight, primary_sky_indirect, primary_sky_weight,
+								visible_support_weight, coverage_confidence);
+						}
+					if (cell_has_missing_probe) { break; }
 				}
 			}
 		}

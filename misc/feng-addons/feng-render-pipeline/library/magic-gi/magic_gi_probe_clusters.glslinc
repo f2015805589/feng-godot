@@ -1,0 +1,100 @@
+layout(set = 0, binding = MAGIC_CLUSTER_BINDING, std430) readonly buffer ProbeClusters {
+	uint values[];
+} probe_cluster_data;
+
+const uint MAGIC_GI_PROBE_CLUSTER_SCHEMA = 1u;
+const uint MAGIC_GI_PROBE_CLUSTER_SLOTS = 8u;
+const uint MAGIC_GI_PROBE_CLUSTER_HEADER_WORDS = 4u;
+const uint MAGIC_GI_PROBE_CLUSTER_CELL_WORDS = 2u;
+const uint MAGIC_GI_PROBE_CLUSTER_RECORD_WORDS = 16u;
+
+bool probe_cluster_cell_range(ivec3 cell, ivec3 dimensions, int cell_count,
+		out uint first_cluster, out uint cluster_count) {
+	first_cluster = 0u;
+	cluster_count = 0u;
+	int word_count = probe_cluster_data.values.length();
+	if (word_count < int(MAGIC_GI_PROBE_CLUSTER_HEADER_WORDS) || cell_count < 0) {
+		return false;
+	}
+	uvec4 header = uvec4(probe_cluster_data.values[0], probe_cluster_data.values[1],
+		probe_cluster_data.values[2], probe_cluster_data.values[3]);
+	uint expected_cells = uint(dimensions.x) * uint(dimensions.y) * uint(dimensions.z);
+	if (header.x != MAGIC_GI_PROBE_CLUSTER_SCHEMA || header.y != expected_cells
+			|| header.w != 1u) {
+		return false;
+	}
+	uint flat_cell = uint(cell.x + cell.y * dimensions.x + cell.z * dimensions.x * dimensions.y);
+	if (flat_cell >= header.y) { return false; }
+	uint range_word = MAGIC_GI_PROBE_CLUSTER_HEADER_WORDS
+			+ flat_cell * MAGIC_GI_PROBE_CLUSTER_CELL_WORDS;
+	if (range_word + 1u >= uint(word_count)) { return false; }
+	first_cluster = probe_cluster_data.values[range_word];
+	cluster_count = probe_cluster_data.values[range_word + 1u];
+	uint expected_cluster_count = (uint(cell_count) + MAGIC_GI_PROBE_CLUSTER_SLOTS - 1u)
+			/ MAGIC_GI_PROBE_CLUSTER_SLOTS;
+	uint records_start = MAGIC_GI_PROBE_CLUSTER_HEADER_WORDS
+			+ header.y * MAGIC_GI_PROBE_CLUSTER_CELL_WORDS;
+	if (cluster_count != expected_cluster_count
+			|| first_cluster > header.z || cluster_count > header.z - first_cluster
+			|| records_start > uint(word_count)
+			|| header.z > (uint(word_count) - records_start)
+					/ MAGIC_GI_PROBE_CLUSTER_RECORD_WORDS) {
+		return false;
+	}
+	return true;
+}
+
+vec4 probe_cluster_record(uint cluster_index, uint vector_index) {
+	uint cell_count = probe_cluster_data.values[1];
+	uint word = MAGIC_GI_PROBE_CLUSTER_HEADER_WORDS
+			+ cell_count * MAGIC_GI_PROBE_CLUSTER_CELL_WORDS
+			+ cluster_index * MAGIC_GI_PROBE_CLUSTER_RECORD_WORDS
+			+ vector_index * 4u;
+	return uintBitsToFloat(uvec4(probe_cluster_data.values[word],
+		probe_cluster_data.values[word + 1u], probe_cluster_data.values[word + 2u],
+		probe_cluster_data.values[word + 3u]));
+}
+
+bool probe_cluster_is_prunable(uint cluster_index, uint group_index, int cell_count,
+		vec3 world, vec3 receiver_normal, float spacing, bool directional_source,
+		bool wide_surface_fallback) {
+	vec4 surface_min_spacing = probe_cluster_record(cluster_index, 0u);
+	vec4 surface_max_count = probe_cluster_record(cluster_index, 1u);
+	vec4 normal_min = probe_cluster_record(cluster_index, 2u);
+	vec4 normal_max = probe_cluster_record(cluster_index, 3u);
+	if (any(isnan(surface_min_spacing)) || any(isinf(surface_min_spacing))
+			|| any(isnan(surface_max_count)) || any(isinf(surface_max_count))
+			|| any(isnan(normal_min)) || any(isinf(normal_min))
+			|| any(isnan(normal_max)) || any(isinf(normal_max))) {
+		return false;
+	}
+	int expected_slots = min(int(MAGIC_GI_PROBE_CLUSTER_SLOTS),
+		cell_count - int(group_index * MAGIC_GI_PROBE_CLUSTER_SLOTS));
+	if (expected_slots <= 0 || abs(surface_max_count.w - float(expected_slots)) > 0.001
+			|| any(greaterThan(surface_min_spacing.xyz, surface_max_count.xyz))) {
+		return false;
+	}
+	vec3 normal_upper = mix(normal_min.xyz, normal_max.xyz,
+		greaterThanEqual(receiver_normal, vec3(0.0)));
+	float upper_normal_match = dot(receiver_normal, normal_upper);
+	if (upper_normal_match < 0.15 - 0.001) {
+		return true;
+	}
+	// The wide fallback intentionally keeps every density candidate. Only its
+	// original zero-normal-gate rejection can be proven at cluster granularity.
+	if (!directional_source || wide_surface_fallback
+			|| surface_min_spacing.w >= spacing * 0.999) {
+		return false;
+	}
+	vec3 outside = max(max(surface_min_spacing.xyz - world,
+		world - surface_max_count.xyz), vec3(0.0));
+	float support = surface_min_spacing.w * 2.5;
+	float coordinate_scale = max(
+		max(max(abs(world.x), abs(world.y)), abs(world.z)),
+		max(max(max(abs(surface_min_spacing.x), abs(surface_min_spacing.y)),
+		abs(surface_min_spacing.z)), max(max(abs(surface_max_count.x),
+		abs(surface_max_count.y)), max(abs(surface_max_count.z), support))));
+	float margin = max(0.00001, coordinate_scale * 0.000005);
+	float strict_support = support + margin;
+	return dot(outside, outside) > strict_support * strict_support;
+}

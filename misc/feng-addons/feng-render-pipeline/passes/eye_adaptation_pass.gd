@@ -10,6 +10,13 @@ const PreviewExposure = preload("editor_preview_exposure_cache.gd")
 const NUM_BINS := 64
 const PARAMS_BYTES := NUM_BINS * 8 + 16 # 64 low/overflow histogram pairs and exposure state
 const STATE_PRUNE_LIMIT := 16
+const EXPOSURE_SOURCE_AUTOMATIC := 0
+const EXPOSURE_SOURCE_CAMERA_ATTRIBUTES := 1
+const EXPOSURE_SOURCE_PASS_SETTINGS := 2
+const EXPOSURE_ROUTE_PASS_SETTINGS := 0
+const EXPOSURE_ROUTE_CAMERA_ATTRIBUTES := 1
+const INTERNAL_METERING_CAMERA_AUTO := 3
+const INTERNAL_METERING_CAMERA_MANUAL := 4
 ## UE Scene.cpp keeps distinct defaults for the legacy and extended modes.
 ## The latter fields are EV100; with UE's default lens attenuation 0.78,
 ## EV100ToLuminance is exactly exp2(EV100).
@@ -23,6 +30,10 @@ const STATE_PRUNE_LIMIT := 16
 		pre_exposure = value
 		emit_changed()
 @export_group("Exposure")
+@export_enum("Automatic", "Camera Attributes", "Pass Settings") var exposure_source := EXPOSURE_SOURCE_AUTOMATIC:
+	set(value):
+		exposure_source = clampi(value, EXPOSURE_SOURCE_AUTOMATIC, EXPOSURE_SOURCE_PASS_SETTINGS)
+		emit_changed()
 @export_enum("Histogram", "Basic", "Manual") var metering_mode := 0:
 	set(value):
 		metering_mode = value
@@ -118,6 +129,17 @@ var _state: Dictionary = {}
 var _frame_parameters: Variant = null
 var _frame_context: FRPPassContext
 
+static func resolve_exposure_route(source: int, has_volume_override: bool,
+		has_camera_attributes: bool) -> int:
+	var selected := clampi(source, EXPOSURE_SOURCE_AUTOMATIC, EXPOSURE_SOURCE_PASS_SETTINGS)
+	if selected == EXPOSURE_SOURCE_PASS_SETTINGS:
+		return EXPOSURE_ROUTE_PASS_SETTINGS
+	if selected == EXPOSURE_SOURCE_CAMERA_ATTRIBUTES:
+		return EXPOSURE_ROUTE_CAMERA_ATTRIBUTES if has_camera_attributes else EXPOSURE_ROUTE_PASS_SETTINGS
+	if has_volume_override or not has_camera_attributes:
+		return EXPOSURE_ROUTE_PASS_SETTINGS
+	return EXPOSURE_ROUTE_CAMERA_ATTRIBUTES
+
 func _init() -> void:
 	var color := TextureInput.new()
 	color.binding = 0
@@ -135,6 +157,7 @@ func ensure_frp_contract() -> bool:
 
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray([
+		"exposure_source",
 		"metering_mode", "low_percent", "high_percent",
 		"min_brightness", "max_brightness", "min_ev100", "max_ev100",
 		"speed_up", "speed_down", "exposure_compensation",
@@ -239,12 +262,31 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var params: RID = state["params"]
 	var exposure_texture: RID = state["exposure_texture"]
 	var values: Dictionary = _frame_parameters if _frame_parameters is Dictionary else {}
+	var camera_data: Dictionary = _frame_context.get_camera_exposure_data() if _frame_context != null else {}
+	var camera_available := bool(camera_data.get("available", false))
+	var route := resolve_exposure_route(
+		int(values.get("exposure_source", exposure_source)),
+		bool(values.get("_frp_volume_eye_exposure_override", false)),
+		camera_available)
+	var camera_auto := route == EXPOSURE_ROUTE_CAMERA_ATTRIBUTES \
+			and bool(camera_data.get("auto_enabled", false))
+	var camera_manual := route == EXPOSURE_ROUTE_CAMERA_ATTRIBUTES and not camera_auto
+	var camera_auto_min_luminance := float(camera_data.get("auto_min_luminance", 1.0e-12))
+	var camera_auto_max_luminance := float(camera_data.get("auto_max_luminance", camera_auto_min_luminance))
+	if not is_finite(camera_auto_min_luminance) or camera_auto_min_luminance <= 0.0:
+		camera_auto_min_luminance = 1.0e-12
+	if not is_finite(camera_auto_max_luminance) or camera_auto_max_luminance <= 0.0:
+		camera_auto_max_luminance = camera_auto_min_luminance
+	camera_auto_min_luminance = clampf(camera_auto_min_luminance, 1.0e-12, 1.0e12)
+	camera_auto_max_luminance = clampf(camera_auto_max_luminance,
+		camera_auto_min_luminance, 1.0e12)
 	var extend := bool(values.get("extend_default_luminance_range", extend_default_luminance_range))
 	var use_pre_exposure := bool(values.get("pre_exposure", pre_exposure))
 	var previous_pre_exposure := 1.0
 	if use_pre_exposure and _frame_context != null:
 		previous_pre_exposure = maxf(_frame_context.get_pre_exposure(view), 1e-12)
 	var method := clampi(int(values.get("metering_mode", metering_mode)), 0, 2)
+	var internal_method := method
 	var low := clampf(float(values.get("low_percent", low_percent)), 1.0, 99.0) * 0.01
 	var high := clampf(float(values.get("high_percent", high_percent)), 1.0, 99.0) * 0.01
 	low = minf(low, high)
@@ -257,32 +299,63 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	max_white = maxf(max_white, min_white)
 	var authored_up := float(values.get("speed_up", speed_up))
 	var authored_down := float(values.get("speed_down", speed_down))
+	if not is_finite(authored_up): authored_up = 0.0
+	if not is_finite(authored_down): authored_down = 0.0
 	var valid_speeds := authored_up >= 0.0 and authored_down >= 0.0
-	var up := maxf(authored_up, 0.001)
-	var down := maxf(authored_down, 0.001)
-	var compensation := pow(2.0, float(values.get("exposure_compensation", exposure_compensation)))
+	var up := clampf(authored_up, 0.001, 1.0e6)
+	var down := clampf(authored_down, 0.001, 1.0e6)
+	var authored_compensation_ev := float(values.get("exposure_compensation", exposure_compensation))
+	if not is_finite(authored_compensation_ev): authored_compensation_ev = 0.0
+	var compensation := clampf(pow(2.0, clampf(authored_compensation_ev, -40.0, 40.0)), 1.0e-12, 1.0e12)
 	var mask_texture: Variant = values.get("metering_mask", metering_mask)
-	var mask_rid := RenderingServer.texture_get_rd_texture(mask_texture.get_rid()) if mask_texture is Texture2D else RID()
+	var mask_rid := RenderingServer.texture_get_rd_texture(mask_texture.get_rid()) if not camera_auto and not camera_manual and mask_texture is Texture2D else RID()
 	var curve_texture: Variant = values.get("exposure_compensation_curve", exposure_compensation_curve)
-	var curve_rid := RenderingServer.texture_get_rd_texture(curve_texture.get_rid()) if curve_texture is CurveTexture else RID()
+	var curve_rid := RenderingServer.texture_get_rd_texture(curve_texture.get_rid()) if not camera_auto and not camera_manual and curve_texture is CurveTexture else RID()
 	var manual_ev100 := 0.0
 	if bool(values.get("apply_physical_camera_exposure", apply_physical_camera_exposure)):
 		var fstop := maxf(float(values.get("aperture", aperture)), 0.001)
 		var shutter := maxf(float(values.get("shutter_speed", shutter_speed)), 0.001)
 		var sensitivity := maxf(float(values.get("iso", iso)), 1.0)
 		manual_ev100 = log(fstop * fstop * shutter * 100.0 / sensitivity) / log(2.0)
-	var manual_white := pow(2.0, manual_ev100)
+	manual_ev100 = clampf(manual_ev100, -40.0, 40.0)
+	var manual_white := clampf(pow(2.0, manual_ev100), 1.0e-12, 1.0e12)
+	if camera_auto:
+		internal_method = INTERNAL_METERING_CAMERA_AUTO
+		min_white = clampf(camera_auto_min_luminance / 0.18, 1.0e-12, 1.0e12)
+		max_white = clampf(camera_auto_max_luminance / 0.18, min_white, 1.0e12)
+		var camera_speed := float(camera_data.get("auto_speed", 1.0))
+		if not is_finite(camera_speed): camera_speed = 1.0
+		up = clampf(camera_speed, 0.0, 1.0e6)
+		down = up
+		compensation = clampf(float(camera_data.get("auto_scale", 1.0)), 1.0e-12, 1.0e12)
+		manual_white = 1.0
+	elif camera_manual:
+		internal_method = INTERNAL_METERING_CAMERA_MANUAL
+		manual_white = clampf(float(camera_data.get("normalization_factor", 1.0)), 1.0e-12, 1.0e12)
+		compensation = 1.0
 	if method == 2:
-		min_white = manual_white
-		max_white = manual_white
+		if not camera_auto and not camera_manual:
+			min_white = manual_white
+			max_white = manual_white
 
 	var now_usec := Time.get_ticks_usec()
 	var last_usec: int = state["last_usec"]
 	state["last_usec"] = now_usec
-	var set_immediate := last_usec == 0
+	var mode_key := "pass:%d" % method
+	if camera_auto:
+		mode_key = "camera-auto:%d:%d" % [int(camera_data.get("identity", 0)), int(camera_data.get("auto_version", 0))]
+	elif camera_manual:
+		mode_key = "camera-manual:%d" % int(camera_data.get("identity", 0))
+	var set_immediate := last_usec == 0 or str(state.get("mode_key", "")) != mode_key
+	state["mode_key"] = mode_key
 	var dt := maxf(float(now_usec - last_usec) / 1000000.0, 0.0) * maxf(Engine.time_scale, 0.0)
 	var log_min := float(values.get("histogram_ev100_min", histogram_ev100_min)) if extend else float(values.get("histogram_log_min", histogram_log_min))
 	var log_max := float(values.get("histogram_ev100_max", histogram_ev100_max)) if extend else float(values.get("histogram_log_max", histogram_log_max))
+	if camera_auto:
+		log_min = log(camera_auto_min_luminance) / log(2.0)
+		log_max = log(camera_auto_max_luminance) / log(2.0)
+		if log_max <= log_min:
+			log_max = log_min + 1.0
 	log_min = minf(log_min, log_max - 1.0)
 
 	var params_uniform := RDUniform.new()
@@ -291,35 +364,37 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	params_uniform.add_id(params)
 
 	var list := rd.compute_list_begin()
-
-	# Meter the frame's luminance into a 64-bin log histogram.
-	var source_uniform := RDUniform.new()
-	source_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	source_uniform.binding = 0
-	source_uniform.add_id(_sampler)
-	source_uniform.add_id(color)
-	var mask_uniform := RDUniform.new()
-	mask_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	mask_uniform.binding = 1
-	mask_uniform.add_id(_linear_sampler)
-	mask_uniform.add_id(mask_rid if mask_rid.is_valid() else color)
-	var histogram_set := UniformSetCacheRD.get_cache(_shaders[0], 0, [source_uniform, mask_uniform])
-	var histogram_params_set := UniformSetCacheRD.get_cache(_shaders[0], 1, [params_uniform])
-	if not histogram_set.is_valid() or not histogram_params_set.is_valid():
-		rd.compute_list_end()
-		_report("Eye adaptation histogram bindings are invalid.")
-		return
-	var histogram_push := PackedInt32Array([size.x, size.y]).to_byte_array() + PackedFloat32Array([
-		log_min, 1.0 / (log_max - log_min), 1.0 / previous_pre_exposure,
-		0.0001 if method == 1 else pow(2.0, log_min), 0.0, 1.0 if mask_rid.is_valid() else 0.0,
-		1.0 if method == 1 else 0.0, 0.05 if method == 1 else 0.0,
-	]).to_byte_array()
-	rd.compute_list_bind_compute_pipeline(list, _histogram_pipeline)
-	rd.compute_list_bind_uniform_set(list, histogram_set, 0)
-	rd.compute_list_bind_uniform_set(list, histogram_params_set, 1)
-	rd.compute_list_set_push_constant(list, histogram_push, histogram_push.size())
-	rd.compute_list_dispatch(list, ceili(float(size.x) / 16.0), ceili(float(size.y) / 16.0), 1)
-	rd.compute_list_add_barrier(list)
+	if not camera_manual:
+		# Meter the frame's luminance into a 64-bin log histogram. Camera manual
+		# exposure bypasses this pass entirely and reuses the same state buffer.
+		var source_uniform := RDUniform.new()
+		source_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+		source_uniform.binding = 0
+		source_uniform.add_id(_sampler)
+		source_uniform.add_id(color)
+		var mask_uniform := RDUniform.new()
+		mask_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+		mask_uniform.binding = 1
+		mask_uniform.add_id(_linear_sampler)
+		mask_uniform.add_id(mask_rid if mask_rid.is_valid() else color)
+		var histogram_set := UniformSetCacheRD.get_cache(_shaders[0], 0, [source_uniform, mask_uniform])
+		var histogram_params_set := UniformSetCacheRD.get_cache(_shaders[0], 1, [params_uniform])
+		if not histogram_set.is_valid() or not histogram_params_set.is_valid():
+			rd.compute_list_end()
+			_report("Eye adaptation histogram bindings are invalid.")
+			return
+		var histogram_luminance_min := maxf(float(camera_data.get("auto_min_luminance", 1.0e-12)), 1.0e-12) if camera_auto else (0.0001 if method == 1 else pow(2.0, log_min))
+		var histogram_push := PackedInt32Array([size.x, size.y]).to_byte_array() + PackedFloat32Array([
+			log_min, 1.0 / (log_max - log_min), 1.0 / previous_pre_exposure,
+			histogram_luminance_min, 0.0, 1.0 if mask_rid.is_valid() else 0.0,
+			1.0 if method == 1 and not camera_auto else 0.0, 0.05 if method == 1 and not camera_auto else 0.0,
+		]).to_byte_array()
+		rd.compute_list_bind_compute_pipeline(list, _histogram_pipeline)
+		rd.compute_list_bind_uniform_set(list, histogram_set, 0)
+		rd.compute_list_bind_uniform_set(list, histogram_params_set, 1)
+		rd.compute_list_set_push_constant(list, histogram_push, histogram_push.size())
+		rd.compute_list_dispatch(list, ceili(float(size.x) / 16.0), ceili(float(size.y) / 16.0), 1)
+		rd.compute_list_add_barrier(list)
 
 	# Percentile metering and UE's two-speed EV adaptation.
 	var adapt_set := UniformSetCacheRD.get_cache(_shaders[1], 0, [params_uniform])
@@ -339,7 +414,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		low if method == 0 else 0.0, high if method == 0 else 1.0,
 		up, down, dt, compensation, manual_white,
 		1.0 if method == 2 or min_white == max_white or not valid_speeds else 0.0,
-		1.0 if set_immediate else 0.0, float(method), 1.0 if curve_rid.is_valid() else 0.0, previous_pre_exposure,
+		1.0 if set_immediate else 0.0, float(internal_method), 1.0 if curve_rid.is_valid() else 0.0, previous_pre_exposure,
 	]).to_byte_array()
 	rd.compute_list_bind_compute_pipeline(list, _adapt_pipeline)
 	rd.compute_list_bind_uniform_set(list, adapt_set, 0)
@@ -350,11 +425,15 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 
 	rd.compute_list_end()
 	var render_target := buffers.get_render_target()
-	if PreviewExposure.should_sample(render_target, view):
+	if camera_manual and render_target.is_valid():
+		PreviewExposure.publish_known_scale(render_target.get_id(), view, manual_white, self)
+	elif PreviewExposure.should_sample(render_target, view):
 		PreviewExposure.request_scale_readback(rd, params, render_target, view, self)
 	if _frame_context != null and view == 0:
 		_frame_context.set_tonemap_exposure_texture(exposure_texture)
-	if use_pre_exposure and _frame_context != null:
+	if use_pre_exposure and _frame_context != null and camera_manual:
+		_frame_context.set_next_pre_exposure(view, manual_white)
+	elif use_pre_exposure and _frame_context != null:
 		# UE uses an asynchronous GPU readback for the next frame's pre-exposure.
 		# The native callback owns its context until readback completes, including
 		# when the pass resource is released during editor shutdown.

@@ -37,12 +37,22 @@ layout(push_constant, std430) uniform Params {
 } params;
 
 void main() {
+	if (params.metering_mode > 3.5) {
+		// Camera manual exposure is already a final normalization factor. Skip
+		// histogram work and keep the existing buffers/texture for this view.
+		float fixed_scale = clamp(params.manual_white_luminance, 1e-12, 1e12);
+		state.adapted_exposure = 1.0;
+		state.exposure_scale = fixed_scale;
+		state.pad0 = params.metering_mode;
+		imageStore(tonemap_exposure, ivec2(0), vec4(params.previous_pre_exposure / fixed_scale, 0.0, 0.0, 0.0));
+		return;
+	}
 	float total = 0.0;
 	for (uint i = 0u; i < NUM_BINS; ++i) {
 		total += float(state.histogram[i]) / WEIGHT_SCALE + float(state.histogram_overflow[i]) * 8192.0;
 	}
-	float min_fraction_sum = total * params.low_percent;
-	float max_fraction_sum = total * params.high_percent;
+	float min_fraction_sum = total * (params.metering_mode > 2.5 ? 0.0 : params.low_percent);
+	float max_fraction_sum = total * (params.metering_mode > 2.5 ? 1.0 : params.high_percent);
 	float weighted_log_sum = 0.0;
 	float retained = 0.0;
 	for (uint i = 0u; i < NUM_BINS; ++i) {
@@ -59,6 +69,26 @@ void main() {
 		state.histogram_overflow[i] = 0u;
 	}
 	float measured = exp2(weighted_log_sum / max(retained, 0.0001));
+	if (params.metering_mode > 2.5) {
+		// CameraAttributes stores already-converted luminance bounds and a
+		// per-second linear adaptation speed. Keep those units instead of
+		// interpreting them as FRP EV rates or applying a default 0.18 grey.
+		float min_luminance = min(params.min_white_luminance, params.max_white_luminance) * 0.18;
+		float max_luminance = max(params.min_white_luminance, params.max_white_luminance) * 0.18;
+		float target_luminance = clamp(measured, min_luminance, max_luminance);
+		float old_luminance = state.adapted_exposure;
+		if (params.set_immediate > 0.5 || state.pad0 != params.metering_mode || old_luminance <= 0.0 || isnan(old_luminance) || isinf(old_luminance)) {
+			old_luminance = target_luminance;
+		}
+		float weight = clamp(params.delta_time * params.speed_up, 0.0, 1.0);
+		float adapted_luminance = clamp(old_luminance + (target_luminance - old_luminance) * weight,
+				min_luminance, max_luminance);
+		state.adapted_exposure = adapted_luminance;
+		state.exposure_scale = clamp(params.exposure_compensation / max(adapted_luminance, 1e-12), 1e-12, 1e12);
+		state.pad0 = params.metering_mode;
+		imageStore(tonemap_exposure, ivec2(0), vec4(params.previous_pre_exposure / state.exposure_scale, 0.0, 0.0, 0.0));
+		return;
+	}
 	float compensation = params.exposure_compensation;
 	if (params.use_exposure_curve > 0.5) {
 		float ev100 = log2(max(measured / 0.18, 0.0001));
@@ -97,6 +127,7 @@ void main() {
 	adapted = clamp(adapted, min_average / 0.18, max_average / 0.18);
 	state.adapted_exposure = adapted;
 	state.exposure_scale = compensation / max(adapted, 0.0001);
+	state.pad0 = params.metering_mode;
 	// Godot's Tonemap samples this reciprocal and multiplies the HDR color by
 	// current exposure / previous scene pre-exposure, like UE's Tonemap pass.
 	imageStore(tonemap_exposure, ivec2(0), vec4(params.previous_pre_exposure / max(state.exposure_scale, 1e-12), 0.0, 0.0, 0.0));

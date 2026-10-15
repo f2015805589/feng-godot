@@ -27,6 +27,13 @@ layout(set = 0, binding = 16) uniform sampler2D diffuse_ambient_occlusion_textur
 layout(set = 0, binding = 17, std430) readonly buffer ProbeLighting {
 	vec4 values[];
 } probe_lighting;
+layout(set = 0, binding = 23, std140) uniform PageParams {
+	vec4 core_min_enabled;
+	vec4 core_max;
+	ivec4 dispatch_rect; // xy = pixel offset, zw = dispatched rectangle size.
+	mat4 owner_world_to_local;
+	vec4 owner_size_enabled; // xyz = original oriented volume size.
+} page;
 
 layout(set = 0, binding = 9, std140) uniform GIParams {
 	mat4 inverse_projection;
@@ -115,7 +122,9 @@ float chebyshev_visibility(vec2 moments, float receiver_distance, float variance
 }
 
 #define MAGIC_INDEX_BINDING 22
+#define MAGIC_CLUSTER_BINDING 24
 #include "magic_gi_index.glslinc"
+#include "magic_gi_probe_clusters.glslinc"
 
 #include "magic_gi_visibility.glslinc"
 #include "magic_gi_sh.glslinc"
@@ -182,14 +191,14 @@ vec3 clv_debug_color(int view, int sample_status, int reject_reason,
 }
 
 void main() {
-	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy) + page.dispatch_rect.xy;
 	ivec2 extent = imageSize(color_image);
-	if (any(greaterThanEqual(pixel, extent))) {
+	if (any(greaterThanEqual(pixel, extent))
+			|| any(greaterThanEqual(gl_GlobalInvocationID.xy, uvec2(page.dispatch_rect.zw)))) {
 		return;
 	}
 	int debug_view = int(round(pc.parameters.w));
 	bool debug_enabled = debug_view != CLV_DEBUG_OFF;
-	imageStore(gi_output, pixel, vec4(0.0));
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
 	if (depth <= 0.0 || (!debug_enabled
 			&& (params.control.x <= 0.0 || pc.parameters.x <= 0.0 || params.grid.w <= 0.0))) {
@@ -210,6 +219,16 @@ void main() {
 	}
 	vec3 view_position = view_h.xyz / view_h.w;
 	vec3 world = (params.view_to_world * vec4(view_position, 1.0)).xyz;
+	if (page.core_min_enabled.w > 0.5 && (any(lessThan(world, page.core_min_enabled.xyz))
+			|| any(greaterThanEqual(world, page.core_max.xyz)))) {
+		return; // Support halos never own pixels; ownership stays half-open and unique.
+	}
+	if (page.owner_size_enabled.w > 0.5) {
+		vec3 owner_local = (page.owner_world_to_local * vec4(world, 1.0)).xyz;
+		if (any(greaterThan(abs(owner_local), page.owner_size_enabled.xyz * 0.5))) {
+			return; // World-aligned page AABBs are additionally clipped to the source OBB.
+		}
+	}
 	// Resolved MSAA depth can refer to a sample away from the pixel center. Locate
 	// the first actual surface in a one-pixel neighborhood along this view ray,
 	// once per pixel, instead of pushing every probe endpoint through thin walls.

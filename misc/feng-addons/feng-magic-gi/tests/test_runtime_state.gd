@@ -5,6 +5,7 @@ const Data = preload("res://addons/feng-magic-gi/feng_magic_gi_data.gd")
 const State = preload("res://addons/feng-magic-gi/feng_magic_gi_runtime_state.gd")
 const Volume = preload("res://addons/feng-magic-gi/feng_magic_gi_volume.gd")
 const Binding = preload("res://addons/feng-magic-gi/feng_magic_gi_emitter_binding.gd")
+const SceneTracker = preload("res://addons/feng-magic-gi/feng_magic_gi_scene_tracker.gd")
 
 class SkyRuntime:
 	static var snapshot: Dictionary = {}
@@ -45,6 +46,15 @@ func run() -> void:
 		material.emission_intensity = 1.0
 	emitter.material_override = material
 	scene.add_child(emitter)
+	var absolute_binding := Binding.resolve_binding(scene,
+			str(emitter.get_path()) + "#surface=0")
+	require(absolute_binding.get("node") == emitter,
+		"legacy absolute emitter paths must resolve from the active SceneTree root")
+	var detached_binding_root := Node3D.new()
+	require(Binding.resolve_binding(detached_binding_root,
+			"/root/Detached/Emitter#surface=0").is_empty(),
+		"absolute emitter paths must be ignored while their scene root is detached")
+	detached_binding_root.free()
 	var data := Data.new()
 	data.positions = PackedVector3Array([Vector3.ZERO])
 	data.emitter_keys = PackedStringArray([Binding.make_key(scene, emitter, 0)])
@@ -61,6 +71,52 @@ func run() -> void:
 		"recollection must replace the emitter owner and discard removed sources")
 	require(emitters.keys.size() == 1, "recollection must not mutate a retained bake's emitter set")
 	material.emission_enabled = true
+	# Persisted source identity must survive editor reloads, where equivalent
+	# Resource instances receive different ObjectIDs and signal revisions.
+	var persisted_source_signature := SceneTracker.stable_scene_signature(volume)
+	var archived_sampler_signature := (3 << 32) | 31
+	require(Data.geometry_signature_matches(archived_sampler_signature, 31),
+		"the persisted geometry word must remain comparable across sampler revisions")
+	require(Data.sampler_revision_for_signature(archived_sampler_signature) == 3,
+		"the persisted signature must retain its independent sampler revision")
+	var current_sampler_signature := Data.signature_for_geometry(31)
+	require(Data.sampler_revision_for_signature(current_sampler_signature) == Data.SAMPLER_REVISION,
+		"new bake signatures must stamp the current sampler revision")
+	require(not Data.geometry_signature_matches(archived_sampler_signature, 32),
+		"the legacy signature comparison must still reject changed placement geometry")
+	var original_mesh: Mesh = emitter.mesh
+	var original_material: Material = emitter.material_override
+	emitter.mesh = original_mesh.duplicate(true) as Mesh
+	emitter.material_override = original_material.duplicate(true) as Material
+	require(SceneTracker.stable_scene_signature(volume) == persisted_source_signature,
+		"equivalent reloaded mesh/material resources must keep the stable source signature")
+	var changed_box := emitter.mesh as BoxMesh
+	changed_box.size.x += 0.25
+	require(SceneTracker.stable_scene_signature(volume) != persisted_source_signature,
+		"stable source signature must include actual mesh arrays, not only resource identity")
+	changed_box.size.x -= 0.25
+	var albedo_image := Image.create(2, 2, false, Image.FORMAT_RGBA8)
+	albedo_image.fill(Color(0.2, 0.4, 0.6, 1.0))
+	var first_texture := ImageTexture.create_from_image(albedo_image)
+	(emitter.material_override as BaseMaterial3D).albedo_texture = first_texture
+	var textured_signature := SceneTracker.stable_scene_signature(volume)
+	var equivalent_image := Image.create(2, 2, false, Image.FORMAT_RGBA8)
+	equivalent_image.fill(Color(0.2, 0.4, 0.6, 1.0))
+	(emitter.material_override as BaseMaterial3D).albedo_texture = ImageTexture.create_from_image(equivalent_image)
+	require(SceneTracker.stable_scene_signature(volume) == textured_signature,
+		"equivalent ImageTexture instances must keep the stable source signature")
+	var updated_texture := (emitter.material_override as BaseMaterial3D).albedo_texture as ImageTexture
+	var quick_texture_signature := SceneTracker.quick_source_signature_uncached(volume)
+	var changed_image := Image.create(2, 2, false, Image.FORMAT_RGBA8)
+	changed_image.fill(Color(0.8, 0.1, 0.3, 1.0))
+	updated_texture.update(changed_image)
+	require(SceneTracker.quick_source_signature_uncached(volume) != quick_texture_signature,
+		"the session watcher must see ImageTexture.update change signals")
+	(emitter.material_override as BaseMaterial3D).albedo_texture = ImageTexture.create_from_image(changed_image)
+	require(SceneTracker.stable_scene_signature(volume) != textured_signature,
+		"stable source signature must include ImageTexture pixel content")
+	emitter.mesh = original_mesh
+	emitter.material_override = original_material
 	var checked := Volume.new()
 	var counted := CountingData.new()
 	checked.bake_data = counted
@@ -73,6 +129,16 @@ func run() -> void:
 	checked.has_usable_bake()
 	require(counted.validations == 2, "resource changes must invalidate validation independently of layout")
 	checked.free()
+	var anchored_volume := Volume.new()
+	anchored_volume.show_probes = false
+	scene.add_child(anchored_volume)
+	anchored_volume.bake_data = Data.new()
+	anchored_volume.probe_positions = PackedVector3Array([Vector3(2.0, 3.0, 4.0)])
+	var anchored_probe_positions := anchored_volume.probe_positions.duplicate()
+	anchored_volume.position = Vector3(1.0, 0.0, 0.0)
+	require(anchored_volume.probe_positions == anchored_probe_positions
+			and anchored_volume.is_layout_stale(),
+		"transform edits must preserve old baked world-space probe anchors and mark them stale")
 
 	var state := State.new()
 	require(state.lighting != null and state.emission != null, "state must own its helpers from construction")

@@ -106,7 +106,30 @@ static func resolve_context(entries: Array, overrides: Dictionary, context: Dict
 			expanded[key] = merged
 			for alias in aliases:
 				expanded[alias] = merged.duplicate()
-	return with_overrides(context.get("base", {}), expanded, context.get("schema", {}))
+	var resolved := with_overrides(context.get("base", {}), expanded, context.get("schema", {}))
+	# Eye Adaptation's automatic source selection needs to distinguish an authored
+	# default from an explicit Volume contribution, even when the resolved value is
+	# numerically equal to that default. This private bit is added after schema
+	# validation, so it is not an authorable Volume parameter or shared resolver data.
+	var eye_values: Variant = expanded.get("library:eye_adaptation", {})
+	var schema_value: Variant = context.get("schema", {})
+	var eye_schema: Variant = {}
+	if schema_value is Dictionary:
+		eye_schema = schema_value.get("library:eye_adaptation", {})
+	var has_eye_volume_override := false
+	if eye_values is Dictionary and eye_schema is Dictionary:
+		for field in eye_values:
+			# The source selector chooses which provider to read. It is not itself
+			# an override of the pass's exposure settings in Automatic mode.
+			if field != "exposure_source" and eye_schema.has(field):
+				has_eye_volume_override = true
+				break
+	if has_eye_volume_override:
+		var eye_parameters_value: Variant = resolved.get("library:eye_adaptation", {})
+		var eye_parameters: Dictionary = eye_parameters_value.duplicate() if eye_parameters_value is Dictionary else {}
+		eye_parameters["_frp_volume_eye_exposure_override"] = true
+		resolved["library:eye_adaptation"] = eye_parameters
+	return resolved
 
 static func warnings(entries: Array) -> PackedStringArray:
 	var result := PackedStringArray()

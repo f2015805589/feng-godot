@@ -250,7 +250,13 @@ DxcCompilerD3D12::DxcCompilerD3D12() {
 }
 
 DxcCompilerD3D12::~DxcCompilerD3D12() {
-	memdelete(impl);
+	// _initialize() frees and nulls Impl when a DXC dependency or interface is
+	// unavailable. Godot's memdelete() requires a non-null pointer, so keep
+	// destruction safe for both failed and partially completed initialization.
+	if (impl != nullptr) {
+		memdelete(impl);
+		impl = nullptr;
+	}
 }
 
 void DxcCompilerD3D12::_initialize() {

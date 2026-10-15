@@ -13,8 +13,9 @@ const SMALL_ISOLATED_TRIANGLE_AREA_RATIO := 0.25
 
 static func mark_refinement_cells(candidate_cells: Dictionary,
 		trace_query: Callable, trace_scene: RefCounted, placement_bounds: AABB,
-		base_spacing: float, minimum_spacing: float) -> Dictionary:
-	var result := {"cells": {}, "error": ""}
+		base_spacing: float, minimum_spacing: float,
+		cancel_check: Callable = Callable()) -> Dictionary:
+	var result := {"cells": {}, "error": "", "cancelled": false}
 	if minimum_spacing >= base_spacing or base_spacing <= 0.0:
 		return result
 	if not trace_query.is_valid():
@@ -23,23 +24,43 @@ static func mark_refinement_cells(candidate_cells: Dictionary,
 	var ray_queries := 0
 	var sorted_cells: Array[Vector3i] = []
 	for cell_value in candidate_cells:
+		if sorted_cells.size() % 128 == 0 and _is_cancelled(cancel_check):
+			result["cancelled"] = true
+			return result
 		sorted_cells.append(cell_value)
+	if _is_cancelled(cancel_check):
+		result["cancelled"] = true
+		return result
 	sorted_cells.sort_custom(func(a: Vector3i, b: Vector3i) -> bool:
 		if a.x != b.x:
 			return a.x < b.x
 		if a.y != b.y:
 			return a.y < b.y
 		return a.z < b.z)
+	var candidate_work := 0
 	for world_cell in sorted_cells:
+		if _is_cancelled(cancel_check):
+			result["cancelled"] = true
+			return result
 		var cell_bucket: Dictionary = candidate_cells[world_cell]
 		var domains: Dictionary = cell_bucket["domains"]
 		var sorted_domains: Array[String] = []
 		for domain_key in domains:
+			if sorted_domains.size() % 128 == 0 and _is_cancelled(cancel_check):
+				result["cancelled"] = true
+				return result
 			sorted_domains.append(String(domain_key))
 		sorted_domains.sort()
+		if _is_cancelled(cancel_check):
+			result["cancelled"] = true
+			return result
 		for domain_key in sorted_domains:
 			var domain_bucket: Dictionary = domains[domain_key]
 			for candidate in domain_bucket["candidates"]:
+				candidate_work += 1
+				if candidate_work % 128 == 0 and _is_cancelled(cancel_check):
+					result["cancelled"] = true
+					return result
 				var normal: Vector3 = candidate["normal"]
 				var origin: Vector3 = candidate["center"]
 				var tangent := normal.cross(Vector3.UP if absf(normal.y) < 0.99 \
@@ -47,6 +68,9 @@ static func mark_refinement_cells(candidate_cells: Dictionary,
 				var bitangent := normal.cross(tangent)
 				for direction in [tangent, -tangent, bitangent, -bitangent, normal]:
 					ray_queries += 1
+					if ray_queries % 128 == 0 and _is_cancelled(cancel_check):
+						result["cancelled"] = true
+						return result
 					if ray_queries > MAX_FEATURE_RAY_QUERIES:
 						result["error"] = "Adaptive feature tracing exceeds its bounded query budget."
 						return result
@@ -63,6 +87,9 @@ static func mark_refinement_cells(candidate_cells: Dictionary,
 				var anchor: Vector3 = candidate["surface"]
 				var inside := anchor - normal * minf(0.0001, minimum_spacing * 0.001)
 				ray_queries += 1
+				if ray_queries % 128 == 0 and _is_cancelled(cancel_check):
+					result["cancelled"] = true
+					return result
 				if ray_queries > MAX_FEATURE_RAY_QUERIES:
 					result["error"] = "Adaptive feature tracing exceeds its bounded query budget."
 					return result
@@ -73,12 +100,16 @@ static func mark_refinement_cells(candidate_cells: Dictionary,
 							or not _add_cell_with_halo(result,
 							ProbeLayout.world_cell(opposite.position, base_spacing)):
 						return result
+	if _is_cancelled(cancel_check):
+		result["cancelled"] = true
+		return result
 	_mark_canonical_triangle_features(trace_scene, placement_bounds,
-				base_spacing, result)
+			base_spacing, result, cancel_check)
 	return result
 
 static func _mark_canonical_triangle_features(trace_scene: RefCounted,
-		placement_bounds: AABB, base_spacing: float, result: Dictionary) -> void:
+		placement_bounds: AABB, base_spacing: float, result: Dictionary,
+		cancel_check: Callable) -> void:
 	if trace_scene == null:
 		return
 	var canonical_faces: PackedVector3Array = trace_scene.faces
@@ -92,6 +123,9 @@ static func _mark_canonical_triangle_features(trace_scene: RefCounted,
 	var shared_edge_counts := PackedInt32Array()
 	shared_edge_counts.resize(face_count)
 	for face_index in face_count:
+		if face_index % 128 == 0 and _is_cancelled(cancel_check):
+			result["cancelled"] = true
+			return
 		var base := face_index * 3
 		var a: Vector3 = canonical_faces[base]
 		var b: Vector3 = canonical_faces[base + 1]
@@ -118,6 +152,9 @@ static func _mark_canonical_triangle_features(trace_scene: RefCounted,
 				edge_points[edge_key] = [first, second]
 	var edge_sample_work := 0
 	for edge_key in edge_faces:
+		if edge_sample_work % 128 == 0 and _is_cancelled(cancel_check):
+			result["cancelled"] = true
+			return
 		var adjacent: Array = edge_faces[edge_key]
 		if adjacent.size() < 2:
 			continue
@@ -145,6 +182,9 @@ static func _mark_canonical_triangle_features(trace_scene: RefCounted,
 		var steps := maxi(1, ceili(edge_length / maxf(base_spacing * 0.5, 0.0001)))
 		for step in steps + 1:
 			edge_sample_work += 1
+			if edge_sample_work % 128 == 0 and _is_cancelled(cancel_check):
+				result["cancelled"] = true
+				return
 			if edge_sample_work > MAX_FEATURE_EDGE_SAMPLES:
 				result["error"] = "Adaptive sharp-edge analysis exceeds its bounded sample budget."
 				return
@@ -152,6 +192,9 @@ static func _mark_canonical_triangle_features(trace_scene: RefCounted,
 					start.lerp(finish, float(step) / float(steps)), base_spacing)):
 				return
 	for face_index in face_count:
+		if face_index % 128 == 0 and _is_cancelled(cancel_check):
+			result["cancelled"] = true
+			return
 		var base := face_index * 3
 		var a: Vector3 = canonical_faces[base]
 		var b: Vector3 = canonical_faces[base + 1]
@@ -190,6 +233,9 @@ static func _add_cell_with_halo(result: Dictionary, center: Vector3i) -> bool:
 					return false
 				marked[cell] = true
 	return true
+
+static func _is_cancelled(cancel_check: Callable) -> bool:
+	return cancel_check.is_valid() and bool(cancel_check.call())
 
 static func _clip_segment_to_aabb(start: Vector3, finish: Vector3,
 		bounds: AABB) -> PackedVector3Array:

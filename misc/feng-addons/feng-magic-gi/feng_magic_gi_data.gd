@@ -46,7 +46,17 @@ const SH_Y00 := 0.2820947918
 @export_storage var terrain_reflectance := 0.0
 @export_storage var material_reflectance := 0.0
 @export_storage var scene_signature := 0
+## Fingerprint of transport-relevant static source content, captured at bake
+## and load-validation boundaries. Ordinary polling uses a separate quick
+## signature. Older resources omit this and keep their legacy staleness path.
+@export_storage var scene_watch_signature := 0
+## 0 is legacy absolute-path signature; 1 is relative to the scene root.
+## Older resources omit this field and retain the legacy validation path.
+@export_storage var scene_watch_signature_schema_version := 0
 @export_storage var positions := PackedVector3Array()
+## Optional stable world-surface identities used by streamed pages. Legacy v2-v6
+## resources omit this and keep their original index-based sampler sequence.
+@export_storage var stable_probe_ids := PackedInt64Array()
 ## Exact world-space surface anchors; positions stores the actual sample centers.
 @export_storage var surface_positions := PackedVector3Array()
 @export_storage var normals := PackedVector3Array()
@@ -95,8 +105,64 @@ static func sh_basis(dir: Vector3) -> PackedFloat32Array:
 static func signature_for_geometry(geometry_signature: int) -> int:
 	return (SAMPLER_REVISION << 32) | (geometry_signature & 0xffffffff)
 
+## The upper word records the sampler revision. The lower word remains the
+## persisted placement fingerprint, so compatible older bakes can be checked
+## against current geometry without expiring only because the sampler changed.
+static func geometry_signature_matches(saved_signature: int, geometry_signature: int) -> bool:
+	return (saved_signature & 0xffffffff) == (geometry_signature & 0xffffffff)
+
+static func sampler_revision_for_signature(saved_signature: int) -> int:
+	return (saved_signature >> 32) & 0xffffffff
+
 func probe_count() -> int:
 	return positions.size()
+
+## Conservative CPU residency estimate for the packed arrays owned by this
+## resource. Resource/file compression is deliberately not used as a proxy for
+## resident memory.
+func estimate_cpu_bytes() -> int:
+	var bytes := 1024
+	bytes += positions.size() * 12 + surface_positions.size() * 12 + normals.size() * 12
+	bytes += stable_probe_ids.size() * 8 + probe_spacings.size() * 4
+	bytes += transfer.size() * 4 + primary_sky_visibility.size() * 4
+	bytes += visibility_moments.size() * 4 + visibility_nodes.size() * 4
+	bytes += visibility_triangles.size() * 4 + cell_ranges.size() * 4 + cell_indices.size() * 4
+	bytes += emitter_static_signatures.size() * 8 + emitter_transport.size() * 4
+	for key in emitter_keys:
+		bytes += key.to_utf8_buffer().size() + 32
+	if directional != null and directional is DirectionalData:
+		bytes += directional.transfer.size() * 4 + directional.sky.size() * 4
+		bytes += directional.emission.size() * 4
+	return bytes
+
+## Conservative per-page GPU residency estimate, including rounded atlas rows,
+## runtime relight outputs, normals, lookup buffers, and persisted BVH buffers.
+## Images are counted at their actual uncompressed texel format.
+func estimate_gpu_bytes() -> int:
+	var count := probe_count()
+	if count <= 0:
+		return 0
+	var atlas_rows := ceili(float(count) / float(ATLAS_COLUMNS))
+	var bytes := 0
+	bytes += ATLAS_COLUMNS * TRANSFER_TEXELS_PER_POINT * atlas_rows * 16
+	bytes += ATLAS_COLUMNS * PRIMARY_SKY_TEXELS_PER_POINT * atlas_rows * 16
+	bytes += ATLAS_COLUMNS * GEOMETRY_TEXELS_PER_POINT * atlas_rows * 16
+	bytes += ATLAS_COLUMNS * VISIBILITY_TILE_SIZE * atlas_rows * VISIBILITY_TILE_SIZE * 8
+	bytes += ATLAS_COLUMNS * atlas_rows * 16 # Dynamic emission atlas.
+	bytes += (visibility_nodes.size() + visibility_triangles.size()) * 4
+	bytes += (cell_ranges.size() + cell_indices.size()) * 4
+	if adaptive_placement:
+		bytes += count * 4 # Renderer probe-index indirection.
+	else:
+		bytes += 4 # Empty adaptive indirection buffer used by the current upload contract.
+	if directional != null and directional is DirectionalData:
+		bytes += (directional.transfer.size() + directional.sky.size()
+				+ directional.emission.size()) * 4
+	bytes += count * 16 # Runtime normal buffer.
+	bytes += count * 32 # Surface relight result.
+	if directional != null:
+		bytes += count * 320 # Directional relight result.
+	return bytes
 
 ## Reports whether any geometry transport coefficient contributes. Volumes
 ## cache this O(coefficients) scan alongside full resource validation.
@@ -125,7 +191,8 @@ func is_valid() -> bool:
 	if directional != null and (not directional is DirectionalData \
 			or not directional.is_valid(probe_count(), emitter_count())):
 		return false
-	if probe_count() == 0 or normals.size() != probe_count():
+	if probe_count() == 0 or normals.size() != probe_count() or \
+			(not stable_probe_ids.is_empty() and stable_probe_ids.size() != probe_count()):
 		return false
 	if transfer.size() != probe_count() * 27:
 		return false

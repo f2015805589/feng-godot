@@ -13,6 +13,7 @@ var _lights: Array[DirectionalLight3D] = []
 var _world: World3D
 var _next_scan := 0
 var _lighting_signature := 0
+var revision := 0
 var _sky_sh := PackedFloat32Array()
 var _cached_result := PackedFloat32Array()
 var _sky_light_runtime: Script
@@ -48,6 +49,7 @@ func coefficient_sets(volume: Node3D) -> Dictionary:
 	if current_lighting_signature == _lighting_signature and sky_only == _sky_sh and not _cached_result.is_empty():
 		return {"lighting": _cached_result, "sky_lighting": _sky_sh}
 	_lighting_signature = current_lighting_signature
+	var previous_sky := _sky_sh
 	_sky_sh = sky_only
 
 	var result := PackedFloat32Array()
@@ -75,6 +77,8 @@ func coefficient_sets(volume: Node3D) -> Dictionary:
 			result[k * 3 + 2] += color.b * energy * basis[k]
 	for i in 27:
 		result[i] += sky_only[i]
+	if _cached_result != result or previous_sky != sky_only:
+		revision += 1
 	_cached_result = result
 	return {"lighting": _cached_result, "sky_lighting": _sky_sh}
 

@@ -113,6 +113,9 @@ class FRPPassContext : public RefCounted {
 	bool indirect_specular_modified[2] = { false, false };
 	// Current scene exposure scale excluding pre-exposure, matching the FRP lighting UBO.
 	float scene_exposure_normalization = 1.0f;
+	// Immutable snapshot of the active CameraAttributes exposure values. The pass
+	// reads these values only; the render thread never looks up SceneNodes.
+	Dictionary camera_exposure_data;
 	// Immutable cloud inputs for this frame. The pass supplies only value packets and
 	// renderer texture/light RIDs; native cloud stages consume them before the context
 	// is released. No Node or Resource is retained across frames.
@@ -174,7 +177,7 @@ public:
 	static void clear_all_sky_lighting_sources();
 	static bool get_sky_lighting_source(RID p_render_target, SkyLightingSource &r_source);
 
-	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>(), float p_scene_exposure_normalization = 1.0f, const std::function<bool(int)> &p_operation_is_scheduled = std::function<bool(int)>());
+	void setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters = Dictionary(), const std::function<void(const StringName &)> &p_present_runner = std::function<void(const StringName &)>(), const std::function<float(int)> &p_pre_exposure_reader = std::function<float(int)>(), const std::function<void(int, float)> &p_pre_exposure_writer = std::function<void(int, float)>(), const std::function<void(RID)> &p_eye_exposure_texture_writer = std::function<void(RID)>(), float p_scene_exposure_normalization = 1.0f, const std::function<bool(int)> &p_operation_is_scheduled = std::function<bool(int)>(), const Dictionary &p_camera_exposure_data = Dictionary());
 
 	// Frame state.
 	RenderDataRD *get_render_data() const { return render_data; }
@@ -189,6 +192,7 @@ public:
 	Dictionary get_pass_parameters(const Variant &p_pass_id) const;
 	float get_pre_exposure(int p_view) const;
 	float get_scene_exposure_normalization() const { return scene_exposure_normalization; }
+	Dictionary get_camera_exposure_data() const { return camera_exposure_data; }
 	void set_next_pre_exposure(int p_view, float p_exposure);
 	void set_height_fog_parameters(const PackedFloat32Array &p_parameters);
 	PackedFloat32Array get_height_fog_parameters() const { return height_fog_parameters; }

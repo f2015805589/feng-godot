@@ -28,6 +28,77 @@ const BASE_PROBE_OFFSET_SPACING_RATIO := 0.025
 const MAX_PROBE_OFFSET_SPACING_RATIO := 0.08
 const OCCLUSION_GRID_AXIS := 8
 const BROADPHASE_EPSILON := SceneTracker.BROADPHASE_EPSILON
+const REFRESH_MAIN_SLICE_USEC := 2500
+const REFRESH_WORKER_CHECK_INTERVAL := 128
+
+class RefreshCancellation:
+	extends RefCounted
+	var _mutex := Mutex.new()
+	var _cancelled := false
+
+	func cancel() -> void:
+		_mutex.lock()
+		_cancelled = true
+		_mutex.unlock()
+
+	func is_cancelled() -> bool:
+		_mutex.lock()
+		var result := _cancelled
+		_mutex.unlock()
+		return result
+
+## A SceneTree-owned coordinator keeps capture, task reaping and completion alive
+## when the Volume leaves the tree or is freed during Refresh.
+class AsyncRefreshCoordinator:
+	extends Node
+	signal completed(success: bool)
+	var _placement
+	var _volume_ref: WeakRef
+	var _for_bake := false
+	var _build_bvh := false
+	var _is_current := Callable()
+	var _progress := Callable()
+	var _collection_bounds := AABB()
+	var _finished := Callable()
+	var _completion_owner: RefCounted
+
+	func begin(placement, volume: Node3D, for_bake: bool, build_bvh: bool,
+			is_current: Callable, progress: Callable, collection_bounds: AABB,
+			finished: Callable, completion_owner: RefCounted) -> void:
+		name = "FMagicGIAsyncRefresh"
+		process_mode = Node.PROCESS_MODE_ALWAYS
+		_placement = placement
+		_volume_ref = weakref(volume)
+		_for_bake = for_bake
+		_build_bvh = build_bvh
+		_is_current = is_current
+		_progress = progress
+		_collection_bounds = collection_bounds
+		_finished = finished
+		_completion_owner = completion_owner
+		call_deferred("_run")
+
+	func cancel() -> void:
+		if _placement != null and is_instance_valid(_placement):
+			_placement.call("cancel_async_refresh")
+
+	func _run() -> void:
+		var volume = _volume_ref.get_ref() if _volume_ref != null else null
+		var success := false
+		if is_instance_valid(volume) and _placement != null \
+				and is_instance_valid(_placement):
+			success = await _placement.collect_async(volume, _for_bake,
+					_build_bvh, _is_current, _progress, _collection_bounds, _finished)
+		elif _finished.is_valid():
+			_finished.call(false)
+		completed.emit(success)
+		_placement = null
+		_volume_ref = null
+		_is_current = Callable()
+		_progress = Callable()
+		_finished = Callable()
+		_completion_owner = null
+		queue_free()
 
 var faces := PackedVector3Array()
 var reflectance := PackedVector3Array()
@@ -47,6 +118,7 @@ var positions := PackedVector3Array()
 var surface_positions := PackedVector3Array()
 var normals := PackedVector3Array()
 var probe_spacings := PackedFloat32Array()
+var stable_probe_ids := PackedInt64Array()
 var scene_signature := 0
 var error_message := ""
 var warning_message := ""
@@ -59,6 +131,16 @@ var _occlusion_cells: Dictionary = {}
 var _source_volume_indices: Dictionary = {}
 var _face_outward_signs: Dictionary = {}
 var _volume: Node3D
+var _volume_size := Vector3.ONE
+var _volume_transform := Transform3D.IDENTITY
+var _source_volume_transform := Transform3D.IDENTITY
+var _source_volume_size := Vector3.ONE
+var _adaptive_placement := false
+var _preferred_offset_value := 0.03
+var _fallback_reflectance := 0.5
+var _terrain_reflectance := 0.5
+var _bake_distance := 1.0
+var _streamed_page := false
 var _world: World3D
 var _collect_emission := false
 var _world_bounds: AABB
@@ -122,14 +204,639 @@ var rejected_lookup_capacity_count := 0
 var rejected_world_cell_limit_count := 0
 var adjusted_center_count := 0
 var _scene_root: Node
+var _async_worker_result := false
+var _refresh_cancel_token: RefCounted
+var _async_capture_guards: Array[Dictionary] = []
+var _source_volume_instance_id := 0
 
-func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emission := false) -> bool:
+func collect(volume: Node3D, for_bake := false, build_bvh := true,
+		collect_emission := false, sample_geometry := true,
+		collection_bounds := AABB()) -> bool:
+	_refresh_cancel_token = null
+	if not _begin_collect(volume, for_bake, collect_emission, sample_geometry,
+			collection_bounds):
+		return false
+	_scene_root = SceneTracker.scene_root(volume)
+	_collect_node(_scene_root)
+	if not error_message.is_empty():
+		return false
+	if not _build_geometry_trace_data(volume):
+		return false
+	if not sample_geometry:
+		return true
+	return _sample_current_geometry(build_bvh)
+
+## Main-thread resource capture is split into short time slices. Once the scene
+## data is immutable, BVH construction and layout sampling run on a worker.
+func collect_async(volume: Node3D, for_bake: bool, build_bvh: bool,
+		is_current: Callable, progress: Callable = Callable(),
+		collection_bounds := AABB(), finished: Callable = Callable()) -> bool:
+	# A RefCounted coroutine does not itself guarantee that the receiver stays
+	# alive when its Node owner is freed. Keep the worker coordinator until its
+	# task has completed and been joined below.
+	var lifetime_hold: RefCounted = self
+	var result: bool = await _collect_async_impl(volume, for_bake, build_bvh,
+			is_current, progress, collection_bounds)
+	if finished.is_valid():
+		finished.call(result)
+	if lifetime_hold == self:
+		return result
+	return false
+
+func _collect_async_impl(volume: Node3D, for_bake: bool, build_bvh: bool,
+		is_current: Callable, progress: Callable,
+		collection_bounds: AABB) -> bool:
+	_refresh_cancel_token = RefreshCancellation.new()
+	if not _begin_collect(volume, for_bake, false, true, collection_bounds):
+		_refresh_cancel_token = null
+		return false
+	_scene_root = SceneTracker.scene_root(volume)
+	var tree: SceneTree = volume.get_tree()
+	if not is_instance_valid(tree):
+		return _abort_async_refresh()
+	var stack: Array[Node] = [_scene_root]
+	var slice_started := Time.get_ticks_usec()
+	var visited := 0
+	while not stack.is_empty():
+		if not _refresh_owner_is_current(volume, is_current):
+			return _abort_async_refresh()
+		var node: Node = stack.pop_back()
+		if not is_instance_valid(node) or not node.is_inside_tree() \
+				or node.is_queued_for_deletion() \
+				or SceneTracker.scene_root(node) != _scene_root:
+			continue
+		var node_id := node.get_instance_id()
+		var node_path := node.get_path()
+		if SceneTracker.should_skip_world_boundary(node, _scene_root, _world):
+			continue
+		if node is MeshInstance3D and node.mesh != null and node.is_visible_in_tree():
+			if not await _collect_mesh_async(node, volume, tree, is_current, progress, slice_started):
+				return _abort_async_refresh()
+			slice_started = Time.get_ticks_usec()
+		elif node.is_class("Terrain3D") and node.get("data") != null and node.is_visible_in_tree():
+			if not await _collect_terrain_async(node, volume, tree, is_current, progress, slice_started):
+				return _abort_async_refresh()
+			slice_started = Time.get_ticks_usec()
+		var children := node.get_children()
+		for child_index in range(children.size() - 1, -1, -1):
+			stack.append(children[child_index])
+			visited += 1
+			if child_index % 64 == 0 and Time.get_ticks_usec() - slice_started >= REFRESH_MAIN_SLICE_USEC:
+				slice_started = await _yield_refresh_slice(volume, tree, is_current,
+						progress, "Capturing scene", visited, children.size(), slice_started)
+				if slice_started < 0 or not _scene_node_is_current(node, node_id,
+						node_path, volume, is_current):
+					return _abort_async_refresh()
+		visited += 1
+		slice_started = await _yield_refresh_slice(volume, tree, is_current,
+				progress, "Capturing scene", visited, -1, slice_started)
+		if slice_started < 0 or not _scene_node_is_current(node, node_id,
+				node_path, volume, is_current):
+			return _abort_async_refresh()
+	if not error_message.is_empty() or not _async_capture_inputs_current():
+		if error_message.is_empty():
+			error_message = "Surface refresh was superseded."
+		_refresh_cancel_token = null
+		return false
+	if not await _run_refresh_worker(volume, tree, is_current, progress,
+			"Building geometry and placing probes", build_bvh):
+		_refresh_cancel_token = null
+		return false
+	var result: bool = _async_worker_result \
+			and _refresh_request_is_current(volume, is_current) \
+			and _async_capture_inputs_current()
+	_refresh_cancel_token = null
+	return result
+
+func cancel_async_refresh() -> void:
+	_request_refresh_cancel()
+
+func async_capture_is_current(volume: Node3D, is_current: Callable) -> bool:
+	return _refresh_request_is_current(volume, is_current) \
+			and _async_capture_inputs_current()
+
+func _abort_async_refresh() -> bool:
+	_request_refresh_cancel()
+	if error_message.is_empty():
+		error_message = "Surface refresh was superseded."
+	_refresh_cancel_token = null
+	return false
+
+func _request_refresh_cancel() -> void:
+	if _refresh_cancel_token != null and is_instance_valid(_refresh_cancel_token):
+		_refresh_cancel_token.call("cancel")
+
+func _refresh_cancelled() -> bool:
+	return _refresh_cancel_token != null and is_instance_valid(_refresh_cancel_token) \
+			and bool(_refresh_cancel_token.call("is_cancelled"))
+
+func _refresh_owner_is_current(volume: Variant, is_current: Callable) -> bool:
+	if not is_instance_valid(volume) or not volume.is_inside_tree() \
+			or volume.is_queued_for_deletion() \
+			or volume.get_instance_id() != _source_volume_instance_id \
+			or volume.global_transform != _source_volume_transform \
+			or volume.size != _source_volume_size \
+			or not is_current.is_valid():
+		return false
+	return bool(is_current.call())
+
+func _refresh_request_is_current(volume: Variant, is_current: Callable) -> bool:
+	return _refresh_owner_is_current(volume, is_current) and _async_capture_inputs_current()
+
+func _scene_node_is_current(node: Variant, node_id: int, node_path: NodePath,
+		volume: Variant, is_current: Callable) -> bool:
+	if not _refresh_owner_is_current(volume, is_current) \
+			or not is_instance_valid(node):
+		return false
+	return node.get_instance_id() == node_id and node.is_inside_tree() \
+			and not node.is_queued_for_deletion() and node.get_path() == node_path \
+			and SceneTracker.scene_root(node) == _scene_root
+
+func _async_capture_inputs_current() -> bool:
+	for capture in _async_capture_guards:
+		if String(capture.get("kind", "")) == "mesh":
+			if not _mesh_capture_guard_current(capture):
+				return false
+		elif String(capture.get("kind", "")) == "terrain":
+			if not _terrain_capture_guard_current(capture):
+				return false
+	return true
+
+func _mesh_capture_guard_current(capture: Dictionary) -> bool:
+	var node: Variant = capture.get("node")
+	var mesh: Variant = capture.get("mesh")
+	if not is_instance_valid(node) or not is_instance_valid(mesh):
+		return false
+	if not node is MeshInstance3D or not mesh is Mesh:
+		return false
+	var mesh_node := node as MeshInstance3D
+	var source_mesh := mesh as Mesh
+	return mesh_node.get_instance_id() == int(capture.get("node_id", 0)) \
+			and mesh_node.is_inside_tree() and not mesh_node.is_queued_for_deletion() \
+			and mesh_node.mesh == source_mesh \
+			and source_mesh.get_instance_id() == int(capture.get("mesh_id", 0)) \
+			and mesh_node.global_transform == capture.get("transform", Transform3D.IDENTITY) \
+			and mesh_node.get_path() == capture.get("path", NodePath()) \
+			and mesh_node.is_visible_in_tree() \
+			and SceneTracker.scene_root(mesh_node) == _scene_root \
+			and SceneTracker.resource_revision(source_mesh) == int(capture.get("revision", -1))
+
+func _terrain_capture_guard_current(capture: Dictionary) -> bool:
+	var terrain: Variant = capture.get("node")
+	var data: Variant = capture.get("data")
+	if not is_instance_valid(terrain) or not is_instance_valid(data) \
+			or not terrain is Node3D:
+		return false
+	var terrain_node := terrain as Node3D
+	return terrain_node.get_instance_id() == int(capture.get("node_id", 0)) \
+			and terrain_node.is_inside_tree() and not terrain_node.is_queued_for_deletion() \
+			and terrain_node.get("data") == data \
+			and terrain_node.global_transform == capture.get("transform", Transform3D.IDENTITY) \
+			and terrain_node.get_path() == capture.get("path", NodePath()) \
+			and terrain_node.is_visible_in_tree() \
+			and SceneTracker.scene_root(terrain_node) == _scene_root \
+			and float(terrain_node.get("vertex_spacing")) == float(capture.get("vertex_spacing", 0.0)) \
+			and SceneTracker.resource_revision(data) == int(capture.get("revision", -1))
+
+func _yield_refresh_slice(volume: Variant, tree: SceneTree, is_current: Callable,
+		progress: Callable, phase: String, completed: int, total: int,
+		slice_started: int) -> int:
+	if Time.get_ticks_usec() - slice_started < REFRESH_MAIN_SLICE_USEC:
+		return slice_started
+	if not _refresh_request_is_current(volume, is_current) or not is_instance_valid(tree):
+		_request_refresh_cancel()
+		error_message = "Surface refresh was superseded."
+		return -1
+	if progress.is_valid():
+		progress.call(phase, completed, total)
+	await tree.process_frame
+	if is_instance_valid(tree) and _refresh_request_is_current(volume, is_current):
+		return Time.get_ticks_usec()
+	error_message = "Surface refresh was superseded."
+	return -1
+
+func _run_refresh_worker(volume: Variant, tree: SceneTree, is_current: Callable,
+		progress: Callable, phase: String, build_bvh: bool) -> bool:
+	_async_worker_result = false
+	var cancellation := _refresh_cancel_token
+	var task_id := WorkerThreadPool.add_task(
+			Callable(self, "_worker_build_and_sample").bind(build_bvh, cancellation), false,
+			"Magic GI Surface Layout")
+	if task_id < 0:
+		error_message = "Could not start the background surface-layout task."
+		return false
+	var cancellation_requested := false
+	while not WorkerThreadPool.is_task_completed(task_id):
+		if cancellation.is_cancelled():
+			cancellation_requested = true
+		elif not cancellation_requested and not _refresh_request_is_current(volume, is_current):
+			cancellation.cancel()
+			cancellation_requested = true
+			if progress.is_valid():
+				progress.call("Cancelling superseded surface refresh", -1, -1)
+		elif not cancellation_requested and progress.is_valid():
+			progress.call(phase, -1, -1)
+		await tree.process_frame
+	WorkerThreadPool.wait_for_task_completion(task_id)
+	var current := _refresh_request_is_current(volume, is_current)
+	if not current:
+		cancellation.cancel()
+	_refresh_cancel_token = null
+	return current and not cancellation.is_cancelled()
+
+func _worker_build_and_sample(build_bvh: bool, cancellation: RefCounted) -> void:
+	if cancellation.is_cancelled():
+		return
+	if not faces.is_empty():
+		# TriangleMesh construction is a single non-interruptible native call. It
+		# stays on this worker; cancellation is checked as soon as it returns.
+		bvh = TriangleMesh.new()
+		bvh_ready = bvh.create_from_faces(faces)
+		if cancellation.is_cancelled():
+			return
+		if not bvh_ready:
+			error_message = "Godot could not create the static PRT triangle BVH."
+			return
+	trace_scene = TraceScene.new()
+	if not trace_scene.initialize_snapshot(self, _inverse, _volume_size,
+			_probe_spacing, _preferred_offset_value, cancellation):
+		return
+	var ready_solids: Array[Dictionary] = []
+	for solid_index in _occlusion_volumes.size():
+		if cancellation.is_cancelled():
+			return
+		var solid: Dictionary = _occlusion_volumes[solid_index]
+		var solid_bvh := TriangleMesh.new()
+		var solid_ready := solid_bvh.create_from_faces(solid["faces"])
+		if cancellation.is_cancelled():
+			return
+		if not solid_ready:
+			continue
+		solid["bvh"] = solid_bvh
+		ready_solids.append(solid)
+	_occlusion_volumes = ready_solids
+	_source_volume_indices.clear()
+	for solid_index in _occlusion_volumes.size():
+		if cancellation.is_cancelled():
+			return
+		_source_volume_indices[int(_occlusion_volumes[solid_index]["instance_id"])] = solid_index
+	if not _build_occlusion_broadphase():
+		return
+	if cancellation.is_cancelled():
+		return
+	_async_worker_result = _sample_current_geometry(build_bvh)
+
+func _collect_mesh_async(node: MeshInstance3D, volume: Node3D, tree: SceneTree,
+		is_current: Callable, progress: Callable, slice_started: int) -> bool:
+	if not is_instance_valid(node) or not node.is_inside_tree() \
+			or node.is_queued_for_deletion() or node.mesh == null:
+		error_message = "Surface refresh was superseded."
+		return false
+	var mesh: Mesh = node.mesh
+	SceneTracker.watch_resource(mesh)
+	var captured_transform := node.global_transform
+	var captured_path := node.get_path()
+	var captured_revision := SceneTracker.resource_revision(mesh)
+	var capture_guard := {"kind": "mesh", "node": node,
+		"node_id": node.get_instance_id(), "mesh": mesh,
+		"mesh_id": mesh.get_instance_id(), "transform": captured_transform,
+		"path": captured_path, "revision": captured_revision}
+	_async_capture_guards.append(capture_guard)
+	if not _mesh_capture_guard_current(capture_guard):
+		error_message = "Surface refresh was superseded."
+		return false
+	var mesh_world_box: AABB = captured_transform * mesh.get_aabb()
+	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(_bake_world_bounds.grow(BROADPHASE_EPSILON)):
+		return true
+	if not await _register_occlusion_volume_async(node, mesh, mesh_world_box,
+			captured_transform, captured_path, captured_revision,
+			volume, tree, is_current, progress, slice_started):
+		return false
+	if not _mesh_capture_inputs_current(node, mesh, captured_transform,
+			captured_path, captured_revision, volume, is_current):
+		error_message = "Surface refresh was superseded."
+		return false
+	if mesh is PrimitiveMesh:
+		var arrays: Array = mesh.get_mesh_arrays()
+		if not arrays.is_empty() and arrays[Mesh.ARRAY_VERTEX] != null:
+			return await _collect_surface_triangles_async(node, mesh,
+					captured_transform, captured_path, captured_revision, 0, arrays, mesh,
+					volume, tree, is_current, progress, slice_started)
+		return await _collect_faces_only_mesh_async(node, mesh,
+			captured_transform, captured_path, captured_revision, volume, tree,
+			is_current, progress, slice_started)
+	if not mesh is ArrayMesh:
+		if mesh.get_surface_count() > 1:
+			error_message = "Non-ArrayMesh resources with multiple material surfaces cannot provide per-face reflectance."
+			return false
+		return await _collect_faces_only_mesh_async(node, mesh,
+			captured_transform, captured_path, captured_revision, volume, tree,
+			is_current, progress, slice_started)
+	for surface in mesh.get_surface_count():
+		if not _mesh_capture_inputs_current(node, mesh, captured_transform,
+				captured_path, captured_revision, volume, is_current):
+			error_message = "Surface refresh was superseded."
+			return false
+		if mesh.surface_get_primitive_type(surface) != Mesh.PRIMITIVE_TRIANGLES:
+			continue
+		var arrays := mesh.surface_get_arrays(surface)
+		if not await _collect_surface_triangles_async(node, mesh,
+				captured_transform, captured_path, captured_revision, surface, arrays, null,
+				volume, tree, is_current, progress, slice_started):
+			return false
+		slice_started = Time.get_ticks_usec()
+	return true
+
+func _collect_faces_only_mesh_async(node: MeshInstance3D, mesh: Mesh,
+		captured_transform: Transform3D, captured_path: NodePath,
+		captured_revision: int, volume: Node3D, tree: SceneTree, is_current: Callable,
+		progress: Callable, slice_started: int) -> bool:
+	if not _mesh_capture_inputs_current(node, mesh, captured_transform,
+			captured_path, captured_revision, volume, is_current):
+		error_message = "Surface refresh was superseded."
+		return false
+	var primitive_faces: PackedVector3Array = mesh.get_faces()
+	if primitive_faces.is_empty():
+		return true
+	_triangle_source_id = node.get_instance_id()
+	_triangle_surface_index = 0
+	_triangle_domain_source = _mesh_domain_source(node, mesh)
+	if not _prepare_surface(node, 0):
+		return error_message.is_empty()
+	if _triangle_emitter_index >= 0:
+		error_message = "An emissive mesh without CPU-accessible UV arrays cannot be baked as an area source."
+		return false
+	for i in range(0, primitive_faces.size() - 2, 3):
+		var a: Vector3 = captured_transform * primitive_faces[i]
+		var b: Vector3 = captured_transform * primitive_faces[i + 1]
+		var c: Vector3 = captured_transform * primitive_faces[i + 2]
+		if not _triangle(a, b, c):
+			return false
+		if i % 96 == 0:
+			slice_started = await _yield_refresh_slice(volume, tree, is_current,
+					progress, "Capturing mesh triangles", i / 3, primitive_faces.size() / 3,
+					slice_started)
+			if slice_started < 0:
+				return false
+			if not _mesh_capture_inputs_current(node, mesh, captured_transform,
+					captured_path, captured_revision, volume, is_current):
+				error_message = "Surface refresh was superseded."
+				return false
+	return true
+
+func _collect_surface_triangles_async(node: MeshInstance3D, source_mesh: Mesh,
+		captured_transform: Transform3D, captured_path: NodePath,
+		captured_revision: int, surface: int, arrays: Array,
+		primitive_mesh: PrimitiveMesh, volume: Node3D, tree: SceneTree,
+		is_current: Callable, progress: Callable, slice_started: int) -> bool:
+	if not _mesh_capture_inputs_current(node, source_mesh, captured_transform,
+			captured_path, captured_revision, volume, is_current):
+		error_message = "Surface refresh was superseded."
+		return false
+	if arrays.is_empty() or arrays[Mesh.ARRAY_VERTEX] == null:
+		return true
+	var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
+	var uv1: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] if arrays.size() > Mesh.ARRAY_TEX_UV and arrays[Mesh.ARRAY_TEX_UV] != null else PackedVector2Array()
+	var uv2: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV2] if arrays.size() > Mesh.ARRAY_TEX_UV2 and arrays[Mesh.ARRAY_TEX_UV2] != null else PackedVector2Array()
+	var count := indices.size() if not indices.is_empty() else vertices.size()
+	var snapped_faces: PackedVector3Array
+	if primitive_mesh != null:
+		snapped_faces = primitive_mesh.get_faces()
+		if count % 3 != 0 or snapped_faces.size() != count:
+			error_message = "PrimitiveMesh face positions and array UV indices disagree; refusing unstable surface data."
+			return false
+	_triangle_source_id = node.get_instance_id()
+	_triangle_surface_index = surface
+	_triangle_domain_source = _mesh_domain_source(node, source_mesh)
+	if not _prepare_surface(node, surface, uv1, uv2, vertices.size()):
+		return error_message.is_empty()
+	for i in range(0, count - 2, 3):
+		var ia := indices[i] if not indices.is_empty() else i
+		var ib := indices[i + 1] if not indices.is_empty() else i + 1
+		var ic := indices[i + 2] if not indices.is_empty() else i + 2
+		var a: Vector3 = captured_transform * (snapped_faces[i] if primitive_mesh != null else vertices[ia])
+		var b: Vector3 = captured_transform * (snapped_faces[i + 1] if primitive_mesh != null else vertices[ib])
+		var c: Vector3 = captured_transform * (snapped_faces[i + 2] if primitive_mesh != null else vertices[ic])
+		var ta := uv1[ia] if uv1.size() == vertices.size() else Vector2.ZERO
+		var tb := uv1[ib] if uv1.size() == vertices.size() else Vector2.ZERO
+		var tc := uv1[ic] if uv1.size() == vertices.size() else Vector2.ZERO
+		var t2a := uv2[ia] if uv2.size() == vertices.size() else Vector2.ZERO
+		var t2b := uv2[ib] if uv2.size() == vertices.size() else Vector2.ZERO
+		var t2c := uv2[ic] if uv2.size() == vertices.size() else Vector2.ZERO
+		if not _triangle(a, b, c, ta, tb, tc, t2a, t2b, t2c):
+			return false
+		if i % 96 == 0:
+			slice_started = await _yield_refresh_slice(volume, tree, is_current,
+					progress, "Capturing mesh triangles", i / 3, count / 3,
+					slice_started)
+			if slice_started < 0:
+				return false
+			if not _mesh_capture_inputs_current(node, source_mesh, captured_transform,
+					captured_path, captured_revision, volume, is_current):
+				error_message = "Surface refresh was superseded."
+				return false
+	return true
+
+func _mesh_capture_inputs_current(node: Variant, mesh: Variant,
+		captured_transform: Transform3D, captured_path: NodePath,
+		captured_revision: int, volume: Variant, is_current: Callable) -> bool:
+	if not _refresh_owner_is_current(volume, is_current) \
+			or not is_instance_valid(node) or not is_instance_valid(mesh):
+		return false
+	return node.is_inside_tree() and not node.is_queued_for_deletion() \
+			and node.mesh == mesh and node.global_transform == captured_transform \
+			and node.get_path() == captured_path and node.is_visible_in_tree() \
+			and SceneTracker.scene_root(node) == _scene_root \
+			and SceneTracker.resource_revision(mesh) == captured_revision
+
+func _register_occlusion_volume_async(node: MeshInstance3D, mesh: Mesh,
+		mesh_world_box: AABB, captured_transform: Transform3D,
+		captured_path: NodePath, captured_revision: int,
+		volume: Node3D, tree: SceneTree,
+		is_current: Callable, progress: Callable, slice_started: int) -> bool:
+	if not _mesh_capture_inputs_current(node, mesh, captured_transform,
+			captured_path, captured_revision, volume, is_current):
+		error_message = "Surface refresh was superseded."
+		return false
+	var placement_box := _world_bounds.grow(_preferred_offset_value + BROADPHASE_EPSILON)
+	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(placement_box) \
+			or _mesh_has_transparent_surface(node, mesh):
+		return true
+	var local_faces: PackedVector3Array = mesh.get_faces()
+	if local_faces.size() < 12 or local_faces.size() % 3 != 0 \
+			or local_faces.size() / 3 > MAX_OCCLUSION_TRIANGLES:
+		return true
+	if not await _mesh_faces_are_watertight_async(local_faces, volume, tree,
+			is_current, progress, slice_started):
+		return error_message.is_empty()
+	if not _mesh_capture_inputs_current(node, mesh, captured_transform,
+			captured_path, captured_revision, volume, is_current):
+		error_message = "Surface refresh was superseded."
+		return false
+	var world_faces := PackedVector3Array()
+	world_faces.resize(local_faces.size())
+	for index in local_faces.size():
+		world_faces[index] = captured_transform * local_faces[index]
+		if index % 192 == 0:
+			slice_started = await _yield_refresh_slice(volume, tree, is_current,
+					progress, "Capturing occlusion geometry", index / 3,
+					local_faces.size() / 3, slice_started)
+		if slice_started < 0:
+			return false
+		if index % 192 == 0 and not _mesh_capture_inputs_current(node, mesh,
+				captured_transform, captured_path, captured_revision, volume, is_current):
+			error_message = "Surface refresh was superseded."
+			return false
+	var instance_id := node.get_instance_id()
+	var solid_index := _occlusion_volumes.size()
+	_occlusion_volumes.append({"instance_id": instance_id,
+		"world_aabb": mesh_world_box, "faces": world_faces})
+	_source_volume_indices[instance_id] = solid_index
+	return true
+
+func _mesh_faces_are_watertight_async(local_faces: PackedVector3Array,
+		volume: Node3D, tree: SceneTree, is_current: Callable,
+		progress: Callable, slice_started: int) -> bool:
+	var vertex_ids: Dictionary = {}
+	var edge_counts: Dictionary = {}
+	for face_offset in range(0, local_faces.size(), 3):
+		var triangle_ids := PackedInt32Array()
+		for corner in 3:
+			var point: Vector3 = local_faces[face_offset + corner]
+			var vertex_key := Vector3i(roundi(point.x / OCCLUSION_WELD_EPSILON),
+				roundi(point.y / OCCLUSION_WELD_EPSILON), roundi(point.z / OCCLUSION_WELD_EPSILON))
+			if not vertex_ids.has(vertex_key):
+				vertex_ids[vertex_key] = vertex_ids.size()
+			triangle_ids.append(int(vertex_ids[vertex_key]))
+		if triangle_ids[0] == triangle_ids[1] or triangle_ids[1] == triangle_ids[2] \
+				or triangle_ids[2] == triangle_ids[0]:
+			return false
+		for edge_index in 3:
+			var first := triangle_ids[edge_index]
+			var second := triangle_ids[(edge_index + 1) % 3]
+			var low := mini(first, second)
+			var high := maxi(first, second)
+			var edge_key: int = (low << 32) | high
+			edge_counts[edge_key] = int(edge_counts.get(edge_key, 0)) + 1
+		if face_offset % 192 == 0:
+			slice_started = await _yield_refresh_slice(volume, tree, is_current,
+					progress, "Checking closed-mesh edges", face_offset / 3,
+					local_faces.size() / 3, slice_started)
+		if slice_started < 0:
+			return false
+	if edge_counts.is_empty():
+		return false
+	for count in edge_counts.values():
+		if int(count) != 2:
+			return false
+	return true
+
+func _collect_terrain_async(terrain: Node3D, volume: Node3D, tree: SceneTree,
+		is_current: Callable, progress: Callable, slice_started: int) -> bool:
+	if not is_instance_valid(terrain) or not terrain.is_inside_tree() \
+			or terrain.is_queued_for_deletion():
+		error_message = "Surface refresh was superseded."
+		return false
+	_triangle_emitter_index = -1
+	_triangle_material = -1
+	_triangle_source_id = terrain.get_instance_id()
+	_triangle_surface_index = -1
+	_triangle_domain_source = _terrain_domain_source(terrain)
+	var data = terrain.get("data")
+	if data == null or not (data is Object):
+		error_message = "Terrain3D data is unavailable during surface refresh."
+		return false
+	var terrain_transform := terrain.global_transform
+	var terrain_path := terrain.get_path()
+	var terrain_id := terrain.get_instance_id()
+	var terrain_vertex_spacing := float(terrain.get("vertex_spacing"))
+	SceneTracker.watch_object(data)
+	var terrain_revision := SceneTracker.resource_revision(data)
+	_async_capture_guards.append({"kind": "terrain", "node": terrain,
+		"node_id": terrain_id, "data": data, "transform": terrain_transform,
+		"path": terrain_path, "vertex_spacing": terrain_vertex_spacing,
+		"revision": terrain_revision})
+	if not data.has_method("get_surface_height"):
+		error_message = "Terrain3D data is missing get_surface_height(); refusing raw height sampling."
+		return false
+	var box := _bake_world_bounds
+	var step := _probe_spacing
+	var vertex_spacing: float = terrain_vertex_spacing
+	if _streamed_page:
+		step = maxf(vertex_spacing, 0.25)
+	else:
+		step = minf(step, maxf(vertex_spacing, 0.25))
+	var start := Vector2(floor(box.position.x / step) * step, floor(box.position.z / step) * step)
+	var end := box.end
+	var nx := ceili((end.x - start.x) / step) + 1
+	var nz := ceili((end.z - start.y) / step) + 1
+	_terrain_work += nx * nz
+	if nx <= 1 or nz <= 1 or _terrain_work > MAX_TERRAIN_CELLS:
+		error_message = "Terrain sampling exceeds the 500,000-cell work limit; increase Probe Spacing or reduce Bake Distance."
+		return false
+	var heights := PackedFloat32Array()
+	heights.resize(nx * nz)
+	for z in nz:
+		for x in nx:
+			heights[z * nx + x] = data.call("get_surface_height",
+					Vector3(start.x + x * step, 0.0, start.y + z * step))
+			if x % 32 == 0:
+				slice_started = await _yield_refresh_slice(volume, tree, is_current,
+						progress, "Capturing terrain heights", z * nx + x,
+						nx * nz, slice_started)
+				if slice_started < 0 or not _terrain_capture_guard_current({
+						"node": terrain, "node_id": terrain_id, "data": data,
+						"transform": terrain_transform, "path": terrain_path,
+						"vertex_spacing": terrain_vertex_spacing,
+						"revision": terrain_revision}):
+					return false
+	var color := Vector3.ONE * _terrain_reflectance
+	for z in nz - 1:
+		for x in nx - 1:
+			var h00 := heights[z * nx + x]
+			var h10 := heights[z * nx + x + 1]
+			var h01 := heights[(z + 1) * nx + x]
+			var h11 := heights[(z + 1) * nx + x + 1]
+			if is_finite(h00) and is_finite(h10) and is_finite(h01) and is_finite(h11):
+				var a := Vector3(start.x + x * step, h00, start.y + z * step)
+				var b := Vector3(start.x + (x + 1) * step, h10, start.y + z * step)
+				var c := Vector3(start.x + x * step, h01, start.y + (z + 1) * step)
+				var d := Vector3(start.x + (x + 1) * step, h11, start.y + (z + 1) * step)
+				_triangle_reflectance = color
+				if not _triangle(a, b, c) or not _triangle(b, d, c):
+					return false
+			if x % 32 == 0:
+				slice_started = await _yield_refresh_slice(volume, tree, is_current,
+						progress, "Building terrain triangles", z * nx + x,
+						nx * nz, slice_started)
+				if slice_started < 0 or not _terrain_capture_guard_current({
+						"node": terrain, "node_id": terrain_id, "data": data,
+						"transform": terrain_transform, "path": terrain_path,
+						"vertex_spacing": terrain_vertex_spacing,
+						"revision": terrain_revision}):
+					return false
+	return true
+
+func _begin_collect(volume: Node3D, for_bake: bool, collect_emission: bool,
+		sample_geometry: bool, collection_bounds: AABB) -> bool:
 	_volume = volume
+	_source_volume_instance_id = volume.get_instance_id()
+	_async_capture_guards.clear()
+	_streamed_page = _has_true_boolean_property(volume, &"streamed_page")
 	_world = volume.get_world_3d()
 	_collect_emission = collect_emission
 	emitters = EmitterBakeSet.new()
+	_volume_size = volume.size
+	_volume_transform = volume.global_transform
+	_source_volume_transform = volume.global_transform
+	_source_volume_size = volume.size
+	_adaptive_placement = volume.adaptive_placement
+	_fallback_reflectance = float(volume.get("fallback_material_reflectance"))
+	_terrain_reflectance = float(volume.get("terrain_reflectance"))
+	_bake_distance = float(volume.get("bake_distance"))
 	_inverse = volume.global_transform.affine_inverse()
-	_dimensions = volume.grid_dimensions()
+	_dimensions = volume.grid_dimensions() if sample_geometry else Vector3i.ONE
 	_probe_spacing = maxf(float(volume.get("probe_spacing")), 0.1)
 	_active_candidate_spacing = _probe_spacing
 	_arbitration_spacing = minf(_probe_spacing, volume.minimum_probe_spacing) \
@@ -141,8 +848,10 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	# segment, even before a bake exists. Bake collection already has the wider
 	# ray-tracing bounds and therefore also contains this local occupancy region.
 	var max_probe_offset := _preferred_probe_offset(volume)
-	_bake_world_bounds = _world_bounds.grow(volume.bake_distance) if for_bake \
-			else _world_bounds.grow(max_probe_offset + BROADPHASE_EPSILON)
+	_preferred_offset_value = max_probe_offset
+	_bake_world_bounds = collection_bounds if _valid_bounds(collection_bounds) else \
+		(_world_bounds.grow(volume.bake_distance) if for_bake \
+		else _world_bounds.grow(max_probe_offset + BROADPHASE_EPSILON))
 	faces.clear()
 	reflectance.clear()
 	material_sampler = MaterialSampler.new()
@@ -157,6 +866,7 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	surface_positions.clear()
 	normals.clear()
 	probe_spacings.clear()
+	stable_probe_ids.clear()
 	_world_candidate_cells.clear()
 	_cell_counts.clear()
 	_occlusion_volumes.clear()
@@ -214,15 +924,14 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	bvh = null
 	trace_scene = null
 	bvh_ready = false
-	if _dimensions.x <= 0 or _dimensions.y <= 0 or _dimensions.z <= 0 \
+	if sample_geometry and (_dimensions.x <= 0 or _dimensions.y <= 0 or _dimensions.z <= 0 \
 			or _dimensions.x > Data.MAX_GRID_AXIS or _dimensions.y > Data.MAX_GRID_AXIS \
-			or _dimensions.z > Data.MAX_GRID_AXIS:
+			or _dimensions.z > Data.MAX_GRID_AXIS):
 		error_message = "Lookup grid exceeds the supported 64 cells per axis."
 		return false
-	_scene_root = SceneTracker.scene_root(volume)
-	_collect_node(_scene_root)
-	if not error_message.is_empty():
-		return false
+	return true
+
+func _build_geometry_trace_data(volume: Node3D) -> bool:
 	# Build once after all faces are collected. Placement filtering and the baker
 	# then share this same accelerated geometry instead of scanning triangles per
 	# sample. Preview also needs it to match the bake's accepted sample layout.
@@ -233,35 +942,82 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 			error_message = "Godot could not create the static PRT triangle BVH."
 			return false
 	trace_scene = TraceScene.new()
-	trace_scene.initialize(self, volume, max_probe_offset)
-	_build_occlusion_broadphase()
-	if not _sample_collected_geometry():
+	trace_scene.initialize(self, volume, _preferred_offset_value)
+	return _build_occlusion_broadphase()
+
+## Reuses a management-block geometry/BVH collection to bake one page. The
+## collector bounds already include the complete multi-bounce trace radius.
+func sample_streamed_page(volume: Node3D, build_bvh := true) -> bool:
+	if bvh == null or not bvh_ready:
+		error_message = "A streamed page requires a collected immutable geometry BVH."
+		return false
+	_volume = volume
+	_world = volume.get_world_3d()
+	_volume_size = volume.size
+	_volume_transform = volume.global_transform
+	_source_volume_transform = volume.get("source_volume_transform") if _has_true_boolean_property(volume, &"streamed_page") else volume.global_transform
+	_source_volume_size = volume.get("source_volume_size") if _has_true_boolean_property(volume, &"streamed_page") else volume.size
+	_adaptive_placement = volume.adaptive_placement
+	_fallback_reflectance = float(volume.get("fallback_material_reflectance"))
+	_terrain_reflectance = float(volume.get("terrain_reflectance"))
+	_bake_distance = float(volume.get("bake_distance"))
+	_inverse = volume.global_transform.affine_inverse()
+	_dimensions = volume.grid_dimensions()
+	_probe_spacing = maxf(float(volume.get("probe_spacing")), 0.1)
+	_active_candidate_spacing = _probe_spacing
+	_arbitration_spacing = minf(_probe_spacing, volume.minimum_probe_spacing) \
+			if volume.adaptive_placement else _probe_spacing
+	_world_bounds = volume.global_transform * AABB(-volume.size * 0.5, volume.size)
+	_preferred_offset_value = _preferred_probe_offset(volume)
+	_collect_emission = true
+	trace_scene = TraceScene.new()
+	trace_scene.initialize(self, volume, _preferred_offset_value)
+	_reset_page_sampling_state()
+	if not _build_occlusion_broadphase():
+		return false
+	if _dimensions.x <= 0 or _dimensions.y <= 0 or _dimensions.z <= 0 \
+			or _dimensions.x > Data.MAX_GRID_AXIS or _dimensions.y > Data.MAX_GRID_AXIS \
+			or _dimensions.z > Data.MAX_GRID_AXIS:
+		error_message = "Lookup grid exceeds the supported 64 cells per axis."
+		return false
+	return _sample_current_geometry(build_bvh)
+
+func _sample_current_geometry(build_bvh: bool) -> bool:
+	if _refresh_cancelled() or not _sample_collected_geometry():
 		positions.clear()
 		surface_positions.clear()
 		normals.clear()
 		return false
+	if _refresh_cancelled():
+		return false
 	_coarse_valid_candidate_count = _valid_candidate_count
-	if volume.adaptive_placement:
+	if _adaptive_placement:
 		var refinement_result: Dictionary = AdaptiveLayout.mark_refinement_cells(
 				_world_candidate_cells, Callable(self, "trace_geometry"), trace_scene,
-				_world_bounds, _probe_spacing, _arbitration_spacing)
+				_world_bounds, _probe_spacing, _arbitration_spacing,
+				Callable(_refresh_cancel_token, "is_cancelled") if _refresh_cancel_token != null else Callable())
+		if _refresh_cancelled() or bool(refinement_result.get("cancelled", false)):
+			return false
 		var refinement_cells: Dictionary = refinement_result["cells"]
 		_refinement_cell_count = refinement_cells.size()
 		var refinement_error := String(refinement_result["error"])
 		if not refinement_error.is_empty():
 			error_message = refinement_error
-		if not error_message.is_empty() or not _sample_refined_geometry(refinement_cells):
+		if not error_message.is_empty() or not _sample_refined_geometry(refinement_cells) \
+				or _refresh_cancelled():
 			positions.clear()
 			surface_positions.clear()
 			normals.clear()
 			return false
 		_refined_valid_candidate_count = _valid_candidate_count - _coarse_valid_candidate_count
-	if not _finalize_world_candidates():
+	if _refresh_cancelled() or not _finalize_world_candidates():
 		positions.clear()
 		surface_positions.clear()
 		normals.clear()
 		return false
 	_world_candidate_cells.clear()
+	if _refresh_cancelled():
+		return false
 	if not build_bvh:
 		bvh = null
 		bvh_ready = false
@@ -277,14 +1033,67 @@ func collect(volume: Node3D, for_bake := false, build_bvh := true, collect_emiss
 	scene_signature = hash([faces, reflectance, surface_positions, positions, normals])
 	if not material_sampler.records.is_empty():
 		scene_signature = hash([scene_signature, face_uv, material_sampler.fingerprint()])
-	return true
+	return not _refresh_cancelled()
+
+func _reset_page_sampling_state() -> void:
+	positions.clear()
+	surface_positions.clear()
+	normals.clear()
+	probe_spacings.clear()
+	stable_probe_ids.clear()
+	_world_candidate_cells.clear()
+	_cell_counts.clear()
+	_fallback_triangle_vertices.clear()
+	_fallback_triangle_normals.clear()
+	_fallback_triangle_source_ids.clear()
+	_fallback_triangle_surface_indices.clear()
+	_fallback_triangle_face_indices.clear()
+	_fallback_triangle_domain_indices.clear()
+	_interned_domain_sources.clear()
+	_interned_domain_source_indices.clear()
+	_candidate_count = 0
+	_coarse_valid_candidate_count = 0
+	_refined_valid_candidate_count = 0
+	_refinement_cell_count = 0
+	_refinement_cell_visit_count = 0
+	_valid_candidate_count = 0
+	_staged_candidate_count = 0
+	_bounded_candidate_pruned_count = 0
+	_canonical_candidate_count = 0
+	_fallback_candidate_count = 0
+	_fallback_triangle_count = 0
+	_fallback_candidate_reservations = 0
+	rejected_no_safe_offset_count = 0
+	rejected_inside_or_indeterminate_center_count = 0
+	rejected_duplicate_count = 0
+	rejected_center_outside_count = 0
+	rejected_foreign_surface_center_count = 0
+	rejected_owner_connection_count = 0
+	rejected_owner_connection_empty_count = 0
+	rejected_owner_connection_mismatch_count = 0
+	owner_connection_raw_anchor_count = 0
+	rejected_owner_backside_center_count = 0
+	rejected_center_clearance_count = 0
+	rejected_ambiguous_side_count = 0
+	rejected_center_overlap_count = 0
+	rejected_world_cell_competition_count = 0
+	rejected_lookup_capacity_count = 0
+	rejected_world_cell_limit_count = 0
+	adjusted_center_count = 0
+	error_message = ""
+	warning_message = ""
+	bvh_ready = bvh != null
+
+func _valid_bounds(bounds: AABB) -> bool:
+	return bounds.position.is_finite() and bounds.size.is_finite() \
+			and bounds.size.x > 0.0 and bounds.size.y > 0.0 and bounds.size.z > 0.0
 
 func _sample_collected_geometry() -> bool:
 	_active_candidate_spacing = _probe_spacing
-	if not _sample_geometry_triangles(false, {}):
+	if _refresh_cancelled() or not _sample_geometry_triangles(false, {}):
 		_clear_fallback_triangle_queue()
 		return false
-	if not _sample_fallback_triangles():
+	if _refresh_cancelled() or not _sample_fallback_triangles():
 		return false
 	return true
 
@@ -299,6 +1108,8 @@ func _sample_refined_geometry(refinement_cells: Dictionary) -> bool:
 func _sample_geometry_triangles(refined: bool,
 		refinement_cells: Dictionary) -> bool:
 	for face_offset in range(0, faces.size(), 3):
+		if face_offset % (REFRESH_WORKER_CHECK_INTERVAL * 3) == 0 and _refresh_cancelled():
+			return false
 		var source_face_index := int(face_offset / 3)
 		_sample_source_id = int(face_source_ids[source_face_index])
 		_sample_surface_index = int(face_surface_indices[source_face_index])
@@ -308,19 +1119,19 @@ func _sample_geometry_triangles(refined: bool,
 		var b: Vector3 = faces[face_offset + 1]
 		var c: Vector3 = faces[face_offset + 2]
 		var polygon := [_inverse * a, _inverse * b, _inverse * c]
-		polygon = _clip_polygon(polygon, 0, -_volume.size.x * 0.5, true)
-		polygon = _clip_polygon(polygon, 0, _volume.size.x * 0.5, false)
-		polygon = _clip_polygon(polygon, 1, -_volume.size.y * 0.5, true)
-		polygon = _clip_polygon(polygon, 1, _volume.size.y * 0.5, false)
-		polygon = _clip_polygon(polygon, 2, -_volume.size.z * 0.5, true)
-		polygon = _clip_polygon(polygon, 2, _volume.size.z * 0.5, false)
+		polygon = _clip_polygon(polygon, 0, -_volume_size.x * 0.5, true)
+		polygon = _clip_polygon(polygon, 0, _volume_size.x * 0.5, false)
+		polygon = _clip_polygon(polygon, 1, -_volume_size.y * 0.5, true)
+		polygon = _clip_polygon(polygon, 1, _volume_size.y * 0.5, false)
+		polygon = _clip_polygon(polygon, 2, -_volume_size.z * 0.5, true)
+		polygon = _clip_polygon(polygon, 2, _volume_size.z * 0.5, false)
 		if polygon.size() < 3:
 			continue
 		var root: Vector3 = polygon[0]
 		for i in range(1, polygon.size() - 1):
-			var p0: Vector3 = _volume.global_transform * root
-			var p1: Vector3 = _volume.global_transform * polygon[i]
-			var p2: Vector3 = _volume.global_transform * polygon[i + 1]
+			var p0: Vector3 = _volume_transform * root
+			var p1: Vector3 = _volume_transform * polygon[i]
+			var p2: Vector3 = _volume_transform * polygon[i + 1]
 			var clipped_normal := (p2 - p0).cross(p1 - p0).normalized()
 			if clipped_normal.length_squared() < 0.5:
 				continue
@@ -380,7 +1191,11 @@ func _sample_triangle_in_refinement_cells(a: Vector3, b: Vector3, c: Vector3,
 		error_message = "Adaptive triangle-to-feature matching exceeds its bounded cell-query budget."
 		return false
 	if scan_marked_cells:
+		var checked_cells := 0
 		for cell_value in refinement_cells:
+			checked_cells += 1
+			if checked_cells % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+				return false
 			_refinement_cell_visit_count += 1
 			var world_cell: Vector3i = cell_value
 			if world_cell.x < cell_min.x or world_cell.x > cell_max.x \
@@ -394,9 +1209,13 @@ func _sample_triangle_in_refinement_cells(a: Vector3, b: Vector3, c: Vector3,
 				return false
 			generated += cell_generated
 	else:
+		var checked_cells := 0
 		for z in range(cell_min.z, cell_max.z + 1):
 			for y in range(cell_min.y, cell_max.y + 1):
 				for x in range(cell_min.x, cell_max.x + 1):
+					checked_cells += 1
+					if checked_cells % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+						return false
 					_refinement_cell_visit_count += 1
 					var world_cell := Vector3i(x, y, z)
 					if not refinement_cells.has(world_cell):
@@ -436,8 +1255,12 @@ func _sample_refinement_cell(a: Vector3, b: Vector3, c: Vector3,
 	var first_v := ceili(cell_low_v / _active_candidate_spacing - 0.5 - 0.000001)
 	var last_v := floori(cell_high_v / _active_candidate_spacing - 0.5 + 0.000001)
 	var generated := 0
+	var checked_candidates := 0
 	for fine_v in range(first_v, last_v + 1):
 		for fine_u in range(first_u, last_u + 1):
+			checked_candidates += 1
+			if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+				return -1
 			_candidate_count += 1
 			if _candidate_count > MAX_SAMPLE_CANDIDATES:
 				error_message = "Adaptive surface refinement exceeds the 2,000,000-candidate work budget."
@@ -504,7 +1327,7 @@ func _collect_mesh(node: MeshInstance3D) -> void:
 
 func _register_occlusion_volume(node: MeshInstance3D, mesh: Mesh, mesh_world_box: AABB) -> void:
 	var instance_id := node.get_instance_id()
-	var placement_box := _world_bounds.grow(_preferred_probe_offset(_volume) + BROADPHASE_EPSILON)
+	var placement_box := _world_bounds.grow(_preferred_offset_value + BROADPHASE_EPSILON)
 	if not mesh_world_box.grow(BROADPHASE_EPSILON).intersects(placement_box):
 		return
 	if _mesh_has_transparent_surface(node, mesh):
@@ -653,7 +1476,7 @@ func _prepare_surface(node: MeshInstance3D, surface: int,
 func _material_reflectance(material: Material) -> Vector3:
 	if material != null and _material_cache.has(material):
 		return _material_cache[material]
-	var color: Vector3 = Vector3.ONE * float(_volume.get("fallback_material_reflectance"))
+	var color: Vector3 = Vector3.ONE * _fallback_reflectance
 	if material is BaseMaterial3D:
 		var linear: Color = material.albedo_color.srgb_to_linear()
 		color = Vector3(linear.r, linear.g, linear.b) * (1.0 - material.metallic)
@@ -662,6 +1485,16 @@ func _material_reflectance(material: Material) -> Vector3:
 	if material != null:
 		_material_cache[material] = color
 	return color
+
+func _has_true_boolean_property(object: Object, property_name: StringName) -> bool:
+	if object == null:
+		return false
+	for property_info in object.get_property_list():
+		if StringName(property_info.get("name", "")) != property_name:
+			continue
+		var property_value: Variant = object.get(property_name)
+		return property_value is bool and property_value
+	return false
 
 func _collect_terrain(terrain: Node3D) -> void:
 	_triangle_emitter_index = -1
@@ -674,9 +1507,15 @@ func _collect_terrain(terrain: Node3D) -> void:
 		error_message = "Terrain3D data is missing get_surface_height(); refusing raw height sampling."
 		return
 	var box := _bake_world_bounds
-	var step: float = _volume.probe_spacing
+	var step: float = _probe_spacing
 	var vertex_spacing: float = terrain.get("vertex_spacing")
-	step = minf(step, maxf(vertex_spacing, 0.25))
+	if _streamed_page:
+		# Terrain3D height sampling cannot recover sub-vertex detail. A streamed
+		# page collector uses the authored source resolution, then independently
+		# places probes at the requested (possibly finer) spacing.
+		step = maxf(vertex_spacing, 0.25)
+	else:
+		step = minf(step, maxf(vertex_spacing, 0.25))
 	var start := Vector2(floor(box.position.x / step) * step, floor(box.position.z / step) * step)
 	var end := box.end
 	var nx := ceili((end.x - start.x) / step) + 1
@@ -691,7 +1530,7 @@ func _collect_terrain(terrain: Node3D) -> void:
 		for x in nx:
 			var query := Vector3(start.x + x * step, 0.0, start.y + z * step)
 			heights[z * nx + x] = data.call("get_surface_height", query)
-	var color: Vector3 = Vector3.ONE * float(_volume.get("terrain_reflectance"))
+	var color: Vector3 = Vector3.ONE * _terrain_reflectance
 	for z in nz - 1:
 		for x in nx - 1:
 			var h00: float = heights[z * nx + x]
@@ -764,9 +1603,13 @@ func _sample_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector3,
 	var last_v := floori(high_v / _active_candidate_spacing - 0.5 + 0.000001)
 	var canonical_points_inside := 0
 	var dominant_normal := normal[dominant_axis]
+	var checked_candidates := 0
 	if absf(dominant_normal) > 0.000001 and first_u <= last_u and first_v <= last_v:
 		for cell_v in range(first_v, last_v + 1):
 			for cell_u in range(first_u, last_u + 1):
+				checked_candidates += 1
+				if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+					return false
 				_candidate_count += 1
 				if _candidate_count > MAX_SAMPLE_CANDIDATES:
 					error_message = "Surface sampling exceeds the 2,000,000-candidate work budget."
@@ -826,6 +1669,8 @@ func _queue_fallback_triangle(a: Vector3, b: Vector3, c: Vector3, normal: Vector
 
 func _sample_fallback_triangles() -> bool:
 	for triangle_index in _fallback_triangle_normals.size():
+		if triangle_index % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return false
 		var vector_index := triangle_index * 3
 		var a: Vector3 = _fallback_triangle_vertices[vector_index]
 		var b: Vector3 = _fallback_triangle_vertices[vector_index + 1]
@@ -862,8 +1707,12 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 		normal: Vector3, owner_face_index: int, steps: int) -> bool:
 	var triangle_centroid := (a + b + c) / 3.0
 	var accepted_before := _valid_candidate_count
+	var checked_candidates := 0
 	for u in steps + 1:
 		for v in steps + 1 - u:
+			checked_candidates += 1
+			if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+				return false
 			_candidate_count += 1
 			if _candidate_count > MAX_SAMPLE_CANDIDATES:
 				error_message = "Surface sampling exceeds the 2,000,000-candidate work budget."
@@ -871,8 +1720,8 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 			_fallback_candidate_count += 1
 			var point := a + (b - a) * (float(u) / steps) \
 					+ (c - a) * (float(v) / steps)
-			if _volume.adaptive_placement:
-				var estimated_center := point + normal * _preferred_probe_offset(_volume)
+			if _adaptive_placement:
+				var estimated_center := point + normal * _preferred_offset_value
 				var estimated_cell := ProbeLayout.world_cell(estimated_center, _probe_spacing)
 				var domain_key := _candidate_domain_key(normal, triangle_centroid)
 				if _has_staged_candidate_for_world_cell(domain_key, estimated_cell):
@@ -884,10 +1733,10 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 	# Retain the small-triangle centroid rescue, but only after all canonical grid
 	# opportunities and the bounded raw fallback have been considered.
 	if steps == 1 and _valid_candidate_count == accepted_before:
-		var estimated_center := triangle_centroid + normal * _preferred_probe_offset(_volume)
+		var estimated_center := triangle_centroid + normal * _preferred_offset_value
 		var estimated_cell := ProbeLayout.world_cell(estimated_center, _probe_spacing)
 		var domain_key := _candidate_domain_key(normal, triangle_centroid)
-		if not _volume.adaptive_placement \
+		if not _adaptive_placement \
 				or not _has_staged_candidate_for_world_cell(domain_key, estimated_cell):
 			_candidate_count += 1
 			if _candidate_count > MAX_SAMPLE_CANDIDATES:
@@ -1065,17 +1914,29 @@ func _face_is_same_coplanar_surface(hit_face_index: int, owner_face_index: int,
 func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		owner_face_index: int, canonical: bool,
 		sample_a: Vector3, sample_b: Vector3, sample_c: Vector3) -> void:
+	if _streamed_page:
+		var source_local := _source_volume_transform.affine_inverse() * surface
+		var source_half := _source_volume_size * 0.5
+		var source_epsilon := maxf(0.0001, _probe_spacing * 0.0001)
+		if source_local.x < -source_half.x - source_epsilon \
+				or source_local.x > source_half.x + source_epsilon \
+				or source_local.y < -source_half.y - source_epsilon \
+				or source_local.y > source_half.y + source_epsilon \
+				or source_local.z < -source_half.z - source_epsilon \
+				or source_local.z > source_half.z + source_epsilon:
+			return
 	var local := _inverse * surface
 	var epsilon := maxf(0.0001, _probe_spacing * 0.0001)
-	if local.x < -_volume.size.x * 0.5 - epsilon or local.x > _volume.size.x * 0.5 + epsilon \
-			or local.y < -_volume.size.y * 0.5 - epsilon or local.y > _volume.size.y * 0.5 + epsilon \
-			or local.z < -_volume.size.z * 0.5 - epsilon or local.z > _volume.size.z * 0.5 + epsilon:
+	if local.x < -_volume_size.x * 0.5 - epsilon or local.x > _volume_size.x * 0.5 + epsilon \
+			or local.y < -_volume_size.y * 0.5 - epsilon or local.y > _volume_size.y * 0.5 + epsilon \
+			or local.z < -_volume_size.z * 0.5 - epsilon or local.z > _volume_size.z * 0.5 + epsilon:
 		return
 	var domain_key := _candidate_domain_key(normal, triangle_centroid)
+	var stable_probe_id := _stable_probe_id(surface, normal)
 	# Triangle meshes commonly repeat the same vertex on adjacent faces. Drop
 	# only a near-identical anchor already retained for the same signed domain,
 	# before running the more expensive offset and closed-solid tests.
-	var estimated_center := surface + normal * _preferred_probe_offset(_volume)
+	var estimated_center := surface + normal * _preferred_offset_value
 	if not _world_point_coordinates_are_supported(estimated_center):
 		error_message = "Probe centers exceed the supported signed world-cell coordinate range."
 		return
@@ -1083,7 +1944,7 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 	if _has_staged_anchor_duplicate(surface, domain_key, estimated_cell):
 		rejected_duplicate_count += 1
 		return
-	var actual_offset := _safe_probe_offset(surface, normal, _preferred_probe_offset(_volume))
+	var actual_offset := _safe_probe_offset(surface, normal, _preferred_offset_value)
 	if actual_offset <= 0.0:
 		rejected_no_safe_offset_count += 1
 		return
@@ -1092,12 +1953,12 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		error_message = "Probe centers exceed the supported signed world-cell coordinate range."
 		return
 	var center_local := _inverse * probe_center
-	if center_local.x < -_volume.size.x * 0.5 - epsilon \
-			or center_local.x > _volume.size.x * 0.5 + epsilon \
-			or center_local.y < -_volume.size.y * 0.5 - epsilon \
-			or center_local.y > _volume.size.y * 0.5 + epsilon \
-			or center_local.z < -_volume.size.z * 0.5 - epsilon \
-			or center_local.z > _volume.size.z * 0.5 + epsilon:
+	if center_local.x < -_volume_size.x * 0.5 - epsilon \
+			or center_local.x > _volume_size.x * 0.5 + epsilon \
+			or center_local.y < -_volume_size.y * 0.5 - epsilon \
+			or center_local.y > _volume_size.y * 0.5 + epsilon \
+			or center_local.z < -_volume_size.z * 0.5 - epsilon \
+			or center_local.z > _volume_size.z * 0.5 + epsilon:
 		rejected_center_outside_count += 1
 		return
 	if not _center_is_on_owner_front_side(probe_center, normal, owner_face_index):
@@ -1125,7 +1986,7 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		rejected_center_clearance_count += 1
 		rejected_foreign_surface_center_count += 1
 		return
-	var grid: Vector3 = (local + _volume.size * 0.5) / _volume.size * Vector3(_dimensions)
+	var grid: Vector3 = (local + _volume_size * 0.5) / _volume_size * Vector3(_dimensions)
 	var cell := Data.cell_coordinates(grid, _dimensions)
 	if cell.x < 0:
 		error_message = "A sampled surface escaped the PRT lookup grid."
@@ -1147,6 +2008,7 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		"canonical": canonical,
 		"face_index": owner_face_index,
 		"world_cell": world_cell,
+		"stable_id": stable_probe_id,
 		"arbitration_key": arbitration_key,
 		"spacing": _active_candidate_spacing,
 		"score": probe_center.distance_squared_to(
@@ -1155,7 +2017,7 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 	_stage_world_candidate(world_cell, domain_key, candidate)
 
 func _candidate_capacity_per_domain() -> int:
-	if not _volume.adaptive_placement:
+	if not _adaptive_placement:
 		return ProbeLayout.CANDIDATES_PER_DOMAIN
 	var refinement_ratio := ceili(_probe_spacing / maxf(_arbitration_spacing, 0.000001))
 	return mini(MAX_PROBES, maxi(ProbeLayout.CANDIDATES_PER_DOMAIN,
@@ -1287,6 +2149,22 @@ func _candidate_domain_key(normal: Vector3, triangle_centroid: Vector3) -> Strin
 		_sample_domain_source, _sample_surface_index, normal_bin.x, normal_bin.y,
 		normal_bin.z, plane_bin]
 
+func _stable_probe_id(surface: Vector3, normal: Vector3) -> int:
+	# This identity is independent of page traversal/output order. Quantization is
+	# far below placement spacing and removes only clipping roundoff at page edges.
+	# Use signed 64-bit triples: Vector3i saturates/wraps after about 21.5 km at
+	# this quantum, making otherwise distinct large-world probes share an ID.
+	var quantum := maxf(0.00001, _probe_spacing * 0.00001)
+	var surface_bin := PackedInt64Array([
+		roundi(surface.x / quantum), roundi(surface.y / quantum), roundi(surface.z / quantum)])
+	var normal_bin := PackedInt64Array([
+		roundi(normal.x * 100000.0), roundi(normal.y * 100000.0), roundi(normal.z * 100000.0)])
+	var identity_parts := [_sample_domain_source, _sample_surface_index, surface_bin, normal_bin]
+	var low := int(hash(identity_parts)) & 0xffffffff
+	var high := int(hash([identity_parts, "stable-probe-high"])) & 0xffffffff
+	var identity := (high << 32) | low
+	return identity if identity != 0 else 1
+
 func _candidate_less(a: Dictionary, b: Dictionary) -> bool:
 	var canonical_a := bool(a["canonical"])
 	var canonical_b := bool(b["canonical"])
@@ -1320,15 +2198,23 @@ func _finalize_world_candidates() -> bool:
 	_bounded_candidate_pruned_count = maxi(0, _valid_candidate_count - _staged_candidate_count)
 	var candidate_groups := [{}, {}]
 	var minimum_base_cell := Vector3i(2147483647, 2147483647, 2147483647)
+	var checked_candidates := 0
 	for cell_value in _world_candidate_cells:
+		if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return false
 		var base_world_cell: Vector3i = cell_value
 		minimum_base_cell.x = mini(minimum_base_cell.x, base_world_cell.x)
 		minimum_base_cell.y = mini(minimum_base_cell.y, base_world_cell.y)
 		minimum_base_cell.z = mini(minimum_base_cell.z, base_world_cell.z)
 		var domains: Dictionary = _world_candidate_cells[base_world_cell]["domains"]
 		for domain_key in domains:
+			if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+				return false
 			var domain_bucket: Dictionary = domains[domain_key]
 			for candidate in domain_bucket["candidates"]:
+				checked_candidates += 1
+				if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+					return false
 				var arbitration_key := String(candidate.get("arbitration_key",
 						_world_spacing_cell_key(candidate["center"], _arbitration_spacing)))
 				var phase_index := 0 if bool(candidate["canonical"]) else 1
@@ -1361,7 +2247,11 @@ func _finalize_world_candidates() -> bool:
 			accepted_cells, accepted_base_cells, spacing_blocked_cells,
 			lookup_blocked_cells):
 		return false
+	var checked_cells := 0
 	for cell_value in _world_candidate_cells:
+		checked_cells += 1
+		if checked_cells % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return false
 		var base_world_cell: Vector3i = cell_value
 		var domains: Dictionary = _world_candidate_cells[base_world_cell]["domains"]
 		var staged_for_cell := 0
@@ -1381,16 +2271,29 @@ func _finalize_world_candidates() -> bool:
 func _make_domain_entries(grouped_candidates: Dictionary,
 		minimum_base_cell: Vector3i) -> Dictionary:
 	var result: Dictionary = {}
+	var checked_entries := 0
 	for domain_key_value in grouped_candidates:
+		if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return {}
 		var domain_key := String(domain_key_value)
 		var domain_groups: Dictionary = grouped_candidates[domain_key]
 		var entries: Array = []
 		for arbitration_key_value in domain_groups:
+			checked_entries += 1
+			if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+				return {}
 			var arbitration_key := String(arbitration_key_value)
 			var candidates: Array = domain_groups[arbitration_key]
+			if _refresh_cancelled():
+				return {}
 			candidates.sort_custom(Callable(self, "_candidate_less"))
+			if _refresh_cancelled():
+				return {}
 			var order_cell: Vector3i = candidates[0].get("world_cell", Vector3i.ZERO)
 			for candidate in candidates:
+				checked_entries += 1
+				if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+					return {}
 				var candidate_cell: Vector3i = candidate.get("world_cell", order_cell)
 				if _world_cell_less(candidate_cell, order_cell):
 					order_cell = candidate_cell
@@ -1409,10 +2312,18 @@ func _run_candidate_phase(domain_entries: Dictionary,
 		lookup_blocked_cells: Dictionary) -> bool:
 	var domain_states: Dictionary = {}
 	var scheduler: Array[Dictionary] = []
+	var checked_entries := 0
 	for domain_key_value in domain_entries:
+		checked_entries += 1
+		if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return false
 		var domain_key := String(domain_key_value)
 		var entries: Array = domain_entries[domain_key]
+		if _refresh_cancelled():
+			return false
 		entries.sort_custom(Callable(self, "_domain_opportunity_less"))
+		if _refresh_cancelled():
+			return false
 		var opportunities := entries.size()
 		if opportunities <= 0:
 			continue
@@ -1426,7 +2337,11 @@ func _run_candidate_phase(domain_entries: Dictionary,
 		}
 		domain_states[domain_key] = state
 		_coverage_heap_push(scheduler, _coverage_heap_item(domain_key, state))
+	var scheduled_work := 0
 	while not scheduler.is_empty():
+		scheduled_work += 1
+		if scheduled_work % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return false
 		var schedule_entry := _coverage_heap_pop(scheduler)
 		var domain_key := String(schedule_entry["key"])
 		if not domain_states.has(domain_key):
@@ -1451,8 +2366,10 @@ func _run_candidate_phase(domain_entries: Dictionary,
 		var cell_accepted := false
 		var candidates: Array = opportunity["candidates"]
 		for candidate in candidates:
+			if _refresh_cancelled():
+				return false
 			var lookup_cell := int(candidate["lookup_cell"])
-			if not _volume.adaptive_placement and int(_cell_counts.get(lookup_cell, 0)) >= Data.CELL_CAPACITY:
+			if not _adaptive_placement and int(_cell_counts.get(lookup_cell, 0)) >= Data.CELL_CAPACITY:
 				lookup_blocked = true
 				continue
 			if positions.size() >= MAX_PROBES:
@@ -1468,7 +2385,8 @@ func _run_candidate_phase(domain_entries: Dictionary,
 			positions.append(center)
 			surface_positions.append(candidate["surface"])
 			normals.append(candidate["normal"])
-			if _volume.adaptive_placement:
+			stable_probe_ids.append(int(candidate.get("stable_id", 0)))
+			if _adaptive_placement:
 				probe_spacings.append(candidate_spacing)
 			_cell_counts[lookup_cell] = int(_cell_counts.get(lookup_cell, 0)) + 1
 			var accepted_bucket: Array = accepted_world_centers.get(base_world_cell, [])
@@ -1626,8 +2544,18 @@ func _terrain_domain_source(terrain: Node3D) -> String:
 	if _domain_source_cache.has(instance_id):
 		return String(_domain_source_cache[instance_id])
 	var values := _transform_domain_values(terrain.global_transform)
-	values = _append_quantized_vector(values, _world_bounds.position)
-	values = _append_quantized_vector(values, _world_bounds.size)
+	if _streamed_page:
+		var data: Object = terrain.get("data")
+		var locations: Array = data.call("get_region_locations") \
+				if data != null and data.has_method("get_region_locations") else []
+		locations.sort_custom(func(a: Variant, b: Variant) -> bool:
+			var va := Vector2i(a)
+			var vb := Vector2i(b)
+			return va.x < vb.x if va.x != vb.x else va.y < vb.y)
+		values.append_array([terrain.get("region_size"), locations])
+	else:
+		values = _append_quantized_vector(values, _world_bounds.position)
+		values = _append_quantized_vector(values, _world_bounds.size)
 	values.append(roundi(float(terrain.get("vertex_spacing")) * 100000.0))
 	var identity := "terrain:%s" % _stable_domain_hash(values)
 	_domain_source_cache[instance_id] = identity
@@ -1712,7 +2640,7 @@ func _safe_probe_offset(surface: Vector3, normal: Vector3, preferred: float) -> 
 		return 0.0
 	var safe_offset := preferred
 	var ray_epsilon := maxf(0.00001, minf(preferred * 0.1,
-			float(_volume.probe_spacing) * 0.0005))
+			_probe_spacing * 0.0005))
 	if bvh_ready:
 		var hit := bvh.intersect_segment(surface + normal * ray_epsilon,
 				surface + normal * preferred)
@@ -1723,8 +2651,8 @@ func _safe_probe_offset(surface: Vector3, normal: Vector3, preferred: float) -> 
 	# boundary. The inverse-basis direction accounts for nonuniform volume scale.
 	var local_surface := _inverse * surface
 	var local_direction := _inverse.basis * normal
-	var half_size: Vector3 = _volume.size * 0.5
-	var local_boundary_epsilon := maxf(0.00001, float(_volume.probe_spacing) * 0.00001)
+	var half_size: Vector3 = _volume_size * 0.5
+	var local_boundary_epsilon := maxf(0.00001, _probe_spacing * 0.00001)
 	for axis in 3:
 		var direction_component := local_direction[axis]
 		if absf(direction_component) < 0.000001:
@@ -1735,41 +2663,49 @@ func _safe_probe_offset(surface: Vector3, normal: Vector3, preferred: float) -> 
 			safe_offset = minf(safe_offset,
 					distance_to_boundary - local_boundary_epsilon / absf(direction_component))
 	var minimum_clearance := maxf(ray_epsilon * 2.0,
-			float(_volume.probe_spacing) * MIN_PROBE_OFFSET_SPACING_RATIO)
+			_probe_spacing * MIN_PROBE_OFFSET_SPACING_RATIO)
 	return safe_offset if safe_offset >= minimum_clearance else 0.0
 
-func _build_occlusion_broadphase() -> void:
+func _build_occlusion_broadphase() -> bool:
 	_occlusion_cells.clear()
 	if _occlusion_volumes.is_empty():
-		return
+		return not _refresh_cancelled()
 	var grid_scale := Vector3(OCCLUSION_GRID_AXIS, OCCLUSION_GRID_AXIS, OCCLUSION_GRID_AXIS)
-	var local_volume := AABB(-_volume.size * 0.5, _volume.size)
+	var local_volume := AABB(-_volume_size * 0.5, _volume_size)
+	var cell_work := 0
 	for solid_index in _occlusion_volumes.size():
+		if _refresh_cancelled():
+			return false
 		var solid: Dictionary = _occlusion_volumes[solid_index]
 		var world_box: AABB = solid.world_aabb
 		var local_box := AABB(_inverse * world_box.get_endpoint(0), Vector3.ZERO)
 		for corner_index in range(1, 8):
 			local_box = local_box.expand(_inverse * world_box.get_endpoint(corner_index))
-		local_box = local_box.grow(maxf(0.00001, _volume.probe_spacing * 0.00001))
+		local_box = local_box.grow(maxf(0.00001, _probe_spacing * 0.00001))
 		if not local_box.intersects(local_volume):
 			continue
 		var clipped_min := local_box.position.max(local_volume.position)
 		var clipped_max := local_box.end.min(local_volume.end)
-		var cell_min := Vector3i(((clipped_min - local_volume.position) / _volume.size * grid_scale).floor()) \
+		var cell_min := Vector3i(((clipped_min - local_volume.position) / _volume_size * grid_scale).floor()) \
 				.clamp(Vector3i.ZERO, Vector3i.ONE * (OCCLUSION_GRID_AXIS - 1))
-		var cell_max := Vector3i(((clipped_max - local_volume.position) / _volume.size * grid_scale).floor()) \
+		var cell_max := Vector3i(((clipped_max - local_volume.position) / _volume_size * grid_scale).floor()) \
 				.clamp(Vector3i.ZERO, Vector3i.ONE * (OCCLUSION_GRID_AXIS - 1))
 		for z in range(cell_min.z, cell_max.z + 1):
 			for y in range(cell_min.y, cell_max.y + 1):
 				for x in range(cell_min.x, cell_max.x + 1):
+					cell_work += 1
+					if cell_work % REFRESH_WORKER_CHECK_INTERVAL == 0 \
+							and _refresh_cancelled():
+						return false
 					var key := x + y * OCCLUSION_GRID_AXIS + z * OCCLUSION_GRID_AXIS * OCCLUSION_GRID_AXIS
 					var solids: Array = _occlusion_cells.get(key, [])
 					solids.append(solid_index)
 					_occlusion_cells[key] = solids
+	return not _refresh_cancelled()
 
 func _probe_center_is_inside_solid(point: Vector3) -> bool:
 	var local := _inverse * point
-	var normalized: Vector3 = (local + _volume.size * 0.5) / _volume.size
+	var normalized: Vector3 = (local + _volume_size * 0.5) / _volume_size
 	var broad_cell := Vector3i((normalized * float(OCCLUSION_GRID_AXIS)).floor()).clamp(
 			Vector3i.ZERO, Vector3i.ONE * (OCCLUSION_GRID_AXIS - 1))
 	var key := broad_cell.x + broad_cell.y * OCCLUSION_GRID_AXIS \

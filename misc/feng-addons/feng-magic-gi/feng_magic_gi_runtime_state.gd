@@ -5,12 +5,14 @@ extends RefCounted
 
 const Lighting = preload("feng_magic_gi_lighting.gd")
 const Emission = preload("feng_magic_gi_emission.gd")
+const PageStreamer = preload("feng_magic_gi_page_streamer.gd")
 
 var volume_ref: WeakRef
 var published_sequence := 0
 var data_key := ""
 var lighting := Lighting.new()
 var emission := Emission.new()
+var streamer := PageStreamer.new()
 
 func attach(volume: FMagicGIVolume) -> void:
 	volume_ref = weakref(volume)

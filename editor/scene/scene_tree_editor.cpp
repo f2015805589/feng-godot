@@ -1810,6 +1810,10 @@ void SceneTreeEditor::_update_selection(TreeItem *item) {
 }
 
 void SceneTreeEditor::_selection_changed() {
+	if (!is_inside_tree()) {
+		return;
+	}
+
 	if (!editor_selection) {
 		return;
 	}

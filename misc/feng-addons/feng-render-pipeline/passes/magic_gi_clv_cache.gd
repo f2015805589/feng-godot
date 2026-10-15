@@ -8,11 +8,13 @@ const FillShader: RDShaderFile = preload("../library/magic-gi/magic_gi_clv_fill.
 const RESOLUTION := 16
 const LEVELS := 3
 const MAX_JOBS := 512
+const MAX_PAGE_EPOCHS := 256
 var texture := RID()
 var tags := RID()
 var parameters := RID()
 var sampler := RID()
 var _jobs := RID()
+var _probe_cluster_fallback := RID()
 var _shader := RID()
 var _pipeline := RID()
 var _origins: Array[Vector3i] = []
@@ -21,12 +23,16 @@ var _pending_set: Dictionary = {}
 var _cursor := 0
 var _refresh_epoch := -1
 var _spacing := 0.0
+var _page_epochs: Dictionary = {}
+var _page_epoch_clock := 0
 
 func create(rd: RenderingDevice) -> bool:
 	texture = _texture(rd, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, 19)
 	tags = _texture(rd, RenderingDevice.DATA_FORMAT_R32G32B32A32_SINT, 1)
 	parameters = rd.uniform_buffer_create(80)
 	_jobs = rd.storage_buffer_create(MAX_JOBS * 16)
+	_probe_cluster_fallback = rd.storage_buffer_create(16,
+		PackedInt32Array([1, 0, 0, 0]).to_byte_array())
 	var state := RDSamplerState.new()
 	state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
 	state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
@@ -60,7 +66,8 @@ func update(rd: RenderingDevice, camera: Vector3, base_spacing: float, epoch: in
 			U.storage_buffer(2, bake.visibility_nodes), U.storage_buffer(3, bake.visibility_triangles),
 			U.storage_buffer(4, directional.lighting), U.storage_buffer(5, _jobs),
 			U.image(6, texture), U.image(7, tags), U.uniform_buffer(8, ubo),
-			U.storage_buffer(9, bake.index_entries)])
+			U.storage_buffer(9, bake.index_entries),
+			U.storage_buffer(10, _cluster_buffer(bake))])
 		if not uniforms.is_valid():
 			# Requeue the failed dispatch; unpublished tags still reject those cells.
 			for cell in selected:
@@ -84,11 +91,13 @@ func update(rd: RenderingDevice, camera: Vector3, base_spacing: float, epoch: in
 	return rd.buffer_update(parameters, 0, constants.size(), constants) == OK
 
 ## Scheduler is pure CPU state, also used by scrolling/epoch tests without a GPU.
-func queue_updates(camera: Vector3, base_spacing: float, epoch: int) -> void:
+func queue_updates(camera: Vector3, base_spacing: float, epoch: int,
+		reset_epoch_immediately := false) -> void:
 	var reset := not is_equal_approx(_spacing, base_spacing) or _origins.is_empty()
 	# Continuous light animation must not restart at the first fine slab forever.
 	# Finish the current fair sweep, then refresh any cells from previous epochs.
-	reset = reset or (_pending_set.is_empty() and epoch != _refresh_epoch)
+	reset = reset or (epoch != _refresh_epoch \
+			and (reset_epoch_immediately or _pending_set.is_empty()))
 	if reset:
 		_pending.clear()
 		_pending_set.clear()
@@ -149,16 +158,140 @@ func take_jobs(budget: int) -> Array[Vector4i]:
 		_cursor = 0
 	return selected
 
-func _enqueue_box(lower: Vector3i, upper: Vector3i, level: int) -> void:
+## Refill only this page's cells when its immutable data/light token changes.
+## Camera entering slabs continue to use queue_updates() and the same per-cell
+## owner dispatch path; page residency changes never invalidate the whole CLV.
+func queue_page_revision(page_key: String, core_bounds: AABB, base_spacing: float, page_token: int) -> int:
+	if page_key.is_empty() or _origins.size() != LEVELS or core_bounds.size == Vector3.ZERO:
+		return 0
+	_page_epoch_clock += 1
+	var existing: Dictionary = _page_epochs.get(page_key, {})
+	if int(existing.get("token", 0x7fffffff)) == page_token:
+		existing["last_used"] = _page_epoch_clock
+		_page_epochs[page_key] = existing
+		return 0
+	_page_epochs[page_key] = {"token": page_token, "last_used": _page_epoch_clock}
+	_trim_page_epochs(page_key)
+	var enqueued := 0
+	for level in LEVELS:
+		var step := base_spacing * float(1 << level)
+		var origin := _origins[level]
+		var end := origin + Vector3i.ONE * RESOLUTION
+		var core_end := core_bounds.position + core_bounds.size
+		var lower := Vector3i(
+			ceili(core_bounds.position.x / step - 0.5),
+			ceili(core_bounds.position.y / step - 0.5),
+			ceili(core_bounds.position.z / step - 0.5))
+		var upper := Vector3i(
+			ceili(core_end.x / step - 0.5),
+			ceili(core_end.y / step - 0.5),
+			ceili(core_end.z / step - 0.5))
+		lower = lower.max(origin)
+		upper = upper.min(end)
+		if lower.x < upper.x and lower.y < upper.y and lower.z < upper.z:
+			enqueued += _enqueue_box(lower, upper, level)
+	return enqueued
+
+
+func world_position(cell: Vector4i, base_spacing: float) -> Vector3:
+	var step := base_spacing * float(1 << cell.w)
+	return (Vector3(cell.x, cell.y, cell.z) + Vector3.ONE * 0.5) * step
+
+
+func requeue_jobs(cells: Array[Vector4i]) -> void:
+	for cell in cells:
+		_enqueue(cell)
+
+
+func dispatch_page_jobs(rd: RenderingDevice, selected: Array[Vector4i], base_spacing: float,
+		page_token: int, bake: Dictionary, directional: RefCounted, ubo: RID,
+		nearest_sampler: RID) -> bool:
+	if selected.is_empty():
+		return true
+	var bytes := PackedByteArray()
+	for cell in selected:
+		bytes.append_array(PackedInt32Array([cell.x, cell.y, cell.z, cell.w]).to_byte_array())
+	if rd.buffer_update(_jobs, 0, bytes.size(), bytes) != OK:
+		requeue_jobs(selected)
+		return false
+	var uniforms := UniformSetCacheRD.get_cache(_shader, 0, [
+		U.sampled(0, nearest_sampler, bake.geometry), U.sampled(1, nearest_sampler, bake.indices),
+		U.storage_buffer(2, bake.visibility_nodes), U.storage_buffer(3, bake.visibility_triangles),
+		U.storage_buffer(4, directional.lighting), U.storage_buffer(5, _jobs),
+		U.image(6, texture), U.image(7, tags), U.uniform_buffer(8, ubo),
+		U.storage_buffer(9, bake.index_entries),
+		U.storage_buffer(10, _cluster_buffer(bake))])
+	if not uniforms.is_valid():
+		requeue_jobs(selected)
+		return false
+	var push := PackedInt32Array([selected.size(), RESOLUTION, page_token]).to_byte_array()
+	push.append_array(PackedFloat32Array([base_spacing]).to_byte_array())
+	var list := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(list, _pipeline)
+	rd.compute_list_bind_uniform_set(list, uniforms, 0)
+	rd.compute_list_set_push_constant(list, push, push.size())
+	rd.compute_list_dispatch(list, (selected.size() + 63) / 64, 1, 1)
+	rd.compute_list_end()
+	return true
+
+
+func update_parameters(rd: RenderingDevice, base_spacing: float, manifest_epoch: int) -> bool:
+	var constants := PackedByteArray()
+	for origin in _origins:
+		constants.append_array(PackedInt32Array([origin.x, origin.y, origin.z, 0]).to_byte_array())
+	constants.append_array(PackedFloat32Array([base_spacing, 0, 0, 0]).to_byte_array())
+	constants.append_array(PackedInt32Array([RESOLUTION, LEVELS, manifest_epoch, 1]).to_byte_array())
+	return rd.buffer_update(parameters, 0, constants.size(), constants) == OK
+
+
+func set_expected_page_epoch(rd: RenderingDevice, page_token: int) -> bool:
+	return rd.buffer_update(parameters, 72, 4, PackedInt32Array([page_token]).to_byte_array()) == OK
+
+
+func retain_page_epochs(page_keys: PackedStringArray) -> void:
+	var retained: Dictionary = {}
+	for key in page_keys:
+		retained[String(key)] = true
+	for key in _page_epochs.keys():
+		if not retained.has(key):
+			_page_epochs.erase(key)
+
+
+func _trim_page_epochs(protected_key: String) -> void:
+	while _page_epochs.size() > MAX_PAGE_EPOCHS:
+		var oldest_key := ""
+		var oldest := 0x7fffffff
+		for key in _page_epochs:
+			if str(key) == protected_key:
+				continue
+			var last_used := int(_page_epochs[key].get("last_used", 0))
+			if last_used < oldest:
+				oldest = last_used
+				oldest_key = str(key)
+		if oldest_key.is_empty():
+			break
+		_page_epochs.erase(oldest_key)
+
+
+static func estimate_gpu_bytes() -> int:
+	return RESOLUTION * RESOLUTION * LEVELS * 19 * 16 \
+		+ RESOLUTION * RESOLUTION * LEVELS * 16 + 80 + MAX_JOBS * 16 + 16
+
+func _enqueue_box(lower: Vector3i, upper: Vector3i, level: int) -> int:
+	var added := 0
 	for z in range(lower.z, upper.z):
 		for y in range(lower.y, upper.y):
 			for x in range(lower.x, upper.x):
-				_enqueue(Vector4i(x, y, z, level))
+				if _enqueue(Vector4i(x, y, z, level)):
+					added += 1
+	return added
 
-func _enqueue(cell: Vector4i) -> void:
+func _enqueue(cell: Vector4i) -> bool:
 	if not _pending_set.has(cell):
 		_pending_set[cell] = true
 		_pending.append(cell)
+		return true
+	return false
 
 static func _contains(origin: Vector3i, cell: Vector3i) -> bool:
 	var d := cell - origin
@@ -190,7 +323,15 @@ static func focus_for_bounds(camera: Vector3, bounds: AABB, spacing: float) -> V
 	return focus
 
 func owned_rids() -> Array[RID]:
-	return [texture, tags, parameters, sampler, _jobs, _pipeline, _shader]
+	return [texture, tags, parameters, sampler, _jobs, _probe_cluster_fallback,
+		_pipeline, _shader]
+
+
+func _cluster_buffer(bake: Dictionary) -> RID:
+	var value: Variant = bake.get("probe_clusters", RID())
+	if value is RID and value.is_valid():
+		return value
+	return _probe_cluster_fallback
 
 static func _texture(rd: RenderingDevice, format_value: int, columns: int) -> RID:
 	var format := RDTextureFormat.new()

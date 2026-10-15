@@ -81,7 +81,7 @@ bool FRPPassContext::get_sky_lighting_source(RID p_render_target, SkyLightingSou
 	return true;
 }
 
-void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer, float p_scene_exposure_normalization, const std::function<bool(int)> &p_operation_is_scheduled) {
+void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer, float p_scene_exposure_normalization, const std::function<bool(int)> &p_operation_is_scheduled, const Dictionary &p_camera_exposure_data) {
 	render_data = p_render_data;
 	operation_runner = p_operation_runner;
 	operation_is_scheduled = p_operation_is_scheduled;
@@ -91,6 +91,7 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	pre_exposure_writer = p_pre_exposure_writer;
 	eye_exposure_texture_writer = p_eye_exposure_texture_writer;
 	scene_exposure_normalization = Math::is_finite(p_scene_exposure_normalization) && p_scene_exposure_normalization > 0.0f ? p_scene_exposure_normalization : 1.0f;
+	camera_exposure_data = p_camera_exposure_data;
 	pass_parameters = p_pass_parameters;
 	after_operation_callbacks.clear();
 	dispatching_after_operation_callbacks.clear();
@@ -864,6 +865,7 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pass_parameters", "pass_id"), &FRPPassContext::get_pass_parameters);
 	ClassDB::bind_method(D_METHOD("get_pre_exposure", "view"), &FRPPassContext::get_pre_exposure);
 	ClassDB::bind_method(D_METHOD("get_scene_exposure_normalization"), &FRPPassContext::get_scene_exposure_normalization);
+	ClassDB::bind_method(D_METHOD("get_camera_exposure_data"), &FRPPassContext::get_camera_exposure_data);
 	ClassDB::bind_method(D_METHOD("get_volume_frame_inputs", "view"), &FRPPassContext::get_volume_frame_inputs, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("get_volume_frame_generation", "view"), &FRPPassContext::get_volume_frame_generation, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("set_volume_output", "texture", "sample_parameters", "rgb_pre_exposure"), &FRPPassContext::set_volume_output);

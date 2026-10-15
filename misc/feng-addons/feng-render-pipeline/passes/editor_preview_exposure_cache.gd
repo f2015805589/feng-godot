@@ -148,6 +148,44 @@ static func request_scale_readback(rd: RenderingDevice, buffer: RID, target: RID
 		_mutex.unlock()
 	return error
 
+static func publish_known_scale(target_id: int, view: int, scale: float,
+		producer: Object) -> Error:
+	if target_id <= 0 or view < 0 or view >= MAX_EDITOR_VIEWPORTS \
+			or not is_finite(scale) or scale <= 0.0 \
+			or producer == null or not is_instance_valid(producer):
+		return ERR_INVALID_PARAMETER
+	var key := _cache_key(target_id, view)
+	_mutex.lock()
+	_prune_dead_targets_locked()
+	if _preview_owners.is_empty() or not _targets.has(target_id):
+		_mutex.unlock()
+		return ERR_UNAVAILABLE
+	var token := _next_token
+	_next_token += 1
+	var epoch := int(_target_epochs.get(target_id, 0))
+	# A pending GPU sample may have been queued before the pass switched to a
+	# known manual exposure. Erasing it while publishing under the same lock
+	# prevents its callback from replacing this value after the mode switch.
+	_inflight.erase(key)
+	_publish_snapshot_locked(producer, target_id, view, scale, token, epoch)
+	_mutex.unlock()
+	return OK
+
+static func _publish_snapshot_locked(producer: Object, target_id: int, view: int,
+		scale: float, token: int, epoch: int) -> void:
+	_sequence += 1
+	_snapshots[_cache_key(target_id, view)] = {
+		"target_id": target_id,
+		"view": view,
+		"exposure_scale": scale,
+		"sequence": _sequence,
+		"token": token,
+		"epoch": epoch,
+		"producer_id": producer.get_instance_id(),
+		"producer_ref": weakref(producer),
+		"published_usec": Time.get_ticks_usec(),
+	}
+
 static func _finish_scale_readback(data: PackedByteArray, producer_ref: WeakRef,
 		target_id: int, view: int, token: int, epoch: int) -> void:
 	var producer: Object = producer_ref.get_ref() if producer_ref != null else null
@@ -165,16 +203,7 @@ static func _finish_scale_readback(data: PackedByteArray, producer_ref: WeakRef,
 	if int(pending.get("token", 0)) == token:
 		_inflight.erase(key)
 	if valid:
-		_sequence += 1
-		_snapshots[key] = {
-			"target_id": target_id,
-			"view": view,
-			"exposure_scale": scale,
-			"sequence": _sequence,
-			"producer_id": producer.get_instance_id(),
-			"producer_ref": weakref(producer),
-			"published_usec": Time.get_ticks_usec(),
-		}
+		_publish_snapshot_locked(producer, target_id, view, scale, token, epoch)
 	_mutex.unlock()
 
 static func get_snapshot(target_id: int, view: int) -> Dictionary:
@@ -189,6 +218,7 @@ static func get_snapshot(target_id: int, view: int) -> Dictionary:
 		_invalidate_target_locked(target_id)
 	var stale := stored.is_empty() or not producer_active or not _targets.has(target_id) \
 			or _preview_owners.is_empty() \
+			or int(stored.get("epoch", _target_epochs.get(target_id, 0))) != int(_target_epochs.get(target_id, 0)) \
 			or Time.get_ticks_usec() - int(stored.get("published_usec", 0)) > MAX_SCALE_AGE_USEC
 	if stale:
 		_snapshots.erase(key)

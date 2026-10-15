@@ -2,6 +2,7 @@ shader_type spatial;
 render_mode unshaded, fog_disabled;
 
 uniform bool preview_unit_transport = false;
+uniform bool preview_layout_stale = false;
 uniform vec4 preview_camera_origin[4];
 uniform vec4 preview_camera_right[4];
 uniform vec4 preview_camera_up[4];
@@ -96,6 +97,9 @@ void fragment() {
 		input_rgb = vec3(0.0);
 	}
 	vec3 output_color = input_rgb * debug_compensation * static_camera_compensation;
+	if (preview_layout_stale) {
+		output_color = mix(output_color, vec3(1.0, 0.38, 0.035), 0.72);
+	}
 	if (any(isnan(output_color)) || any(isinf(output_color))) {
 		output_color = vec3(0.0);
 	}

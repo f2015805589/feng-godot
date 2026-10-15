@@ -19,11 +19,25 @@ var spacing := 1.0
 var preferred := 0.03
 
 func initialize(geometry: RefCounted, volume: Node3D, offset: float) -> void:
+	initialize_snapshot(geometry, volume.global_transform.affine_inverse(),
+			volume.size, volume.probe_spacing, offset)
+
+## Initializes from captured value data; safe to call after scene/resource capture
+## when geometry work is dispatched to a worker thread.
+func initialize_snapshot(geometry: RefCounted, inverse: Transform3D,
+		volume_size: Vector3, probe_spacing: float, offset: float,
+		cancellation: Object = null) -> bool:
 	bvh = geometry.bvh
 	faces = PackedVector3Array()
 	faces.resize(geometry.faces.size())
 	for vertex in geometry.faces.size():
+		if vertex % 384 == 0 and _cancelled(cancellation):
+			faces.clear()
+			return false
 		faces[vertex] = EmitterBakeSet.canonical_vertex(geometry.faces[vertex])
+	if _cancelled(cancellation):
+		faces.clear()
+		return false
 	reflectance = geometry.reflectance
 	face_materials = geometry.face_materials
 	face_uv = geometry.face_uv
@@ -31,10 +45,15 @@ func initialize(geometry: RefCounted, volume: Node3D, offset: float) -> void:
 	face_emitter_indices = geometry.face_emitter_indices
 	material_sampler = geometry.material_sampler
 	emitters = geometry.emitters
-	_inverse = volume.global_transform.affine_inverse()
-	half_size = volume.size * 0.5
-	spacing = volume.probe_spacing
+	_inverse = inverse
+	half_size = volume_size * 0.5
+	spacing = probe_spacing
 	preferred = offset
+	return true
+
+func _cancelled(cancellation: Object) -> bool:
+	return cancellation != null and is_instance_valid(cancellation) \
+			and bool(cancellation.call("is_cancelled"))
 
 func trace(origin: Vector3, direction: Vector3, max_distance: float) -> Dictionary:
 	if bvh == null:

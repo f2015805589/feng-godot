@@ -20,7 +20,9 @@ layout(push_constant, std430) uniform FillParameters {
 } config;
 #include "magic_gi_visibility.glslinc"
 #define MAGIC_INDEX_BINDING 9
+#define MAGIC_CLUSTER_BINDING 10
 #include "magic_gi_index.glslinc"
+#include "magic_gi_probe_clusters.glslinc"
 #define LOOKUP_CELL_RADIUS 2
 #define probe_lighting directional_lighting
 vec2 sample_visibility_moments(int probe, vec3 direction) { return vec2(0.0); }

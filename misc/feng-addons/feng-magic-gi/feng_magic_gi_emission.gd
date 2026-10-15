@@ -36,7 +36,9 @@ func update_snapshot(volume: Node3D, data: Data) -> bool:
 ## [color term RGB, texture term RGB]. ADD uses [color*energy, energy];
 ## MULTIPLY uses [0, color*energy].
 func read_source_values(volume: Node3D, data: FMagicGIData) -> PackedFloat32Array:
-	var data_token := "%d:%d:%d" % [volume.get_instance_id(), data.get_instance_id(), data.bake_version]
+	var data_revision := int(volume.call("data_revision")) if volume.has_method("data_revision") else 0
+	var data_token := "%d:%d:%d:%d" % [volume.get_instance_id(), data.get_instance_id(),
+		data.bake_version, data_revision]
 	if data_token != _data_cache_token:
 		_data_cache_token = data_token
 		_static_signature_cache.clear()

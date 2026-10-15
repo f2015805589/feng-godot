@@ -3954,6 +3954,45 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 			mark_pass_operations(pipeline_provided[i]);
 		}
 	}
+	Dictionary camera_exposure_data;
+	const RID camera_attributes = p_render_data->camera_attributes;
+	const bool has_camera_attributes = camera_attributes.is_valid();
+	camera_exposure_data["available"] = has_camera_attributes;
+	if (has_camera_attributes) {
+		float manual_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(camera_attributes);
+		if (!Math::is_finite(manual_normalization) || manual_normalization < 0.0f) {
+			manual_normalization = 1.0f;
+		}
+		camera_exposure_data["normalization_factor"] = CLAMP(manual_normalization, 1e-12f, 1e12f);
+		camera_exposure_data["identity"] = int64_t(camera_attributes.get_id());
+		const bool auto_enabled = RSG::camera_attributes->camera_attributes_uses_auto_exposure(camera_attributes);
+		camera_exposure_data["auto_enabled"] = auto_enabled;
+		if (auto_enabled) {
+			float min_luminance = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(camera_attributes);
+			float max_luminance = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(camera_attributes);
+			float speed = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(camera_attributes);
+			float scale = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(camera_attributes);
+			if (!Math::is_finite(min_luminance) || min_luminance <= 0.0f) {
+				min_luminance = 1e-12f;
+			}
+			if (!Math::is_finite(max_luminance) || max_luminance <= 0.0f) {
+				max_luminance = min_luminance;
+			}
+			min_luminance = CLAMP(min_luminance, 1e-12f, 1e12f);
+			max_luminance = CLAMP(max_luminance, min_luminance, 1e12f);
+			if (!Math::is_finite(speed) || speed < 0.0f) {
+				speed = 0.0f;
+			}
+			if (!Math::is_finite(scale) || scale < 0.0f) {
+				scale = 1.0f;
+			}
+			camera_exposure_data["auto_min_luminance"] = min_luminance;
+			camera_exposure_data["auto_max_luminance"] = max_luminance;
+			camera_exposure_data["auto_speed"] = MIN(speed, 1e6f);
+			camera_exposure_data["auto_scale"] = CLAMP(scale, 1e-12f, 1e12f);
+			camera_exposure_data["auto_version"] = int64_t(RSG::camera_attributes->camera_attributes_get_auto_exposure_version(camera_attributes));
+		}
+	}
 	pass_context->setup(
 			const_cast<RenderDataRD *>(p_render_data),
 			[&](int p_operation) { run_builtin_operation(p_operation); },
@@ -3997,7 +4036,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 					return false;
 				}
 				return true;
-			});
+			},
+			camera_exposure_data);
 	pass_context->set_indirect_specular_target_provider([&](int p_view) {
 		if (!rb.is_valid() || !rb_data.is_valid() || p_view < 0 || p_view >= int(rb->get_view_count())) {
 			return RID();

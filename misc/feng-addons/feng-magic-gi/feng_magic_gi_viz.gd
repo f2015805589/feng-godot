@@ -30,11 +30,48 @@ static func rebuild(volume: FMagicGIVolume, root: Node3D, preview_snapshot: Dict
 	for child in root.get_children():
 		child.queue_free()
 		root.remove_child(child)
+	root.set_meta("_layout_stale", volume.is_layout_stale())
 	_build_box(volume, root)
+	_update_stream_status(volume, root, preview_snapshot)
 	if volume.show_probes:
 		_build_probes(volume, root, preview_snapshot)
 	if volume.show_sh_probes and _can_show_sh(preview_snapshot):
 		_build_sh(volume, root, preview_snapshot)
+	set_layout_stale(root, volume.is_layout_stale())
+
+## Resizes only the local box mesh. Baked probe positions remain world-anchored.
+static func update_box(volume: FMagicGIVolume, root: Node3D) -> void:
+	if root == null or not is_instance_valid(root):
+		return
+	var old_box := root.get_node_or_null("_Box")
+	if old_box != null:
+		root.remove_child(old_box)
+		old_box.queue_free()
+	_build_box(volume, root)
+
+## One uniform change updates stale tint without touching probe instance arrays.
+static func set_layout_stale(root: Node3D, stale: bool) -> void:
+	if root == null or not is_instance_valid(root):
+		return
+	root.set_meta("_layout_stale", stale)
+	var probe_node := root.get_node_or_null("_Probes") as MultiMeshInstance3D
+	if probe_node != null and probe_node.multimesh != null:
+		var sphere := probe_node.multimesh.mesh as SphereMesh
+		var probe_material := sphere.material as ShaderMaterial if sphere != null else null
+		if probe_material != null:
+			probe_material.set_shader_parameter("preview_layout_stale", stale)
+	var holder := root.get_node_or_null("_Transport") as Node3D
+	if holder != null and not holder.get_children().is_empty():
+		var first_probe := holder.get_child(0) as MeshInstance3D
+		var transport_material := first_probe.material_override as ShaderMaterial if first_probe != null else null
+		if transport_material != null:
+			transport_material.set_shader_parameter("preview_layout_stale", stale)
+
+static func _track_preview_material(root: Node3D, material: ShaderMaterial) -> void:
+	if root == null or material == null:
+		return
+	material.set_shader_parameter("preview_layout_stale",
+			bool(root.get_meta("_layout_stale", false)))
 
 static func _build_box(volume: FMagicGIVolume, root: Node3D) -> void:
 	var h: Vector3 = volume.size * 0.5
@@ -71,6 +108,79 @@ static func _probe_gizmo_radius(volume: FMagicGIVolume) -> float:
 	# surfaces; all visualization meshes explicitly stay out of shadow maps.
 	return ProbeLayout.marker_radius(volume.cell_size())
 
+## Candidate points are a separate world-anchored layer. They never reuse saved
+## page/data indices, so an old SH preview remains paired with its old probes.
+static func build_candidate_layout_node(volume: FMagicGIVolume,
+		positions: PackedVector3Array, spacings: PackedFloat32Array,
+		layout_current: bool, revision: int) -> Node3D:
+	var count := positions.size()
+	if count <= 0 or not is_instance_valid(volume) or not volume.is_inside_tree():
+		return null
+	var sphere := SphereMesh.new()
+	sphere.radius = _probe_gizmo_radius(volume)
+	sphere.height = sphere.radius * 2.0
+	var material := StandardMaterial3D.new()
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.albedo_color = Color(0.12, 0.95, 0.76, 0.82) if layout_current else Color(0.58, 0.62, 0.62, 0.65)
+	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	sphere.material = material
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = sphere
+	mm.instance_count = count
+	var basis: Basis = volume.global_transform.basis
+	var tree := volume.get_tree()
+	var slice_started := Time.get_ticks_usec()
+	for index in count:
+		var density_scale := 1.0
+		if volume.adaptive_placement and spacings.size() == count:
+			density_scale = spacings[index] / volume.probe_spacing
+		mm.set_instance_transform(index, Transform3D(
+				basis * Basis.IDENTITY.scaled(Vector3.ONE * density_scale), positions[index]))
+		if Time.get_ticks_usec() - slice_started >= 2500:
+			if not is_instance_valid(tree) or not volume.is_inside_tree():
+				return null
+			await tree.process_frame
+			slice_started = Time.get_ticks_usec()
+	var node := MultiMeshInstance3D.new()
+	node.name = "_CandidateProbes"
+	node.top_level = true
+	node.multimesh = mm
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	node.set_meta("candidate_layout_revision", revision)
+	node.set_meta("candidate_layout_current", layout_current)
+	return node
+
+static func install_candidate_layout(root: Node3D, node: Node3D, revision: int) -> void:
+	if root == null or not is_instance_valid(root):
+		return
+	clear_candidate_layout(root)
+	if node == null or not is_instance_valid(node):
+		return
+	root.add_child(node)
+	node.set_meta("candidate_layout_revision", revision)
+
+static func clear_candidate_layout(root: Node3D) -> void:
+	if root == null or not is_instance_valid(root):
+		return
+	var old := root.get_node_or_null("_CandidateProbes")
+	if old != null:
+		root.remove_child(old)
+		old.queue_free()
+
+static func set_candidate_layout_current(root: Node3D, layout_current: bool) -> void:
+	if root == null or not is_instance_valid(root):
+		return
+	var node := root.get_node_or_null("_CandidateProbes") as MultiMeshInstance3D
+	if node == null or node.multimesh == null:
+		return
+	var sphere := node.multimesh.mesh as SphereMesh
+	var material := sphere.material as StandardMaterial3D if sphere != null else null
+	if material == null:
+		return
+	material.albedo_color = Color(0.12, 0.95, 0.76, 0.82) if layout_current else Color(0.58, 0.62, 0.62, 0.65)
+	node.set_meta("candidate_layout_current", layout_current)
+
 static func _probe_color_state(preview_snapshot: Dictionary, index: int) -> Dictionary:
 	if not bool(preview_snapshot.get("data_valid", false)) \
 			or not bool(preview_snapshot.get("layout_matches", false)) \
@@ -84,6 +194,27 @@ static func _probe_color_state(preview_snapshot: Dictionary, index: int) -> Dict
 			preview_snapshot.get("sky_lighting", PackedFloat32Array()),
 			preview_snapshot.get("emission_payload", PackedFloat32Array()),
 			float(preview_snapshot.get("strength", 1.0)))
+	if response == Vector3.ZERO:
+		return {"color": ZERO_RESPONSE_COLOR, "compensate": true}
+	return {"color": Color(response.x, response.y, response.z), "compensate": false}
+
+static func _streamed_probe_color_state(preview_snapshot: Dictionary,
+		page: Dictionary, index: int) -> Dictionary:
+	if not bool(preview_snapshot.get("data_valid", false)) \
+			or not bool(preview_snapshot.get("current_available", false)):
+		return {"color": UNAVAILABLE_COLOR, "compensate": true}
+	var data := page.get("data") as FMagicGIData
+	if data == null or index < 0 or index >= data.probe_count():
+		return {"color": UNAVAILABLE_COLOR, "compensate": true}
+	var lighting: PackedFloat32Array = page.get("lighting", PackedFloat32Array())
+	var sky_lighting: PackedFloat32Array = page.get("sky_lighting", PackedFloat32Array())
+	var emission_payload: PackedFloat32Array = page.get("emission_payload", PackedFloat32Array())
+	var response := data.evaluate(index, lighting, sky_lighting)
+	if emission_payload.size() == data.probe_count() * 3:
+		var base := index * 3
+		response += Vector3(emission_payload[base], emission_payload[base + 1],
+				emission_payload[base + 2])
+	response *= float(preview_snapshot.get("strength", 1.0))
 	if response == Vector3.ZERO:
 		return {"color": ZERO_RESPONSE_COLOR, "compensate": true}
 	return {"color": Color(response.x, response.y, response.z), "compensate": false}
@@ -146,13 +277,25 @@ static func _preview_view_uniforms(editor_views: Array) -> Dictionary:
 	}
 
 static func _build_probes(volume: FMagicGIVolume, root: Node3D, preview_snapshot: Dictionary) -> void:
-	var count := volume.probe_count()
+	var streamed := bool(preview_snapshot.get("streamed", false))
+	if not streamed and volume.candidate_probe_count() > 0 and not volume.has_bake():
+		return # Candidate points are built in bounded main-thread slices below.
+	var pages: Array = preview_snapshot.get("pages", [])
+	var count := 0
+	if streamed:
+		for page in pages:
+			var data := page.get("data") as FMagicGIData
+			if data != null:
+				count += data.probe_count()
+	else:
+		count = volume.probe_count()
 	if count == 0:
 		return
 	var sphere := SphereMesh.new()
 	sphere.radius = _probe_gizmo_radius(volume)
 	sphere.height = sphere.radius * 2.0
 	var preview_material := _new_preview_material(preview_snapshot)
+	_track_preview_material(root, preview_material)
 	sphere.material = preview_material
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
@@ -160,37 +303,88 @@ static func _build_probes(volume: FMagicGIVolume, root: Node3D, preview_snapshot
 	mm.use_custom_data = true
 	mm.mesh = sphere
 	mm.instance_count = count
-	var inverse_volume_transform: Transform3D = volume.global_transform.affine_inverse()
-	for i in count:
-		# probe_positions is world space; the viz node is a volume child, so
-		# convert through the inverse transform.
-		var local: Vector3 = inverse_volume_transform * volume.probe_positions[i]
-		var density_scale := 1.0
-		if volume.adaptive_placement and volume.probe_spacings.size() == count:
-			# The same marker-to-spacing ratio represents the selected local density.
-			# Placement checks the larger physical footprint before accepting a point.
-			density_scale = volume.probe_spacings[i] / volume.probe_spacing
-		mm.set_instance_transform(i, Transform3D(Basis.IDENTITY.scaled(Vector3.ONE * density_scale), local))
-		var color_state := _probe_color_state(preview_snapshot, i)
-		mm.set_instance_color(i, color_state["color"])
-		mm.set_instance_custom_data(i, Color(1.0 if color_state["compensate"] else 0.0, 0.0, 0.0, 1.0))
+	var instance_basis: Basis = volume.global_transform.basis
+	var output_index := 0
+	if streamed:
+		for page in pages:
+			var data := page.get("data") as FMagicGIData
+			if data == null:
+				continue
+			for probe in data.probe_count():
+				var density_scale := _probe_density_scale(data, probe, volume.probe_spacing)
+				mm.set_instance_transform(output_index, Transform3D(
+						instance_basis * Basis.IDENTITY.scaled(Vector3.ONE * density_scale),
+						data.positions[probe]))
+				var color_state := _streamed_probe_color_state(preview_snapshot, page, probe)
+				mm.set_instance_color(output_index, color_state["color"])
+				mm.set_instance_custom_data(output_index,
+						Color(1.0 if color_state["compensate"] else 0.0, 0.0, 0.0, 1.0))
+				output_index += 1
+	else:
+		for i in count:
+			# The marker node is top-level so baked world anchors do not follow a
+			# moved Volume. Keep its original scene-scaled radius/orientation.
+			var density_scale := 1.0
+			if volume.adaptive_placement and volume.probe_spacings.size() == count:
+				# Keep the established marker-to-spacing ratio for local density.
+				density_scale = volume.probe_spacings[i] / volume.probe_spacing
+			mm.set_instance_transform(i, Transform3D(
+					instance_basis * Basis.IDENTITY.scaled(Vector3.ONE * density_scale),
+					volume.probe_positions[i]))
+			var color_state := _probe_color_state(preview_snapshot, i)
+			mm.set_instance_color(i, color_state["color"])
+			mm.set_instance_custom_data(i,
+					Color(1.0 if color_state["compensate"] else 0.0, 0.0, 0.0, 1.0))
 	var node := MultiMeshInstance3D.new()
 	node.name = "_Probes"
+	node.top_level = true
 	node.multimesh = mm
 	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	if streamed:
+		node.set_meta("page_layout_key", String(preview_snapshot.get("page_layout_key", "")))
 	root.add_child(node)
+
+static func _probe_density_scale(data: FMagicGIData, index: int, fallback_spacing: float) -> float:
+	if data.adaptive_placement and data.probe_spacings.size() == data.probe_count():
+		return data.probe_spacings[index] / maxf(fallback_spacing, 0.1)
+	return data.spacing / maxf(fallback_spacing, 0.1)
 
 ## Updates data-dependent preview geometry without rebuilding its layout or box.
 static func update_preview(volume: FMagicGIVolume, root: Node3D, preview_snapshot: Dictionary) -> void:
+	_update_stream_status(volume, root, preview_snapshot)
 	if volume.show_probes:
 		var probe_node := root.get_node_or_null("_Probes") as MultiMeshInstance3D
+		var streamed := bool(preview_snapshot.get("streamed", false))
+		if streamed and (probe_node == null \
+				or String(probe_node.get_meta("page_layout_key", "")) \
+				!= String(preview_snapshot.get("page_layout_key", ""))):
+			if probe_node != null:
+				root.remove_child(probe_node)
+				probe_node.queue_free()
+			_build_probes(volume, root, preview_snapshot)
+			probe_node = root.get_node_or_null("_Probes") as MultiMeshInstance3D
 		if probe_node != null and probe_node.multimesh != null:
 			var mm := probe_node.multimesh
-			for index in mini(volume.probe_count(), mm.instance_count):
-				var color_state := _probe_color_state(preview_snapshot, index)
-				mm.set_instance_color(index, color_state["color"])
-				mm.set_instance_custom_data(index,
-						Color(1.0 if color_state["compensate"] else 0.0, 0.0, 0.0, 1.0))
+			if streamed:
+				var output_index := 0
+				for page in preview_snapshot.get("pages", []):
+					var data := page.get("data") as FMagicGIData
+					if data == null:
+						continue
+					for probe in data.probe_count():
+						if output_index >= mm.instance_count:
+							break
+						var color_state := _streamed_probe_color_state(preview_snapshot, page, probe)
+						mm.set_instance_color(output_index, color_state["color"])
+						mm.set_instance_custom_data(output_index,
+								Color(1.0 if color_state["compensate"] else 0.0, 0.0, 0.0, 1.0))
+						output_index += 1
+			else:
+				for index in mini(volume.probe_count(), mm.instance_count):
+					var color_state := _probe_color_state(preview_snapshot, index)
+					mm.set_instance_color(index, color_state["color"])
+					mm.set_instance_custom_data(index,
+							Color(1.0 if color_state["compensate"] else 0.0, 0.0, 0.0, 1.0))
 	if not volume.show_sh_probes:
 		return
 	var holder := root.get_node_or_null("_Transport") as Node3D
@@ -201,12 +395,11 @@ static func update_preview(volume: FMagicGIVolume, root: Node3D, preview_snapsho
 	if holder == null:
 		_build_sh(volume, root, preview_snapshot)
 		return
-	var data := preview_snapshot.get("data") as FMagicGIData
-	var key := _sh_data_key(data)
+	var key := _preview_sh_key(preview_snapshot)
 	if String(holder.get_meta("preview_data_key", "")) == key:
 		return
 	_clear_holder(holder)
-	_populate_sh(volume, holder, data, -1, preview_snapshot)
+	_populate_sh_pages(volume, holder, preview_snapshot)
 	holder.set_meta("preview_data_key", key)
 
 ## Updates only per-view shader parameters. Camera motion and exposure readback
@@ -221,13 +414,19 @@ static func update_preview_exposure(_volume: FMagicGIVolume, root: Node3D,
 			material = sphere.material as ShaderMaterial
 		_set_preview_view_parameters(material, preview_snapshot.get("editor_views", []))
 	var holder := root.get_node_or_null("_Transport") as Node3D
-	if holder != null and holder.get_child_count() > 0:
-		var mesh_instance := holder.get_child(0) as MeshInstance3D
-		if mesh_instance != null:
-			_set_preview_view_parameters(mesh_instance.material_override as ShaderMaterial,
-					preview_snapshot.get("editor_views", []))
+	if holder != null:
+		for child in holder.get_children():
+			var mesh_instance := child as MeshInstance3D
+			if mesh_instance != null:
+				_set_preview_view_parameters(mesh_instance.material_override as ShaderMaterial,
+						preview_snapshot.get("editor_views", []))
 
 static func _can_show_sh(preview_snapshot: Dictionary) -> bool:
+	if bool(preview_snapshot.get("streamed", false)):
+		for page in preview_snapshot.get("pages", []):
+			if page.get("data") is FMagicGIData:
+				return true
+		return false
 	return bool(preview_snapshot.get("data_valid", false)) \
 			and bool(preview_snapshot.get("layout_matches", false)) \
 			and preview_snapshot.get("data") is FMagicGIData
@@ -235,28 +434,44 @@ static func _can_show_sh(preview_snapshot: Dictionary) -> bool:
 static func _build_sh(volume: FMagicGIVolume, root: Node3D, preview_snapshot: Dictionary) -> void:
 	var holder := Node3D.new()
 	holder.name = "_Transport"
-	holder.set_meta("preview_data_key", _sh_data_key(preview_snapshot.get("data") as FMagicGIData))
+	holder.top_level = true
+	holder.set_meta("preview_data_key", _preview_sh_key(preview_snapshot))
 	root.add_child(holder)
-	_populate_sh(volume, holder, preview_snapshot.get("data") as FMagicGIData, -1, preview_snapshot)
+	_populate_sh_pages(volume, holder, preview_snapshot)
+
+static func _populate_sh_pages(volume: FMagicGIVolume, holder: Node3D,
+		preview_snapshot: Dictionary) -> void:
+	if bool(preview_snapshot.get("streamed", false)):
+		var remaining := MAX_SH_VIZ_PROBES
+		for page in preview_snapshot.get("pages", []):
+			var data := page.get("data") as FMagicGIData
+			if data == null or remaining <= 0:
+				continue
+			var count := mini(data.probe_count(), remaining)
+			_populate_sh(volume, holder, data, count, preview_snapshot)
+			remaining -= count
+	else:
+		_populate_sh(volume, holder, preview_snapshot.get("data") as FMagicGIData,
+				-1, preview_snapshot)
 
 static func _populate_sh(volume: FMagicGIVolume, holder: Node3D, data: FMagicGIData,
 		count: int = -1, preview_snapshot: Dictionary = {}) -> void:
 	if data == null:
 		return
 	if count < 0:
-		count = mini(volume.probe_count(), MAX_SH_VIZ_PROBES)
+		count = mini(data.probe_count(), MAX_SH_VIZ_PROBES)
 	var radius := _cell_extent(volume) * 0.45
-	var plot_basis := volume.global_basis.orthonormalized()
+	var world_basis := volume.global_transform.basis
+	var plot_basis := world_basis.orthonormalized()
 	var material := _new_preview_material(preview_snapshot, true)
+	_track_preview_material(holder.get_parent() as Node3D, material)
 	for i in count:
 		var local_radius := radius
-		if volume.adaptive_placement and volume.probe_spacings.size() == count:
-			local_radius *= volume.probe_spacings[i] / volume.probe_spacing
-		var mesh := _sh_mesh(data, i, local_radius, plot_basis)
+		local_radius *= _probe_density_scale(data, i, volume.probe_spacing)
+		var mesh := _sh_mesh(data, i, local_radius, plot_basis, world_basis)
 		var node := MeshInstance3D.new()
 		node.mesh = mesh
-		var local: Vector3 = volume.global_transform.affine_inverse() * volume.probe_positions[i]
-		node.position = local
+		node.position = data.positions[i]
 		node.material_override = material
 		node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		holder.add_child(node)
@@ -270,8 +485,36 @@ static func _clear_holder(holder: Node3D) -> void:
 static func _sh_data_key(data: FMagicGIData) -> String:
 	return "%d:%d" % [data.get_instance_id(), data.bake_version] if data != null else ""
 
+static func _preview_sh_key(preview_snapshot: Dictionary) -> String:
+	if not bool(preview_snapshot.get("streamed", false)):
+		return _sh_data_key(preview_snapshot.get("data") as FMagicGIData)
+	return String(preview_snapshot.get("page_layout_key", ""))
+
+static func _update_stream_status(volume: FMagicGIVolume, root: Node3D,
+		preview_snapshot: Dictionary) -> void:
+	var label := root.get_node_or_null("_StreamStatus") as Label3D
+	if not bool(preview_snapshot.get("streamed", false)):
+		if label != null:
+			root.remove_child(label)
+			label.queue_free()
+		return
+	if label == null:
+		label = Label3D.new()
+		label.name = "_StreamStatus"
+		label.font_size = 32
+		label.pixel_size = 0.01
+		label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		label.no_depth_test = true
+		label.modulate = Color(0.7, 1.0, 0.8, 1.0)
+		root.add_child(label)
+	var status: Dictionary = preview_snapshot.get("streaming_status", {})
+	label.text = "Magic GI pages: %d / %d  ·  loading %d" % [
+		int(status.get("resident_pages", 0)), int(preview_snapshot.get("total_pages", 0)),
+		int(status.get("loading_pages", 0))]
+	label.position = Vector3(0.0, volume.size.y * 0.5, 0.0)
+
 static func _sh_mesh(data: FMagicGIData, probe_index: int, radius: float,
-		local_to_world: Basis) -> ArrayMesh:
+		local_to_world: Basis, world_basis: Basis = Basis.IDENTITY) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	var verts := PackedVector3Array()
 	var colors := PackedColorArray()
@@ -294,7 +537,7 @@ static func _sh_mesh(data: FMagicGIData, probe_index: int, radius: float,
 			var world_dir := (local_to_world * dir).normalized()
 			var response := Preview.unit_source_response(data, probe_index, world_dir)
 			var magnitude := response.length() / scale if not zero_response else 0.0
-			verts.append(dir * (radius * (0.25 + 0.75 * magnitude)))
+			verts.append(world_basis * dir * (radius * (0.25 + 0.75 * magnitude)))
 			colors.append(ZERO_TRANSPORT_COLOR if zero_response else Color(response.x, response.y, response.z) / scale)
 	for ring in rings:
 		for sector in sectors:
