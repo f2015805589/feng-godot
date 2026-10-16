@@ -32,9 +32,14 @@ struct GIPathPayload {
 	float ray_pdf;
 };
 
+#ifndef FENG_GI_SURFEL_CACHE
+#define FENG_GI_SURFEL_CACHE 0
+#endif
+
 static const uint GI_MATERIAL_TWO_SIDED = 2u;
 static const uint GI_MATERIAL_WORD_STRIDE = 20u;
 static const uint GI_HIT_KIND_FRONT_FACE = 0xfeu;
+static const uint GI_RAY_MODE_SURFEL_LOCAL_VISIBILITY = 65u;
 
 [shader("anyhit")]
 void FengGIAnyHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAttributes attributes) {
@@ -43,6 +48,19 @@ void FengGIAnyHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAttrib
 		AcceptHitAndEndSearch();
 		return;
 	}
+	#if FENG_GI_SURFEL_CACHE
+	if (payload.flags == GI_RAY_MODE_SURFEL_LOCAL_VISIBILITY) {
+		uint light_mask = asuint(payload.ray_pdf);
+		uint surface_byte = InstanceID() * 32u;
+		if ((gi_surfaces.Load(surface_byte + 20u) & light_mask) == 0u) {
+			IgnoreHit();
+			return;
+		}
+		payload.radiance = 0.0f;
+		AcceptHitAndEndSearch();
+		return;
+	}
+	#endif
 
 	uint surface_byte = InstanceID() * 32u;
 	if (payload.flags == 1u) {

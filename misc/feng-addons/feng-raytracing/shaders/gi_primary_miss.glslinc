@@ -4,6 +4,9 @@
 #ifndef FENG_GI_SKY_ARRAY
 #define FENG_GI_SKY_ARRAY 0
 #endif
+#ifndef FENG_GI_SURFEL_CACHE
+#define FENG_GI_SURFEL_CACHE 0
+#endif
 
 struct GIPathPayload {
 	vec3 radiance;
@@ -64,6 +67,14 @@ vec3 gi_sample_sky(vec3 world_direction) {
 
 void main() {
 	uint path_mode = gi_payload.flags;
+	#if FENG_GI_SURFEL_CACHE
+	if (path_mode == 32u) {
+		gi_payload.radiance = vec3(0.0);
+		gi_payload.flags = 0u;
+		gi_payload.hit_distance = 0.0;
+		return;
+	}
+	#endif
 	gi_payload.radiance = gi_sample_sky(gl_WorldRayDirectionEXT);
 	gi_payload.flags = path_mode == 2u ? 4u : 0u;
 	gi_payload.hit_distance = path_mode == 2u ? -max(gi_frame.data.trace_parameters.x, 0.001) : 0.0;

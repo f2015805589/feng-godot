@@ -21,6 +21,7 @@ func _parse_begin(_object: Object) -> void:
 	container.add_child(info)
 
 	var bake_row := HBoxContainer.new()
+	ui["bake_row"] = bake_row
 	var bake_button := Button.new()
 	bake_button.pressed.connect(_on_bake_pressed.bind(volume, ui))
 	bake_row.add_child(bake_button)
@@ -50,6 +51,7 @@ func _parse_begin(_object: Object) -> void:
 	var quality_label := Label.new()
 	quality_label.text = "Bake quality (rays per point)"
 	container.add_child(quality_label)
+	ui["quality_label"] = quality_label
 	var quality := OptionButton.new()
 	for preset_index in Volume.BAKE_QUALITY_SAMPLES.size():
 		var samples: int = Volume.BAKE_QUALITY_SAMPLES[preset_index]
@@ -98,6 +100,10 @@ func _on_quality_selected(index: int, quality: OptionButton, volume: FMagicGIVol
 func _update_status(volume: FMagicGIVolume, info: Label, ui: Dictionary) -> void:
 	if not is_instance_valid(volume) or not is_instance_valid(info):
 		return
+	if volume.is_surfel_mode():
+		info.text = "Surfel MagicGI: realtime surface cache"
+		_update_controls(volume, ui)
+		return
 	if volume.bake_manifest != null and is_instance_valid(volume.bake_manifest):
 		var stream: Dictionary = Runtime.streaming_status(volume)
 		var progress: Vector2i = volume.streamed_bake_progress()
@@ -142,6 +148,24 @@ func _update_status(volume: FMagicGIVolume, info: Label, ui: Dictionary) -> void
 	_update_controls(volume, ui)
 
 func _update_controls(volume: FMagicGIVolume, ui: Dictionary) -> void:
+	var prt_visible := not volume.is_surfel_mode()
+	var bake_row: HBoxContainer = ui.get("bake_row")
+	if is_instance_valid(bake_row):
+		bake_row.visible = prt_visible
+	var quality_label: Label = ui.get("quality_label")
+	if is_instance_valid(quality_label):
+		quality_label.visible = prt_visible
+	var quality: OptionButton = ui.get("quality")
+	if is_instance_valid(quality):
+		quality.visible = prt_visible
+	var refresh: Button = ui.get("refresh_button")
+	if is_instance_valid(refresh):
+		refresh.visible = prt_visible
+	if not prt_visible:
+		var chunk_row: HBoxContainer = ui.get("chunk_row")
+		if is_instance_valid(chunk_row):
+			chunk_row.visible = false
+		return
 	var baking := volume.is_baking()
 	var refreshing := volume.is_refreshing()
 	var cancel_requested := volume.is_bake_cancel_requested()
@@ -154,7 +178,7 @@ func _update_controls(volume: FMagicGIVolume, ui: Dictionary) -> void:
 		cancel_button.visible = baking or refreshing
 		cancel_button.disabled = cancel_requested or not (baking or refreshing)
 		cancel_button.text = "Canceling..." if cancel_requested else ("Cancel Refresh" if refreshing and not baking else "Cancel Bake")
-	var quality: OptionButton = ui.get("quality")
+	quality = ui.get("quality")
 	if is_instance_valid(quality):
 		quality.disabled = baking
 	var chunk_row: HBoxContainer = ui.get("chunk_row")
@@ -166,7 +190,7 @@ func _update_controls(volume: FMagicGIVolume, ui: Dictionary) -> void:
 	var chunk_button: Button = ui.get("chunk_button")
 	if is_instance_valid(chunk_button):
 		chunk_button.disabled = baking or not volume.chunked_baking
-	var refresh: Button = ui.get("refresh_button")
+	refresh = ui.get("refresh_button")
 	if is_instance_valid(refresh):
 		refresh.disabled = baking
 		refresh.text = "Refresh Again" if refreshing else "Refresh Surface Points"

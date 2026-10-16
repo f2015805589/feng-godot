@@ -1,7 +1,12 @@
 @tool
 class_name FMagicGIVolume
 extends Node3D
-## Surface PRT volume. Samples lie on visible geometry; spacing is in world meters.
+## Selects one indirect-light provider for this volume: baked surface PRT or realtime Surfels.
+
+enum GIMode {
+	PRT_MAGIC_GI,
+	SURFEL_MAGIC_GI,
+}
 
 signal bake_status_changed
 signal surface_refresh_completed(generation: int, success: bool)
@@ -15,10 +20,96 @@ const Manifest = preload("feng_magic_gi_manifest.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const Preview = preload("feng_magic_gi_preview.gd")
 const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
+const SurfelSettings = preload("feng_magic_gi_surfel_settings.gd")
 const ZERO_TRANSFER_DIAGNOSTIC := "本次几何间接传输与天空可见性均为零。请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新 Bake。"
 const BAKE_QUALITY_NAMES := ["Draft", "Final", "High"]
 const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
 const LAYOUT_IDLE_DEBOUNCE_MSEC := 280
+const PRT_ONLY_PROPERTIES := [
+	"probe_spacing", "surface_offset", "adaptive_placement", "minimum_probe_spacing",
+	"bake_samples", "bake_bounces", "bake_distance", "terrain_reflectance",
+	"fallback_material_reflectance", "use_clv", "clv_cell_size", "clv_cells_per_frame",
+	"chunked_baking", "management_block_size", "core_page_size", "bake_output_directory",
+	"stream_distance", "stream_hysteresis", "cpu_resident_budget_mib",
+	"gpu_resident_budget_mib", "upload_budget_mib_per_frame", "max_inflight_page_loads",
+	"sun", "lighting_environment", "show_probes", "show_sh_probes", "bake_data",
+	"bake_manifest",
+]
+const PRT_ONLY_GROUPS := ["Runtime Cache", "Paged Baking", "Page Streaming"]
+
+@export_enum("PRT MagicGI", "Surfel MagicGI") var gi_mode: int = GIMode.PRT_MAGIC_GI:
+	set(value):
+		var next_mode := clampi(int(value), GIMode.PRT_MAGIC_GI, GIMode.SURFEL_MAGIC_GI)
+		if gi_mode == next_mode:
+			return
+		gi_mode = next_mode
+		_on_gi_mode_changed()
+
+@export var surfel_settings: FMagicGISurfelSettings:
+	set(value):
+		var next_settings: FMagicGISurfelSettings = value if value != null else SurfelSettings.new()
+		if surfel_settings == next_settings:
+			return
+		if surfel_settings != null and surfel_settings.changed.is_connected(_on_surfel_settings_changed):
+			surfel_settings.changed.disconnect(_on_surfel_settings_changed)
+		surfel_settings = next_settings
+		if not surfel_settings.changed.is_connected(_on_surfel_settings_changed):
+			surfel_settings.changed.connect(_on_surfel_settings_changed)
+		_on_surfel_settings_changed()
+
+func _init() -> void:
+	# Give each Volume independent editable settings; a class default Resource could
+	# otherwise be shared by several instances in the same scene.
+	surfel_settings = SurfelSettings.new()
+
+func is_surfel_mode() -> bool:
+	return gi_mode == GIMode.SURFEL_MAGIC_GI
+
+func _on_gi_mode_changed() -> void:
+	notify_property_list_changed()
+	_preview_revision += 1
+	if is_surfel_mode():
+		cancel_bake()
+		_source_validation_pending = false
+		_source_validation_reset_legacy_baseline = false
+		_source_validation_queued = false
+		_layout_queued = false
+		_layout_refresh_deadline_msec = 0
+		Runtime.set_preview_requested(self, false)
+		if _viz != null and is_instance_valid(_viz):
+			_viz.visible = false
+	elif is_inside_tree():
+		_restore_prt_probe_layout()
+		if _viz != null and is_instance_valid(_viz):
+			_viz.visible = true
+		_current_quick_source_signature = -1
+		if _has_saved_bake():
+			_schedule_saved_source_validation()
+		else:
+			_mark_layout_stale()
+		_sync_preview_exposure_request()
+		_refresh_viz()
+	if is_inside_tree():
+		Runtime.publish(self)
+	update_configuration_warnings()
+	bake_status_changed.emit()
+
+func _on_surfel_settings_changed() -> void:
+	if not is_inside_tree():
+		return
+	if is_surfel_mode():
+		Runtime.publish(self)
+		bake_status_changed.emit()
+
+func _validate_property(property: Dictionary) -> void:
+	var property_name := String(property.get("name", ""))
+	if is_surfel_mode() and (property_name in PRT_ONLY_PROPERTIES \
+			or property_name in PRT_ONLY_GROUPS):
+		# Hide PRT controls without removing their serialized values, so switching
+		# modes never discards an existing bake or its settings.
+		property["usage"] = PROPERTY_USAGE_STORAGE
+	elif not is_surfel_mode() and property_name == "surfel_settings":
+		property["usage"] = PROPERTY_USAGE_STORAGE
 
 class SurfaceRefreshRequest:
 	extends RefCounted
@@ -172,18 +263,22 @@ class SurfaceRefreshRequest:
 		_data_change_revision += 1
 		_preview_revision += 1
 		_preview_layout_match_key = ""
-		_set_probe_layout_from_data(bake_data)
+		if not is_surfel_mode():
+			_restore_prt_probe_layout()
 		_clear_candidate_layout()
 		if is_inside_tree() and not _bake_assigning_data:
 			_bake_generation += 1
-			_mark_layout_stale()
-			_schedule_saved_source_validation(true)
+			if not is_surfel_mode():
+				_mark_layout_stale()
+				_schedule_saved_source_validation(true)
 			Runtime.publish(self)
 @export var bake_manifest: Manifest:
 	set(value):
 		if bake_manifest == value:
 			return
 		bake_manifest = value
+		if not is_surfel_mode():
+			_restore_prt_probe_layout()
 		if is_inside_tree() and not _bake_assigning_manifest:
 			_settings_changed()
 			_schedule_saved_source_validation(true)
@@ -276,7 +371,15 @@ func _enter_tree() -> void:
 	_sync_preview_exposure_request()
 
 func _ready() -> void:
-	_set_probe_layout_from_data(bake_data)
+	if is_surfel_mode():
+		_source_validation_pending = false
+		_source_validation_queued = false
+		_layout_queued = false
+		Runtime.set_preview_requested(self, false)
+		Runtime.publish(self)
+		_refresh_viz()
+		return
+	_restore_prt_probe_layout()
 	_current_watch_signature = SceneTracker.quick_signature_uncached(self)
 	_current_quick_source_signature = SceneTracker.quick_source_signature_uncached(self)
 	_quick_scene_signature = _current_watch_signature
@@ -325,6 +428,8 @@ func _exit_tree() -> void:
 
 func _process(_delta: float) -> void:
 	Runtime.tick()
+	if is_surfel_mode():
+		return
 	if Engine.is_editor_hint() and (show_probes or show_sh_probes):
 		_update_preview_if_changed()
 	var now := Time.get_ticks_msec()
@@ -523,7 +628,7 @@ func _clear_candidate_layout() -> void:
 	Viz.clear_candidate_layout(_viz)
 
 func bake() -> bool:
-	if not is_inside_tree() or is_baking():
+	if is_surfel_mode() or not is_inside_tree() or is_baking():
 		return false
 	_bake_start_pending = true
 	var start_generation := _bake_generation
@@ -563,7 +668,7 @@ func bake() -> bool:
 	_scene_signature_checked = true
 	_exact_scene_signature_available = false
 	_layout_stale = false
-	_set_probe_layout_from_data(data)
+	_restore_prt_probe_layout()
 	_clear_candidate_layout()
 	_layout_dirty = false
 	_layout_epoch += 1
@@ -574,7 +679,7 @@ func bake() -> bool:
 	return has_bake()
 
 func bake_chunk(chunk_x: int, chunk_z: int) -> bool:
-	if not chunked_baking or not is_inside_tree() or is_baking():
+	if is_surfel_mode() or not chunked_baking or not is_inside_tree() or is_baking():
 		return false
 	_bake_start_pending = true
 	var start_generation := _bake_generation
@@ -660,16 +765,16 @@ func _bake_streamed_generation(selected_chunk: Vector2i) -> bool:
 ## Public bake-generation check used by the async Baker after yielding. The
 ## generation remains private so callers cannot invalidate a bake themselves.
 func is_bake_request_current(generation: int) -> bool:
-	return is_inside_tree() and generation == _bake_generation
+	return not is_surfel_mode() and is_inside_tree() and generation == _bake_generation
 
 func _rebuild_probes() -> void:
-	if not is_inside_tree():
+	if is_surfel_mode() or not is_inside_tree():
 		return
 	_layout_queued = true
 	_schedule_layout_settle()
 
 func _schedule_layout_settle() -> void:
-	if not is_inside_tree():
+	if is_surfel_mode() or not is_inside_tree():
 		return
 	_layout_dirty = true
 	_layout_refresh_deadline_msec = Time.get_ticks_msec() + LAYOUT_IDLE_DEBOUNCE_MSEC
@@ -696,7 +801,7 @@ func _mark_layout_stale(schedule_settle := true) -> void:
 		_schedule_layout_settle()
 
 func _settle_layout_change() -> void:
-	if not is_inside_tree() or is_baking():
+	if is_surfel_mode() or not is_inside_tree() or is_baking():
 		return
 	if _source_validation_pending:
 		_run_saved_source_validation()
@@ -731,6 +836,8 @@ func _settle_layout_change() -> void:
 	await refresh_surface_points()
 
 func _schedule_saved_source_validation(reset_legacy_baseline := false) -> void:
+	if is_surfel_mode():
+		return
 	_source_validation_pending = true
 	_source_validation_reset_legacy_baseline = _source_validation_reset_legacy_baseline \
 			or reset_legacy_baseline
@@ -741,7 +848,7 @@ func _schedule_saved_source_validation(reset_legacy_baseline := false) -> void:
 
 func _run_saved_source_validation() -> void:
 	_source_validation_queued = false
-	if not _source_validation_pending or not is_inside_tree() or _baking:
+	if is_surfel_mode() or not _source_validation_pending or not is_inside_tree() or _baking:
 		return
 	_source_validation_pending = false
 	var reset_legacy_baseline := _source_validation_reset_legacy_baseline
@@ -823,7 +930,7 @@ func _capture_saved_source_watch_state(reset_legacy_baseline := false,
 			_exact_scene_signature_available = true
 
 func refresh_surface_points() -> bool:
-	if not is_inside_tree() or is_baking():
+	if is_surfel_mode() or not is_inside_tree() or is_baking():
 		return false
 	_layout_queued = false
 	_layout_dirty = false
@@ -846,7 +953,8 @@ func refresh_surface_points() -> bool:
 	return request.succeeded
 
 func _run_surface_refresh_queue() -> void:
-	while is_instance_valid(self) and _refresh_pending and is_inside_tree() and not is_baking():
+	while is_instance_valid(self) and _refresh_pending and is_inside_tree() \
+			and not is_surfel_mode() and not is_baking():
 		var generation := _refresh_request_generation
 		var completion_request: SurfaceRefreshRequest = _refresh_requests.get(generation)
 		_refresh_pending = false
@@ -936,7 +1044,7 @@ func _resolve_all_surface_refresh_requests(success: bool) -> void:
 		request.resolve(success)
 
 func _surface_refresh_is_current(generation: int) -> bool:
-	return is_inside_tree() and _refresh_active and not is_baking() \
+	return not is_surfel_mode() and is_inside_tree() and _refresh_active and not is_baking() \
 			and generation == _refresh_request_generation
 
 func _set_surface_refresh_progress(phase: String, completed: int, total: int) -> void:
@@ -1028,6 +1136,10 @@ func _upgrade_matching_visibility_bake(placement: Placement) -> void:
 func _settings_changed(rebuild := true) -> void:
 	_bake_generation += 1
 	_scene_signature_checked = false
+	if is_surfel_mode():
+		_mark_layout_stale(false)
+		Runtime.publish(self)
+		return
 	if rebuild:
 		_mark_layout_stale()
 	else:
@@ -1142,6 +1254,13 @@ func _set_probe_layout_from_data(data: Data) -> void:
 	_probe_layout_revision += 1
 	_preview_layout_match_key = ""
 
+func _restore_prt_probe_layout() -> void:
+	# A streamed Manifest owns the active PRT provider when both resources are
+	# present. Never repopulate the legacy preview arrays from its inactive Data.
+	var active_data: Data = null if bake_manifest != null and is_instance_valid(bake_manifest) \
+			else bake_data
+	_set_probe_layout_from_data(active_data)
+
 func preview_layout_matches(data: Data) -> bool:
 	if data == null:
 		return false
@@ -1173,14 +1292,17 @@ func _on_data_changed() -> void:
 	_data_change_revision += 1
 	_preview_revision += 1
 	_preview_layout_match_key = ""
-	_set_probe_layout_from_data(bake_data)
-	if is_inside_tree():
+	if not is_surfel_mode():
+		_restore_prt_probe_layout()
+	if is_inside_tree() and not is_surfel_mode():
 		_mark_layout_stale()
 		_schedule_saved_source_validation()
 	Runtime.publish(self)
 
 func _get_configuration_warnings() -> PackedStringArray:
 	var warnings := PackedStringArray()
+	if is_surfel_mode():
+		return warnings
 	var dims := grid_dimensions()
 	if not chunked_baking and (dims.x > Data.MAX_GRID_AXIS \
 			or dims.y > Data.MAX_GRID_AXIS or dims.z > Data.MAX_GRID_AXIS):
@@ -1228,6 +1350,10 @@ func _apply_viz() -> void:
 	_viz_queued = false
 	if not is_inside_tree() or not Engine.is_editor_hint() or _baking:
 		return
+	if is_surfel_mode():
+		if _viz != null and is_instance_valid(_viz):
+			_viz.visible = false
+		return
 	var preview_snapshot := Runtime.preview_snapshot(self) if show_probes or show_sh_probes else {}
 	if _viz == null:
 		_viz = Viz.build(self, preview_snapshot)
@@ -1240,7 +1366,8 @@ func _apply_viz() -> void:
 		call_deferred("_rebuild_candidate_viz")
 
 func _update_preview_if_changed() -> void:
-	if not is_inside_tree() or not Engine.is_editor_hint() or _baking or _viz == null:
+	if is_surfel_mode() or not is_inside_tree() or not Engine.is_editor_hint() \
+			or _baking or _viz == null:
 		return
 	var preview_snapshot := Runtime.preview_snapshot(self)
 	if preview_snapshot.is_empty():
@@ -1256,4 +1383,5 @@ func _update_preview_if_changed() -> void:
 
 func _sync_preview_exposure_request() -> void:
 	if is_inside_tree() and Engine.is_editor_hint():
-		Runtime.set_preview_requested(self, show_probes or show_sh_probes)
+		Runtime.set_preview_requested(self,
+				not is_surfel_mode() and (show_probes or show_sh_probes))

@@ -4,6 +4,9 @@
 #ifndef FENG_GI_SKY_ARRAY
 #define FENG_GI_SKY_ARRAY 0
 #endif
+#ifndef FENG_GI_SURFEL_CACHE
+#define FENG_GI_SURFEL_CACHE 0
+#endif
 
 layout(set=0,binding=25,std430) readonly buffer GIEmitters { vec4 rows[]; } gi_emitters;
 struct GIPathPayload {
@@ -267,6 +270,15 @@ void main() {
 	if (dot(world_normal, gl_WorldRayDirectionEXT) > 0.0) {
 		world_normal = -world_normal;
 	}
+	#if FENG_GI_SURFEL_CACHE
+	if (gi_payload.flags == 32u) {
+		gi_payload.radiance = vec3(uintBitsToFloat(instance_index),
+				uintBitsToFloat(uint(gl_PrimitiveID)),
+				uintBitsToFloat(gi_surfaces.words[row_word + 5u]));
+		gi_payload.hit_distance = gl_HitTEXT;
+		return;
+	}
+	#endif
 
 	uint material_word = material_index * GI_MATERIAL_WORD_STRIDE;
 	vec4 base_color = uintBitsToFloat(uvec4(gi_materials.words[material_word + 0u], gi_materials.words[material_word + 1u],
@@ -371,6 +383,24 @@ void main() {
 			outgoing_radiance += diffuse_reflectance * light_color * energy * (no_l * GI_INV_PI) * visibility;
 		}
 	}
+	#if FENG_GI_SURFEL_CACHE
+	if (gi_payload.flags == GI_RAY_MODE_SURFEL) {
+		vec3 world_hit = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
+		uint surfel_seed = gi_hash(instance_index * 0x9e3779b9u ^ uint(gl_PrimitiveID) * 0x85ebca6bu
+				^ floatBitsToUint(gi_barycentrics.x) ^ floatBitsToUint(gi_barycentrics.y));
+		vec3 incident_over_pi = surfel_local_incident(world_hit, world_normal, full_layer_mask,
+				uvec3(gi_surfel_config.light_counts.yzw), surfel_seed);
+		vec3 previous_irradiance_over_pi;
+		if (gi_surfel_lookup_previous(world_hit, world_normal, full_layer_mask,
+				gi_surfel_config.limits.w, previous_irradiance_over_pi)) {
+			incident_over_pi += previous_irradiance_over_pi;
+		}
+		outgoing_radiance += diffuse_reflectance * incident_over_pi;
+		gi_payload.radiance = gi_finite_nonnegative(outgoing_radiance);
+		gi_payload.hit_distance = gl_HitTEXT;
+		return;
+	}
+	#endif
 
 	uint sky_seed = gi_hash(instance_index * 0x9e3779b9u ^ uint(gl_PrimitiveID) * 0x85ebca6bu
 			^ floatBitsToUint(gi_barycentrics.x) ^ floatBitsToUint(gi_barycentrics.y));

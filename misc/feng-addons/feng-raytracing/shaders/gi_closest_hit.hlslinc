@@ -1,6 +1,9 @@
 #ifndef FENG_GI_SKY_ARRAY
 #define FENG_GI_SKY_ARRAY 0
 #endif
+#ifndef FENG_GI_SURFEL_CACHE
+#define FENG_GI_SURFEL_CACHE 0
+#endif
 
 RaytracingAccelerationStructure gi_scene_tlas : register(t0, space0);
 #if FENG_GI_SKY_ARRAY
@@ -281,6 +284,14 @@ void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAt
 	if (dot(world_normal, WorldRayDirection()) > 0.0f) {
 		world_normal = -world_normal;
 	}
+	#if FENG_GI_SURFEL_CACHE
+	if (payload.flags == GI_RAY_MODE_SURFEL_VALIDATE) {
+		payload.radiance = float3(asfloat(InstanceID()), asfloat(PrimitiveIndex()),
+				asfloat(gi_surfaces.Load(row_byte + 20u)));
+		payload.hit_distance = RayTCurrent();
+		return;
+	}
+	#endif
 
 	uint material_byte = material_index * GI_MATERIAL_ROW_BYTES;
 	float4 base_color = asfloat(gi_materials.Load4(material_byte + 0u));
@@ -388,6 +399,24 @@ void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAt
 			outgoing_radiance += diffuse_reflectance * max(sun.color, 0.0f) * energy * (no_l * GI_INV_PI) * visibility;
 		}
 	}
+	#if FENG_GI_SURFEL_CACHE
+	if (payload.flags == GI_RAY_MODE_SURFEL) {
+		float3 world_hit = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+		uint surfel_seed = gi_hash(InstanceID() * 0x9e3779b9u ^ PrimitiveIndex() * 0x85ebca6bu
+				^ asuint(attributes.barycentrics.x) ^ asuint(attributes.barycentrics.y));
+		float3 incident_over_pi = surfel_local_incident(world_hit, world_normal, full_layer_mask,
+				gi_surfel_light_counts.yzw, surfel_seed);
+		float3 previous_irradiance_over_pi;
+		if (gi_surfel_lookup_previous(world_hit, world_normal, full_layer_mask,
+				gi_surfel_limits.w, previous_irradiance_over_pi)) {
+			incident_over_pi += previous_irradiance_over_pi;
+		}
+		outgoing_radiance += diffuse_reflectance * incident_over_pi;
+		payload.radiance = gi_finite_nonnegative(outgoing_radiance);
+		payload.hit_distance = RayTCurrent();
+		return;
+	}
+	#endif
 
 	uint sky_seed = gi_hash(InstanceID() * 0x9e3779b9u ^ primitive * 0x85ebca6bu
 			^ asuint(attributes.barycentrics.x) ^ asuint(attributes.barycentrics.y));

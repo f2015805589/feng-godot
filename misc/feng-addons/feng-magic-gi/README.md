@@ -1,10 +1,22 @@
 # Feng Magic GI
 
-FMagicGI 为 Feng Render Pipeline 提供预计算漫反射传输。烘焙保存几何、材质和天空可见性，运行时使用当前方向光、SkyLight 和自发光源重照明；曝光、接收材质、AO 和 GI 强度在最终合成时应用。
+Feng Magic GI 提供两种漫反射全局光照模式：`PRT MagicGI` 预计算表面传输并在运行时重照明；`Surfel MagicGI` 在运行时维护表面缓存并用光追更新间接光。两种模式共用 `FMagicGIVolume` 和 Magic GI 渲染入口。Surfel 的缓存与照明保持场景线性；预曝光由最终合成应用一次，接收材质、AO 和 GI 强度也在最终合成时处理。
+
+## GI 模式
+
+`FMagicGIVolume` 默认使用 `PRT MagicGI`，旧场景继续沿用原有 Bake 数据和流程。选择 `Surfel MagicGI` 后，Surfel 模式会从当前场景快照自动覆盖可见表面，并在运行时追踪光线更新表面间接光；不需要离线布点，也不需要执行 Bake 或 Refresh。Surfel 缓存在 World 内共享并受容量预算限制，新表面首次覆盖和历史收敛需要运行一段时间。Volume 的 `size`、启用状态和 GI 强度仍共用；Surfel 参数控制半径、数量上限、每帧更新量、射线数与距离、历史权重和调试视图。Inspector 会显示 Surfel 参数并隐藏 PRT 的 Bake、Refresh 与布点参数；切回 PRT 时，原有 `bake_data` 和 manifest 保留。
+
+Surfel 模式需要 `feng-raytracing` 插件代码，以及支持硬件光追的 D3D12 或 Vulkan 渲染路径；无需启用 `RTGI Diffuse` pass。当前场景快照支持刚体 `MeshInstance3D` 与 `BaseMaterial3D` 表面；skinned mesh、`ShaderMaterial`、透明接收表面和自定义 area-light 纹理暂不支持。
+
+设计参考：EA 的 [GIBS 技术介绍](https://www.ea.com/news/gibs-lighting-ea-sports-college-football-25) 与 [SIGGRAPH 2024 演讲幻灯片](https://advances.realtimerendering.com/s2024/content/EA-GIBS2/Apers_Advances-s2024_Shipping-Dynamic-GI.pdf)。
+
+Surfel 的 `Debug View` 可通过 Feng Render Pipeline 的 `Debug Buffers` → `Magic GI` 查看贡献；调试内容只写入 sidecar，不改变正常 `SceneColor`。
+
+### PRT MagicGI 烘焙数据
 
 新烘焙同时保存表面响应和完整的 SH9→SH9 方向传输矩阵。首段天空、次级反弹、自发光分开保存；方向数据可以按接收法线进行余弦卷积。重照明时以同批路径的表面估计校准 SH 常数项，抑制高亮发光面在背面半球的低阶振铃。两种响应共享球面低差异路径及后续余弦采样的求交结果。烘焙以只读几何快照分发到 CPU 工作线程，每个任务独占一个探针的数据，完成后统一合并；取消、场景关闭和静态内容改变均会丢弃未完成或过期结果。距离矩使用 8×8 八面体图集，每格至少追踪四条射线。旧 v2–v6 烘焙继续读取原有表面响应，不会把旧的 27 个系数误当作方向矩阵。
 
-## 使用与烘焙
+## PRT 使用与烘焙
 
 1. 启用 `Feng Render Pipeline` 和 `Feng Magic GI`，将两个插件链接到 `res://addons/`
 2. 添加 `FMagicGIVolume`，调整 `size`、`Probe Spacing` 和表面偏移。默认基础间距为 1 米；探针沿可证实表面的外侧安全偏移，并保留表面锚点。非自适应布局使用以世界原点对齐的基础间距网格，每格最多一个探针、探针中心至少相隔一个基础间距。自适应布局按有效最小间距网格保证每格唯一，跨密度探针中心至少相隔两者实际间距的平均值；Volume 的旋转或缩放不会改变米制密度。平面按 dominant-axis 投影采样世界格点，拥挤时按有界、确定性的空间覆盖顺序选点；小三角、狭长面和局部细节仍经过相同的安全检查。闭合体内部及靠近其他表面的候选会丢弃或提示；无需碰撞体，无几何时不生成探针。`Adaptive Placement` 和 `Use CLV` 对新 Volume 均默认开启且相互独立；显式保存的 Adaptive 关闭状态仍受尊重。结构有效的旧 v6 烘焙会继续发布旧预览并标记为过期，不会自动改写或重烘；布局更新后，显式刷新布点并重新 Bake

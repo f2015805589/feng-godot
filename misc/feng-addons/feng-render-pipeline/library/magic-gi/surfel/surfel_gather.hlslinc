@@ -1,0 +1,88 @@
+#ifndef FENG_GI_SURFEL_GATHER_HLSLINC
+#define FENG_GI_SURFEL_GATHER_HLSLINC
+
+RWTexture2D<float4> gi_surfel_gather_color : register(u29, space0);
+RWTexture2D<float4> gi_surfel_gather_output : register(u30, space0);
+Texture2D<float> gi_surfel_gather_depth : register(t31, space0);
+Texture2D<float4> gi_surfel_gather_normal : register(t32, space0);
+Texture2D<float4> gi_surfel_gather_albedo : register(t33, space0);
+Texture2D<float4> gi_surfel_gather_orm : register(t34, space0);
+Texture2D<float4> gi_surfel_gather_sky_diffuse : register(t35, space0);
+Texture2D<float> gi_surfel_gather_diffuse_ao : register(t36, space0);
+SamplerState gi_surfel_gather_diffuse_ao_sampler : register(s36, space0);
+cbuffer FENGGISurfelGatherParameters : register(b37, space0) {
+	float4 gi_surfel_gather_values; // Strength, SkyLight replacement enabled, frame token, reserved.
+};
+
+static const uint GI_SURFEL_GATHER_MATERIAL_MODEL_MASK = 0x0fu;
+static const uint GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL = 0u;
+
+void gi_surfel_gather() {
+	uint2 dispatch_pixel = DispatchRaysIndex().xy;
+	uint width;
+	uint height;
+	gi_surfel_gather_color.GetDimensions(width, height);
+	if (dispatch_pixel.x >= width || dispatch_pixel.y >= height) return;
+	int2 pixel = (int2)dispatch_pixel;
+	gi_surfel_gather_output[pixel] = 0.0f;
+	float depth = gi_surfel_gather_depth.Load(int3(pixel, 0));
+	if (!(depth > 0.0f) || !isfinite(depth)) return;
+	float4 orm = gi_surfel_gather_orm.Load(int3(pixel, 0));
+	uint material_model = (uint)round(saturate(orm.a) * 255.0f)
+			& GI_SURFEL_GATHER_MATERIAL_MODEL_MASK;
+	if (material_model == GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL) return;
+	float2 uv = (float2(dispatch_pixel) + 0.5f) / float2(width, height);
+	float4 view_h = mul(gi_frame.inverse_projection, float4(uv * 2.0f - 1.0f, depth, 1.0f));
+	if (!(abs(view_h.w) > 1e-8f) || !isfinite(view_h.w)) return;
+	float3 view_position = view_h.xyz / view_h.w;
+	float3 world_position = mul(gi_frame.view_to_world, float4(view_position, 1.0f)).xyz;
+	float3 owner_local = mul(gi_surfel_world_to_owner, float4(world_position, 1.0f)).xyz;
+	float3 half_extent = gi_surfel_owner_size_cell_radius.xyz * 0.5f;
+	// TAA inverse projection can round an edge sample a few float ULPs outside.
+	float3 bounds_epsilon = max(half_extent, float3(1.0f, 1.0f, 1.0f)) * 1.9073486328125e-6f;
+	if (any(abs(owner_local) > half_extent + bounds_epsilon)) return;
+	float3 normal_view = gi_surfel_gather_normal.Load(int3(pixel, 0)).xyz * 2.0f - 1.0f;
+	float normal_length = length(normal_view);
+	if (!(normal_length > 1e-6f) || !isfinite(normal_length)) return;
+	float3 normal = normalize(mul((float3x3)gi_frame.view_to_world, normal_view / normal_length));
+	float3 incident_over_pi;
+	float coverage;
+	float age;
+	uint frame_token = gi_surfel_limits.w;
+	if (!gi_surfel_lookup_visible(world_position, normal, 0xffffffffu, frame_token,
+			incident_over_pi, coverage, age) || !(coverage > 0.0f)) return;
+	float strength = max(gi_surfel_gather_values.x, 0.0f);
+	float pre_exposure = max(gi_frame.size_exposure.z, 0.0f);
+	float scene_normalization = max(gi_frame.size_exposure.w, 0.0f);
+	float ao = saturate(orm.r);
+	float diffuse_ao = gi_surfel_gather_diffuse_ao.SampleLevel(
+			gi_surfel_gather_diffuse_ao_sampler, uv, 0.0f);
+	if (!isfinite(diffuse_ao)) diffuse_ao = 1.0f;
+	float3 albedo = max(gi_surfel_gather_albedo.Load(int3(pixel, 0)).rgb, 0.0f);
+	float metallic = saturate(orm.b);
+	float3 contribution = incident_over_pi * albedo * (1.0f - metallic) * ao
+			* saturate(diffuse_ao) * strength * coverage * pre_exposure * scene_normalization;
+	float ownership_weight = gi_surfel_gather_values.y > 0.5f
+			? saturate(strength) * coverage : 0.0f;
+	float4 scene = gi_surfel_gather_color[pixel];
+	if (ownership_weight > 0.0f) {
+		float3 sky = gi_surfel_gather_sky_diffuse.Load(int3(pixel, 0)).rgb;
+		scene.rgb -= sky * ownership_weight;
+	}
+	gi_surfel_gather_color[pixel] = float4(scene.rgb + contribution, scene.a);
+	float debug_view = gi_surfel_control.w;
+	if (debug_view > 0.5f) {
+		float3 debug_color = incident_over_pi / (1.0f + incident_over_pi);
+		if (debug_view > 1.5f && debug_view < 2.5f) {
+			debug_color = float3(coverage, 1.0f - coverage, 0.15f);
+		} else if (debug_view > 2.5f) {
+			float age_fraction = saturate(age / (float)GI_SURFEL_TTL_FRAMES);
+			debug_color = float3(age_fraction, 1.0f - age_fraction, 0.1f);
+		}
+		gi_surfel_gather_output[pixel] = float4(debug_color, ownership_weight);
+	} else {
+		gi_surfel_gather_output[pixel] = float4(contribution, ownership_weight);
+	}
+}
+
+#endif // FENG_GI_SURFEL_GATHER_HLSLINC

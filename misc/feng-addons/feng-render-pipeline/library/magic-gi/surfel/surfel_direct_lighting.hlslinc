@@ -1,0 +1,303 @@
+#ifndef FENG_GI_SURFEL_DIRECT_LIGHTING_HLSLINC
+#define FENG_GI_SURFEL_DIRECT_LIGHTING_HLSLINC
+
+// Include after the surfel frame/random declarations and before the update entry.
+// Expects gi_random, gi_frame.view_to_world, gi_frame.light_sky_parameters.x, and
+// the caller's TLAS visibility helper. Returns signed, un-preexposed E/pi.
+// These resources mirror the native RendererRD LightData SSBOs (224-byte stride).
+#ifndef FENG_GI_SURFEL_LOCAL_LIGHT_BUFFERS_DEFINED
+#define FENG_GI_SURFEL_LOCAL_LIGHT_BUFFERS_DEFINED
+// Native offsets (bytes): position 0, direction 16, color 32, area_width 48,
+// area_height 64, specular 80, atlas_rect 96, shadow_matrix 112, shadow_bias
+// 176, mask 196, volumetric_fog_energy 200, bake_mode 204, projector_rect 208.
+struct FENGGISurfelLightData {
+	float3 position;
+	float inv_radius;
+	float3 direction;
+	float size;
+	float3 color;
+	float attenuation;
+	float3 area_width;
+	float cone_attenuation;
+	float3 area_height;
+	float cone_angle;
+	float specular_amount;
+	float shadow_opacity;
+	float pad[2];
+	float4 atlas_rect;
+	float4x4 shadow_matrix;
+	float shadow_bias;
+	float shadow_normal_bias;
+	float transmittance_bias;
+	float soft_shadow_size;
+	float soft_shadow_scale;
+	uint mask;
+	float volumetric_fog_energy;
+	uint bake_mode;
+	float4 projector_rect;
+};
+ByteAddressBuffer gi_surfel_omni : register(t26, space0);
+ByteAddressBuffer gi_surfel_spot : register(t27, space0);
+ByteAddressBuffer gi_surfel_area : register(t28, space0);
+
+static const uint FENG_GI_SURFEL_LIGHT_STRIDE_BYTES = 224u;
+
+FENGGISurfelLightData surfel_direct_decode_light(uint4 row0, uint4 row1, uint4 row2,
+		uint4 row3, uint4 row4, uint4 row5, uint4 row6, uint4 row7, uint4 row8,
+		uint4 row9, uint4 row10, uint4 row11, uint4 row12, uint4 row13) {
+	FENGGISurfelLightData light;
+	float4 f0 = asfloat(row0);
+	float4 f1 = asfloat(row1);
+	float4 f2 = asfloat(row2);
+	float4 f3 = asfloat(row3);
+	float4 f4 = asfloat(row4);
+	float4 f5 = asfloat(row5);
+	float4 f11 = asfloat(row11);
+	float4 f12 = asfloat(row12);
+	light.position = f0.xyz;
+	light.inv_radius = f0.w;
+	light.direction = f1.xyz;
+	light.size = f1.w;
+	light.color = f2.xyz;
+	light.attenuation = f2.w;
+	light.area_width = f3.xyz;
+	light.cone_attenuation = f3.w;
+	light.area_height = f4.xyz;
+	light.cone_angle = f4.w;
+	light.specular_amount = f5.x;
+	light.shadow_opacity = f5.y;
+	light.pad[0] = f5.z;
+	light.pad[1] = f5.w;
+	light.atlas_rect = asfloat(row6);
+	light.shadow_matrix = transpose(float4x4(asfloat(row7), asfloat(row8),
+			asfloat(row9), asfloat(row10)));
+	light.shadow_bias = f11.x;
+	light.shadow_normal_bias = f11.y;
+	light.transmittance_bias = f11.z;
+	light.soft_shadow_size = f11.w;
+	light.soft_shadow_scale = f12.x;
+	light.mask = row12.y;
+	light.volumetric_fog_energy = f12.z;
+	light.bake_mode = row12.w;
+	light.projector_rect = asfloat(row13);
+	return light;
+}
+
+#define FENG_GI_SURFEL_DEFINE_LIGHT_LOADER(loader_name, buffer_name) \
+FENGGISurfelLightData loader_name(uint index) { \
+	uint byte_offset = index * FENG_GI_SURFEL_LIGHT_STRIDE_BYTES; \
+	return surfel_direct_decode_light( \
+		buffer_name.Load4(byte_offset + 0u), buffer_name.Load4(byte_offset + 16u), \
+		buffer_name.Load4(byte_offset + 32u), buffer_name.Load4(byte_offset + 48u), \
+		buffer_name.Load4(byte_offset + 64u), buffer_name.Load4(byte_offset + 80u), \
+		buffer_name.Load4(byte_offset + 96u), buffer_name.Load4(byte_offset + 112u), \
+		buffer_name.Load4(byte_offset + 128u), buffer_name.Load4(byte_offset + 144u), \
+		buffer_name.Load4(byte_offset + 160u), buffer_name.Load4(byte_offset + 176u), \
+		buffer_name.Load4(byte_offset + 192u), buffer_name.Load4(byte_offset + 208u)); \
+}
+FENG_GI_SURFEL_DEFINE_LIGHT_LOADER(surfel_direct_load_omni_light, gi_surfel_omni)
+FENG_GI_SURFEL_DEFINE_LIGHT_LOADER(surfel_direct_load_spot_light, gi_surfel_spot)
+FENG_GI_SURFEL_DEFINE_LIGHT_LOADER(surfel_direct_load_area_light, gi_surfel_area)
+#undef FENG_GI_SURFEL_DEFINE_LIGHT_LOADER
+#endif
+
+static const float FENG_GI_SURFEL_DIRECT_INV_PI = 0.3183098861837907;
+
+bool surfel_direct_finite_float(float value) {
+	return isfinite(value);
+}
+
+bool surfel_direct_finite_vec3(float3 value) {
+	return all(isfinite(value));
+}
+
+float surfel_direct_range_falloff(float distance_to_light, float inverse_range,
+		float attenuation_power) {
+	float normalized_distance = distance_to_light * inverse_range;
+	normalized_distance *= normalized_distance;
+	normalized_distance *= normalized_distance;
+	float range_falloff = max(1.0 - normalized_distance, 0.0);
+	range_falloff *= range_falloff;
+	return range_falloff * pow(max(distance_to_light, 1e-4), -attenuation_power);
+}
+
+float3 surfel_direct_transform_point(float3 view_position) {
+	return mul(gi_frame.view_to_world, float4(view_position, 1.0)).xyz;
+}
+
+float3 surfel_direct_transform_vector(float3 view_vector) {
+	return mul((float3x3)gi_frame.view_to_world, view_vector);
+}
+
+float surfel_direct_smoothstep(float edge0, float edge1, float value) {
+	float t = saturate((value - edge0) / max(edge1 - edge0, 1e-6));
+	return t * t * (3.0 - 2.0 * t);
+}
+
+float3 surfel_local_incident(float3 world_position, float3 world_normal, uint layer_mask,
+		uint3 light_counts, inout uint seed) {
+	if (!surfel_direct_finite_vec3(world_position) || !surfel_direct_finite_vec3(world_normal)) {
+		return 0.0;
+	}
+	float normal_length_squared = dot(world_normal, world_normal);
+	if (!(normal_length_squared > 1e-12) || !surfel_direct_finite_float(normal_length_squared)) {
+		return 0.0;
+	}
+	float3 normal = world_normal * rsqrt(normal_length_squared);
+	if (light_counts.y > 0xffffffffu - light_counts.x
+			|| light_counts.z > 0xffffffffu - (light_counts.x + light_counts.y)) {
+		return 0.0;
+	}
+	uint total_count = light_counts.x + light_counts.y + light_counts.z;
+	if (total_count == 0u) {
+		return 0.0;
+	}
+	uint selected = min((uint)(gi_random(seed) * (float)total_count), total_count - 1u);
+	uint kind;
+	FENGGISurfelLightData light;
+	if (selected < light_counts.x) {
+		kind = 0u;
+		light = surfel_direct_load_omni_light(selected);
+	} else if (selected - light_counts.x < light_counts.y) {
+		kind = 1u;
+		light = surfel_direct_load_spot_light(selected - light_counts.x);
+	} else {
+		kind = 2u;
+		light = surfel_direct_load_area_light(selected - light_counts.x - light_counts.y);
+	}
+	if ((light.mask & layer_mask) == 0u || !surfel_direct_finite_vec3(light.position)
+			|| !surfel_direct_finite_vec3(light.color) || !surfel_direct_finite_float(light.inv_radius)
+			|| !(light.inv_radius > 0.0) || !surfel_direct_finite_float(light.attenuation)
+			|| !surfel_direct_finite_float(light.shadow_opacity)) {
+		return 0.0;
+	}
+
+	float3 light_center = surfel_direct_transform_point(light.position);
+	if (!surfel_direct_finite_vec3(light_center)) {
+		return 0.0;
+	}
+	float3 light_direction = 0.0;
+	if (kind != 0u) {
+		if (!surfel_direct_finite_vec3(light.direction)) {
+			return 0.0;
+		}
+		light_direction = surfel_direct_transform_vector(light.direction);
+		float direction_length_squared = dot(light_direction, light_direction);
+		if (!surfel_direct_finite_float(direction_length_squared) || !(direction_length_squared > 1e-12)) {
+			return 0.0;
+		}
+		light_direction *= rsqrt(direction_length_squared);
+	}
+
+	float3 source_position = light_center;
+	float source_area = 1.0;
+	float source_cosine = 1.0;
+	float attenuation_power = light.attenuation;
+	float area_front_fade = 1.0;
+	if (kind == 1u) {
+		if (!surfel_direct_finite_float(light.cone_angle)
+				|| !surfel_direct_finite_float(light.cone_attenuation)) {
+			return 0.0;
+		}
+	} else if (kind == 2u) {
+		float3 area_width = surfel_direct_transform_vector(light.area_width);
+		float3 area_height = surfel_direct_transform_vector(light.area_height);
+		if (!surfel_direct_finite_vec3(area_width) || !surfel_direct_finite_vec3(area_height)
+				|| !surfel_direct_finite_float(light.cone_attenuation)
+				|| !(light.cone_attenuation > 0.0)) {
+			return 0.0;
+		}
+		float width_squared = dot(area_width, area_width);
+		float height_squared = dot(area_height, area_height);
+		float3 area_cross = cross(area_width, area_height);
+		source_area = length(area_cross);
+		if (!(width_squared > 1e-10) || !(height_squared > 1e-10)
+				|| !(source_area > 1e-8) || !surfel_direct_finite_float(source_area)) {
+			return 0.0;
+		}
+		float3 width_axis = area_width * rsqrt(width_squared);
+		float3 height_axis = area_height * rsqrt(height_squared);
+		float3 receiver_from_center = world_position - light_center;
+		float width_coord = clamp(dot(receiver_from_center, width_axis), -0.5 * sqrt(width_squared), 0.5 * sqrt(width_squared));
+		float height_coord = clamp(dot(receiver_from_center, height_axis), -0.5 * sqrt(height_squared), 0.5 * sqrt(height_squared));
+		float3 closest_delta = receiver_from_center - width_axis * width_coord - height_axis * height_coord;
+		float closest_distance = length(closest_delta);
+		if (!surfel_direct_finite_float(closest_distance)
+				|| closest_distance * light.cone_attenuation >= 1.0) {
+			return 0.0;
+		}
+		float front = dot(light_direction, receiver_from_center);
+		if (!surfel_direct_finite_float(front) || !(front > 0.0)) {
+			return 0.0;
+		}
+		area_front_fade = surfel_direct_smoothstep(0.0, 0.1, front);
+		source_position += area_width * (gi_random(seed) - 0.5)
+				+ area_height * (gi_random(seed) - 0.5);
+		// The sampled-area geometry below already contributes inverse-square falloff.
+		attenuation_power -= 2.0f;
+	}
+
+	float3 to_source = source_position - world_position;
+	float distance_squared = dot(to_source, to_source);
+	if (!surfel_direct_finite_float(distance_squared) || !(distance_squared > 9e-6)) {
+		return 0.0;
+	}
+	float distance_to_light = sqrt(distance_squared);
+	if (!surfel_direct_finite_float(distance_to_light)) {
+		return 0.0;
+	}
+	float3 direction_to_light = to_source / distance_to_light;
+	float receiver_cosine = max(dot(normal, direction_to_light), 0.0);
+	if (!(receiver_cosine > 0.0)) {
+		return 0.0;
+	}
+	float light_shape = 1.0;
+	if (kind == 1u) {
+		float cone_cosine = light.cone_angle;
+		float cone_exponent = light.cone_attenuation;
+		if (!(cone_cosine >= -1.0 && cone_cosine < 1.0)
+				|| !surfel_direct_finite_float(cone_exponent) || !(cone_exponent > 0.0)) {
+			return 0.0;
+		}
+		float cos_to_receiver = dot(-direction_to_light, light_direction);
+		float rim = max(0.0001, saturate((1.0 - max(cos_to_receiver, cone_cosine))
+				/ max(1.0 - cone_cosine, 1e-6)));
+		light_shape = max(1.0 - pow(rim, cone_exponent), 0.0);
+		if (!(light_shape > 0.0)) {
+			return 0.0;
+		}
+	} else if (kind == 2u) {
+		source_cosine = max(dot(light_direction, -direction_to_light), 0.0);
+		if (!(source_cosine > 0.0)) {
+			return 0.0;
+		}
+	}
+
+	float exposure_normalization = gi_frame.light_sky_parameters.x;
+	if (!(exposure_normalization > 0.0) || !surfel_direct_finite_float(exposure_normalization)) {
+		return 0.0;
+	}
+	float range_falloff = surfel_direct_range_falloff(distance_to_light,
+			light.inv_radius, attenuation_power);
+	if (!surfel_direct_finite_float(range_falloff) || !(range_falloff > 0.0)) {
+		return 0.0;
+	}
+	float geometric_factor = receiver_cosine * FENG_GI_SURFEL_DIRECT_INV_PI;
+	if (kind == 2u) {
+		geometric_factor *= area_front_fade * source_area * source_cosine / distance_squared;
+	}
+	float shadow_visibility = 1.0;
+	if (surfel_direct_finite_float(light.shadow_opacity) && light.shadow_opacity > 0.001) {
+		float visibility = surfel_shadow_visibility(world_position, normal, direction_to_light,
+				max(distance_to_light - 0.001, 0.0), light.mask);
+		if (!surfel_direct_finite_float(visibility)) {
+			return 0.0;
+		}
+		shadow_visibility = lerp(1.0, saturate(visibility), saturate(light.shadow_opacity));
+	}
+	float3 incident_over_pi = light.color / exposure_normalization
+			* (range_falloff * light_shape * geometric_factor * shadow_visibility * (float)total_count);
+	return surfel_direct_finite_vec3(incident_over_pi) ? incident_over_pi : 0.0;
+}
+
+#endif // FENG_GI_SURFEL_DIRECT_LIGHTING_HLSLINC

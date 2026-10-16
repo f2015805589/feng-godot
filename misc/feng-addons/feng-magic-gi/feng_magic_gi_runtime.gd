@@ -106,12 +106,17 @@ static func publish(volume: FMagicGIVolume) -> void:
 		register(volume)
 		var id := volume.get_instance_id()
 		var state: RuntimeState = _registry.get(id)
-		var data := volume.bake_data
 		var data_key := ""
-		if volume.bake_manifest != null and is_instance_valid(volume.bake_manifest):
+		if volume.is_surfel_mode():
+			var settings: Dictionary = volume.surfel_settings.to_runtime_settings() \
+					if volume.surfel_settings != null else {}
+			var version := hash([volume.global_transform, volume.size, settings])
+			data_key = "surfel:%d:%d" % [id, version]
+		elif volume.bake_manifest != null and is_instance_valid(volume.bake_manifest):
 			data_key = "stream:%s:%s" % [volume.bake_manifest.manifest_key,
 				volume.bake_manifest.generation]
-		elif data != null:
+		elif volume.bake_data != null:
+			var data = volume.bake_data
 			data_key = "%d:%d:%d" % [data.get_instance_id(), data.bake_version,
 				volume.data_revision()]
 		if state.data_key != data_key:
@@ -157,7 +162,8 @@ static func snapshots() -> Array[Dictionary]:
 ## is disabled or not selected for rendering. Published values are reused for
 ## the selected volume; other volumes read from the same cached producers.
 static func preview_snapshot(volume: FMagicGIVolume) -> Dictionary:
-	if volume == null or not is_instance_valid(volume) or not volume.is_inside_tree():
+	if volume == null or not is_instance_valid(volume) or not volume.is_inside_tree() \
+			or volume.is_surfel_mode():
 		return {}
 	var id := volume.get_instance_id()
 	var state: RuntimeState = _registry.get(id)
@@ -187,7 +193,7 @@ static func preview_snapshot(volume: FMagicGIVolume) -> Dictionary:
 		var lighting_revision := state.lighting.revision if state != null else 0
 		var layout_key := "%s:%s:%d" % [manifest.manifest_key,
 			manifest.generation, page_layout_revision]
-		var revision_values: Array = [id, manifest.manifest_key, manifest.generation,
+		var revision_values: Array = [id, int(volume.gi_mode), manifest.manifest_key, manifest.generation,
 			data_valid, current_available, streamer_revision, lighting_revision,
 			volume.gi_strength, volume.preview_revision(), streaming_status.get("active_pages", 0),
 			streaming_status.get("resident_pages", 0), streaming_status.get("loading_pages", 0),
@@ -255,7 +261,7 @@ static func preview_snapshot(volume: FMagicGIVolume) -> Dictionary:
 		current_available = lighting.size() == 27 and sky_lighting.size() == 27
 	var lighting_revision := state.lighting.revision if state != null else 0
 	var emission_revision := state.emission.revision if state != null else 0
-	var revision_values: Array = [id, data.get_instance_id() if data != null else 0,
+	var revision_values: Array = [id, int(volume.gi_mode), data.get_instance_id() if data != null else 0,
 			data.bake_version if data != null else 0, volume.data_revision(),
 			data_valid, layout_matches,
 			volume.probe_layout_revision(), volume.preview_revision(),
@@ -348,7 +354,7 @@ static func _published_snapshot_for_volume(volume_id: int) -> Dictionary:
 	return {}
 
 static func emission_warning(volume: FMagicGIVolume) -> String:
-	if volume == null or not is_instance_valid(volume):
+	if volume == null or not is_instance_valid(volume) or volume.is_surfel_mode():
 		return ""
 	var state: RuntimeState = _registry.get(volume.get_instance_id())
 	if state == null:
@@ -378,7 +384,8 @@ static func streaming_status(volume: FMagicGIVolume) -> Dictionary:
 ## viewport. This explicit, throttled path keeps configuration warnings useful
 ## without making the warning getter mutate emission state.
 static func refresh_emission_diagnostics(volume: FMagicGIVolume) -> void:
-	if volume == null or not is_instance_valid(volume) or not volume.is_inside_tree():
+	if volume == null or not is_instance_valid(volume) or not volume.is_inside_tree() \
+			or volume.is_surfel_mode():
 		return
 	var state: RuntimeState = _registry.get(volume.get_instance_id())
 	if state == null:
@@ -440,7 +447,7 @@ static func _publish() -> void:
 			continue
 		if not volume.enabled:
 			continue
-		if not volume.has_usable_bake():
+		if not volume.is_surfel_mode() and not volume.has_usable_bake():
 			state.emission.warning = ""
 			continue
 		var world := volume.get_world_3d()
@@ -466,18 +473,28 @@ static func _publish() -> void:
 		if state == null:
 			continue
 		var volume := state.get_volume()
-		if volume == null or volume.bake_manifest == null:
+		if volume == null or volume.is_surfel_mode() or volume.bake_manifest == null:
 			continue
 		state.streamer.request_view(int(request.target_id), int(request.view_id),
 				request.camera, request.bounds, now)
 	for id in _registry.keys():
 		var state: RuntimeState = _registry[id]
 		var volume := state.get_volume()
-		if volume == null or not selected_state_ids.has(state.get_instance_id()) \
-				or volume.bake_manifest == null:
+		if volume == null:
+			state.streamer.deactivate()
+			state.streamer.drain_completed()
+			continue
+		if volume.is_surfel_mode():
+			if not state.surfel_streamer_stopped or state.streamer.inflight_count() > 0:
+				state.streamer.deactivate()
+				state.streamer.drain_completed()
+			state.surfel_streamer_stopped = true
+		elif not selected_state_ids.has(state.get_instance_id()) or volume.bake_manifest == null:
+			state.surfel_streamer_stopped = false
 			state.streamer.deactivate()
 			state.streamer.drain_completed()
 		elif volume.is_inside_tree() and volume.enabled:
+			state.surfel_streamer_stopped = false
 			state.streamer.refresh(volume, now)
 	_drain_retired_streamers()
 	var result: Array[Dictionary] = []
@@ -487,6 +504,32 @@ static func _publish() -> void:
 		var id := volume.get_instance_id()
 		var world := volume.get_world_3d()
 		if world == null:
+			continue
+		if volume.is_surfel_mode():
+			var surfel_settings: Dictionary = volume.surfel_settings.to_runtime_settings() \
+					if volume.surfel_settings != null else {}
+			# version tracks every setting for snapshot publication. layout_version
+			# alone keys GPU allocation and temporal-light history.
+			var surfel_version := hash([volume.global_transform, volume.size, surfel_settings])
+			var surfel_layout_version := hash([volume.global_transform, volume.size,
+				surfel_settings.get("surfel_radius", 0.15),
+				surfel_settings.get("max_surfels", 65536)])
+			result.append({
+				"mode": int(volume.gi_mode),
+				"surfel": true,
+				"surfel_settings": surfel_settings,
+				"data": null,
+				"version": surfel_version,
+				"layout_version": surfel_layout_version,
+				"cache_key": "surfel:%d" % id,
+				"strength": volume.gi_strength,
+				"replacement_enabled": true,
+				"world_id": world.get_instance_id(),
+				"volume_id": id,
+				"owner_transform": volume.global_transform,
+				"owner_size": volume.size,
+				"render_targets": _render_targets(world),
+			})
 			continue
 		var data := volume.bake_data
 		var lighting_sets: Dictionary = state.lighting.coefficient_sets(volume)
@@ -498,6 +541,7 @@ static func _publish() -> void:
 			var pending_pages := state.streamer.pending_pages()
 			var cache_key := "%d:stream:%s:%s" % [id, manifest.manifest_key, manifest.generation]
 			result.append({
+				"mode": int(volume.gi_mode),
 				"streamed": true,
 				"manifest": manifest,
 				"manifest_key": manifest.manifest_key,
@@ -551,6 +595,7 @@ static func _publish() -> void:
 			_emission_revision_sequence += 1
 			state.emission.revision = _emission_revision_sequence
 		result.append({
+			"mode": int(volume.gi_mode),
 			"data": data,
 			"version": data_token,
 			"cache_key": cache_key,

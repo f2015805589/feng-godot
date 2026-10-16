@@ -1,6 +1,10 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 
+#ifndef FENG_GI_SURFEL_CACHE
+#define FENG_GI_SURFEL_CACHE 0
+#endif
+
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
@@ -35,6 +39,7 @@ layout(location = 0) rayPayloadInEXT GIPathPayload gi_payload;
 hitAttributeEXT vec2 gi_barycentrics;
 
 const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
+const uint GI_RAY_MODE_SURFEL_LOCAL_VISIBILITY = 65u;
 const uint GI_MATERIAL_TWO_SIDED = 2u;
 const uint GI_DIRECTIONAL_CAPACITY = 8u;
 const uint GI_MATERIAL_WORD_STRIDE = 20u;
@@ -46,6 +51,19 @@ void main() {
 		terminateRayEXT;
 		return;
 	}
+	#if FENG_GI_SURFEL_CACHE
+	if (gi_payload.flags == GI_RAY_MODE_SURFEL_LOCAL_VISIBILITY) {
+		uint light_mask = floatBitsToUint(gi_payload.ray_pdf);
+		uint full_layer_mask = gi_surfaces.words[gl_InstanceCustomIndexEXT * 8u + 5u];
+		if ((full_layer_mask & light_mask) == 0u) {
+			ignoreIntersectionEXT;
+			return;
+		}
+		gi_payload.radiance = vec3(0.0);
+		terminateRayEXT;
+		return;
+	}
+	#endif
 
 	if (gi_payload.flags == GI_RAY_MODE_SUN_VISIBILITY) {
 		uint sun_index = gi_frame.data.sun_view_generation_sky_array.x;

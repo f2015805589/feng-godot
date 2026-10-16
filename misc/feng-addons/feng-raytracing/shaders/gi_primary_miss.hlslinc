@@ -1,6 +1,9 @@
 #ifndef FENG_GI_SKY_ARRAY
 #define FENG_GI_SKY_ARRAY 0
 #endif
+#ifndef FENG_GI_SURFEL_CACHE
+#define FENG_GI_SURFEL_CACHE 0
+#endif
 
 #if FENG_GI_SKY_ARRAY
 Texture2DArray<float4> gi_sky_radiance : register(t6, space0);
@@ -66,6 +69,14 @@ float3 gi_sample_sky(float3 world_direction) {
 [shader("miss")]
 void FengGIPrimaryMiss(inout GIPathPayload payload) {
 	uint path_mode = payload.flags;
+	#if FENG_GI_SURFEL_CACHE
+	if (path_mode == 32u) {
+		payload.radiance = 0.0f;
+		payload.flags = 0u;
+		payload.hit_distance = 0.0f;
+		return;
+	}
+	#endif
 	payload.radiance = gi_sample_sky(WorldRayDirection());
 	payload.flags = path_mode == GI_RAY_MODE_REFLECTION ? GI_RAY_MODE_MISS : 0u;
 	payload.hit_distance = path_mode == GI_RAY_MODE_REFLECTION

@@ -13,6 +13,8 @@ const PageStream = preload("magic_gi_page_stream.gd")
 const PageResidency = preload("magic_gi_page_residency.gd")
 const PageUpload = preload("magic_gi_page_upload.gd")
 const ProbeClusters = preload("magic_gi_probe_clusters.gd")
+const SurfelGPU = preload("magic_gi_surfel_gpu.gd")
+const RTGI_RUNTIME_PATH := "res://addons/feng-raytracing/scene/feng_rt_gi_runtime.gd"
 const MAGIC_GI_OUTPUT: StringName = &"magic_gi"
 const IndirectGISelection = preload("../pipeline/indirect_gi_selection.gd")
 const UBO_BINDING := 9
@@ -86,11 +88,22 @@ var _probe_cluster_payload_cache_bytes := 0
 var _probe_cluster_payload_cache_clock := 0
 var _probe_cluster_debug_frame := -1
 var _probe_cluster_debug_bound_keys: Dictionary = {}
+var _surfel_gpu: RefCounted
+var _frame_surfel_inputs: Array[Dictionary] = []
+var _frame_rtgi_snapshot: Dictionary = {}
+var _surfel_runtime_start_queued := false
+var _surfel_request_prepared := false
+var _surfel_replacement_requested := false
+var _surfel_warnings: Dictionary = {}
+var _rtgi_runtime_script: Script
+var _rtgi_runtime_script_checked := false
 
 func get_indirect_gi_kind() -> StringName:
 	return IndirectGISelection.KIND_MAGIC
 
 func _frp_execute(ctx: FRPPassContext) -> void:
+	_frame_surfel_inputs.clear()
+	_frame_rtgi_snapshot.clear()
 	_frame_diffuse_ao_texture = RID()
 	var rd := RenderingServer.get_rendering_device()
 	if rd != null and not _diffuse_ao_view_cache.is_empty():
@@ -101,6 +114,8 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 		# backend is unsupported this frame. Leave native SkyDiffuse untouched and
 		# clear this pass's old sidecar so no later consumer can reuse stale GI.
 		_replacement_request_prepared = false
+		_surfel_request_prepared = false
+		_surfel_replacement_requested = false
 		_frame_replacement_enabled = false
 		_clear_magic_gi_output(ctx)
 		return
@@ -108,12 +123,28 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_frame_replacement_enabled = false
 	_pre_exposure = ctx.get_pre_exposure(0) if ctx != null else 1.0
 	_scene_exposure_normalization = _get_scene_exposure_normalization(ctx)
+	if ctx != null:
+		var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
+		if buffers != null and bool(_snapshot_for_target(buffers).get("surfel", false)):
+			for view in buffers.get_view_count():
+				_frame_surfel_inputs.append(ctx.get_volume_frame_inputs(view))
+			var target: RID = buffers.get_render_target()
+			if target.is_valid():
+				var rtgi_runtime := _get_rtgi_runtime_script()
+				if rtgi_runtime != null and rtgi_runtime.has_method("snapshot_for_target"):
+					var rtgi_value: Variant = rtgi_runtime.call("snapshot_for_target", target)
+					if rtgi_value is Dictionary:
+						_frame_rtgi_snapshot = rtgi_value
 	super._frp_execute(ctx)
 	_pre_exposure = 1.0
 	_scene_exposure_normalization = 1.0
 	_replacement_request_prepared = false
 	_frame_replacement_enabled = false
 	_frame_diffuse_ao_texture = RID()
+	_frame_surfel_inputs.clear()
+	_frame_rtgi_snapshot.clear()
+	_surfel_request_prepared = false
+	_surfel_replacement_requested = false
 
 func _get_scene_exposure_normalization(ctx: FRPPassContext) -> float:
 	if ctx == null:
@@ -127,11 +158,46 @@ func _get_scene_exposure_normalization(ctx: FRPPassContext) -> float:
 ## the exact SkyLight diffuse attachment only when a current bake can replace it.
 func _frp_prepare(ctx: FRPPassContext) -> void:
 	_replacement_request_prepared = false
+	_surfel_request_prepared = false
+	_surfel_replacement_requested = false
 	if ctx == null or not IndirectGISelection.is_owner(ctx, String(get_parameter_key()),
 			IndirectGISelection.KIND_MAGIC, true):
 		return
 	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
 	var snapshot := _snapshot_for_target(buffers)
+	if bool(snapshot.get("surfel", false)):
+		var owner_size: Variant = snapshot.get("owner_size", Vector3.ZERO)
+		if str(snapshot.get("cache_key", "")).is_empty() \
+				or not snapshot.get("owner_transform", Transform3D.IDENTITY) is Transform3D \
+				or not owner_size is Vector3 or owner_size.x <= 0.0 or owner_size.y <= 0.0 or owner_size.z <= 0.0:
+			_warn_surfel_once("configuration", "Surfel GI volume configuration is incomplete; leaving native Sky diffuse unchanged.")
+			return
+		var target: RID = buffers.get_render_target() if buffers != null else RID()
+		var runtime := _get_rtgi_runtime_script()
+		if runtime == null:
+			_warn_surfel_once("runtime", "Surfel GI requires the optional feng-raytracing addon; leaving native Sky diffuse unchanged.")
+			return
+		var device := RenderingServer.get_rendering_device()
+		if not target.is_valid() or device == null or not device.has_feature(
+				RenderingDevice.SUPPORTS_RAYTRACING_PIPELINE):
+			_warn_surfel_once("backend", "Surfel GI requires a RenderingDevice with ray-tracing pipeline support; leaving native Sky diffuse unchanged.")
+			return
+		_queue_surfel_runtime_start()
+		runtime.call("request_target", target)
+		var resolved_surfel: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
+		var pass_strength := float(resolved_surfel.x) if resolved_surfel is Vector4 else float(parameters.x)
+		var geometry_value: Variant = runtime.call("snapshot_for_target", target) \
+				if runtime.has_method("snapshot_for_target") else {}
+		var geometry_ready: bool = geometry_value is Dictionary \
+				and bool(geometry_value.get("valid", false)) \
+				and int(geometry_value.get("world_id", 0)) == int(snapshot.get("world_id", 0)) \
+				and geometry_value.get("instances", []) is Array \
+				and not geometry_value.get("instances", []).is_empty()
+		_surfel_replacement_requested = geometry_ready and _replacement_requested(snapshot, pass_strength)
+		if _surfel_replacement_requested:
+			ctx.request_sky_light_diffuse()
+		_surfel_request_prepared = true
+		return
 	if bool(snapshot.get("streamed", false)):
 		_request_streaming_views(ctx, buffers)
 	var resolved: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
@@ -177,6 +243,36 @@ func _replacement_requested(snapshot: Dictionary, pass_strength := 1.0) -> bool:
 	return bool(snapshot.get("replacement_enabled", false)) \
 		and float(snapshot.get("strength", 1.0)) * pass_strength > 0.0
 
+func _get_rtgi_runtime_script() -> Script:
+	if not _rtgi_runtime_script_checked:
+		_rtgi_runtime_script_checked = true
+		if ResourceLoader.exists(RTGI_RUNTIME_PATH):
+			var loaded: Variant = load(RTGI_RUNTIME_PATH)
+			if loaded is Script:
+				_rtgi_runtime_script = loaded
+	return _rtgi_runtime_script
+
+func _queue_surfel_runtime_start() -> void:
+	if _surfel_runtime_start_queued:
+		return
+	var runtime := _get_rtgi_runtime_script()
+	if runtime == null:
+		return
+	_surfel_runtime_start_queued = true
+	_start_surfel_runtime.call_deferred()
+
+func _start_surfel_runtime() -> void:
+	_surfel_runtime_start_queued = false
+	var runtime := _get_rtgi_runtime_script()
+	if runtime != null and runtime.has_method("start"):
+		runtime.call("start")
+
+func _warn_surfel_once(key: String, message: String) -> void:
+	if _surfel_warnings.has(key):
+		return
+	_surfel_warnings[key] = true
+	push_warning(message)
+
 func _warn_missing_replacement_bridge() -> void:
 	if _replacement_bridge_warning_shown:
 		return
@@ -191,6 +287,7 @@ func _parameter_bytes() -> PackedByteArray:
 func _init() -> void:
 	inputs = _make_inputs()
 	outputs = _make_outputs()
+	_surfel_gpu = SurfelGPU.new()
 	_sky_diffuse_input = TextureInput.new()
 	_sky_diffuse_input.binding = 12
 	_sky_diffuse_input.source = TextureInput.Source.CUSTOM
@@ -299,6 +396,66 @@ func _make_outputs() -> Array[OutputDeclaration]:
 	output.usage = OutputDeclaration.Usage.SAMPLED | OutputDeclaration.Usage.STORAGE | OutputDeclaration.Usage.COPY_TO
 	return [output]
 
+func _render_surfel(buffers: RenderSceneBuffersRD, view: int, device: RenderingDevice) -> void:
+	var output: RID = inputs[5].get_texture(buffers, view) if inputs.size() > 5 else RID()
+	if not output.is_valid():
+		_warn_surfel_once("output", "Surfel GI could not acquire its output attachment.")
+		return
+	var sky_diffuse: RID = _sky_diffuse_input.get_texture(buffers, view)
+	var diffuse_replacement_requested: bool = _surfel_request_prepared and _surfel_replacement_requested
+	_frame_replacement_enabled = diffuse_replacement_requested and sky_diffuse.is_valid()
+	if diffuse_replacement_requested and not sky_diffuse.is_valid():
+		_warn_missing_replacement_bridge()
+	var geometry := _frame_rtgi_snapshot.duplicate(false)
+	var geometry_instances: Variant = geometry.get("instances", [])
+	var volume_world_id := int(_frame_snapshot.get("world_id", 0))
+	var geometry_ready: bool = bool(geometry.get("valid", false)) \
+			and int(geometry.get("world_id", 0)) == volume_world_id \
+			and geometry_instances is Array and not geometry_instances.is_empty()
+	if not geometry_ready:
+		# The RTGI scene snapshot is published asynchronously. During its initial
+		# warmup there is no Surfel contribution yet; keep the output neutral and
+		# leave native Sky diffuse in charge without reporting a missing bridge.
+		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		return
+	if _frame_surfel_inputs.size() <= view:
+		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		_warn_surfel_once("frame-input", "Surfel GI frame inputs are unavailable for this view.")
+		return
+	var frame: Dictionary = _frame_surfel_inputs[view]
+	var color: RID = inputs[0].get_texture(buffers, view)
+	var depth: RID = inputs[1].get_texture(buffers, view)
+	var normal: RID = inputs[2].get_texture(buffers, view)
+	var albedo: RID = inputs[3].get_texture(buffers, view)
+	var orm: RID = inputs[4].get_texture(buffers, view)
+	var snapshot := geometry.duplicate(false)
+	snapshot.merge(_frame_snapshot, true)
+	snapshot["valid"] = geometry_ready
+	if not bool(frame.get("valid", false)) or int(frame.get("abi_version", 0)) != 1:
+		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		_warn_surfel_once("frame-contract", "Surfel GI received an invalid FRP frame-input packet.")
+		return
+	var frame_token := int(frame.get("frame_generation", Engine.get_frames_drawn()))
+	var current_revision: int = -1
+	if _surfel_gpu != null:
+		current_revision = int(_surfel_gpu.call("get_resource_revision"))
+	var textures: Array[RID] = [depth, normal, albedo, orm]
+	var pass_strength := float(_frame_parameters.x) if _frame_parameters is Vector4 else float(parameters.x)
+	var succeeded: bool = _surfel_gpu != null and bool(_surfel_gpu.call("render", device,
+		snapshot, frame, textures, color, output, sky_diffuse, _frame_diffuse_ao_texture,
+		buffers.get_internal_size(), pass_strength, _frame_replacement_enabled, frame_token))
+	if _surfel_gpu != null and int(_surfel_gpu.call("get_resource_revision")) != current_revision:
+		_sync_owned_rid_snapshot()
+	if not succeeded:
+		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		var reason := str(_surfel_gpu.get("error")) if _surfel_gpu != null else "Surfel helper is unavailable"
+		_warn_surfel_once("render:" + reason, "Surfel GI is inactive: %s" % reason)
+
+func get_surfel_debug_info(cache_key := "", readback_counters := false) -> Dictionary:
+	if _surfel_gpu == null or not _surfel_gpu.has_method("get_debug_info"):
+		return {"available": false}
+	return _surfel_gpu.call("get_debug_info", cache_key, readback_counters)
+
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray(["parameters"])
 
@@ -311,6 +468,9 @@ func refresh_resource_flags() -> void:
 	super.refresh_resource_flags()
 
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
+	if bool(_frame_snapshot.get("surfel", false)):
+		_render_surfel(buffers, view, rd)
+		return
 	var resolved_parameters: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
 	var replacement_eligible := _replacement_requested(_frame_snapshot, resolved_parameters.x)
 	var sky_diffuse: RID = _sky_diffuse_input.get_texture(buffers, view)
@@ -2067,6 +2227,8 @@ func _ensure_zero_sky_diffuse(rd: RenderingDevice) -> RID:
 
 func _current_owned_rids() -> Array[RID]:
 	var rids: Array[RID] = []
+	if _surfel_gpu != null and _surfel_gpu.has_method("get_all_rids"):
+		rids.append_array(_surfel_gpu.call("get_all_rids"))
 	rids.append_array(_raster_pipelines.values())
 	rids.append_array([_compute_pipeline, _shader, _sampler, _ubo])
 	rids.append_array([_relight_pipeline, _relight_shader])
@@ -2105,6 +2267,9 @@ func _take_owned_rids() -> Array[RID]:
 	# shader pass transfers its RIDs. Capture the complete owned-only inventory
 	# and clear our fields first; only append the detached snapshot afterwards.
 	var owned_rids: Array[RID] = super.call("_current_owned_rids")
+	if _surfel_gpu != null and _surfel_gpu.has_method("take_owned_rids"):
+		owned_rids.append_array(_surfel_gpu.call("take_owned_rids"))
+	_surfel_gpu = null
 	_bake_resources.clear()
 	_page_uploads.clear()
 	_page_ready_by_key.clear()

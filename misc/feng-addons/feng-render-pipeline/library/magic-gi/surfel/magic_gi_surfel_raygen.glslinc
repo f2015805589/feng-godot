@@ -1,0 +1,164 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT gi_scene_tlas;
+struct GIPathPayload {
+	vec3 radiance;
+	uint flags;
+	float hit_distance;
+	float ray_pdf;
+};
+layout(location = 0) rayPayloadEXT GIPathPayload gi_payload;
+layout(location = 1) rayPayloadEXT GIPathPayload shadow_payload;
+struct GIFrameData {
+	mat4 inverse_projection;
+	mat4 view_to_world;
+	vec4 size_exposure;
+	vec4 light_sky_parameters;
+	vec4 world_to_sky_columns[3];
+	uvec4 sun_view_generation_sky_array;
+	vec4 trace_parameters;
+	uvec4 generation_history_flags;
+};
+layout(set = 0, binding = 20, std140) uniform GIFrame {
+	GIFrameData data;
+} gi_frame;
+
+// FENG_GI_SURFEL_CACHE_AND_GATHER_INCLUDES
+
+layout(set = 1, binding = 6, std430) buffer FENGGISurfelUpdateQueue {
+	uint indices[];
+} gi_surfel_update_queue;
+layout(set = 1, binding = 7, std430) buffer FENGGISurfelPendingResults {
+	uvec4 values[];
+} gi_surfel_pending_results;
+layout(set = 1, binding = 8, std430) buffer FENGGISurfelProcessedBits {
+	uint values[];
+} gi_surfel_processed_bits;
+
+const float GI_INV_PI = 0.3183098861837907;
+const uint GI_SURFEL_UNKNOWN_INSTANCE = 0xffffffffu;
+
+uint gi_hash(uint value) {
+	value ^= value >> 16u;
+	value *= 0x7feb352du;
+	value ^= value >> 15u;
+	value *= 0x846ca68bu;
+	return value ^ (value >> 16u);
+}
+
+float gi_random(inout uint state) {
+	state = gi_hash(state);
+	return float(state) * (1.0 / 4294967296.0);
+}
+
+vec3 gi_surfel_cosine_direction(vec3 normal, float u, float v) {
+	float radius = sqrt(u);
+	float angle = 6.28318530718 * v;
+	vec3 local_direction = vec3(radius * cos(angle), radius * sin(angle), sqrt(max(0.0, 1.0 - u)));
+	vec3 helper = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tangent = normalize(cross(helper, normal));
+	vec3 bitangent = cross(normal, tangent);
+	return normalize(tangent * local_direction.x + bitangent * local_direction.y + normal * local_direction.z);
+}
+
+void gi_surfel_invalidate(uint index, uint launch_index) {
+	gi_surfel_store_response_next(index, vec4(0.0));
+	gi_surfel_pending_results.values[launch_index].w = 2u;
+}
+
+void main() {
+	if (gi_frame.data.generation_history_flags.z == 1u) {
+		gi_surfel_gather();
+		return;
+	}
+	uint capacity = gi_surfel_config.limits.x;
+	uint active_count = min(capacity, gi_surfel_load_counter(1u));
+	uint update_count = min(gi_surfel_config.limits.z, active_count);
+	uint launch_index = gl_LaunchIDEXT.x;
+	gi_surfel_pending_results.values[launch_index] = uvec4(0u);
+	gi_surfel_update_queue.indices[capacity + launch_index] = 0xffffffffu;
+	if (capacity == 0u || update_count == 0u || launch_index >= update_count) return;
+	uint queued_count = min(gi_surfel_load_counter(3u), update_count);
+	uint index = 0xffffffffu;
+	if (launch_index < queued_count) {
+		uint queued_index = gi_surfel_update_queue.indices[launch_index];
+		if (queued_index < active_count) {
+			uint word = queued_index >> 5u;
+			uint bit = 1u << (queued_index & 31u);
+			if ((atomicOr(gi_surfel_processed_bits.values[word], bit) & bit) == 0u) index = queued_index;
+		}
+	} else {
+		uint start = (gi_frame.data.generation_history_flags.x + launch_index - queued_count) % active_count;
+		for (uint offset = 0u; offset < active_count; offset++) {
+			uint candidate = (start + offset) % active_count;
+			uint word = candidate >> 5u;
+			uint bit = 1u << (candidate & 31u);
+			if ((atomicOr(gi_surfel_processed_bits.values[word], bit) & bit) == 0u) {
+				index = candidate;
+				break;
+			}
+		}
+	}
+	gi_surfel_update_queue.indices[capacity + launch_index] = index;
+	if (index >= active_count) return;
+	FENGGISurfelRecord record = gi_surfel_load_record(index);
+	if (record.normal_valid.w < 0.5) return;
+	uint frame_token = gi_surfel_config.limits.w;
+	uint age = frame_token - uint(record.cell_last_seen.w);
+	if (age > GI_SURFEL_TTL_FRAMES) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
+	vec3 normal = normalize(record.normal_valid.xyz);
+	float radius = max(record.position_radius.w, 0.001);
+	gi_payload.radiance = vec3(0.0);
+	gi_payload.flags = GI_RAY_MODE_SURFEL_VALIDATE;
+	gi_payload.hit_distance = 0.0;
+	gi_payload.ray_pdf = 0.0;
+	float validate_limit = max(radius * 0.25, 0.01);
+	traceRayEXT(gi_scene_tlas, gl_RayFlagsNoneEXT, 0x01u, 0u, 0u, 0u,
+		record.position_radius.xyz + normal * 0.002, 0.0005, -normal, validate_limit, 0);
+	if (gi_payload.flags != GI_RAY_MODE_SURFEL_VALIDATE || !(gi_payload.hit_distance > 0.0)) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
+	uint hit_instance = floatBitsToUint(gi_payload.radiance.x);
+	uint hit_primitive = floatBitsToUint(gi_payload.radiance.y);
+	uint hit_layer_mask = floatBitsToUint(gi_payload.radiance.z);
+	if (record.surface.z != GI_SURFEL_UNKNOWN_INSTANCE
+			&& (record.surface.z != hit_instance || record.surface.w != hit_primitive)) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
+	uint ray_count = uint(clamp(round(gi_frame.data.trace_parameters.z), 1.0, 32.0));
+	uint seed = gi_hash(index * 0x9e3779b9u ^ frame_token * 0x85ebca6bu
+			^ gi_frame.data.generation_history_flags.x);
+	float rotation_u = gi_random(seed);
+	float rotation_v = gi_random(seed);
+	vec3 incident_over_pi = vec3(0.0);
+	float max_distance = max(gi_surfel_config.control.x, 0.1);
+	for (uint ray_index = 0u; ray_index < ray_count; ray_index++) {
+		float u = fract((float(ray_index) + 0.5) / float(ray_count) + rotation_u);
+		float v = fract(rotation_v + float(ray_index) * 0.61803398875);
+		vec3 direction = gi_surfel_cosine_direction(normal, u, v);
+		gi_payload.radiance = vec3(0.0);
+		gi_payload.flags = GI_RAY_MODE_SURFEL;
+		gi_payload.hit_distance = 0.0;
+		gi_payload.ray_pdf = max(dot(normal, direction), 0.0) * GI_INV_PI;
+		traceRayEXT(gi_scene_tlas, gl_RayFlagsNoneEXT, 0x01u, 0u, 0u, 0u,
+			record.position_radius.xyz + normal * 0.002, 0.001, direction, max_distance, 0);
+		if (all(not(isnan(gi_payload.radiance))) && all(not(isinf(gi_payload.radiance)))
+					&& all(greaterThanEqual(gi_payload.radiance, vec3(0.0)))) {
+			incident_over_pi += gi_payload.radiance;
+		}
+	}
+	incident_over_pi /= float(max(ray_count, 1u));
+	vec4 old_response = gi_surfel_load_response_previous(index);
+	float history = old_response.w > 0.5 ? clamp(gi_surfel_config.control.y, 0.0, 0.99) : 0.0;
+	vec3 filtered = mix(incident_over_pi, max(old_response.rgb, vec3(0.0)), history);
+	gi_surfel_store_response_next(index, vec4(filtered, 1.0));
+	gi_surfel_pending_results.values[launch_index] = uvec4(hit_instance, hit_primitive,
+			hit_layer_mask, 1u);
+	atomicAdd(gi_surfel_counters.values[2], 1u);
+}

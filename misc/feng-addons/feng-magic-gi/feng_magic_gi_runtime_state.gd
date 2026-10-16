@@ -10,6 +10,7 @@ const PageStreamer = preload("feng_magic_gi_page_streamer.gd")
 var volume_ref: WeakRef
 var published_sequence := 0
 var data_key := ""
+var surfel_streamer_stopped := false
 var lighting := Lighting.new()
 var emission := Emission.new()
 var streamer := PageStreamer.new()

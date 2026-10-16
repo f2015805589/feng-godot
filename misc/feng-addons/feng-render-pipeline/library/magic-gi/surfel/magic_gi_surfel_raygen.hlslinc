@@ -1,0 +1,177 @@
+RaytracingAccelerationStructure gi_scene_tlas : register(t0, space0);
+struct GIPathPayload {
+	float3 radiance;
+	uint flags;
+	float hit_distance;
+	float ray_pdf;
+};
+struct GIFrameData {
+	column_major float4x4 inverse_projection;
+	column_major float4x4 view_to_world;
+	float4 size_exposure;
+	float4 light_sky_parameters;
+	float4 world_to_sky_columns[3];
+	uint4 sun_view_generation_sky_array;
+	float4 trace_parameters;
+	uint4 generation_history_flags;
+};
+ConstantBuffer<GIFrameData> gi_frame : register(b20, space0);
+
+// FENG_GI_SURFEL_CACHE_AND_GATHER_INCLUDES
+
+RWByteAddressBuffer gi_surfel_update_queue : register(u6, space1);
+RWByteAddressBuffer gi_surfel_pending_results : register(u7, space1);
+RWByteAddressBuffer gi_surfel_processed_bits : register(u8, space1);
+
+static const float GI_INV_PI = 0.3183098861837907f;
+static const uint GI_SURFEL_UNKNOWN_INSTANCE = 0xffffffffu;
+
+void gi_surfel_raygen_store_pending_result(uint index, uint4 value) {
+	gi_surfel_pending_results.Store4(index * 16u, value);
+}
+
+void gi_surfel_raygen_store_pending_status(uint index, uint value) {
+	gi_surfel_pending_results.Store(index * 16u + 12u, value);
+}
+
+uint gi_surfel_raygen_load_update_queue(uint index) {
+	return gi_surfel_update_queue.Load(index * 4u);
+}
+
+void gi_surfel_raygen_store_update_queue(uint index, uint value) {
+	gi_surfel_update_queue.Store(index * 4u, value);
+}
+
+uint gi_hash(uint value) {
+	value ^= value >> 16u;
+	value *= 0x7feb352du;
+	value ^= value >> 15u;
+	value *= 0x846ca68bu;
+	return value ^ (value >> 16u);
+}
+float gi_random(inout uint state) {
+	state = gi_hash(state);
+	return float(state) * (1.0f / 4294967296.0f);
+}
+float3 gi_surfel_cosine_direction(float3 normal, float u, float v) {
+	float radius = sqrt(u);
+	float angle = 6.28318530718f * v;
+	float3 local_direction = float3(radius * cos(angle), radius * sin(angle), sqrt(max(0.0f, 1.0f - u)));
+	float3 helper = abs(normal.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
+	float3 tangent = normalize(cross(helper, normal));
+	float3 bitangent = cross(normal, tangent);
+	return normalize(tangent * local_direction.x + bitangent * local_direction.y + normal * local_direction.z);
+}
+
+void gi_surfel_invalidate(uint index, uint launch_index) {
+	gi_surfel_store_response_next(index, 0.0f);
+	gi_surfel_raygen_store_pending_status(launch_index, 2u);
+}
+bool gi_surfel_claim(uint index) {
+	uint previous;
+	uint bit = 1u << (index & 31u);
+	gi_surfel_processed_bits.InterlockedOr((index >> 5u) * 4u, bit, previous);
+	return (previous & bit) == 0u;
+}
+
+[shader("raygeneration")]
+void FengMagicGISurfelRayGen() {
+	if (gi_frame.generation_history_flags.z == 1u) {
+		gi_surfel_gather();
+		return;
+	}
+	uint capacity = gi_surfel_limits.x;
+	uint active_count = min(capacity, gi_surfel_load_counter(1u));
+	uint update_count = min(gi_surfel_limits.z, active_count);
+	uint launch_index = DispatchRaysIndex().x;
+	uint frame_token = gi_surfel_limits.w;
+	gi_surfel_raygen_store_pending_result(launch_index, uint4(0u, 0u, 0u, 0u));
+	gi_surfel_raygen_store_update_queue(capacity + launch_index, 0xffffffffu);
+	if (capacity == 0u || update_count == 0u || launch_index >= update_count) return;
+	uint queued_count = min(gi_surfel_load_counter(3u), update_count);
+	uint index = 0xffffffffu;
+	if (launch_index < queued_count) {
+		uint queued_index = gi_surfel_raygen_load_update_queue(launch_index);
+		if (queued_index < active_count && gi_surfel_claim(queued_index)) {
+			index = queued_index;
+		}
+	} else {
+		uint start = (gi_frame.generation_history_flags.x + launch_index - queued_count) % active_count;
+		for (uint offset = 0u; offset < active_count; offset++) {
+			uint candidate = (start + offset) % active_count;
+			if (gi_surfel_claim(candidate)) {
+				index = candidate;
+				break;
+			}
+		}
+	}
+	gi_surfel_raygen_store_update_queue(capacity + launch_index, index);
+	if (index >= active_count) return;
+	FENGGISurfelRecord record = gi_surfel_load_record(index);
+	if (record.normal_valid.w < 0.5f) return;
+	uint age = frame_token - (uint)record.cell_last_seen.w;
+	if (age > GI_SURFEL_TTL_FRAMES) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
+	float3 normal = normalize(record.normal_valid.xyz);
+	float radius = max(record.position_radius.w, 0.001f);
+	GIPathPayload validation;
+	validation.radiance = 0.0f;
+	validation.flags = GI_RAY_MODE_SURFEL_VALIDATE;
+	validation.hit_distance = 0.0f;
+	validation.ray_pdf = 0.0f;
+	RayDesc validation_ray;
+	validation_ray.Origin = record.position_radius.xyz + normal * 0.002f;
+	validation_ray.TMin = 0.0005f;
+	validation_ray.Direction = -normal;
+	validation_ray.TMax = max(radius * 0.25f, 0.01f);
+	TraceRay(gi_scene_tlas, RAY_FLAG_NONE, 0x01, 0, 0, 0, validation_ray, validation);
+	if (validation.flags != GI_RAY_MODE_SURFEL_VALIDATE || !(validation.hit_distance > 0.0f)) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
+	uint hit_instance = asuint(validation.radiance.x);
+	uint hit_primitive = asuint(validation.radiance.y);
+	uint hit_layer_mask = asuint(validation.radiance.z);
+	if (record.surface.z != GI_SURFEL_UNKNOWN_INSTANCE
+			&& (record.surface.z != hit_instance || record.surface.w != hit_primitive)) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
+	uint ray_count = (uint)clamp(round(gi_frame.trace_parameters.z), 1.0f, 32.0f);
+	uint seed = gi_hash(index * 0x9e3779b9u ^ frame_token * 0x85ebca6bu
+			^ gi_frame.generation_history_flags.x);
+	float rotation_u = gi_random(seed);
+	float rotation_v = gi_random(seed);
+	float3 incident_over_pi = 0.0f;
+	float max_distance = max(gi_surfel_control.x, 0.1f);
+	for (uint ray_index = 0u; ray_index < ray_count; ray_index++) {
+		float u = frac((float(ray_index) + 0.5f) / float(ray_count) + rotation_u);
+		float v = frac(rotation_v + float(ray_index) * 0.61803398875f);
+		float3 direction = gi_surfel_cosine_direction(normal, u, v);
+		GIPathPayload payload;
+		payload.radiance = 0.0f;
+		payload.flags = GI_RAY_MODE_SURFEL;
+		payload.hit_distance = 0.0f;
+		payload.ray_pdf = max(dot(normal, direction), 0.0f) * GI_INV_PI;
+		RayDesc ray;
+		ray.Origin = record.position_radius.xyz + normal * 0.002f;
+		ray.TMin = 0.001f;
+		ray.Direction = direction;
+		ray.TMax = max_distance;
+		TraceRay(gi_scene_tlas, RAY_FLAG_NONE, 0x01, 0, 0, 0, ray, payload);
+		if (all(isfinite(payload.radiance)) && all(payload.radiance >= 0.0f)) {
+			incident_over_pi += payload.radiance;
+		}
+	}
+	incident_over_pi /= (float)max(ray_count, 1u);
+	float4 old_response = gi_surfel_load_response_previous(index);
+	float history = old_response.w > 0.5f ? clamp(gi_surfel_control.y, 0.0f, 0.99f) : 0.0f;
+	float3 filtered = lerp(incident_over_pi, max(old_response.rgb, 0.0f), history);
+	gi_surfel_store_response_next(index, float4(filtered, 1.0f));
+	gi_surfel_raygen_store_pending_result(launch_index, uint4(hit_instance, hit_primitive,
+			hit_layer_mask, 1u));
+	uint previous_count;
+	gi_surfel_counters.InterlockedAdd(8u, 1u, previous_count);
+}
