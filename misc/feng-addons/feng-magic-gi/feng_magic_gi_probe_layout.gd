@@ -2,7 +2,9 @@ extends RefCounted
 ## Shared probe marker sizing and deterministic world-space layout helpers.
 
 const MARKER_RADIUS_CELL_RATIO := 0.12
-const MAX_DOMAINS_PER_WORLD_CELL := 8
+## Version of persisted world-space candidate arbitration and coverage selection.
+const PLACEMENT_LAYOUT_REVISION := 2
+const MAX_DOMAINS_PER_ARBITRATION_CELL := 8
 const CANDIDATES_PER_DOMAIN := 2
 
 static func marker_radius(cell_size: Vector3) -> float:

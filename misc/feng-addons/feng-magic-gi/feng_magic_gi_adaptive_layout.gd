@@ -42,31 +42,68 @@ static func mark_refinement_cells(candidate_cells: Dictionary,
 		if _is_cancelled(cancel_check):
 			result["cancelled"] = true
 			return result
-		var cell_bucket: Dictionary = candidate_cells[world_cell]
-		var domains: Dictionary = cell_bucket["domains"]
-		var sorted_domains: Array[String] = []
-		for domain_key in domains:
-			if sorted_domains.size() % 128 == 0 and _is_cancelled(cancel_check):
+		var coarse_bucket: Dictionary = candidate_cells[world_cell]
+		var arbitration_cells: Dictionary = coarse_bucket.get("arbitration_cells", {})
+		var sorted_arbitration_cells: Array[Vector3i] = []
+		for arbitration_cell_value in arbitration_cells:
+			if sorted_arbitration_cells.size() % 128 == 0 and _is_cancelled(cancel_check):
 				result["cancelled"] = true
 				return result
-			sorted_domains.append(String(domain_key))
-		sorted_domains.sort()
+			sorted_arbitration_cells.append(arbitration_cell_value)
+		sorted_arbitration_cells.sort_custom(func(a: Vector3i, b: Vector3i) -> bool:
+			if a.x != b.x:
+				return a.x < b.x
+			if a.y != b.y:
+				return a.y < b.y
+			return a.z < b.z)
 		if _is_cancelled(cancel_check):
 			result["cancelled"] = true
 			return result
-		for domain_key in sorted_domains:
-			var domain_bucket: Dictionary = domains[domain_key]
-			for candidate in domain_bucket["candidates"]:
-				candidate_work += 1
-				if candidate_work % 128 == 0 and _is_cancelled(cancel_check):
+		for arbitration_cell in sorted_arbitration_cells:
+			var cell_bucket: Dictionary = arbitration_cells[arbitration_cell]
+			var domains: Dictionary = cell_bucket["domains"]
+			var sorted_domains: Array[String] = []
+			for domain_key in domains:
+				if sorted_domains.size() % 128 == 0 and _is_cancelled(cancel_check):
 					result["cancelled"] = true
 					return result
-				var normal: Vector3 = candidate["normal"]
-				var origin: Vector3 = candidate["center"]
-				var tangent := normal.cross(Vector3.UP if absf(normal.y) < 0.99 \
-						else Vector3.RIGHT).normalized()
-				var bitangent := normal.cross(tangent)
-				for direction in [tangent, -tangent, bitangent, -bitangent, normal]:
+				sorted_domains.append(String(domain_key))
+			sorted_domains.sort()
+			if _is_cancelled(cancel_check):
+				result["cancelled"] = true
+				return result
+			for domain_key in sorted_domains:
+				var domain_bucket: Dictionary = domains[domain_key]
+				for candidate in domain_bucket["candidates"]:
+					candidate_work += 1
+					if candidate_work % 128 == 0 and _is_cancelled(cancel_check):
+						result["cancelled"] = true
+						return result
+					var normal: Vector3 = candidate["normal"]
+					var origin: Vector3 = candidate["center"]
+					var tangent := normal.cross(Vector3.UP if absf(normal.y) < 0.99 \
+							else Vector3.RIGHT).normalized()
+					var bitangent := normal.cross(tangent)
+					for direction in [tangent, -tangent, bitangent, -bitangent, normal]:
+						ray_queries += 1
+						if ray_queries % 128 == 0 and _is_cancelled(cancel_check):
+							result["cancelled"] = true
+							return result
+						if ray_queries > MAX_FEATURE_RAY_QUERIES:
+							result["error"] = "Adaptive feature tracing exceeds its bounded query budget."
+							return result
+						var hit: Dictionary = trace_query.call(origin, direction, base_spacing)
+						if hit.is_empty() or normal.dot(hit.normal) >= 0.95:
+							continue
+						if not _add_cell_with_halo(result,
+								ProbeLayout.world_cell(origin, base_spacing)) \
+							or not _add_cell_with_halo(result,
+								ProbeLayout.world_cell(hit.position, base_spacing)):
+							return result
+					# Opposite faces of a thin wall can share one world cell. Every staged
+					# surface domain is queried before refinement, so both sides are marked.
+					var anchor: Vector3 = candidate["surface"]
+					var inside := anchor - normal * minf(0.0001, minimum_spacing * 0.001)
 					ray_queries += 1
 					if ray_queries % 128 == 0 and _is_cancelled(cancel_check):
 						result["cancelled"] = true
@@ -74,32 +111,13 @@ static func mark_refinement_cells(candidate_cells: Dictionary,
 					if ray_queries > MAX_FEATURE_RAY_QUERIES:
 						result["error"] = "Adaptive feature tracing exceeds its bounded query budget."
 						return result
-					var hit: Dictionary = trace_query.call(origin, direction, base_spacing)
-					if hit.is_empty() or normal.dot(hit.normal) >= 0.95:
-						continue
-					if not _add_cell_with_halo(result,
-							ProbeLayout.world_cell(origin, base_spacing)) \
+					var opposite: Dictionary = trace_query.call(inside, -normal, base_spacing * 0.5)
+					if not opposite.is_empty():
+						if not _add_cell_with_halo(result,
+								ProbeLayout.world_cell(anchor, base_spacing)) \
 							or not _add_cell_with_halo(result,
-							ProbeLayout.world_cell(hit.position, base_spacing)):
-						return result
-				# Opposite faces of a thin wall can share one world cell. Every staged
-				# surface domain is queried before refinement, so both sides are marked.
-				var anchor: Vector3 = candidate["surface"]
-				var inside := anchor - normal * minf(0.0001, minimum_spacing * 0.001)
-				ray_queries += 1
-				if ray_queries % 128 == 0 and _is_cancelled(cancel_check):
-					result["cancelled"] = true
-					return result
-				if ray_queries > MAX_FEATURE_RAY_QUERIES:
-					result["error"] = "Adaptive feature tracing exceeds its bounded query budget."
-					return result
-				var opposite: Dictionary = trace_query.call(inside, -normal, base_spacing * 0.5)
-				if not opposite.is_empty():
-					if not _add_cell_with_halo(result,
-							ProbeLayout.world_cell(anchor, base_spacing)) \
-							or not _add_cell_with_halo(result,
-							ProbeLayout.world_cell(opposite.position, base_spacing)):
-						return result
+								ProbeLayout.world_cell(opposite.position, base_spacing)):
+							return result
 	if _is_cancelled(cancel_check):
 		result["cancelled"] = true
 		return result

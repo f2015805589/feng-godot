@@ -6,6 +6,19 @@ const Baker = preload("res://addons/feng-magic-gi/feng_magic_gi_baker.gd")
 const PageContext = preload("res://addons/feng-magic-gi/feng_magic_gi_page_context.gd")
 const Planner = preload("res://addons/feng-magic-gi/feng_magic_gi_page_planner.gd")
 const Manifest = preload("res://addons/feng-magic-gi/feng_magic_gi_manifest.gd")
+const ProbeLayout = preload("res://addons/feng-magic-gi/feng_magic_gi_probe_layout.gd")
+const Visibility = preload("res://addons/feng-magic-gi/feng_magic_gi_visibility.gd")
+
+class CancelDuringSpacingPlacement:
+	extends "res://addons/feng-magic-gi/feng_magic_gi_placement.gd"
+	var exclusion_checks := 0
+
+	func _candidate_records_conflict(a: Dictionary, b: Dictionary) -> bool:
+		exclusion_checks += 1
+		var conflicts: bool = super._candidate_records_conflict(a, b)
+		if exclusion_checks == 1:
+			_request_refresh_cancel()
+		return conflicts
 
 var checks := 0
 var failures := 0
@@ -40,6 +53,7 @@ func run() -> void:
 		quit(1)
 		return
 	_test_large_world_probe_ids()
+	_test_local_layout_arbitration()
 	_test_chunk_rebake_influence_bounds()
 	_test_512m_plane_page_collection()
 	print("MAGIC_GI_STREAMED_LARGE_WORLD checks=", checks, " failures=", failures)
@@ -56,6 +70,158 @@ func _test_large_world_probe_ids() -> void:
 	var second := placement._stable_probe_id(Vector3(-12949.67296, 0.0, 0.0), Vector3.UP)
 	require(first != second,
 			"Large-world surface coordinates must retain distinct 64-bit quantized IDs.")
+
+func _test_local_layout_arbitration() -> void:
+	var contact_cell := Vector3i(-6, 0, -5)
+	var floor_candidate := _layout_candidate(Vector3(-1.375, 0.047502, -1.125),
+			Vector3.UP, "mesh:contact-floor\u001f0\u001f0,20,0\u001f0", true, 1101)
+	var sphere_candidate := _layout_candidate(Vector3(-1.365103, 0.047239, -1.120908),
+			Vector3(0.330, -0.934, 0.136), "mesh:contact-sphere\u001f0\u001f7,-19,3\u001f0", true, 2202)
+	require(ProbeLayout.world_cell(floor_candidate["center"], 0.25) == contact_cell
+			and ProbeLayout.world_cell(sphere_candidate["center"], 0.25) == contact_cell,
+			"the owner/halo fixture must put competing contact surfaces in one arbitration cell")
+	var owner := _placement_with_candidates([floor_candidate, sphere_candidate])
+	var halo_candidates: Array[Dictionary] = [floor_candidate.duplicate(true), sphere_candidate.duplicate(true)]
+	for index in 48:
+		var normal := Vector3(0.04 * float(index % 5), -1.0,
+				0.03 * float(index % 7)).normalized()
+		halo_candidates.append(_layout_candidate(Vector3(4.0 + float(index), 0.2, 0.1),
+				normal, "mesh:contact-sphere\u001f0\u001f%d,-20,%d\u001f%d" % [index, index % 7, index],
+				true, 3000 + index))
+	var halo := _placement_with_candidates(halo_candidates)
+	require(owner._finalize_world_candidates() and halo._finalize_world_candidates(),
+			"both page-local candidate sets must finalize")
+	var owner_contact_ids := _stable_ids_in_cell(owner, contact_cell, 0.25)
+	var halo_contact_ids := _stable_ids_in_cell(halo, contact_cell, 0.25)
+	require(owner_contact_ids.size() == 1 and owner_contact_ids == halo_contact_ids,
+			"extra support-page domains must not change a shared world-cell winner")
+	require(_has_unique_fine_cells(owner, 0.25) and _has_unique_fine_cells(halo, 0.25),
+			"final output must still contain at most one probe per world arbitration cell")
+
+	var close_a := _layout_candidate(Vector3(0.999995, 0.1, 0.1), Vector3.UP,
+			"mesh:spacing-a\u001f0\u001f0,20,0\u001f0", true, 4101)
+	var close_b := _layout_candidate(Vector3(1.000005, 0.1, 0.1), Vector3.UP,
+			"mesh:spacing-b\u001f0\u001f0,20,0\u001f0", true, 4102)
+	var spacing_candidates: Array[Dictionary] = [close_a, close_b]
+	var spacing_forward := _placement_with_candidates(spacing_candidates)
+	var spacing_reverse := _placement_with_candidates([close_b, close_a])
+	require(spacing_forward._finalize_world_candidates()
+			and spacing_reverse._finalize_world_candidates(),
+			"minimum-spacing candidates must finalize in either input order")
+	require(spacing_forward.positions.size() == 1 and spacing_reverse.positions.size() == 1
+			and spacing_forward.stable_probe_ids == spacing_reverse.stable_probe_ids,
+			"symmetric local priority must enforce minimum spacing independent of insertion order")
+	var cancel_a := _layout_candidate(Vector3(0.249, 0.1, 0.1), Vector3.UP,
+			"mesh:cancel-a\u001f0\u001f0,20,0\u001f0", true, 4201)
+	var cancel_b := _layout_candidate(Vector3(0.251, 0.1, 0.1), Vector3.UP,
+			"mesh:cancel-b\u001f0\u001f0,20,0\u001f0", true, 4202)
+	var cancel_layout := CancelDuringSpacingPlacement.new()
+	cancel_layout._adaptive_placement = true
+	cancel_layout._probe_spacing = 1.0
+	cancel_layout._arbitration_spacing = 0.25
+	cancel_layout._valid_candidate_count = 2
+	for candidate in [cancel_a, cancel_b]:
+		cancel_layout._stage_world_candidate(
+				cancel_layout._arbitration_parent_cell(candidate["arbitration_cell"]),
+					String(candidate["domain"]), candidate)
+	cancel_layout._refresh_cancel_token = Placement.RefreshCancellation.new()
+	var cancelled_during_exclusion := not cancel_layout._finalize_world_candidates()
+	require(cancelled_during_exclusion and cancel_layout.exclusion_checks > 0
+			and cancel_layout.positions.is_empty() and cancel_layout.surface_positions.is_empty()
+			and cancel_layout.normals.is_empty(),
+			"cancellation reached local spacing exclusion without publishing partial probes")
+	cancel_layout._clear_staged_candidate_storage()
+
+	var canonical := _layout_candidate(Vector3(2.03, 0.1, 0.1), Vector3.UP,
+			"mesh:canonical\u001f0\u001f0,20,0\u001f0", true, 5101)
+	var same_cell_fallback := _layout_candidate(Vector3(2.20, 0.1, 0.1), Vector3.UP,
+			"mesh:fallback-overlap\u001f0\u001f0,20,0\u001f0", false, 5102)
+	var fallback_only := _layout_candidate(Vector3(3.1, 0.1, 0.1), Vector3.UP,
+			"mesh:fallback-open\u001f0\u001f0,20,0\u001f0", false, 5103)
+	var fallback_layout := _placement_with_candidates(
+			[canonical, same_cell_fallback, fallback_only])
+	require(fallback_layout._finalize_world_candidates()
+			and fallback_layout.stable_probe_ids.has(5101)
+			and not fallback_layout.stable_probe_ids.has(5102)
+			and fallback_layout.stable_probe_ids.has(5103),
+			"fallback must fill open cells while preserving canonical winners")
+
+	var wall_faces := PackedVector3Array([
+		Vector3(0, -1, -1), Vector3(0, 1, -1), Vector3(0, 1, 1),
+		Vector3(0, -1, -1), Vector3(0, 1, 1), Vector3(0, -1, 1)])
+	var wall_bvh := Visibility.build(wall_faces)
+	var left_side := _layout_candidate(Vector3(-0.15, 0.2, 0.0), Vector3.LEFT,
+			"mesh:thin-wall\u001f0\u001f-20,0,0\u001f0", true, 6101)
+	var right_side := _layout_candidate(Vector3(0.15, 0.2, 0.0), Vector3.RIGHT,
+			"mesh:thin-wall\u001f0\u001f20,0,0\u001f0", true, 6102)
+	var wall_layout := _placement_with_candidates([left_side, right_side])
+	require(Visibility.segment_blocked(wall_bvh.nodes, wall_bvh.triangles,
+			left_side["center"], right_side["center"]),
+			"the thin-wall control must still block cross-side visibility")
+	require(wall_layout._finalize_world_candidates()
+			and wall_layout.stable_probe_ids.has(6101)
+			and wall_layout.stable_probe_ids.has(6102),
+			"separated surface candidates on both wall sides must remain distinct")
+
+	var narrow_spacing := Placement.new()
+	narrow_spacing._probe_spacing = 1.0
+	narrow_spacing._arbitration_spacing = 0.1
+	require(not narrow_spacing._world_point_coordinates_are_supported(
+			Vector3(214748300.0, 0.0, 0.0)),
+			"fine-cell coordinates must be range-checked before signed Vector3i conversion")
+	require(Placement.MAX_STAGED_ARBITRATION_CELLS == Placement.MAX_PROBES,
+			"local arbitration must retain the existing global staged-cell hard limit")
+
+func _placement_with_candidates(candidates: Array[Dictionary]) -> Placement:
+	var placement := Placement.new()
+	placement._adaptive_placement = true
+	placement._probe_spacing = 1.0
+	placement._arbitration_spacing = 0.25
+	for candidate in candidates:
+		placement._valid_candidate_count += 1
+		placement._stage_world_candidate(
+				placement._arbitration_parent_cell(candidate["arbitration_cell"]),
+				String(candidate["domain"]), candidate)
+	return placement
+
+func _layout_candidate(center: Vector3, normal: Vector3, domain: String,
+		canonical: bool, stable_id: int) -> Dictionary:
+	var probe_spacing := 1.0
+	var arbitration_spacing := 0.25
+	var arbitration_cell := ProbeLayout.world_cell(center, arbitration_spacing)
+	return {
+		"surface": center - normal.normalized() * 0.03,
+		"center": center,
+		"normal": normal.normalized(),
+		"lookup_cell": 0,
+		"domain": domain,
+		"canonical": canonical,
+		"face_index": 0,
+		"world_cell": ProbeLayout.world_cell(center, probe_spacing),
+		"arbitration_cell": arbitration_cell,
+		"stable_id": stable_id,
+		"arbitration_key": "%d,%d,%d" % [arbitration_cell.x, arbitration_cell.y, arbitration_cell.z],
+		"spacing": arbitration_spacing,
+		"score": 0.0,
+	}
+
+func _stable_ids_in_cell(placement: Placement, cell: Vector3i,
+		spacing: float) -> PackedInt64Array:
+	var result := PackedInt64Array()
+	for index in placement.positions.size():
+		if ProbeLayout.world_cell(placement.positions[index], spacing) == cell:
+			result.append(placement.stable_probe_ids[index])
+	return result
+
+func _has_unique_fine_cells(placement: Placement, spacing: float) -> bool:
+	var seen: Dictionary = {}
+	for position in placement.positions:
+		var cell := ProbeLayout.world_cell(position, spacing)
+		var key := "%d,%d,%d" % [cell.x, cell.y, cell.z]
+		if seen.has(key):
+			return false
+		seen[key] = true
+	return true
 
 func _test_chunk_rebake_influence_bounds() -> void:
 	var core := AABB(Vector3.ZERO, Vector3(32.0, 32.0, 32.0))

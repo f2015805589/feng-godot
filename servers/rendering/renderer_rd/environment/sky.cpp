@@ -323,11 +323,47 @@ void SkyRD::_render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineC
 // ReflectionData
 
 void SkyRD::ReflectionData::clear_reflection_data() {
-	layers.clear();
-	radiance_base_octmap = RID();
-	if (downsampled_radiance_octmap.is_valid()) {
-		RD::get_singleton()->free_rid(downsampled_radiance_octmap);
+	RD *rd = RD::get_singleton();
+	auto free_framebuffer = [rd](RID &r_framebuffer) {
+		if (r_framebuffer.is_valid() && rd->framebuffer_is_valid(r_framebuffer)) {
+			rd->free_rid(r_framebuffer);
+		}
+		r_framebuffer = RID();
+	};
+	auto free_texture_view = [rd](RID &r_texture) {
+		if (r_texture.is_valid() && rd->texture_is_valid(r_texture)) {
+			rd->free_rid(r_texture);
+		}
+		r_texture = RID();
+	};
+
+	// Framebuffers depend on the shared views below, so release them first.
+	// The source radiance parent is owned by Sky and may already have freed its
+	// dependent views before this data is cleared.
+	for (Layer &layer : layers) {
+		for (Layer::Mipmap &mipmap : layer.mipmaps) {
+			free_framebuffer(mipmap.framebuffer);
+		}
 	}
+	for (DownsampleLayer::Mipmap &mipmap : downsampled_layer.mipmaps) {
+		free_framebuffer(mipmap.framebuffer);
+	}
+
+	for (Layer &layer : layers) {
+		for (Layer::Mipmap &mipmap : layer.mipmaps) {
+			free_texture_view(mipmap.view);
+		}
+	}
+	for (DownsampleLayer::Mipmap &mipmap : downsampled_layer.mipmaps) {
+		free_texture_view(mipmap.octmap_view);
+		free_texture_view(mipmap.view);
+	}
+	free_texture_view(radiance_base_octmap);
+	if (downsampled_radiance_octmap.is_valid() && rd->texture_is_valid(downsampled_radiance_octmap)) {
+		rd->free_rid(downsampled_radiance_octmap);
+	}
+
+	layers.clear();
 	downsampled_radiance_octmap = RID();
 	downsampled_layer.mipmaps.clear();
 	coefficient_buffer = RID();
@@ -1794,25 +1830,99 @@ void SkyRD::_create_external_radiance_storage(Sky *p_sky, RID &r_radiance, Refle
 	const uint32_t width = p_sky->radiance_size * 2 + padding_pixels * 2;
 	const float border_size = float(padding_pixels) / float(width);
 	const bool use_storage = !copy_effects->get_raster_effects().has_flag(RendererRD::CopyEffects::RASTER_EFFECT_OCTMAP);
+	RD *rd = RD::get_singleton();
+
+	RD::TextureFormat radiance_format;
+	radiance_format.format = texture_format;
+	radiance_format.width = width;
+	radiance_format.height = width;
+	radiance_format.mipmaps = mipmaps;
+	radiance_format.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
+	if (sky_use_octmap_array) {
+		radiance_format.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+		radiance_format.array_layers = layers;
+	} else {
+		radiance_format.array_layers = 1;
+	}
+	if (use_storage) {
+		radiance_format.usage_bits |= RD::TEXTURE_USAGE_STORAGE_BIT;
+	}
+
+	const bool radiance_is_valid = r_radiance.is_valid() && rd->texture_is_valid(r_radiance);
+	if (!radiance_is_valid) {
+		// Clear dependent shared views if their parent was retired elsewhere.
+		r_reflection.clear_reflection_data();
+		r_radiance = RID();
+	} else if (!(rd->texture_get_format(r_radiance) == radiance_format)) {
+		// A valid parent with a changed layout cannot back the existing views.
+		r_reflection.clear_reflection_data();
+		rd->free_rid(r_radiance);
+		r_radiance = RID();
+	}
 
 	if (r_radiance.is_null()) {
-		RD::TextureFormat tf;
-		tf.format = texture_format;
-		tf.width = width;
-		tf.height = width;
-		tf.mipmaps = mipmaps;
-		tf.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
-		if (sky_use_octmap_array) {
-			tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
-			tf.array_layers = layers;
-		} else {
-			tf.array_layers = 1;
+		r_radiance = rd->texture_create(radiance_format, RD::TextureView());
+		rd->set_resource_name(r_radiance, "FengSkyLight External Radiance");
+	}
+
+	RD::TextureFormat downsampled_format;
+	downsampled_format.format = texture_format;
+	downsampled_format.width = width >> 1;
+	downsampled_format.height = width >> 1;
+	downsampled_format.mipmaps = mipmaps - 1;
+	downsampled_format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
+	if (use_storage) {
+		downsampled_format.usage_bits |= RD::TEXTURE_USAGE_STORAGE_BIT;
+	}
+
+	bool reflection_is_reusable = r_reflection.uv_border_size == border_size &&
+			r_reflection.layers.size() == (sky_use_octmap_array ? layers : 1) &&
+			r_reflection.downsampled_layer.mipmaps.size() == downsampled_format.mipmaps &&
+			r_reflection.radiance_base_octmap.is_valid() && rd->texture_is_valid(r_reflection.radiance_base_octmap) &&
+			r_reflection.downsampled_radiance_octmap.is_valid() && rd->texture_is_valid(r_reflection.downsampled_radiance_octmap) &&
+			rd->texture_get_format(r_reflection.downsampled_radiance_octmap) == downsampled_format;
+	if (reflection_is_reusable) {
+		uint32_t layer_width = width;
+		uint32_t layer_height = width;
+		for (const ReflectionData::Layer &layer : r_reflection.layers) {
+			if (layer.mipmaps.size() != mipmaps) {
+				reflection_is_reusable = false;
+				break;
+			}
+			uint32_t mip_width = layer_width;
+			uint32_t mip_height = layer_height;
+			for (const ReflectionData::Layer::Mipmap &mipmap : layer.mipmaps) {
+				if (mipmap.size.width != int32_t(mip_width) || mipmap.size.height != int32_t(mip_height) ||
+						!mipmap.view.is_valid() || !rd->texture_is_valid(mipmap.view) ||
+						!mipmap.framebuffer.is_valid() || !rd->framebuffer_is_valid(mipmap.framebuffer)) {
+					reflection_is_reusable = false;
+					break;
+				}
+				mip_width = MAX(1u, mip_width >> 1);
+				mip_height = MAX(1u, mip_height >> 1);
+			}
+			if (!reflection_is_reusable) {
+				break;
+			}
 		}
-		if (use_storage) {
-			tf.usage_bits |= RD::TEXTURE_USAGE_STORAGE_BIT;
+	}
+	if (reflection_is_reusable) {
+		uint32_t mip_width = width >> 1;
+		uint32_t mip_height = width >> 1;
+		const bool use_raster_effect = !use_storage;
+		for (const ReflectionData::DownsampleLayer::Mipmap &mipmap : r_reflection.downsampled_layer.mipmaps) {
+			if (mipmap.size.width != int32_t(mip_width) || mipmap.size.height != int32_t(mip_height) ||
+					!mipmap.view.is_valid() || !rd->texture_is_valid(mipmap.view) ||
+					(use_raster_effect && (!mipmap.framebuffer.is_valid() || !rd->framebuffer_is_valid(mipmap.framebuffer)))) {
+				reflection_is_reusable = false;
+				break;
+			}
+			mip_width = MAX(1u, mip_width >> 1);
+			mip_height = MAX(1u, mip_height >> 1);
 		}
-		r_radiance = RD::get_singleton()->texture_create(tf, RD::TextureView());
-		RD::get_singleton()->set_resource_name(r_radiance, "FengSkyLight External Radiance");
+	}
+	if (reflection_is_reusable) {
+		return;
 	}
 
 	r_reflection.clear_reflection_data();

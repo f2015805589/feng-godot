@@ -155,6 +155,7 @@ vec3 clv_reject_color(int reason) {
 		case CLV_REJECT_NO_EXACT_SUPPORT: return vec3(0.95, 0.1, 0.65);
 		case CLV_REJECT_NO_EXACT_CANDIDATE: return vec3(0.18, 0.18, 0.18);
 		case CLV_REJECT_OUTSIDE_BAKE_GRID: return vec3(0.1, 0.65, 0.8);
+		case CLV_REJECT_INCOMPLETE_SUPPORT: return vec3(1.0, 0.45, 0.02);
 	}
 	return vec3(0.0);
 }
@@ -170,13 +171,16 @@ vec3 clv_debug_color(int view, int sample_status, int reject_reason,
 	}
 	if (view == CLV_DEBUG_CACHE_VALIDITY) {
 		if (sample_status == CLV_SAMPLE_EXACT) {
-			return clv_reject_color(reject_reason);
+			vec3 reject_color = clv_reject_color(reject_reason);
+			if (reject_reason == CLV_REJECT_INCOMPLETE_SUPPORT) {
+				return mix(reject_color, vec3(1.0, 0.82, 0.03), clamp(coverage, 0.0, 1.0));
+			}
+			return reject_color;
 		}
 		if (sample_status == CLV_SAMPLE_FULL) {
 			return vec3(0.05, 0.9, 0.12);
 		}
-		return mix(vec3(1.0, 0.24, 0.01), vec3(1.0, 0.82, 0.03),
-				clamp(coverage, 0.0, 1.0));
+		return clv_reject_color(reject_reason);
 	}
 	if (view == CLV_DEBUG_CELLS) {
 		if (sample_status == CLV_SAMPLE_EXACT) {
@@ -276,8 +280,8 @@ void main() {
 	int reject_reason = CLV_REJECT_NONE;
 	vec3 cell_fraction = vec3(0.0);
 	int receiver_patch = receiver_triangle >= 0 ? int(visibility_geometry.triangles[receiver_triangle * 3 + 2].w) : 0;
-	// CLV moves its query to an exterior cell from the receiver triangle's geometric plane when needed.
-	// It still checks all eight corner connections; partial radiance is completed from the exact path below.
+	// Cache radiance is used only when every positive-weight corner has valid metadata and clear LOS.
+	// Incomplete support falls through to one exact gather so both paths reconstruct the same field.
 	bool cached_light;
 	if (debug_enabled) {
 		cached_light = sample_clv_diagnostic(world, normal_world, receiver_triangle, receiver_patch,
@@ -294,19 +298,8 @@ void main() {
 				coefficients, candidate_weight, visible_support_weight);
 		secondary_emission = max(coefficients[0].rgb, vec3(0.0));
 		primary_sky = max(coefficients[9].rgb, vec3(0.0));
-	} else if (!complete_support) {
-		vec4 exact_coefficients[18];
-		float exact_candidate_weight = 0.0;
-		float exact_visible_support_weight = 0.0;
-		gather_probe_field(world, normal_world, receiver_triangle, false, clv.control.w > 0,
-				exact_coefficients, exact_candidate_weight, exact_visible_support_weight);
-		vec3 partial_secondary = secondary_emission;
-		vec3 partial_primary = primary_sky;
-		complete_partial_clv(partial_secondary, partial_primary, cache_weight,
-				max(exact_coefficients[0].rgb, vec3(0.0)),
-				max(exact_coefficients[9].rgb, vec3(0.0)), exact_visible_support_weight,
-				secondary_emission, primary_sky);
-		if (debug_enabled && exact_visible_support_weight <= 1e-10) {
+		if (debug_enabled && reject_reason == CLV_REJECT_INCOMPLETE_SUPPORT
+				&& visible_support_weight <= 1e-10) {
 			sample_status = CLV_SAMPLE_EXACT;
 			reject_reason = CLV_REJECT_NO_EXACT_SUPPORT;
 		}

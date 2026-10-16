@@ -12,6 +12,7 @@ const Page = preload("feng_magic_gi_page.gd")
 const PageContext = preload("feng_magic_gi_page_context.gd")
 const PagePlanner = preload("feng_magic_gi_page_planner.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
+const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
 const MAX_BAKE_PATHS := 100000000
 const SAMPLER_REVISION := Data.SAMPLER_REVISION
 const QMC_PRIME_BASES := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59]
@@ -99,6 +100,7 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.material_reflectance = volume.fallback_material_reflectance
 	var geometry_signature: int = geometry.scene_signature
 	data.scene_signature = signature_for_geometry(geometry_signature)
+	data.placement_layout_revision = ProbeLayout.PLACEMENT_LAYOUT_REVISION
 	data.scene_watch_signature = scene_watch_signature
 	data.scene_watch_signature_schema_version = SceneTracker.SIGNATURE_SCHEMA_CURRENT
 	data.positions = geometry.positions
@@ -510,6 +512,7 @@ func _create_streamed_page_data(volume: FMagicGIVolume, geometry: Placement,
 	data.terrain_reflectance = volume.terrain_reflectance
 	data.material_reflectance = volume.fallback_material_reflectance
 	data.scene_signature = Data.signature_for_geometry(hash([geometry.scene_signature, page_key]))
+	data.placement_layout_revision = ProbeLayout.PLACEMENT_LAYOUT_REVISION
 	data.scene_watch_signature_schema_version = SceneTracker.SIGNATURE_SCHEMA_CURRENT
 	data.positions = geometry.positions
 	data.surface_positions = geometry.surface_positions
@@ -581,7 +584,8 @@ func _streamed_settings_signature(volume: FMagicGIVolume) -> int:
 		volume.minimum_probe_spacing, volume.surface_offset, volume.adaptive_placement,
 		volume.bake_samples, volume.bake_bounces, volume.bake_distance,
 		volume.terrain_reflectance, volume.fallback_material_reflectance,
-		volume.management_block_size, volume.core_page_size, volume.clv_cell_size])
+		volume.management_block_size, volume.core_page_size, volume.clv_cell_size,
+		ProbeLayout.PLACEMENT_LAYOUT_REVISION])
 
 func _scene_signature_uncached(volume: FMagicGIVolume) -> int:
 	return SceneTracker.stable_scene_signature(volume)

@@ -957,15 +957,15 @@ func _complete_inflight_capture(now_msec: int) -> void:
 func _poll_external_radiance() -> void:
 	if not _provider_active or _output_sky == null:
 		return
+	var revision := NativeAdapter.external_radiance_revision(_output_sky)
+	if revision >= 0 and _capture_in_flight and revision > _capture_submitted_revision:
+		_complete_inflight_capture(Time.get_ticks_msec())
 	var is_ready := NativeAdapter.external_radiance_ready(_output_sky)
 	if not is_ready:
 		_native_radiance_ready = false
 		return
-	var revision := NativeAdapter.external_radiance_revision(_output_sky)
 	if revision < 0:
 		return
-	if _capture_in_flight and revision > _capture_submitted_revision:
-		_complete_inflight_capture(Time.get_ticks_msec())
 	var exposure := NativeAdapter.external_radiance_exposure(_output_sky)
 	_native_radiance_ready = true
 	_native_radiance_revision = revision

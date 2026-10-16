@@ -7,6 +7,7 @@ const RESOLUTION := 16
 const LEVELS := 3
 const EPOCH := 7
 const PATCH := 7
+const CONTACT_WORLD := Vector3(-1.044751, 0.017502, -0.255381)
 
 var checks := 0
 var failures := 0
@@ -21,6 +22,7 @@ var sampler := RID()
 var input_buffer := RID()
 var output_buffer := RID()
 var origins: Array[Vector3i] = [Vector3i(-1, -1, -1), Vector3i(15, -1, -1), Vector3i(15, -1, -1)]
+var clv_spacing := 1.0
 var coefficient_texture := RID()
 
 func _initialize() -> void:
@@ -58,25 +60,26 @@ func run() -> void:
 			"Every valid interior/seam sample must match the CPU trilinear SH oracle.")
 	_rd_free(good_tags)
 	_run_partial("wrong logical tag", "tag_xyz", Vector3i(15, 2, 3),
-			Vector3i(0, 0, 0), Vector3(0.35, 0.25, 0.6), 0.805)
+			Vector3(0.35, 0.25, 0.6), 0.805)
 	_run_partial("stale epoch", "epoch", Vector3i(15, 2, 3),
-			Vector3i(0, 0, 0), Vector3(0.35, 0.25, 0.6), 0.805)
+			Vector3(0.35, 0.25, 0.6), 0.805)
 	_run_partial("wrong patch", "wrong_patch", Vector3i(15, 2, 3),
-			Vector3i(0, 0, 0), Vector3(0.35, 0.25, 0.6), 0.805)
+			Vector3(0.35, 0.25, 0.6), 0.805)
 	_run_partial("missing support", "invalid_patch", Vector3i(15, 2, 3),
-			Vector3i(0, 0, 0), Vector3(0.35, 0.25, 0.6), 0.805)
+			Vector3(0.35, 0.25, 0.6), 0.805)
 	_run_partial("normal gate", "normal", Vector3i(15, 2, 3),
-			Vector3i(0, 0, 0), Vector3(0.35, 0.25, 0.6), 0.805)
-	_run_partial("zero-weight invalid corner", "tag_xyz", Vector3i(0, 2, 3),
-			Vector3i(1, 0, 0), Vector3(0.0, 0.25, 0.6), 1.0)
+			Vector3(0.35, 0.25, 0.6), 0.805)
+	_run_zero_weight_invalid_metadata()
 	_run_zero_coverage_rejection()
 	_run_black_primary()
-	_run_thin_blocker()
+	_run_contact_invalid_blocker()
+	_run_zero_weight_blocker()
+	_run_valid_weight_blocker()
 	_run_geometric_query_position()
 	_run_clv_disabled_reason()
 	_run_outside_reason()
 	print("MAGIC_GI_CLV_SAMPLING checks=", checks, " failures=", failures,
-			" cases=interior,x,y,z,xyz,level1,level2,geometric_query,negative_world,known_wall gates=partial_tag,epoch,patch,support,normal,zero_weight,thin_wall,exact_support,focus_bounds,diagnostics")
+			" cases=interior,x,y,z,xyz,level1,level2,geometric_query,negative_world,contact_invalid_blocker,zero_weight_blocker,valid_weight_blocker gates=incomplete_exact,zero_weight_metadata,thin_wall,geometry_fallback,focus_bounds,diagnostics")
 	_finish()
 
 func _test_focus_for_bounds() -> void:
@@ -194,22 +197,12 @@ void main() {
 	results.values[index * 9 + 1] = vec4(primary, valid ? 1.0 : 0.0);
 	results.values[index * 9 + 2] = vec4(cache_weight, complete_support ? 1.0 : 0.0,
 			float(selected_level), float(sample_status));
-	vec3 supported_secondary; vec3 supported_primary;
-	complete_partial_clv(secondary, primary, cache_weight,
-			vec3(0.0), vec3(0.0), 1.0, supported_secondary, supported_primary);
-	results.values[index * 9 + 3] = vec4(supported_secondary, float(reject_reason));
-	results.values[index * 9 + 4] = vec4(supported_primary, cell_fraction.x);
-	vec3 unsupported_secondary; vec3 unsupported_primary;
-	complete_partial_clv(secondary, primary, cache_weight,
-			vec3(0.0), vec3(0.0), 0.0, unsupported_secondary, unsupported_primary);
-	results.values[index * 9 + 5] = vec4(unsupported_secondary, cell_fraction.y);
-	results.values[index * 9 + 6] = vec4(unsupported_primary, cell_fraction.z);
-	vec3 blended_secondary; vec3 blended_primary;
-	complete_partial_clv(vec3(2.0, 3.0, 4.0), vec3(5.0, 6.0, 7.0), 0.25,
-			vec3(10.0, 20.0, 30.0), vec3(40.0, 50.0, 60.0), 1.0,
-			blended_secondary, blended_primary);
-	results.values[index * 9 + 7] = vec4(blended_secondary, 0.0);
-	results.values[index * 9 + 8] = vec4(blended_primary, 0.0);
+	results.values[index * 9 + 3] = vec4(0.0, 0.0, 0.0, float(reject_reason));
+	results.values[index * 9 + 4] = vec4(0.0, 0.0, 0.0, cell_fraction.x);
+	results.values[index * 9 + 5] = vec4(0.0, 0.0, 0.0, cell_fraction.y);
+	results.values[index * 9 + 6] = vec4(0.0, 0.0, 0.0, cell_fraction.z);
+	results.values[index * 9 + 7] = vec4(0.0);
+	results.values[index * 9 + 8] = vec4(0.0);
 	if (normal_and_patch.w == -1.0) {
 		vec3 query_position;
 		ivec3 query_base;
@@ -298,59 +291,70 @@ func _run_cases(cases: Array, tag_texture: RID, node_buffer: RID, triangle_buffe
 				or secondary.distance_to(expected_secondary) >= 0.0002 \
 				or primary.distance_to(expected_primary) >= 0.0002:
 			all_match = false
-		if i == 0:
-			check(Vector3(output[output_base + 12], output[output_base + 13], output[output_base + 14])
-					.distance_to(secondary) < 0.00001,
-					"Zero-RGB exact light with positive visible support must retain partial cached SH.")
-			check(Vector3(output[output_base + 16], output[output_base + 17], output[output_base + 18])
-					.distance_to(primary) < 0.00001,
-					"Zero-RGB exact light with positive visible support must retain partial primary SH.")
-			check(Vector3(output[output_base + 20], output[output_base + 21], output[output_base + 22]).length()
-					< 0.00001,
-					"Zero visible exact support must reject partial cached secondary SH even when exact RGB is black.")
-			check(Vector3(output[output_base + 24], output[output_base + 25], output[output_base + 26]).length()
-					< 0.00001,
-					"Zero visible exact support must reject partial cached primary SH even when exact RGB is black.")
-			check(Vector3(output[output_base + 28], output[output_base + 29], output[output_base + 30])
-					.distance_to(Vector3(9.5, 18.0, 26.5)) < 0.00001,
-					"Supported partial cache must add exact SH by the missing coverage weight.")
-			check(Vector3(output[output_base + 32], output[output_base + 33], output[output_base + 34])
-					.distance_to(Vector3(35.0, 43.5, 52.0)) < 0.00001,
-					"Supported partial primary must add exact SH by the missing coverage weight.")
 	if set.is_valid():
 		rd.free_rid(set)
 	return all_match
 
 func _run_partial(label: String, mutation: String, target: Vector3i,
-		invalid_offset: Vector3i, fraction: Vector3, expected_coverage: float) -> void:
+		fraction: Vector3, expected_coverage: float) -> void:
+	var saved_origins := origins
+	var saved_spacing := clv_spacing
+	var saved_texture := coefficient_texture
+	origins = [Vector3i(-8, -8, -8), Vector3i(-8, -8, -8), Vector3i(-8, -8, -8)]
+	check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters(true, 2)) == OK,
+			label + " must expose a valid coarser cache level for the no-mixing check.")
 	var query := _case(label, Vector3i(-1, 2, 3), fraction, 0, PATCH)
 	var tag_texture := _create_tag_texture(mutation, target)
-	var original_coefficients := coefficient_texture
 	coefficient_texture = _create_coefficient_texture(false, mutation, target, true)
 	var output := _run_single_with_values(query, tag_texture, nodes, triangles)
-	var expected_secondary := _expected(query.base, fraction, 0, false, false, invalid_offset)
-	var expected_primary := _expected(query.base, fraction, 0, true, false, invalid_offset)
-	check(output.valid and not output.complete,
-			label + " must publish only its metadata-valid partial CLV support.")
-	check(output.selected_level == 0 and output.sample_status == 2 and output.reject_reason == 0,
-			label + " diagnostics must identify the selected partial level without a reject reason.")
+	check(not output.valid and not output.complete,
+			label + " must reject incomplete CLV support so the caller uses one exact gather.")
+	check(output.selected_level == 0 and output.sample_status == 0 and output.reject_reason == 8,
+			label + " diagnostics must report an exact fallback at the first partial level.")
 	check(output.cell_fraction.distance_to(fraction) < 0.00001,
-			label + " diagnostics must expose the partial stencil fraction.")
+			label + " diagnostics must expose the rejected stencil fraction.")
 	check(absf(output.cache_weight - expected_coverage) < 0.00001,
-			label + " must expose the unnormalized valid trilinear coverage C.")
-	check(output.secondary.distance_to(expected_secondary) < 0.0002,
-			label + " must ignore its bright invalid secondary sentinel and match the partial SH oracle.")
-	check(output.primary.distance_to(expected_primary) < 0.0002,
-			label + " must ignore its bright invalid primary sentinel and match the partial SH oracle.")
-	check(output.supported_secondary.distance_to(expected_secondary) < 0.0002
-				and output.supported_primary.distance_to(expected_primary) < 0.0002,
-			label + " must preserve partial radiance when exact visible support exists but exact RGB is black.")
-	check(output.unsupported_secondary.length() < 0.00001
-				and output.unsupported_primary.length() < 0.00001,
-			label + " must use the exact black result when exact visible support is zero.")
+			label + " diagnostics must report the measured partial coverage.")
+	check(output.secondary.length() < 0.00001 and output.primary.length() < 0.00001,
+			label + " must not read or return radiance from its invalid sentinel corner.")
+	var coarse_tags := _create_tag_texture("invalidate_level0_stencil", Vector3i(15, 2, 3))
+	_rd_free(coefficient_texture)
+	coefficient_texture = _create_coefficient_texture(false)
+	var coarse_output := _run_single_with_values(query, coarse_tags, nodes, triangles)
+	check(coarse_output.valid and coarse_output.complete and coarse_output.selected_level == 1
+				and coarse_output.sample_status == 1
+				and absf(coarse_output.cache_weight - 1.0) < 0.00001,
+			label + " fixture must prove a complete coarser cache exists when level zero is incomplete.")
+	check(not output.valid and output.selected_level == 0,
+			label + " must not silently replace the first partial level with coarser cache radiance.")
+	_rd_free(coarse_tags)
+	_rd_free(coefficient_texture)
+	coefficient_texture = saved_texture
+	_rd_free(tag_texture)
+	origins = saved_origins
+	clv_spacing = saved_spacing
+	check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters()) == OK,
+			"CLV state must be restored after partial-support exact-fallback checks.")
+
+func _run_zero_weight_invalid_metadata() -> void:
+	var query := _case("zero-weight invalid metadata", Vector3i(-1, 2, 3),
+			Vector3(0.0, 0.25, 0.6), 0, PATCH)
+	var tags := _create_tag_texture("tag_xyz", Vector3i(0, 2, 3))
+	var original_coefficients := coefficient_texture
+	coefficient_texture = _create_coefficient_texture(false, "", Vector3i(0, 2, 3), true)
+	var output := _run_single_with_values(query, tags, nodes, triangles)
+	var expected_secondary := _expected(query.base, query.fraction, 0, false, false)
+	var expected_primary := _expected(query.base, query.fraction, 0, true, false)
+	check(output.valid and output.complete and output.selected_level == 0
+				and output.sample_status == 1 and output.reject_reason == 0
+				and absf(output.cache_weight - 1.0) < 0.00001,
+			"A zero-weight invalid corner must leave all contributing cache support complete.")
+	check(output.secondary.distance_to(expected_secondary) < 0.0002
+				and output.primary.distance_to(expected_primary) < 0.0002,
+			"Manual interpolation must skip the bright invalid zero-weight corner and match the full oracle.")
+	_rd_free(tags)
 	_rd_free(coefficient_texture)
 	coefficient_texture = original_coefficients
-	_rd_free(tag_texture)
 
 func _run_zero_coverage_rejection() -> void:
 	var tags := _create_tag_texture("")
@@ -377,32 +381,304 @@ func _run_black_primary() -> void:
 	_rd_free(coefficient_texture)
 	coefficient_texture = original
 
-func _run_thin_blocker() -> void:
-	var faces := PackedVector3Array([
-		Vector3(0.0, 0.0, 0.0), Vector3(0.0, 8.0, 0.0), Vector3(0.0, 8.0, 8.0),
-		Vector3(0.0, 0.0, 0.0), Vector3(0.0, 8.0, 8.0), Vector3(0.0, 0.0, 8.0),
-	])
+func _run_contact_invalid_blocker() -> void:
+	var saved_origins := origins
+	var saved_spacing := clv_spacing
+	var saved_texture := coefficient_texture
+	origins = [Vector3i(-8, -8, -8), Vector3i(-8, -8, -8), Vector3i(-8, -8, -8)]
+	clv_spacing = 0.5
+	check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters(true, 1)) == OK,
+			"Contact test must use its half-meter level-zero clipmap.")
+	var bvh: Dictionary = Visibility.build(_contact_faces())
+	check(not bvh.is_empty() and Visibility.validate(bvh.nodes, bvh.triangles),
+			"Sphere/floor contact fixture must use the production BVH builder.")
+	if bvh.is_empty():
+		_restore_clv_test_state(saved_origins, saved_spacing, saved_texture)
+		return
+	var floor_patch := _find_floor_patch(bvh.triangles)
+	var receiver_triangle := _find_floor_triangle(bvh.triangles)
+	check(floor_patch > 0 and receiver_triangle >= 0,
+			"Contact fixture must identify the floor patch and receiver triangle.")
+	if floor_patch <= 0 or receiver_triangle < 0:
+		_restore_clv_test_state(saved_origins, saved_spacing, saved_texture)
+		return
+	var base := _surface_grid_base(CONTACT_WORLD, Vector3.UP, clv_spacing)
+	var fraction := _surface_grid_fraction(CONTACT_WORLD, Vector3.UP, clv_spacing, base)
+	var overrides: Dictionary = {}
+	var valid_coverage := 0.0
+	var blocked_invalid := 0
+	var blocked_valid_contributors := 0
+	for z in 2:
+		for y in 2:
+			for x in 2:
+				var offset := Vector3i(x, y, z)
+				var weight := _corner_weight(fraction, offset)
+				var cell := base + offset
+				var corner := (Vector3(cell) + Vector3.ONE * 0.5) * clv_spacing
+				var hit := _nearest_axis_surface(corner, bvh.triangles)
+				var patch := int(hit.patch) if hit.found else -1
+				var corner_normal: Vector3 = hit.normal if hit.found else Vector3.ZERO
+				var valid := bool(hit.found) and patch == floor_patch \
+						and corner_normal.dot(Vector3.UP) >= 0.9
+				var blocked := Visibility.segment_blocked(bvh.nodes, bvh.triangles,
+					corner, CONTACT_WORLD)
+				overrides[cell] = {"patch": patch, "normal": corner_normal}
+				if valid and weight > 0.0:
+					valid_coverage += weight
+					if blocked:
+						blocked_valid_contributors += 1
+				elif blocked:
+					blocked_invalid += 1
+	check(valid_coverage > 0.8 and valid_coverage < 0.85,
+			"Contact fixture must retain its measured partial floor support.")
+	check(blocked_invalid > 0 and blocked_valid_contributors == 0,
+			"Contact fixture must block an invalid sphere corner while floor contributors remain clear.")
+	var tag_texture := _create_tag_texture("")
+	coefficient_texture = _create_coefficient_texture(false, "", Vector3i.ZERO,
+			false, Vector3.UP, overrides, -1)
+	var contact_nodes := rd.storage_buffer_create(bvh.nodes.size() * 4, bvh.nodes.to_byte_array())
+	var contact_triangles := rd.storage_buffer_create(bvh.triangles.size() * 4,
+			bvh.triangles.to_byte_array())
+	var query := {"label": "near-touch sphere/floor", "world": CONTACT_WORLD,
+			"normal": Vector3.UP, "receiver_triangle": receiver_triangle,
+			"receiver_patch": floor_patch}
+	var output := _run_single_with_values(query, tag_texture, contact_nodes, contact_triangles)
+	check(not output.valid and not output.complete and output.selected_level == 0
+				and output.sample_status == 0 and output.reject_reason == 8,
+			"Near-touch floor partial support must miss the cache and use exact sampling.")
+	check(absf(output.cache_weight - valid_coverage) < 0.002,
+			"Contact cache weight must match the measured valid floor-corner coverage.")
+	check(output.cell_fraction.distance_to(fraction) < 0.00002,
+			"Contact sampling must keep the current floor interpolation address.")
+	print("CLV_CONTACT_REGRESSION gap=%.6f spacing=%.3f base=%s fraction=%s coverage=%.6f blocked_invalid=%d blocked_contributors=%d cache_hit=%s diagnostic_coverage=%.6f status=%d reject=%d" % [
+			0.020000 - 0.017502, clv_spacing, str(base), str(fraction), valid_coverage,
+			blocked_invalid, blocked_valid_contributors, str(output.valid), output.cache_weight,
+			output.sample_status, output.reject_reason])
+	_rd_free(tag_texture)
+	_rd_free(contact_nodes)
+	_rd_free(contact_triangles)
+	_restore_clv_test_state(saved_origins, saved_spacing, saved_texture)
+
+func _run_zero_weight_blocker() -> void:
+	var saved_origins := origins
+	var saved_spacing := clv_spacing
+	var saved_texture := coefficient_texture
+	clv_spacing = 1.0
+	check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters(true, 1)) == OK,
+			"Zero-weight wall test must use only level zero.")
+	var query := _case("zero-weight blocked corner", Vector3i(-1, 2, 3),
+			Vector3(0.35, 0.25, 0.0), 0, PATCH)
+	var zero_corner := (Vector3(query.base + Vector3i(1, 0, 1)) + Vector3.ONE * 0.5)
+	var faces := _small_wall_faces(zero_corner, query.world)
 	var bvh: Dictionary = Visibility.build(faces)
 	check(not bvh.is_empty() and Visibility.validate(bvh.nodes, bvh.triangles),
-			"Thin-blocker fixture must build a valid production-format static BVH.")
+			"Zero-weight blocker must use the production BVH builder.")
 	if bvh.is_empty():
+		_restore_clv_test_state(saved_origins, saved_spacing, saved_texture)
 		return
+	check(_corner_weight(query.fraction, Vector3i(1, 0, 1)) == 0.0
+				and Visibility.segment_blocked(bvh.nodes, bvh.triangles, zero_corner, query.world),
+			"The wall must block the exactly zero-weight stencil corner.")
+	var positive_rays_clear := true
+	for z in 2:
+		for y in 2:
+			for x in 2:
+				var offset := Vector3i(x, y, z)
+				if _corner_weight(query.fraction, offset) <= 0.0 or offset == Vector3i(1, 0, 1):
+					continue
+				var corner := (Vector3(query.base + offset) + Vector3.ONE * 0.5)
+				positive_rays_clear = positive_rays_clear and not Visibility.segment_blocked(
+						bvh.nodes, bvh.triangles, corner, query.world)
+	check(positive_rays_clear,
+			"The zero-weight wall must not obscure any positive-weight interpolation corner.")
+	var tags := _create_tag_texture("")
+	coefficient_texture = _create_coefficient_texture(false)
 	var wall_nodes := rd.storage_buffer_create(bvh.nodes.size() * 4, bvh.nodes.to_byte_array())
-	var wall_triangles := rd.storage_buffer_create(bvh.triangles.size() * 4, bvh.triangles.to_byte_array())
-	# The blocked corner is deliberately metadata-invalid; geometry must still test it.
-	var tags := _create_tag_texture("tag_xyz")
-	var query := _case("thin blocker", Vector3i(-1, 2, 3), Vector3(0.35, 0.25, 0.6), 0)
-	check(Visibility.segment_blocked(bvh.nodes, bvh.triangles,
-			Vector3(0.5, 2.5, 3.5), query.world),
-			"The production BVH fixture must block an actual corner-to-receiver segment.")
+	var wall_triangles := rd.storage_buffer_create(bvh.triangles.size() * 4,
+			bvh.triangles.to_byte_array())
 	var output := _run_single_with_values(query, tags, wall_nodes, wall_triangles)
-	check(not output.valid and absf(output.cache_weight) < 0.000001,
-			"A thin blocker at an invalid-metadata corner must reject the complete level.")
-	check(output.selected_level == -1 and output.sample_status == 0 and output.reject_reason == 4,
-			"A thin blocker must expose the exact-fallback geometry rejection reason.")
+	check(output.valid and output.complete and output.selected_level == 0
+				and output.reject_reason == 0 and absf(output.cache_weight - 1.0) < 0.00001,
+			"A blocked exactly zero-weight corner must not reject otherwise complete CLV support.")
+	print("CLV_ZERO_WEIGHT_BLOCKER weight=0 blocked=true positive_rays_clear=%s result_valid=%s cache=%.6f status=%d reject=%d" % [
+			str(positive_rays_clear), str(output.valid), output.cache_weight,
+			output.sample_status, output.reject_reason])
 	_rd_free(tags)
 	_rd_free(wall_nodes)
 	_rd_free(wall_triangles)
+	_restore_clv_test_state(saved_origins, saved_spacing, saved_texture)
+
+func _run_valid_weight_blocker() -> void:
+	var saved_origins := origins
+	var saved_spacing := clv_spacing
+	var saved_texture := coefficient_texture
+	clv_spacing = 1.0
+	check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters(true, 1)) == OK,
+			"Positive-weight wall control must use only level zero.")
+	var query := _case("positive-weight blocked corner", Vector3i(-1, 2, 3),
+			Vector3(0.35, 0.25, 0.6), 0, PATCH)
+	var blocked_offset := Vector3i(1, 0, 0)
+	var blocked_corner := Vector3(query.base + blocked_offset) + Vector3.ONE * 0.5
+	var faces := _small_wall_faces(blocked_corner, query.world)
+	var bvh: Dictionary = Visibility.build(faces)
+	check(not bvh.is_empty() and Visibility.validate(bvh.nodes, bvh.triangles),
+			"Positive-weight thin-wall control must use the production BVH builder.")
+	if bvh.is_empty():
+		_restore_clv_test_state(saved_origins, saved_spacing, saved_texture)
+		return
+	var corner_weight := _corner_weight(query.fraction, blocked_offset)
+	check(corner_weight > 0.0 and Visibility.segment_blocked(bvh.nodes, bvh.triangles,
+			blocked_corner, query.world),
+			"Thin wall must block the positive-weight contributor segment.")
+	var tags := _create_tag_texture("")
+	coefficient_texture = _create_coefficient_texture(false)
+	var wall_nodes := rd.storage_buffer_create(bvh.nodes.size() * 4, bvh.nodes.to_byte_array())
+	var wall_triangles := rd.storage_buffer_create(bvh.triangles.size() * 4,
+			bvh.triangles.to_byte_array())
+	var output := _run_single_with_values(query, tags, wall_nodes, wall_triangles)
+	check(not output.valid and not output.complete and output.selected_level == -1
+				and output.cache_weight == 0.0 and output.reject_reason == 4,
+			"A blocked positive-weight contributor must still reject the entire clipmap level.")
+	print("CLV_POSITIVE_WEIGHT_BLOCKER weight=%.6f blocked=true result_valid=%s reject=%d" % [
+			corner_weight, str(output.valid), output.reject_reason])
+	_rd_free(tags)
+	_rd_free(wall_nodes)
+	_rd_free(wall_triangles)
+	_restore_clv_test_state(saved_origins, saved_spacing, saved_texture)
+
+func _restore_clv_test_state(saved_origins: Array[Vector3i], saved_spacing: float,
+		saved_texture: RID) -> void:
+	if coefficient_texture != saved_texture:
+		_rd_free(coefficient_texture)
+	coefficient_texture = saved_texture
+	origins = saved_origins
+	clv_spacing = saved_spacing
+	check(rd.buffer_update(parameters, 0, 80, _clipmap_parameters()) == OK,
+			"CLV sampling state must be restored after each geometry regression.")
+
+func _contact_faces() -> PackedVector3Array:
+	var faces := PackedVector3Array()
+	var a := Vector3(-12.0, 0.017502, -12.0)
+	var b := Vector3(12.0, 0.017502, 12.0)
+	var c := Vector3(-12.0, 0.017502, 12.0)
+	var d := Vector3(12.0, 0.017502, -12.0)
+	faces.append_array(PackedVector3Array([a, b, c, a, d, b]))
+	var center := Vector3(-1.644751, 0.92, -1.230381)
+	for latitude in 18:
+		var theta0 := PI * float(latitude) / 18.0
+		var theta1 := PI * float(latitude + 1) / 18.0
+		for longitude in 32:
+			var phi0 := TAU * float(longitude) / 32.0
+			var phi1 := TAU * float(longitude + 1) / 32.0
+			var p00 := _sphere_point(center, theta0, phi0)
+			var p01 := _sphere_point(center, theta0, phi1)
+			var p10 := _sphere_point(center, theta1, phi0)
+			var p11 := _sphere_point(center, theta1, phi1)
+			_append_inward_triangle(faces, center, p00, p10, p11)
+			_append_inward_triangle(faces, center, p00, p11, p01)
+	return faces
+
+func _sphere_point(center: Vector3, theta: float, phi: float) -> Vector3:
+	return center + 0.9 * Vector3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi))
+
+func _append_inward_triangle(faces: PackedVector3Array, center: Vector3,
+		a: Vector3, b: Vector3, c: Vector3) -> void:
+	var triangle_center := (a + b + c) / 3.0
+	if (b - a).cross(c - a).dot(triangle_center - center) > 0.0:
+		faces.append_array(PackedVector3Array([a, c, b]))
+	else:
+		faces.append_array(PackedVector3Array([a, b, c]))
+
+func _find_floor_patch(triangles: PackedFloat32Array) -> int:
+	for triangle in triangles.size() / 12:
+		var index := triangle * 12
+		var a := Vector3(triangles[index], triangles[index + 1], triangles[index + 2])
+		var edge1 := Vector3(triangles[index + 4], triangles[index + 5], triangles[index + 6])
+		var edge2 := Vector3(triangles[index + 8], triangles[index + 9], triangles[index + 10])
+		if absf(a.y - 0.017502) < 0.00001 and edge2.cross(edge1).normalized().dot(Vector3.UP) > 0.99:
+			return int(triangles[index + 11])
+	return 0
+
+func _find_floor_triangle(triangles: PackedFloat32Array) -> int:
+	var point := Vector3(-1.644751 + 0.013, 0.017502, -1.230381 + 0.011)
+	for triangle in triangles.size() / 12:
+		var index := triangle * 12
+		var a := Vector3(triangles[index], triangles[index + 1], triangles[index + 2])
+		var edge1 := Vector3(triangles[index + 4], triangles[index + 5], triangles[index + 6])
+		var edge2 := Vector3(triangles[index + 8], triangles[index + 9], triangles[index + 10])
+		if absf(a.y - 0.017502) < 0.00001 and _inside_triangle(point, a, edge1, edge2):
+			return triangle
+	return -1
+
+func _inside_triangle(point: Vector3, a: Vector3, edge1: Vector3, edge2: Vector3) -> bool:
+	var relative := point - a
+	var d00 := edge1.dot(edge1)
+	var d01 := edge1.dot(edge2)
+	var d11 := edge2.dot(edge2)
+	var d20 := relative.dot(edge1)
+	var d21 := relative.dot(edge2)
+	var denominator := d00 * d11 - d01 * d01
+	if absf(denominator) < 1e-10:
+		return false
+	var u := (d11 * d20 - d01 * d21) / denominator
+	var v := (d00 * d21 - d01 * d20) / denominator
+	return u >= -0.0001 and v >= -0.0001 and u + v <= 1.0001
+
+func _nearest_axis_surface(point: Vector3, triangles: PackedFloat32Array) -> Dictionary:
+	var directions := [Vector3.RIGHT, Vector3.LEFT, Vector3.UP, Vector3.DOWN,
+			Vector3.BACK, Vector3.FORWARD]
+	var best_distance := 1e30
+	var result := {"found": false, "patch": -1, "normal": Vector3.ZERO}
+	for direction: Vector3 in directions:
+		for triangle in triangles.size() / 12:
+			var index := triangle * 12
+			var a := Vector3(triangles[index], triangles[index + 1], triangles[index + 2])
+			var edge1 := Vector3(triangles[index + 4], triangles[index + 5], triangles[index + 6])
+			var edge2 := Vector3(triangles[index + 8], triangles[index + 9], triangles[index + 10])
+			var p := direction.cross(edge2)
+			var determinant := edge1.dot(p)
+			if absf(determinant) < triangles[index + 7]:
+				continue
+			var from_a := point - a
+			var u := from_a.dot(p) / determinant
+			var q := from_a.cross(edge1)
+			var v := direction.dot(q) / determinant
+			var distance := edge2.dot(q) / determinant
+			if u < -1e-6 or v < -1e-6 or u + v > 1.000001 \
+					or distance <= 0.00001 or distance >= best_distance or distance > 18.0:
+				continue
+			best_distance = distance
+			result = {"found": true, "patch": int(triangles[index + 11]),
+					"normal": edge2.cross(edge1).normalized()}
+	return result
+
+func _surface_grid_base(world: Vector3, normal: Vector3, step_size: float) -> Vector3i:
+	var position := (world + normal * step_size * 0.75) / step_size - Vector3.ONE * 0.5
+	return Vector3i(floori(position.x), floori(position.y), floori(position.z))
+
+func _surface_grid_fraction(world: Vector3, normal: Vector3, step_size: float,
+		base: Vector3i) -> Vector3:
+	var position := (world + normal * step_size * 0.75) / step_size - Vector3.ONE * 0.5
+	return position - Vector3(base)
+
+func _corner_weight(fraction: Vector3, offset: Vector3i) -> float:
+	return (fraction.x if offset.x == 1 else 1.0 - fraction.x) \
+			* (fraction.y if offset.y == 1 else 1.0 - fraction.y) \
+			* (fraction.z if offset.z == 1 else 1.0 - fraction.z)
+
+func _small_wall_faces(corner: Vector3, world: Vector3) -> PackedVector3Array:
+	var ray := (world - corner).normalized()
+	var tangent := ray.cross(Vector3.UP)
+	if tangent.length_squared() < 1e-8:
+		tangent = ray.cross(Vector3.RIGHT)
+	tangent = tangent.normalized() * 0.05
+	var bitangent := ray.cross(tangent).normalized() * 0.05
+	var center := (corner + world) * 0.5
+	var a := center - tangent - bitangent
+	var b := center + tangent - bitangent
+	var c := center + tangent + bitangent
+	var d := center - tangent + bitangent
+	return PackedVector3Array([a, b, c, a, c, d])
 
 func _run_geometric_query_position() -> void:
 	var geometric_normal := Vector3(0.28, 0.92, 0.28).normalized()
@@ -694,10 +970,6 @@ func _run_single_with_values(query: Dictionary, tag_texture: RID, node_buffer: R
 		"cell_fraction": Vector3(output[19], output[23], output[27]),
 		"secondary": Vector3(output[0], output[1], output[2]),
 		"primary": Vector3(output[4], output[5], output[6]),
-		"supported_secondary": Vector3(output[12], output[13], output[14]),
-		"supported_primary": Vector3(output[16], output[17], output[18]),
-		"unsupported_secondary": Vector3(output[20], output[21], output[22]),
-		"unsupported_primary": Vector3(output[24], output[25], output[26]),
 		"query_position": Vector3(output[28], output[29], output[30]),
 		"query_position_valid": output[31] > 0.5}
 
@@ -736,7 +1008,8 @@ func _storage(binding: int, buffer: RID) -> RDUniform:
 
 func _create_coefficient_texture(zero_primary: bool, mutation := "",
 		target := Vector3i(15, 2, 3), bright_invalid := false,
-		metadata_normal := Vector3.UP) -> RID:
+		metadata_normal := Vector3.UP, metadata_overrides: Dictionary = {},
+		default_metadata_patch := PATCH) -> RID:
 	var width := RESOLUTION * 19
 	var height := RESOLUTION
 	var depth := RESOLUTION * LEVELS
@@ -750,10 +1023,20 @@ func _create_coefficient_texture(zero_primary: bool, mutation := "",
 					var px := x % RESOLUTION
 					var index := _index4(x, y, z + level * RESOLUTION, width, height)
 					if slab == 18:
-						data[index] = metadata_normal.x
-						data[index + 1] = metadata_normal.y
-						data[index + 2] = metadata_normal.z
-						data[index + 3] = float(PATCH)
+						var current_normal := metadata_normal
+						var current_patch := float(default_metadata_patch)
+						var logical_cell := Vector3i(
+							_logical_at_slot(px, origins[level].x),
+							_logical_at_slot(y, origins[level].y),
+							_logical_at_slot(z, origins[level].z))
+						if metadata_overrides.has(logical_cell):
+							var override: Dictionary = metadata_overrides[logical_cell]
+							current_normal = override.normal
+							current_patch = float(override.patch)
+						data[index] = current_normal.x
+						data[index + 1] = current_normal.y
+						data[index + 2] = current_normal.z
+						data[index + 3] = current_patch
 						if level == 0 and px == target.x and y == target.y and z == target.z:
 							if mutation == "invalid_patch": data[index + 3] = -1.0
 							if mutation == "normal": data[index + 1] = -1.0
@@ -782,6 +1065,10 @@ func _create_coefficient_texture(zero_primary: bool, mutation := "",
 func _create_tag_texture(mutation: String, target := Vector3i(15, 2, 3)) -> RID:
 	var data := PackedInt32Array()
 	data.resize(RESOLUTION * RESOLUTION * RESOLUTION * LEVELS * 4)
+	var invalid_stencil_base := Vector3i(
+			_logical_at_slot(target.x, origins[0].x),
+			_logical_at_slot(target.y, origins[0].y),
+			_logical_at_slot(target.z, origins[0].z))
 	for level in LEVELS:
 		for z in RESOLUTION:
 			for y in RESOLUTION:
@@ -795,6 +1082,14 @@ func _create_tag_texture(mutation: String, target := Vector3i(15, 2, 3)) -> RID:
 					data[index + 1] = logical.y
 					data[index + 2] = logical.z
 					data[index + 3] = EPOCH
+					if mutation == "invalidate_level0_stencil" and level == 0 \
+							and logical.x >= invalid_stencil_base.x \
+							and logical.x <= invalid_stencil_base.x + 1 \
+							and logical.y >= invalid_stencil_base.y \
+							and logical.y <= invalid_stencil_base.y + 1 \
+							and logical.z >= invalid_stencil_base.z \
+							and logical.z <= invalid_stencil_base.z + 1:
+						data[index + 3] = EPOCH - 1
 	var mutation_index := _index4(target.x, target.y, target.z, RESOLUTION, RESOLUTION)
 	if mutation == "tag_xyz": data[mutation_index] += 1
 	if mutation == "epoch": data[mutation_index + 3] = EPOCH - 1
@@ -852,7 +1147,7 @@ func _clipmap_parameters(clv_enabled := true, level_count := LEVELS) -> PackedBy
 	var bytes := PackedByteArray()
 	for origin in origins:
 		bytes.append_array(PackedInt32Array([origin.x, origin.y, origin.z, 0]).to_byte_array())
-	bytes.append_array(PackedFloat32Array([1.0, 0.0, 0.0, 0.0]).to_byte_array())
+	bytes.append_array(PackedFloat32Array([clv_spacing, 0.0, 0.0, 0.0]).to_byte_array())
 	bytes.append_array(PackedInt32Array([RESOLUTION, level_count, EPOCH, 1 if clv_enabled else 0]).to_byte_array())
 	return bytes
 

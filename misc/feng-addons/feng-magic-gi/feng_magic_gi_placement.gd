@@ -14,9 +14,9 @@ const MAX_PROBES := 65536
 const MAX_GEOMETRY_TRIANGLES := 250000
 const MAX_TERRAIN_CELLS := 500000
 const MAX_SAMPLE_CANDIDATES := 2000000
-const MAX_STAGED_WORLD_CELLS := MAX_PROBES
-const MAX_STAGED_CANDIDATE_RECORDS := MAX_STAGED_WORLD_CELLS \
-		* ProbeLayout.MAX_DOMAINS_PER_WORLD_CELL * ProbeLayout.CANDIDATES_PER_DOMAIN
+const MAX_STAGED_ARBITRATION_CELLS := MAX_PROBES
+const MAX_STAGED_CANDIDATE_RECORDS := MAX_STAGED_ARBITRATION_CELLS \
+		* ProbeLayout.MAX_DOMAINS_PER_ARBITRATION_CELL * ProbeLayout.CANDIDATES_PER_DOMAIN
 const MAX_REFINEMENT_CELL_VISITS := 2000000
 const MAX_TRIANGLE_STEPS := 512
 const MAX_OCCLUSION_TRIANGLES := 250000
@@ -125,6 +125,9 @@ var warning_message := ""
 var bvh_ready := false
 
 var _world_candidate_cells: Dictionary = {}
+var _staged_arbitration_cell_count := 0
+var _staged_anchor_index: Dictionary = {}
+var _staged_anchor_index_count := 0
 var _cell_counts: Dictionary = {}
 var _occlusion_volumes: Array[Dictionary] = []
 var _occlusion_cells: Dictionary = {}
@@ -201,7 +204,7 @@ var rejected_ambiguous_side_count := 0
 var rejected_center_overlap_count := 0
 var rejected_world_cell_competition_count := 0
 var rejected_lookup_capacity_count := 0
-var rejected_world_cell_limit_count := 0
+var rejected_arbitration_cell_limit_count := 0
 var adjusted_center_count := 0
 var _scene_root: Node
 var _async_worker_result := false
@@ -867,7 +870,7 @@ func _begin_collect(volume: Node3D, for_bake: bool, collect_emission: bool,
 	normals.clear()
 	probe_spacings.clear()
 	stable_probe_ids.clear()
-	_world_candidate_cells.clear()
+	_clear_staged_candidate_storage()
 	_cell_counts.clear()
 	_occlusion_volumes.clear()
 	_occlusion_cells.clear()
@@ -919,7 +922,7 @@ func _begin_collect(volume: Node3D, for_bake: bool, collect_emission: bool,
 	rejected_center_overlap_count = 0
 	rejected_world_cell_competition_count = 0
 	rejected_lookup_capacity_count = 0
-	rejected_world_cell_limit_count = 0
+	rejected_arbitration_cell_limit_count = 0
 	adjusted_center_count = 0
 	bvh = null
 	trace_scene = null
@@ -987,8 +990,10 @@ func _sample_current_geometry(build_bvh: bool) -> bool:
 		positions.clear()
 		surface_positions.clear()
 		normals.clear()
+		_clear_staged_candidate_storage()
 		return false
 	if _refresh_cancelled():
+		_clear_staged_candidate_storage()
 		return false
 	_coarse_valid_candidate_count = _valid_candidate_count
 	if _adaptive_placement:
@@ -997,6 +1002,7 @@ func _sample_current_geometry(build_bvh: bool) -> bool:
 				_world_bounds, _probe_spacing, _arbitration_spacing,
 				Callable(_refresh_cancel_token, "is_cancelled") if _refresh_cancel_token != null else Callable())
 		if _refresh_cancelled() or bool(refinement_result.get("cancelled", false)):
+			_clear_staged_candidate_storage()
 			return false
 		var refinement_cells: Dictionary = refinement_result["cells"]
 		_refinement_cell_count = refinement_cells.size()
@@ -1008,14 +1014,16 @@ func _sample_current_geometry(build_bvh: bool) -> bool:
 			positions.clear()
 			surface_positions.clear()
 			normals.clear()
+			_clear_staged_candidate_storage()
 			return false
 		_refined_valid_candidate_count = _valid_candidate_count - _coarse_valid_candidate_count
 	if _refresh_cancelled() or not _finalize_world_candidates():
 		positions.clear()
 		surface_positions.clear()
 		normals.clear()
+		_clear_staged_candidate_storage()
 		return false
-	_world_candidate_cells.clear()
+	_clear_staged_candidate_storage()
 	if _refresh_cancelled():
 		return false
 	if not build_bvh:
@@ -1030,10 +1038,17 @@ func _sample_current_geometry(build_bvh: bool) -> bool:
 			rejected_foreign_surface_center_count, rejected_owner_backside_center_count,
 			rejected_center_outside_count,
 			rejected_lookup_capacity_count, rejected_ambiguous_side_count]
-	scene_signature = hash([faces, reflectance, surface_positions, positions, normals])
+	scene_signature = hash([faces, reflectance, surface_positions, positions, normals,
+		ProbeLayout.PLACEMENT_LAYOUT_REVISION])
 	if not material_sampler.records.is_empty():
 		scene_signature = hash([scene_signature, face_uv, material_sampler.fingerprint()])
 	return not _refresh_cancelled()
+
+func _clear_staged_candidate_storage() -> void:
+	_world_candidate_cells.clear()
+	_staged_arbitration_cell_count = 0
+	_staged_anchor_index.clear()
+	_staged_anchor_index_count = 0
 
 func _reset_page_sampling_state() -> void:
 	positions.clear()
@@ -1041,7 +1056,7 @@ func _reset_page_sampling_state() -> void:
 	normals.clear()
 	probe_spacings.clear()
 	stable_probe_ids.clear()
-	_world_candidate_cells.clear()
+	_clear_staged_candidate_storage()
 	_cell_counts.clear()
 	_fallback_triangle_vertices.clear()
 	_fallback_triangle_normals.clear()
@@ -1078,7 +1093,7 @@ func _reset_page_sampling_state() -> void:
 	rejected_center_overlap_count = 0
 	rejected_world_cell_competition_count = 0
 	rejected_lookup_capacity_count = 0
-	rejected_world_cell_limit_count = 0
+	rejected_arbitration_cell_limit_count = 0
 	adjusted_center_count = 0
 	error_message = ""
 	warning_message = ""
@@ -1722,9 +1737,11 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 					+ (c - a) * (float(v) / steps)
 			if _adaptive_placement:
 				var estimated_center := point + normal * _preferred_offset_value
-				var estimated_cell := ProbeLayout.world_cell(estimated_center, _probe_spacing)
+				var estimated_arbitration_cell := ProbeLayout.world_cell(
+						estimated_center, _arbitration_spacing)
 				var domain_key := _candidate_domain_key(normal, triangle_centroid)
-				if _has_staged_candidate_for_world_cell(domain_key, estimated_cell):
+				if _has_staged_candidate_for_arbitration_cell(
+						domain_key, estimated_arbitration_cell):
 					continue
 			_add_surface(point, normal, triangle_centroid, owner_face_index, false,
 					a, b, c)
@@ -1734,10 +1751,12 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 	# opportunities and the bounded raw fallback have been considered.
 	if steps == 1 and _valid_candidate_count == accepted_before:
 		var estimated_center := triangle_centroid + normal * _preferred_offset_value
-		var estimated_cell := ProbeLayout.world_cell(estimated_center, _probe_spacing)
+		var estimated_arbitration_cell := ProbeLayout.world_cell(
+				estimated_center, _arbitration_spacing)
 		var domain_key := _candidate_domain_key(normal, triangle_centroid)
 		if not _adaptive_placement \
-				or not _has_staged_candidate_for_world_cell(domain_key, estimated_cell):
+				or not _has_staged_candidate_for_arbitration_cell(
+					domain_key, estimated_arbitration_cell):
 			_candidate_count += 1
 			if _candidate_count > MAX_SAMPLE_CANDIDATES:
 				error_message = "Surface sampling exceeds the 2,000,000-candidate work budget."
@@ -1749,11 +1768,19 @@ func _sample_triangle_fallback(a: Vector3, b: Vector3, c: Vector3,
 				return false
 	return true
 
-func _has_staged_candidate_for_world_cell(domain_key: String,
-		world_cell: Vector3i) -> bool:
-	var cell_bucket: Dictionary = _world_candidate_cells.get(world_cell, {})
+func _has_staged_candidate_for_arbitration_cell(domain_key: String,
+		arbitration_cell: Vector3i) -> bool:
+	var parent_cell := _arbitration_parent_cell(arbitration_cell)
+	var parent_bucket: Dictionary = _world_candidate_cells.get(parent_cell, {})
+	var arbitration_cells: Dictionary = parent_bucket.get("arbitration_cells", {})
+	var cell_bucket: Dictionary = arbitration_cells.get(arbitration_cell, {})
 	var domains: Dictionary = cell_bucket.get("domains", {})
 	return domains.has(domain_key) and not domains[domain_key]["candidates"].is_empty()
+
+func _arbitration_parent_cell(arbitration_cell: Vector3i) -> Vector3i:
+	var arbitration_center := ProbeLayout.world_cell_center(
+			arbitration_cell, _arbitration_spacing)
+	return ProbeLayout.world_cell(arbitration_center, _probe_spacing)
 
 func _dominant_normal_axis(normal: Vector3) -> int:
 	var axis := 0
@@ -1940,8 +1967,7 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 	if not _world_point_coordinates_are_supported(estimated_center):
 		error_message = "Probe centers exceed the supported signed world-cell coordinate range."
 		return
-	var estimated_cell := ProbeLayout.world_cell(estimated_center, _probe_spacing)
-	if _has_staged_anchor_duplicate(surface, domain_key, estimated_cell):
+	if _has_staged_anchor_duplicate(surface, domain_key):
 		rejected_duplicate_count += 1
 		return
 	var actual_offset := _safe_probe_offset(surface, normal, _preferred_offset_value)
@@ -1996,6 +2022,7 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		rejected_inside_or_indeterminate_center_count += 1
 		return
 	var world_cell := ProbeLayout.world_cell(probe_center, _probe_spacing)
+	var arbitration_cell := ProbeLayout.world_cell(probe_center, _arbitration_spacing)
 	var arbitration_key := _world_spacing_cell_key(probe_center, _arbitration_spacing)
 	var arbitration_center := _world_spacing_cell_center(probe_center, _arbitration_spacing)
 	_valid_candidate_count += 1
@@ -2008,20 +2035,18 @@ func _add_surface(surface: Vector3, normal: Vector3, triangle_centroid: Vector3,
 		"canonical": canonical,
 		"face_index": owner_face_index,
 		"world_cell": world_cell,
+		"arbitration_cell": arbitration_cell,
 		"stable_id": stable_probe_id,
 		"arbitration_key": arbitration_key,
 		"spacing": _active_candidate_spacing,
 		"score": probe_center.distance_squared_to(
 				arbitration_center),
 	}
-	_stage_world_candidate(world_cell, domain_key, candidate)
+	_stage_world_candidate(_arbitration_parent_cell(arbitration_cell),
+			domain_key, candidate)
 
 func _candidate_capacity_per_domain() -> int:
-	if not _adaptive_placement:
-		return ProbeLayout.CANDIDATES_PER_DOMAIN
-	var refinement_ratio := ceili(_probe_spacing / maxf(_arbitration_spacing, 0.000001))
-	return mini(MAX_PROBES, maxi(ProbeLayout.CANDIDATES_PER_DOMAIN,
-			refinement_ratio * refinement_ratio * 2))
+	return ProbeLayout.CANDIDATES_PER_DOMAIN
 
 func _world_spacing_cell_key(point: Vector3, spacing: float) -> String:
 	var scaled := point / spacing
@@ -2031,52 +2056,34 @@ func _world_spacing_cell_center(point: Vector3, spacing: float) -> Vector3:
 	var lower := (point / spacing).floor() * spacing
 	return lower + Vector3.ONE * spacing * 0.5
 
-func _stage_world_candidate(world_cell: Vector3i, domain_key: String,
+func _stage_world_candidate(parent_world_cell: Vector3i, domain_key: String,
 		candidate: Dictionary) -> void:
-	var cell_bucket: Dictionary = _world_candidate_cells.get(world_cell, {})
+	var coarse_bucket: Dictionary = _world_candidate_cells.get(parent_world_cell, {})
+	var arbitration_cells: Dictionary = coarse_bucket.get("arbitration_cells", {})
+	var arbitration_cell: Vector3i = candidate["arbitration_cell"]
+	var cell_bucket: Dictionary = arbitration_cells.get(arbitration_cell, {})
 	if cell_bucket.is_empty():
-		if _world_candidate_cells.size() >= MAX_STAGED_WORLD_CELLS:
-			rejected_world_cell_limit_count += 1
-			error_message = "World-space probe staging exceeds the 65,536-cell limit. Increase Probe Spacing or reduce the volume."
+		if _staged_arbitration_cell_count >= MAX_STAGED_ARBITRATION_CELLS:
+			rejected_arbitration_cell_limit_count += 1
+			error_message = "Surface staging exceeds the 65,536 arbitration-cell limit. Increase Probe Spacing or reduce the volume."
 			return
 		cell_bucket = {"domains": {}}
-		_world_candidate_cells[world_cell] = cell_bucket
+		_staged_arbitration_cell_count += 1
 	var domains: Dictionary = cell_bucket["domains"]
-	var candidate_rank := ProbeLayout.world_cell_rank(domain_key, world_cell)
+	var candidate_rank := ProbeLayout.world_cell_rank(domain_key, arbitration_cell)
 	if domains.has(domain_key):
 		var domain_bucket: Dictionary = domains[domain_key]
 		var candidates: Array = domain_bucket["candidates"]
-		for candidate_index in candidates.size():
-			var existing: Dictionary = candidates[candidate_index]
-			var existing_surface: Vector3 = existing["surface"]
-			var anchor_epsilon := maxf(0.000001, _probe_spacing * 0.000001)
-			if existing_surface.distance_squared_to(candidate["surface"]) \
-					<= anchor_epsilon * anchor_epsilon:
-				if _candidate_less(candidate, existing):
-					candidates[candidate_index] = candidate
-					candidates.sort_custom(Callable(self, "_candidate_less"))
-					domain_bucket["canonical"] = true
-					domain_bucket["candidates"] = candidates
-					domains[domain_key] = domain_bucket
-					cell_bucket["domains"] = domains
-					_world_candidate_cells[world_cell] = cell_bucket
-				return
-			if candidate["arbitration_key"] == existing["arbitration_key"]:
-				if _candidate_less(candidate, existing):
-					candidates[candidate_index] = candidate
-					candidates.sort_custom(Callable(self, "_candidate_less"))
-					domain_bucket["candidates"] = candidates
-					domains[domain_key] = domain_bucket
-					cell_bucket["domains"] = domains
-					_world_candidate_cells[world_cell] = cell_bucket
-				return
-		var previous_candidate_count := candidates.size()
+		var previous_candidates: Array = candidates.duplicate()
 		candidates.append(candidate)
 		candidates.sort_custom(Callable(self, "_candidate_less"))
 		var capacity := _candidate_capacity_per_domain()
 		if candidates.size() > capacity:
 			candidates.resize(capacity)
-		_staged_candidate_count += candidates.size() - previous_candidate_count
+		for previous_candidate in previous_candidates:
+			if not candidates.has(previous_candidate):
+				_unindex_staged_anchor(previous_candidate)
+		_staged_candidate_count += candidates.size() - previous_candidates.size()
 		if _staged_candidate_count > MAX_STAGED_CANDIDATE_RECORDS:
 			error_message = "World-space probe candidate staging exceeds its bounded record limit."
 		domain_bucket["canonical"] = bool(domain_bucket.get("canonical", false)) \
@@ -2084,9 +2091,13 @@ func _stage_world_candidate(world_cell: Vector3i, domain_key: String,
 		domain_bucket["candidates"] = candidates
 		domains[domain_key] = domain_bucket
 		cell_bucket["domains"] = domains
-		_world_candidate_cells[world_cell] = cell_bucket
+		arbitration_cells[arbitration_cell] = cell_bucket
+		coarse_bucket["arbitration_cells"] = arbitration_cells
+		_world_candidate_cells[parent_world_cell] = coarse_bucket
+		if candidates.has(candidate):
+			_index_staged_anchor(candidate)
 		return
-	if domains.size() >= ProbeLayout.MAX_DOMAINS_PER_WORLD_CELL:
+	if domains.size() >= ProbeLayout.MAX_DOMAINS_PER_ARBITRATION_CELL:
 		var worst_key := ""
 		var worst_rank := -1
 		var worst_is_canonical := true
@@ -2110,6 +2121,8 @@ func _stage_world_candidate(world_cell: Vector3i, domain_key: String,
 			return
 		var evicted: Dictionary = domains[worst_key]
 		var evicted_candidates: Array = evicted["candidates"]
+		for evicted_candidate in evicted_candidates:
+			_unindex_staged_anchor(evicted_candidate)
 		_staged_candidate_count -= evicted_candidates.size()
 		domains.erase(worst_key)
 	var new_domain := {"rank": candidate_rank, "canonical": bool(candidate["canonical"]),
@@ -2118,27 +2131,71 @@ func _stage_world_candidate(world_cell: Vector3i, domain_key: String,
 	_staged_candidate_count += 1
 	if _staged_candidate_count > MAX_STAGED_CANDIDATE_RECORDS:
 		error_message = "World-space probe candidate staging exceeds its bounded record limit."
-		return
 	cell_bucket["domains"] = domains
-	_world_candidate_cells[world_cell] = cell_bucket
+	arbitration_cells[arbitration_cell] = cell_bucket
+	coarse_bucket["arbitration_cells"] = arbitration_cells
+	_world_candidate_cells[parent_world_cell] = coarse_bucket
+	_index_staged_anchor(candidate)
 
-func _has_staged_anchor_duplicate(surface: Vector3, domain_key: String,
-		estimated_cell: Vector3i) -> bool:
+func _anchor_index_cell(point: Vector3) -> PackedInt64Array:
+	var anchor_epsilon := maxf(0.000001, _probe_spacing * 0.000001)
+	return PackedInt64Array([
+		floori(point.x / anchor_epsilon),
+		floori(point.y / anchor_epsilon),
+		floori(point.z / anchor_epsilon),
+	])
+
+func _anchor_index_key(domain_key: String, cell: PackedInt64Array,
+		delta: Vector3i = Vector3i.ZERO) -> String:
+	return domain_key + "\u001e%d,%d,%d" % [
+		int(cell[0]) + delta.x, int(cell[1]) + delta.y, int(cell[2]) + delta.z]
+
+func _has_staged_anchor_duplicate(surface: Vector3, domain_key: String) -> bool:
+	var cell := _anchor_index_cell(surface)
 	var anchor_epsilon := maxf(0.000001, _probe_spacing * 0.000001)
 	var epsilon_squared := anchor_epsilon * anchor_epsilon
 	for dz in range(-1, 2):
 		for dy in range(-1, 2):
 			for dx in range(-1, 2):
-				var cell_bucket: Dictionary = _world_candidate_cells.get(
-						estimated_cell + Vector3i(dx, dy, dz), {})
-				var domains: Dictionary = cell_bucket.get("domains", {})
-				if not domains.has(domain_key):
-					continue
-				for candidate in domains[domain_key]["candidates"]:
-					var existing_surface: Vector3 = candidate["surface"]
+				var key := _anchor_index_key(domain_key, cell, Vector3i(dx, dy, dz))
+				for existing_surface in _staged_anchor_index.get(key, []):
 					if existing_surface.distance_squared_to(surface) <= epsilon_squared:
 						return true
 	return false
+
+func _index_staged_anchor(candidate: Dictionary) -> void:
+	var surface: Vector3 = candidate["surface"]
+	var domain_key := String(candidate["domain"])
+	var key := _anchor_index_key(domain_key, _anchor_index_cell(surface))
+	var anchors: Array = _staged_anchor_index.get(key, [])
+	var anchor_epsilon := maxf(0.000001, _probe_spacing * 0.000001)
+	var epsilon_squared := anchor_epsilon * anchor_epsilon
+	for existing_surface in anchors:
+		if existing_surface.distance_squared_to(surface) <= epsilon_squared:
+			return
+	if _staged_anchor_index_count >= MAX_STAGED_CANDIDATE_RECORDS:
+		error_message = "Surface anchor lookup exceeds the bounded candidate-record limit."
+		return
+	anchors.append(surface)
+	_staged_anchor_index[key] = anchors
+	_staged_anchor_index_count += 1
+
+func _unindex_staged_anchor(candidate: Dictionary) -> void:
+	var surface: Vector3 = candidate["surface"]
+	var domain_key := String(candidate["domain"])
+	var key := _anchor_index_key(domain_key, _anchor_index_cell(surface))
+	if not _staged_anchor_index.has(key):
+		return
+	var anchors: Array = _staged_anchor_index[key]
+	for index in anchors.size():
+		if anchors[index] == surface:
+			anchors.remove_at(index)
+			_staged_anchor_index_count -= 1
+			break
+	if anchors.is_empty():
+		_staged_anchor_index.erase(key)
+	else:
+		_staged_anchor_index[key] = anchors
 
 func _candidate_domain_key(normal: Vector3, triangle_centroid: Vector3) -> String:
 	var normal_bin := Vector3i(roundi(normal.x * 20.0), roundi(normal.y * 20.0),
@@ -2194,69 +2251,84 @@ func _candidate_less(a: Dictionary, b: Dictionary) -> bool:
 		return normal_a.y < normal_b.y
 	return normal_a.z < normal_b.z
 
+## Choose each arbitration cell locally, then apply a deterministic symmetric
+## separation rule. Page-global acceptance ratios cannot change shared-cell winners.
 func _finalize_world_candidates() -> bool:
 	_bounded_candidate_pruned_count = maxi(0, _valid_candidate_count - _staged_candidate_count)
-	var candidate_groups := [{}, {}]
-	var minimum_base_cell := Vector3i(2147483647, 2147483647, 2147483647)
+	var candidates_by_phase := [{}, {}]
+	var staged_by_world_cell: Dictionary = {}
 	var checked_candidates := 0
 	for cell_value in _world_candidate_cells:
 		if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
 			return false
-		var base_world_cell: Vector3i = cell_value
-		minimum_base_cell.x = mini(minimum_base_cell.x, base_world_cell.x)
-		minimum_base_cell.y = mini(minimum_base_cell.y, base_world_cell.y)
-		minimum_base_cell.z = mini(minimum_base_cell.z, base_world_cell.z)
-		var domains: Dictionary = _world_candidate_cells[base_world_cell]["domains"]
-		for domain_key in domains:
+		var coarse_bucket: Dictionary = _world_candidate_cells[cell_value]
+		var arbitration_cells: Dictionary = coarse_bucket.get("arbitration_cells", {})
+		for arbitration_cell_value in arbitration_cells:
 			if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
 				return false
-			var domain_bucket: Dictionary = domains[domain_key]
-			for candidate in domain_bucket["candidates"]:
-				checked_candidates += 1
+			var cell_bucket: Dictionary = arbitration_cells[arbitration_cell_value]
+			var domains: Dictionary = cell_bucket["domains"]
+			for domain_key in domains:
 				if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
 					return false
-				var arbitration_key := String(candidate.get("arbitration_key",
-						_world_spacing_cell_key(candidate["center"], _arbitration_spacing)))
-				var phase_index := 0 if bool(candidate["canonical"]) else 1
-				var phase_groups: Dictionary = candidate_groups[phase_index]
-				var domain_groups: Dictionary = phase_groups.get(String(domain_key), {})
-				var cell_candidates: Array = domain_groups.get(arbitration_key, [])
-				cell_candidates.append(candidate)
-				domain_groups[arbitration_key] = cell_candidates
-				phase_groups[String(domain_key)] = domain_groups
-				candidate_groups[phase_index] = phase_groups
-	if minimum_base_cell.x == 2147483647:
-		minimum_base_cell = Vector3i.ZERO
-	var canonical_domain_entries: Dictionary = _make_domain_entries(candidate_groups[0],
-			minimum_base_cell)
-	var fallback_domain_entries: Dictionary = _make_domain_entries(candidate_groups[1],
-			minimum_base_cell)
-	var accepted_world_centers: Dictionary = {}
-	var accepted_cells: Dictionary = {}
-	var accepted_base_cells: Dictionary = {}
+				var domain_bucket: Dictionary = domains[domain_key]
+				for candidate in domain_bucket["candidates"]:
+					checked_candidates += 1
+					if checked_candidates % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+						return false
+					var base_world_cell: Vector3i = candidate.get("world_cell", Vector3i.ZERO)
+					staged_by_world_cell[base_world_cell] = \
+							int(staged_by_world_cell.get(base_world_cell, 0)) + 1
+					var arbitration_key := String(candidate.get("arbitration_key",
+							_world_spacing_cell_key(candidate["center"], _arbitration_spacing)))
+					var phase_index := 0 if bool(candidate["canonical"]) else 1
+					var phase_candidates: Dictionary = candidates_by_phase[phase_index]
+					var cell_candidates: Array = phase_candidates.get(arbitration_key, [])
+					cell_candidates.append(candidate)
+					phase_candidates[arbitration_key] = cell_candidates
+					candidates_by_phase[phase_index] = phase_candidates
+
 	var spacing_blocked_cells: Dictionary = {}
 	var lookup_blocked_cells: Dictionary = {}
-	# Canonical projected world-grid points own the first complete fairness pass.
-	# Only after it finishes can small-face barycentric/centroid fallback points
-	# compete for local arbitration cells that remain available.
-	if not _run_candidate_phase(canonical_domain_entries, accepted_world_centers,
-			accepted_cells, accepted_base_cells, spacing_blocked_cells,
-			lookup_blocked_cells):
+	var accepted_cells: Dictionary = {}
+	var accepted_base_cells: Dictionary = {}
+	var canonical_options := _select_local_cell_winners(candidates_by_phase[0])
+	if _refresh_cancelled():
 		return false
-	if not _run_candidate_phase(fallback_domain_entries, accepted_world_centers,
-			accepted_cells, accepted_base_cells, spacing_blocked_cells,
-			lookup_blocked_cells):
+	var canonical_survivors := _local_priority_survivors(canonical_options, [],
+			spacing_blocked_cells)
+	if _refresh_cancelled():
 		return false
+	if not _commit_priority_winners(canonical_survivors, accepted_cells,
+			accepted_base_cells, lookup_blocked_cells):
+		return false
+
+	var fallback_options := _select_local_cell_winners(candidates_by_phase[1])
+	if _refresh_cancelled():
+		return false
+	var fallback_available: Array[Dictionary] = []
+	for option in fallback_options:
+		if _refresh_cancelled():
+			return false
+		var candidate: Dictionary = option["candidate"]
+		if accepted_cells.has(String(candidate["arbitration_key"])):
+			continue
+		fallback_available.append(option)
+	var fallback_survivors := _local_priority_survivors(fallback_available,
+			canonical_survivors, spacing_blocked_cells)
+	if _refresh_cancelled():
+		return false
+	if not _commit_priority_winners(fallback_survivors, accepted_cells,
+			accepted_base_cells, lookup_blocked_cells):
+		return false
+
 	var checked_cells := 0
-	for cell_value in _world_candidate_cells:
+	for cell_value in staged_by_world_cell:
 		checked_cells += 1
 		if checked_cells % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
 			return false
 		var base_world_cell: Vector3i = cell_value
-		var domains: Dictionary = _world_candidate_cells[base_world_cell]["domains"]
-		var staged_for_cell := 0
-		for domain_bucket_value in domains.values():
-			staged_for_cell += domain_bucket_value["candidates"].size()
+		var staged_for_cell := int(staged_by_world_cell[base_world_cell])
 		var accepted_in_cell := int(accepted_base_cells.get(base_world_cell, 0))
 		if accepted_in_cell > 0:
 			rejected_world_cell_competition_count += maxi(0, staged_for_cell - accepted_in_cell)
@@ -2268,253 +2340,216 @@ func _finalize_world_candidates() -> bool:
 				rejected_lookup_capacity_count += 1
 	return true
 
-func _make_domain_entries(grouped_candidates: Dictionary,
-		minimum_base_cell: Vector3i) -> Dictionary:
-	var result: Dictionary = {}
-	var checked_entries := 0
-	for domain_key_value in grouped_candidates:
-		if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
-			return {}
-		var domain_key := String(domain_key_value)
-		var domain_groups: Dictionary = grouped_candidates[domain_key]
-		var entries: Array = []
-		for arbitration_key_value in domain_groups:
-			checked_entries += 1
-			if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
-				return {}
-			var arbitration_key := String(arbitration_key_value)
-			var candidates: Array = domain_groups[arbitration_key]
+func _select_local_cell_winners(candidates_by_cell: Dictionary) -> Array[Dictionary]:
+	var result: Array[Dictionary] = []
+	var checked_cells := 0
+	for arbitration_key_value in candidates_by_cell:
+		checked_cells += 1
+		if checked_cells % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return []
+		var arbitration_key := String(arbitration_key_value)
+		var candidates: Array = candidates_by_cell[arbitration_key]
+		var candidates_by_group: Dictionary = {}
+		for candidate in candidates:
+			var group_key := _coverage_group_key(candidate)
+			var group_candidates: Array = candidates_by_group.get(group_key, [])
+			group_candidates.append(candidate)
+			candidates_by_group[group_key] = group_candidates
+		var options: Array[Dictionary] = []
+		for group_key_value in candidates_by_group:
 			if _refresh_cancelled():
-				return {}
-			candidates.sort_custom(Callable(self, "_candidate_less"))
-			if _refresh_cancelled():
-				return {}
-			var order_cell: Vector3i = candidates[0].get("world_cell", Vector3i.ZERO)
-			for candidate in candidates:
-				checked_entries += 1
-				if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
-					return {}
-				var candidate_cell: Vector3i = candidate.get("world_cell", order_cell)
-				if _world_cell_less(candidate_cell, order_cell):
-					order_cell = candidate_cell
-			entries.append({
-				"cell": order_cell,
+				return []
+			var group_key := String(group_key_value)
+			var group_candidates: Array = candidates_by_group[group_key]
+			group_candidates.sort_custom(Callable(self, "_candidate_less"))
+			var candidate: Dictionary = group_candidates[0]
+			var arbitration_cell: Vector3i = candidate.get("arbitration_cell", Vector3i.ZERO)
+			options.append({
+				"candidate": candidate,
+				"group": group_key,
+				"rank": ProbeLayout.world_cell_rank(group_key, arbitration_cell),
 				"arbitration_key": arbitration_key,
-				"morton": ProbeLayout.morton_words(order_cell - minimum_base_cell),
-				"candidates": candidates,
 			})
-		result[domain_key] = entries
+		options.sort_custom(Callable(self, "_coverage_group_option_less"))
+		if not options.is_empty():
+			result.append(options[0])
 	return result
 
-func _run_candidate_phase(domain_entries: Dictionary,
-		accepted_world_centers: Dictionary, accepted_cells: Dictionary,
-		accepted_base_cells: Dictionary, spacing_blocked_cells: Dictionary,
-		lookup_blocked_cells: Dictionary) -> bool:
-	var domain_states: Dictionary = {}
-	var scheduler: Array[Dictionary] = []
-	var checked_entries := 0
-	for domain_key_value in domain_entries:
-		checked_entries += 1
-		if checked_entries % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
-			return false
-		var domain_key := String(domain_key_value)
-		var entries: Array = domain_entries[domain_key]
-		if _refresh_cancelled():
-			return false
-		entries.sort_custom(Callable(self, "_domain_opportunity_less"))
-		if _refresh_cancelled():
-			return false
-		var opportunities := entries.size()
-		if opportunities <= 0:
-			continue
-		var state := {
-			"entries": entries,
-			"cursor": 0,
-			"accepted": 0,
-			"attempted": 0,
-			"opportunities": opportunities,
-			"rank": ProbeLayout.world_cell_rank(domain_key, Vector3i.ZERO),
-		}
-		domain_states[domain_key] = state
-		_coverage_heap_push(scheduler, _coverage_heap_item(domain_key, state))
-	var scheduled_work := 0
-	while not scheduler.is_empty():
-		scheduled_work += 1
-		if scheduled_work % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
-			return false
-		var schedule_entry := _coverage_heap_pop(scheduler)
-		var domain_key := String(schedule_entry["key"])
-		if not domain_states.has(domain_key):
-			continue
-		var state: Dictionary = domain_states[domain_key]
-		var entries: Array = state["entries"]
-		var cursor := int(state["cursor"])
-		if cursor >= entries.size():
-			domain_states.erase(domain_key)
-			continue
-		var opportunity: Dictionary = entries[cursor]
-		var arbitration_key := String(opportunity["arbitration_key"])
-		state["cursor"] = cursor + 1
-		state["attempted"] = int(state["attempted"]) + 1
-		if accepted_cells.has(arbitration_key):
-			domain_states[domain_key] = state
-			if int(state["cursor"]) < entries.size():
-				_coverage_heap_push(scheduler, _coverage_heap_item(domain_key, state))
-			continue
-		var spacing_blocked := false
-		var lookup_blocked := false
-		var cell_accepted := false
-		var candidates: Array = opportunity["candidates"]
-		for candidate in candidates:
-			if _refresh_cancelled():
-				return false
-			var lookup_cell := int(candidate["lookup_cell"])
-			if not _adaptive_placement and int(_cell_counts.get(lookup_cell, 0)) >= Data.CELL_CAPACITY:
-				lookup_blocked = true
-				continue
-			if positions.size() >= MAX_PROBES:
-				error_message = "Surface sampling exceeds the 65,536-probe limit; increase Probe Spacing or reduce the volume."
-				return false
-			var center: Vector3 = candidate["center"]
-			var candidate_spacing := float(candidate.get("spacing", _probe_spacing))
-			var base_world_cell: Vector3i = candidate.get("world_cell", opportunity["cell"])
-			if _accepted_world_center_conflict(base_world_cell, center,
-						candidate_spacing, accepted_world_centers):
-				spacing_blocked = true
-				continue
-			positions.append(center)
-			surface_positions.append(candidate["surface"])
-			normals.append(candidate["normal"])
-			stable_probe_ids.append(int(candidate.get("stable_id", 0)))
-			if _adaptive_placement:
-				probe_spacings.append(candidate_spacing)
-			_cell_counts[lookup_cell] = int(_cell_counts.get(lookup_cell, 0)) + 1
-			var accepted_bucket: Array = accepted_world_centers.get(base_world_cell, [])
-			accepted_bucket.append({"center": center, "spacing": candidate_spacing})
-			accepted_world_centers[base_world_cell] = accepted_bucket
-			accepted_cells[arbitration_key] = true
-			accepted_base_cells[base_world_cell] = int(accepted_base_cells.get(base_world_cell, 0)) + 1
-			state["accepted"] = int(state["accepted"]) + 1
-			cell_accepted = true
-			break
-		if not cell_accepted:
-			if spacing_blocked:
-				var base_world_cell: Vector3i = candidates[0].get("world_cell", opportunity["cell"])
-				spacing_blocked_cells[base_world_cell] = true
-			if lookup_blocked:
-				var base_world_cell: Vector3i = candidates[0].get("world_cell", opportunity["cell"])
-				lookup_blocked_cells[base_world_cell] = true
-		domain_states[domain_key] = state
-		if int(state["cursor"]) < entries.size():
-			_coverage_heap_push(scheduler, _coverage_heap_item(domain_key, state))
-	return true
+func _coverage_group_key(candidate: Dictionary) -> String:
+	# Keep source and material-surface identity, but collapse tessellation-driven
+	# normal microbins to six signed principal directions for coverage fairness.
+	var domain_parts := String(candidate.get("domain", "")).split("\u001f")
+	var source_surface := String(candidate.get("domain", ""))
+	if domain_parts.size() >= 2:
+		source_surface = String(domain_parts[0]) + "\u001f" + String(domain_parts[1])
+	var normal: Vector3 = candidate.get("normal", Vector3.UP)
+	var axis := _dominant_normal_axis(normal)
+	var sign := "+" if normal[axis] >= 0.0 else "-"
+	return "%s\u001faxis=%d%s" % [source_surface, axis, sign]
 
-func _domain_opportunity_less(a: Dictionary, b: Dictionary) -> bool:
-	var cell_a: Vector3i = a["cell"]
-	var cell_b: Vector3i = b["cell"]
-	var morton_a: PackedInt64Array = a["morton"]
-	var morton_b: PackedInt64Array = b["morton"]
-	if ProbeLayout.morton_words_less(morton_a, morton_b):
-		return true
-	if ProbeLayout.morton_words_less(morton_b, morton_a):
-		return false
+func _coverage_group_option_less(a: Dictionary, b: Dictionary) -> bool:
+	var rank_a := int(a["rank"])
+	var rank_b := int(b["rank"])
+	if rank_a != rank_b:
+		return rank_a < rank_b
+	return String(a["group"]) < String(b["group"])
+
+func _priority_record_less(a: Dictionary, b: Dictionary) -> bool:
+	var candidate_a: Dictionary = a["candidate"]
+	var candidate_b: Dictionary = b["candidate"]
+	var canonical_a := bool(candidate_a.get("canonical", false))
+	var canonical_b := bool(candidate_b.get("canonical", false))
+	if canonical_a != canonical_b:
+		return canonical_a
+	var spacing_a := float(candidate_a.get("spacing", _probe_spacing))
+	var spacing_b := float(candidate_b.get("spacing", _probe_spacing))
+	if spacing_a != spacing_b:
+		return spacing_a < spacing_b
+	var rank_a := int(a["rank"])
+	var rank_b := int(b["rank"])
+	if rank_a != rank_b:
+		return rank_a < rank_b
+	var cell_a: Vector3i = candidate_a.get("arbitration_cell", Vector3i.ZERO)
+	var cell_b: Vector3i = candidate_b.get("arbitration_cell", Vector3i.ZERO)
 	if cell_a.x != cell_b.x:
 		return cell_a.x < cell_b.x
 	if cell_a.y != cell_b.y:
 		return cell_a.y < cell_b.y
 	if cell_a.z != cell_b.z:
 		return cell_a.z < cell_b.z
-	return String(a["arbitration_key"]) < String(b["arbitration_key"])
+	var group_a := String(a["group"])
+	var group_b := String(b["group"])
+	if group_a != group_b:
+		return group_a < group_b
+	return int(candidate_a.get("stable_id", 0)) < int(candidate_b.get("stable_id", 0))
 
-func _world_cell_less(a: Vector3i, b: Vector3i) -> bool:
-	if a.x != b.x:
-		return a.x < b.x
-	if a.y != b.y:
-		return a.y < b.y
-	return a.z < b.z
+func _candidate_records_conflict(a: Dictionary, b: Dictionary) -> bool:
+	var candidate_a: Dictionary = a["candidate"]
+	var candidate_b: Dictionary = b["candidate"]
+	var spacing_a := float(candidate_a.get("spacing", _probe_spacing))
+	var spacing_b := float(candidate_b.get("spacing", _probe_spacing))
+	var average_spacing := 0.5 * (spacing_a + spacing_b)
+	var minimum_distance := maxf(0.0, average_spacing -
+			maxf(0.000001, average_spacing * 0.000001))
+	var center_a: Vector3 = candidate_a["center"]
+	var center_b: Vector3 = candidate_b["center"]
+	return center_a.distance_squared_to(center_b) < minimum_distance * minimum_distance
 
-func _coverage_heap_item(domain_key: String, state: Dictionary) -> Dictionary:
-	return {
-		"key": domain_key,
-		"accepted": int(state["accepted"]),
-		"attempted": int(state["attempted"]),
-		"opportunities": int(state["opportunities"]),
-		"rank": int(state["rank"]),
-	}
+func _local_priority_survivors(winners: Array[Dictionary],
+		fixed_winners: Array[Dictionary],
+		spacing_blocked_cells: Dictionary) -> Array[Dictionary]:
+	var winners_by_base_cell: Dictionary = {}
+	for winner in winners:
+		if _refresh_cancelled():
+			return []
+		var candidate: Dictionary = winner["candidate"]
+		var base_cell: Vector3i = candidate.get("world_cell", Vector3i.ZERO)
+		var bucket: Array = winners_by_base_cell.get(base_cell, [])
+		bucket.append(winner)
+		winners_by_base_cell[base_cell] = bucket
+	var fixed_by_base_cell: Dictionary = {}
+	for fixed_winner in fixed_winners:
+		if _refresh_cancelled():
+			return []
+		var fixed_candidate: Dictionary = fixed_winner["candidate"]
+		var fixed_base_cell: Vector3i = fixed_candidate.get("world_cell", Vector3i.ZERO)
+		var fixed_bucket: Array = fixed_by_base_cell.get(fixed_base_cell, [])
+		fixed_bucket.append(fixed_winner)
+		fixed_by_base_cell[fixed_base_cell] = fixed_bucket
 
-func _coverage_heap_less(a: Dictionary, b: Dictionary) -> bool:
-	var accepted_a := int(a["accepted"])
-	var accepted_b := int(b["accepted"])
-	var opportunities_a := int(a["opportunities"])
-	var opportunities_b := int(b["opportunities"])
-	var accepted_cross_a := accepted_a * opportunities_b
-	var accepted_cross_b := accepted_b * opportunities_a
-	if accepted_cross_a != accepted_cross_b:
-		return accepted_cross_a < accepted_cross_b
-	# Among equal accepted/opportunity ratios, rotate domains by the fraction of
-	# their opportunities already tried. Stable rank/key resolves exact ties.
-	var attempted_cross_a := int(a["attempted"]) * opportunities_b
-	var attempted_cross_b := int(b["attempted"]) * opportunities_a
-	if attempted_cross_a != attempted_cross_b:
-		return attempted_cross_a < attempted_cross_b
-	var rank_a := int(a["rank"])
-	var rank_b := int(b["rank"])
-	if rank_a != rank_b:
-		return rank_a < rank_b
-	return String(a["key"]) < String(b["key"])
+	var survivors: Array[Dictionary] = []
+	var checked_winners := 0
+	for winner in winners:
+		checked_winners += 1
+		if checked_winners % REFRESH_WORKER_CHECK_INTERVAL == 0 and _refresh_cancelled():
+			return []
+		var candidate: Dictionary = winner["candidate"]
+		var arbitration_key := String(candidate["arbitration_key"])
+		var base_cell: Vector3i = candidate.get("world_cell", Vector3i.ZERO)
+		var blocked := false
+		# Accepted spacing never exceeds base spacing, so a conflict can only
+		# occur in the same or an adjacent base-world cell on each axis.
+		for dz in range(-1, 2):
+			for dy in range(-1, 2):
+				for dx in range(-1, 2):
+					var neighbor_cell := base_cell + Vector3i(dx, dy, dz)
+					for fixed_value in fixed_by_base_cell.get(neighbor_cell, []):
+						var fixed_winner: Dictionary = fixed_value
+						var fixed_candidate: Dictionary = fixed_winner["candidate"]
+						if String(fixed_candidate["arbitration_key"]) == arbitration_key:
+							continue
+						if _candidate_records_conflict(winner, fixed_winner):
+							blocked = true
+							break
+					if blocked:
+						break
+					for other_value in winners_by_base_cell.get(neighbor_cell, []):
+						var other: Dictionary = other_value
+						var other_candidate: Dictionary = other["candidate"]
+						if String(other_candidate["arbitration_key"]) == arbitration_key:
+							continue
+						if _priority_record_less(other, winner) \
+								and _candidate_records_conflict(winner, other):
+							blocked = true
+							break
+					if blocked:
+						break
+				if blocked:
+					break
+			if blocked:
+				break
+		if blocked:
+			spacing_blocked_cells[base_cell] = true
+		else:
+			survivors.append(winner)
+	return survivors
 
-func _coverage_heap_push(heap: Array[Dictionary], item: Dictionary) -> void:
-	heap.append(item)
-	var index := heap.size() - 1
-	while index > 0:
-		var parent := int((index - 1) / 2)
-		if not _coverage_heap_less(item, heap[parent]):
-			break
-		heap[index] = heap[parent]
-		index = parent
-	heap[index] = item
-
-func _coverage_heap_pop(heap: Array[Dictionary]) -> Dictionary:
-	var result: Dictionary = heap[0]
-	var last: Dictionary = heap.pop_back()
-	if heap.is_empty():
-		return result
-	var index := 0
-	while true:
-		var left := index * 2 + 1
-		if left >= heap.size():
-			break
-		var best := left
-		var right := left + 1
-		if right < heap.size() and _coverage_heap_less(heap[right], heap[left]):
-			best = right
-		if not _coverage_heap_less(heap[best], last):
-			break
-		heap[index] = heap[best]
-		index = best
-	heap[index] = last
-	return result
-
-func _accepted_world_center_conflict(world_cell: Vector3i, center: Vector3,
-		candidate_spacing: float, accepted: Dictionary) -> bool:
-	for dz in range(-1, 2):
-		for dy in range(-1, 2):
-			for dx in range(-1, 2):
-				var neighbor := world_cell + Vector3i(dx, dy, dz)
-				for other_value in accepted.get(neighbor, []):
-					var other: Dictionary = other_value
-					var average_spacing := 0.5 * (candidate_spacing + float(other["spacing"]))
-					var minimum_distance := maxf(0.0, average_spacing -
-							maxf(0.000001, average_spacing * 0.000001))
-					if center.distance_squared_to(other["center"]) \
-							< minimum_distance * minimum_distance:
-						return true
-	return false
+func _commit_priority_winners(winners: Array[Dictionary],
+		accepted_cells: Dictionary, accepted_base_cells: Dictionary,
+		lookup_blocked_cells: Dictionary) -> bool:
+	var ordered := winners.duplicate()
+	ordered.sort_custom(Callable(self, "_priority_record_less"))
+	for winner in ordered:
+		if _refresh_cancelled():
+			return false
+		var candidate: Dictionary = winner["candidate"]
+		var arbitration_key := String(candidate["arbitration_key"])
+		if accepted_cells.has(arbitration_key):
+			continue
+		var lookup_cell := int(candidate["lookup_cell"])
+		if not _adaptive_placement \
+				and int(_cell_counts.get(lookup_cell, 0)) >= Data.CELL_CAPACITY:
+			var blocked_base_cell: Vector3i = candidate.get("world_cell", Vector3i.ZERO)
+			lookup_blocked_cells[blocked_base_cell] = true
+			continue
+		if positions.size() >= MAX_PROBES:
+			error_message = "Surface sampling exceeds the 65,536-probe limit; increase Probe Spacing or reduce the volume."
+			return false
+		var center: Vector3 = candidate["center"]
+		var spacing := float(candidate.get("spacing", _probe_spacing))
+		var base_world_cell: Vector3i = candidate.get("world_cell", Vector3i.ZERO)
+		positions.append(center)
+		surface_positions.append(candidate["surface"])
+		normals.append(candidate["normal"])
+		stable_probe_ids.append(int(candidate.get("stable_id", 0)))
+		if _adaptive_placement:
+			probe_spacings.append(spacing)
+		_cell_counts[lookup_cell] = int(_cell_counts.get(lookup_cell, 0)) + 1
+		accepted_cells[arbitration_key] = true
+		accepted_base_cells[base_world_cell] = int(accepted_base_cells.get(base_world_cell, 0)) + 1
+	return true
 
 func _world_point_coordinates_are_supported(point: Vector3) -> bool:
-	var scaled := point / _probe_spacing
-	return scaled.is_finite() and absf(scaled.x) < 2147483000.0 \
-			and absf(scaled.y) < 2147483000.0 and absf(scaled.z) < 2147483000.0
+	const MAX_SAFE_CELL_COORDINATE := 2147483000.0
+	var base_scaled := point / _probe_spacing
+	var arbitration_scaled := point / _arbitration_spacing
+	return base_scaled.is_finite() and arbitration_scaled.is_finite() \
+			and absf(base_scaled.x) < MAX_SAFE_CELL_COORDINATE \
+			and absf(base_scaled.y) < MAX_SAFE_CELL_COORDINATE \
+			and absf(base_scaled.z) < MAX_SAFE_CELL_COORDINATE \
+			and absf(arbitration_scaled.x) < MAX_SAFE_CELL_COORDINATE \
+			and absf(arbitration_scaled.y) < MAX_SAFE_CELL_COORDINATE \
+			and absf(arbitration_scaled.z) < MAX_SAFE_CELL_COORDINATE
 
 func _mesh_domain_source(node: MeshInstance3D, mesh: Mesh) -> String:
 	var instance_id := node.get_instance_id()

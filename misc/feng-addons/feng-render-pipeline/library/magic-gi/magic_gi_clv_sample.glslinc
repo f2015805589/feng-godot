@@ -7,7 +7,6 @@ layout(set = 0, binding = 21, std140) uniform ClipmapParameters {
 
 const int CLV_SAMPLE_EXACT = 0;
 const int CLV_SAMPLE_FULL = 1;
-const int CLV_SAMPLE_PARTIAL = 2;
 const int CLV_REJECT_NONE = 0;
 const int CLV_REJECT_DISABLED = 1;
 const int CLV_REJECT_OUTSIDE = 2;
@@ -16,6 +15,7 @@ const int CLV_REJECT_GEOMETRY_BLOCKED = 4;
 const int CLV_REJECT_NO_EXACT_SUPPORT = 5;
 const int CLV_REJECT_NO_EXACT_CANDIDATE = 6;
 const int CLV_REJECT_OUTSIDE_BAKE_GRID = 7;
+const int CLV_REJECT_INCOMPLETE_SUPPORT = 8;
 
 const float CLV_QUERY_PLANE_EPSILON = 1e-4;
 const float CLV_QUERY_AXIS_EPSILON = 1e-4;
@@ -134,8 +134,7 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 	bool found_blocked_geometry = false;
 	for (int level = 0; level < clv.control.y; level++) {
 		float step_size = clv.spacing.x * float(1 << level);
-		// Sample on the receiving side. Every interpolation corner must have a
-		// clear connection to the actual surface; thin walls cannot be skipped.
+		// Address the sample from the receiving side before validating this level.
 		vec3 position;
 		ivec3 base;
 		vec3 fraction;
@@ -151,6 +150,7 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 		bool seam = any(equal(physical, ivec3(resolution - 1)));
 		int valid_mask = 0;
 		bool all_metadata_valid = true;
+		bool all_positive_metadata_valid = true;
 		float coverage = 0.0;
 		for (int z = 0; z < 2; z++) for (int yy = 0; yy < 2; yy++) for (int x = 0; x < 2; x++) {
 			ivec3 offset = ivec3(x, yy, z);
@@ -167,22 +167,31 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 					&& surface_patch >= 0
 					&& !(receiver_patch > 0 && surface_patch != receiver_patch)
 					&& !(surface_patch > 0 && dot(metadata.xyz, normal) < 0.9);
+			float corner_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+					* (yy == 0 ? 1.0 - fraction.y : fraction.y)
+					* (z == 0 ? 1.0 - fraction.z : fraction.z);
 			all_metadata_valid = all_metadata_valid && corner_valid;
+			if (corner_weight > 0.0 && !corner_valid) {
+				all_positive_metadata_valid = false;
+			}
 			if (corner_valid) {
 				valid_mask |= 1 << (x | (yy << 1) | (z << 2));
-				coverage += (x == 0 ? 1.0 - fraction.x : fraction.x)
-						* (yy == 0 ? 1.0 - fraction.y : fraction.y)
-						* (z == 0 ? 1.0 - fraction.z : fraction.z);
+				coverage += corner_weight;
 			}
 		}
 		if (coverage <= 0.0) { continue; }
 		if (collect_diagnostics) { found_valid_corner = true; }
-		// Geometry ownership remains all-corner: invalid or zero-weight metadata
-		// cannot hide a thin blocker between any logical corner and the receiver.
+		// Geometry guards apply to valid, positive-weight contributors; any blocked
+		// contributor rejects this entire clipmap level.
 		bool geometry_clear = true;
 		for (int z = 0; z < 2 && geometry_clear; z++)
 		for (int yy = 0; yy < 2 && geometry_clear; yy++)
 		for (int x = 0; x < 2; x++) {
+			int corner_index = x | (yy << 1) | (z << 2);
+			float corner_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+					* (yy == 0 ? 1.0 - fraction.y : fraction.y)
+					* (z == 0 ? 1.0 - fraction.z : fraction.z);
+			if ((valid_mask & (1 << corner_index)) == 0 || !(corner_weight > 0.0)) { continue; }
 			ivec3 corner_cell = base + ivec3(x, yy, z);
 			vec3 corner = (vec3(corner_cell) + 0.5) * step_size;
 			bool blocked = segment_blocked(corner, world, receiver_triangle, 0);
@@ -195,6 +204,14 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 		if (collect_diagnostics) {
 			selected_level = level;
 			cell_fraction = fraction;
+		}
+		if (!all_positive_metadata_valid) {
+			cache_weight = clamp(coverage, 0.0, 1.0);
+			if (collect_diagnostics) {
+				sample_status = CLV_SAMPLE_EXACT;
+				reject_reason = CLV_REJECT_INCOMPLETE_SUPPORT;
+			}
+			return false;
 		}
 		if (all_metadata_valid && !seam) {
 			vec3 coordinate = vec3(physical) + fraction + 0.5;
@@ -227,11 +244,11 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 				secondary += corner_secondary * weight;
 				primary += corner_primary * weight;
 			}
-			cache_weight = all_metadata_valid ? 1.0 : clamp(coverage, 0.0, 1.0);
-			complete_support = all_metadata_valid;
+			cache_weight = 1.0;
+			complete_support = true;
 		}
 		if (collect_diagnostics) {
-			sample_status = complete_support ? CLV_SAMPLE_FULL : CLV_SAMPLE_PARTIAL;
+			sample_status = CLV_SAMPLE_FULL;
 		}
 		secondary = max(secondary, vec3(0.0)); primary = max(primary, vec3(0.0));
 		return cache_weight > 0.0;
@@ -268,17 +285,4 @@ bool sample_clv(vec3 world, vec3 normal, int receiver_triangle, int receiver_pat
 	return sample_clv_core(world, normal, receiver_triangle, receiver_patch, false,
 			secondary, primary, cache_weight, complete_support, selected_level,
 			sample_status, reject_reason, cell_fraction);
-}
-
-void complete_partial_clv(vec3 cached_secondary, vec3 cached_primary, float cache_weight,
-		vec3 exact_secondary, vec3 exact_primary, float exact_visible_support_weight,
-		out vec3 secondary, out vec3 primary) {
-	if (exact_visible_support_weight <= 1e-10) {
-		secondary = max(exact_secondary, vec3(0.0));
-		primary = max(exact_primary, vec3(0.0));
-		return;
-	}
-	float exact_weight = 1.0 - clamp(cache_weight, 0.0, 1.0);
-	secondary = max(cached_secondary + exact_secondary * exact_weight, vec3(0.0));
-	primary = max(cached_primary + exact_primary * exact_weight, vec3(0.0));
 }

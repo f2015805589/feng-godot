@@ -14,6 +14,7 @@ const Data = preload("feng_magic_gi_data.gd")
 const Manifest = preload("feng_magic_gi_manifest.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const Preview = preload("feng_magic_gi_preview.gd")
+const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
 const ZERO_TRANSFER_DIAGNOSTIC := "本次几何间接传输与天空可见性均为零。请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新 Bake。"
 const BAKE_QUALITY_NAMES := ["Draft", "Final", "High"]
 const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
@@ -404,6 +405,8 @@ func bake_staleness_reasons() -> PackedStringArray:
 	if has_legacy_sampler_signature():
 		reasons.append("it uses sampler revision %d; the current sampler is revision %d" % [
 			Data.sampler_revision_for_signature(bake_data.scene_signature), Data.SAMPLER_REVISION])
+	if bake_data.placement_layout_revision != ProbeLayout.PLACEMENT_LAYOUT_REVISION:
+		reasons.append("probe placement layout revision changed; rebake to refresh points")
 	if bake_data.bake_samples != bake_samples:
 		reasons.append("it used %d rays per point; the selected quality requests %d" % [
 			bake_data.bake_samples, bake_samples])
@@ -1086,6 +1089,8 @@ func _saved_bake_matches_current() -> bool:
 		# and keep the readable generation until an actual source edit is observed.
 		return _legacy_manifest_unverified
 	if bake_data == null or not has_usable_bake():
+		return false
+	if bake_data.placement_layout_revision != ProbeLayout.PLACEMENT_LAYOUT_REVISION:
 		return false
 	if not SceneTracker.is_signature_schema_supported(
 			int(bake_data.scene_watch_signature_schema_version)):

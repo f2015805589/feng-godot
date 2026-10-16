@@ -9,6 +9,7 @@ const Manifest = preload("res://addons/feng-magic-gi/feng_magic_gi_manifest.gd")
 const Baker = preload("res://addons/feng-magic-gi/feng_magic_gi_baker.gd")
 const Binding = preload("res://addons/feng-magic-gi/feng_magic_gi_emitter_binding.gd")
 const SceneTracker = preload("res://addons/feng-magic-gi/feng_magic_gi_scene_tracker.gd")
+const ProbeLayout = preload("res://addons/feng-magic-gi/feng_magic_gi_probe_layout.gd")
 const FIXTURE_DIRECTORY := "user://magic_gi_persistence_roundtrip"
 const DATA_PATH := FIXTURE_DIRECTORY + "/watchless_legacy_data.res"
 const SCENE_PATH := FIXTURE_DIRECTORY + "/unchanged_scene.tscn"
@@ -93,6 +94,7 @@ func _make_data(volume: Volume) -> Data:
 	data.material_reflectance = volume.fallback_material_reflectance
 	data.scene_signature = (Data.SAMPLER_REVISION << 32) \
 			| (placement.scene_signature & 0xffffffff)
+	data.placement_layout_revision = ProbeLayout.PLACEMENT_LAYOUT_REVISION
 	data.scene_watch_signature = 0
 	data.positions = placement.positions.duplicate()
 	data.surface_positions = placement.surface_positions.duplicate()
@@ -287,12 +289,17 @@ func _verify_fixture() -> void:
 			_check(current_volume.bake_data.scene_watch_signature_schema_version
 					== SceneTracker.SIGNATURE_SCHEMA_CURRENT,
 				"the persisted current-schema marker must survive Data and scene serialization")
+			_check(current_volume.bake_data.placement_layout_revision
+					== ProbeLayout.PLACEMENT_LAYOUT_REVISION,
+				"the placement revision must survive direct Data and scene serialization")
 			_check(current_volume.has_bake() and not current_volume.needs_rebake(),
 				"a current root-relative Data bake must validate in a fresh process")
+			await _verify_layout_revision_stales_watched_data(current_volume)
 	await _verify_manifest_coexistence_fixture(CURRENT_MANIFEST_SCENE_PATH,
 			SceneTracker.SIGNATURE_SCHEMA_CURRENT)
 	await _verify_manifest_coexistence_fixture(LEGACY_MANIFEST_SCENE_PATH,
 			SceneTracker.SIGNATURE_SCHEMA_LEGACY)
+	await _verify_layout_revision_stales_legacy_data(volume)
 	var emissive_surface := MeshInstance3D.new()
 	emissive_surface.name = "LateEmissive"
 	emissive_surface.mesh = BoxMesh.new()
@@ -558,6 +565,11 @@ func _verify_fixture() -> void:
 	_check(volume.probe_positions == saved_world_positions and volume.is_layout_stale(),
 		"moving the Volume must leave old baked world anchors visible and mark them stale")
 	await _verify_signature_schema_contract()
+	var direct_bake_succeeded := await volume.bake()
+	_check(direct_bake_succeeded and volume.bake_data != null
+			and volume.bake_data.placement_layout_revision
+			== ProbeLayout.PLACEMENT_LAYOUT_REVISION,
+			"a real direct CPU bake must stamp the current probe placement revision")
 	print("MAGIC_GI_PERSISTENCE_VERIFY checks=", checks, " failures=", failures,
 		" probes=", saved_world_positions.size())
 	quit(1 if failures else 0)
@@ -587,6 +599,27 @@ func _verify_manifest_coexistence_fixture(scene_path: String,
 		"the active Manifest signature must validate independently of retained legacy Data")
 	_check(volume.has_bake() and not volume.needs_rebake(),
 		"the public bake state must accept an active Manifest with retained legacy Data")
+	var current_manifest := volume.bake_manifest
+	var old_layout_manifest := current_manifest.duplicate(true) as Manifest
+	old_layout_manifest.bake_settings_signature = _legacy_streamed_settings_signature(volume)
+	volume._bake_assigning_manifest = true
+	volume.bake_manifest = old_layout_manifest
+	volume._bake_assigning_manifest = false
+	volume._schedule_saved_source_validation(true)
+	await process_frame
+	await volume._settle_layout_change()
+	_check(old_layout_manifest.is_valid() and volume.has_usable_bake(),
+			"a pre-layout-revision Manifest must remain structurally usable")
+	_check(not volume.has_bake() and volume.needs_rebake(),
+			"a pre-layout-revision Manifest must request a new placement bake")
+	volume._bake_assigning_manifest = true
+	volume.bake_manifest = current_manifest
+	volume._bake_assigning_manifest = false
+	volume._schedule_saved_source_validation(true)
+	await process_frame
+	await volume._settle_layout_change()
+	_check(volume.has_bake() and not volume.needs_rebake(),
+			"restoring the current layout signature must validate the Manifest again")
 	var fallback_data := _make_data(volume)
 	if fallback_data == null:
 		return
@@ -603,6 +636,72 @@ func _verify_manifest_coexistence_fixture(scene_path: String,
 	await volume._settle_layout_change()
 	_check(volume.has_bake() and not volume.needs_rebake(),
 		"clearing the active Manifest must correctly fall back to a matching Data bake")
+
+func _verify_layout_revision_stales_legacy_data(volume: Volume) -> void:
+	var placement := Placement.new()
+	_check(placement.collect(volume, true, true, true),
+			"the layout-version fixture must collect the current geometry")
+	if placement.positions.is_empty():
+		return
+	var current_data := volume.bake_data
+	_check(current_data.scene_watch_signature == 0,
+			"the layout-version fixture must explicitly cover the watchless legacy Data path")
+	_check(Data.geometry_signature_matches(current_data.scene_signature,
+			placement.scene_signature),
+			"the watchless fixture geometry must match before changing only its layout revision")
+	var original_scene_signature := current_data.scene_signature
+	var original_watch_signature := current_data.scene_watch_signature
+	current_data.placement_layout_revision = 0
+	current_data.emit_changed()
+	_check(current_data.is_valid(),
+			"a structurally valid old-layout Data resource must remain readable")
+	await process_frame
+	await volume._settle_layout_change()
+	_check(volume.has_usable_bake() and not volume.has_bake() and volume.needs_rebake(),
+			"a pre-layout-revision Data resource must stay usable and request rebaking")
+	_check(current_data.scene_signature == original_scene_signature
+			and current_data.scene_watch_signature == original_watch_signature,
+			"the watchless staleness case must preserve both saved source signatures")
+	current_data.placement_layout_revision = ProbeLayout.PLACEMENT_LAYOUT_REVISION
+	current_data.emit_changed()
+	await process_frame
+	await volume._settle_layout_change()
+	_check(volume.has_bake() and not volume.needs_rebake(),
+			"restoring the current placement fingerprint must validate direct Data again")
+
+func _verify_layout_revision_stales_watched_data(volume: Volume) -> void:
+	var current_data := volume.bake_data
+	_check(current_data.scene_watch_signature > 0
+			and current_data.placement_layout_revision == ProbeLayout.PLACEMENT_LAYOUT_REVISION,
+			"the watched regression must change only placement_layout_revision")
+	var original_scene_signature := current_data.scene_signature
+	var original_watch_signature := current_data.scene_watch_signature
+	current_data.placement_layout_revision = 0
+	current_data.emit_changed()
+	_check(current_data.is_valid(),
+			"an old-layout watched Data resource must remain structurally valid")
+	await process_frame
+	await volume._settle_layout_change()
+	_check(volume.has_usable_bake() and not volume.has_bake() and volume.needs_rebake(),
+			"a source-watched old-layout Data resource must remain usable and request rebaking")
+	_check("placement layout revision" in "; ".join(volume.bake_staleness_reasons()),
+			"the inspector must explain the placement-layout staleness")
+	_check(current_data.scene_signature == original_scene_signature
+			and current_data.scene_watch_signature == original_watch_signature,
+			"the watched staleness case must preserve both saved source signatures")
+	current_data.placement_layout_revision = ProbeLayout.PLACEMENT_LAYOUT_REVISION
+	current_data.emit_changed()
+	await process_frame
+	await volume._settle_layout_change()
+	_check(volume.has_bake() and not volume.needs_rebake(),
+			"restoring a current layout marker must validate source-watched Data again")
+
+func _legacy_streamed_settings_signature(volume: Volume) -> int:
+	return hash([volume.global_transform, volume.size, volume.probe_spacing,
+		volume.minimum_probe_spacing, volume.surface_offset, volume.adaptive_placement,
+		volume.bake_samples, volume.bake_bounces, volume.bake_distance,
+		volume.terrain_reflectance, volume.fallback_material_reflectance,
+		volume.management_block_size, volume.core_page_size, volume.clv_cell_size])
 
 func _verify_signature_schema_contract() -> void:
 	var editor_fixture := _make_signature_fixture("EditorLikeSceneRoot")

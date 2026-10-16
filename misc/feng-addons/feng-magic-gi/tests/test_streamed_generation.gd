@@ -4,6 +4,7 @@ extends SceneTree
 const Volume = preload("res://addons/feng-magic-gi/feng_magic_gi_volume.gd")
 const Page = preload("res://addons/feng-magic-gi/feng_magic_gi_page.gd")
 const Manifest = preload("res://addons/feng-magic-gi/feng_magic_gi_manifest.gd")
+const ProbeLayout = preload("res://addons/feng-magic-gi/feng_magic_gi_probe_layout.gd")
 
 var _checks := 0
 var _failures := 0
@@ -63,18 +64,27 @@ func _run() -> void:
 			"saved manifest reopens with a valid generation and spatial index")
 		var nonempty := 0
 		var page_files_valid := true
+		var page_layout_revisions_match := true
 		for entry in manifest.page_entries:
 			if bool(entry.get("empty", false)):
 				continue
 			nonempty += 1
 			var path := String(entry.get("resource_path", ""))
 			var page := ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE) as Page
-			page_files_valid = page_files_valid and page != null \
+			if page == null:
+				page_files_valid = false
+				page_layout_revisions_match = false
+				continue
+			page_files_valid = page_files_valid \
 					and page.is_valid(String(entry.get("page_generation", "")),
 						String(entry.get("page_key", ""))) \
 					and not String(entry.get("content_hash", "")).is_empty()
+			page_layout_revisions_match = page_layout_revisions_match \
+					and page.data.placement_layout_revision == ProbeLayout.PLACEMENT_LAYOUT_REVISION
 		_check(nonempty > 0 and page_files_valid,
 			"saved page payloads reload and validate without embedding them in the manifest")
+		_check(nonempty > 0 and page_layout_revisions_match,
+			"new streamed page Data resources must stamp the current placement revision")
 		_check(volume.has_bake(), "newly published full generation matches current scene and bake settings")
 		var old_generation := manifest.generation
 		var old_manifest_key := manifest.manifest_key

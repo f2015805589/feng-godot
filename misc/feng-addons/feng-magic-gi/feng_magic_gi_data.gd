@@ -46,6 +46,8 @@ const SH_Y00 := 0.2820947918
 @export_storage var terrain_reflectance := 0.0
 @export_storage var material_reflectance := 0.0
 @export_storage var scene_signature := 0
+## Probe-placement algorithm version. Missing legacy storage defaults to zero.
+@export_storage var placement_layout_revision := 0
 ## Fingerprint of transport-relevant static source content, captured at bake
 ## and load-validation boundaries. Ordinary polling uses a separate quick
 ## signature. Older resources omit this and keep their legacy staleness path.
