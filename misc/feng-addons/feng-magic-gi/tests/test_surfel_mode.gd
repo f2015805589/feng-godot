@@ -6,10 +6,15 @@ const Settings = preload("res://addons/feng-magic-gi/feng_magic_gi_surfel_settin
 const Runtime = preload("res://addons/feng-magic-gi/feng_magic_gi_runtime.gd")
 const Data = preload("res://addons/feng-magic-gi/feng_magic_gi_data.gd")
 const Manifest = preload("res://addons/feng-magic-gi/feng_magic_gi_manifest.gd")
+const AdaptiveLayout = preload("res://addons/feng-render-pipeline/passes/magic_gi_surfel_adaptive_layout.gd")
 const RESTORE_FIXTURE_DIRECTORY := "user://surfel_mode_restore"
 const RESTORE_DATA_PATH := RESTORE_FIXTURE_DIRECTORY + "/saved_prt_data.res"
 const RESTORE_DATA_SCENE_PATH := RESTORE_FIXTURE_DIRECTORY + "/surfel_with_prt_data.tscn"
 const RESTORE_MANIFEST_SCENE_PATH := RESTORE_FIXTURE_DIRECTORY + "/surfel_with_manifest_and_prt_data.tscn"
+const SURFEL_CACHE_GLSL_PATH := "res://addons/feng-render-pipeline/library/magic-gi/surfel/gi_surfel_cache.glslinc"
+const SURFEL_CACHE_HLSL_PATH := "res://addons/feng-render-pipeline/library/magic-gi/surfel/gi_surfel_cache.hlslinc"
+const SURFEL_LOD_SUMMARY_PATH := "res://addons/feng-render-pipeline/library/magic-gi/surfel/magic_gi_surfel_lod_summary.glsl"
+const SURFEL_GPU_PATH := "res://addons/feng-render-pipeline/passes/magic_gi_surfel_gpu.gd"
 
 class RefreshCanceler:
 	extends Node
@@ -30,6 +35,8 @@ func _initialize() -> void:
 	call_deferred("run")
 
 func run() -> void:
+	_test_lod_presence_contract()
+	_test_adaptive_layout_contracts()
 	var first := Volume.new()
 	var second := Volume.new()
 	require(first.gi_mode == Volume.GIMode.PRT_MAGIC_GI,
@@ -57,6 +64,12 @@ func run() -> void:
 		"rays_per_surfel": 4,
 		"max_ray_distance": 128.0,
 		"history_weight": 0.9,
+		"denoiser": 0,
+		"half_resolution": true,
+		"probe_fallback_enabled": true,
+		"adaptive_distribution_enabled": true,
+		"ray_guiding_enabled": true,
+		"guide_cosine_floor": 0.5,
 		"debug_view": 0,
 	}, "the serialized defaults produce the frozen plain-value runtime settings")
 	settings.surfel_radius = NAN
@@ -65,11 +78,15 @@ func run() -> void:
 	settings.rays_per_surfel = 0
 	settings.max_ray_distance = INF
 	settings.history_weight = NAN
+	settings.denoiser = 9
+	settings.half_resolution = false
 	settings.debug_view = 9
 	var bounded := settings.to_runtime_settings()
 	require(bounded["surfel_radius"] == 0.15 and bounded["max_surfels"] == 1024 \
 			and bounded["updates_per_frame"] == 16384 and bounded["rays_per_surfel"] == 1 \
 			and bounded["max_ray_distance"] == 128.0 and bounded["history_weight"] == 0.9 \
+			and bounded["denoiser"] == 1 and not bounded["half_resolution"] \
+			and bounded["probe_fallback_enabled"] \
 			and bounded["debug_view"] == 3,
 		"non-finite and out-of-range values are clamped to finite hard limits")
 
@@ -102,7 +119,9 @@ func run() -> void:
 		require(int(snapshot.get("mode", -1)) == Volume.GIMode.SURFEL_MAGIC_GI \
 				and bool(snapshot.get("surfel", false)) and snapshot.get("data") == null,
 			"the snapshot identifies the surfel path and carries no bake data")
-		require(snapshot.get("surfel_settings", {}).size() == 7 \
+		require(snapshot.get("surfel_settings", {}).size() == 13 \
+				and int(snapshot.get("surfel_settings", {}).get("denoiser", -1)) == 0 \
+				and bool(snapshot.get("surfel_settings", {}).get("half_resolution", false)) \
 				and snapshot.get("cache_key", "") == "surfel:%d" % volume.get_instance_id() \
 				and bool(snapshot.get("replacement_enabled", false)) \
 				and snapshot.has("owner_transform") and snapshot.has("owner_size") \
@@ -111,19 +130,33 @@ func run() -> void:
 		require(snapshot.get("version", 0) == hash([volume.global_transform,
 				volume.size, snapshot.get("surfel_settings", {})]),
 			"cache version tracks the current volume bounds and surfel settings")
-		require(snapshot.get("layout_version", 0) == hash([volume.global_transform,
-				volume.size, 0.15, 65536]),
-			"layout version tracks only bounds and surfel allocation settings")
+		require(snapshot.get("layout_version", 0) == hash(["surfel-layout-v5-lod-presence",
+				volume.global_transform, volume.size, 0.15, 65536, true,
+				AdaptiveLayout.LOD_TARGET_PIXELS,
+				AdaptiveLayout.TILE_REPRESENTATIVE_COUNT]),
+			"layout version tracks bounds, allocation, LOD and tile coverage policy")
 		var original_version: int = snapshot.get("version", 0)
 		var original_layout_version: int = snapshot.get("layout_version", 0)
 		volume.surfel_settings.updates_per_frame = 3072
 		volume.surfel_settings.history_weight = 0.8
+		volume.surfel_settings.denoiser = 1
+		volume.surfel_settings.half_resolution = false
 		volume.surfel_settings.debug_view = 2
+		volume.surfel_settings.ray_guiding_enabled = false
+		volume.surfel_settings.guide_cosine_floor = 0.35
 		var updated := _snapshot_for_volume(volume.get_instance_id())
 		require(not updated.is_empty() and updated.get("version", 0) != original_version,
 			"any surfel setting change republishes the settings version")
 		require(updated.get("layout_version", 0) == original_layout_version,
-			"update-budget, history, and debug changes do not invalidate layout history")
+				"update-budget, history, denoiser, resolution, debug, and guiding changes do not invalidate layout history")
+		volume.surfel_settings.adaptive_distribution_enabled = false
+		var adaptive_disabled := _snapshot_for_volume(volume.get_instance_id())
+		require(adaptive_disabled.get("layout_version", 0) != original_layout_version,
+			"changing the two-level layout mode invalidates geometry history")
+		volume.surfel_settings.adaptive_distribution_enabled = true
+		var adaptive_restored := _snapshot_for_volume(volume.get_instance_id())
+		require(adaptive_restored.get("layout_version", 0) == original_layout_version,
+			"restoring the adaptive layout mode restores its structural version")
 		volume.surfel_settings.max_surfels = 131072
 		var resized_capacity := _snapshot_for_volume(volume.get_instance_id())
 		require(resized_capacity.get("layout_version", 0) != original_layout_version,
@@ -177,6 +210,157 @@ func run() -> void:
 	await process_frame
 	print("Surfel mode checks: %d, failures: %d" % [checks, failures])
 	quit(1 if failures > 0 else 0)
+
+func _test_lod_presence_contract() -> void:
+	var cache_glsl := FileAccess.get_file_as_string(SURFEL_CACHE_GLSL_PATH)
+	var cache_hlsl := FileAccess.get_file_as_string(SURFEL_CACHE_HLSL_PATH)
+	var summary_glsl := FileAccess.get_file_as_string(SURFEL_LOD_SUMMARY_PATH)
+	var gpu_source := FileAccess.get_file_as_string(SURFEL_GPU_PATH)
+	require(not cache_glsl.is_empty() and not cache_hlsl.is_empty() \
+			and not summary_glsl.is_empty() and not gpu_source.is_empty(),
+		"the LOD-presence shader and host sources are available")
+	if cache_glsl.is_empty() or cache_hlsl.is_empty() \
+			or summary_glsl.is_empty() or gpu_source.is_empty():
+		return
+	require(cache_glsl.contains("layout(set = 1, binding = 17") \
+			and cache_glsl.contains("present_levels & (1u << level)"),
+		"GLSL cache lookups use the read-only LOD summary at binding 17")
+	require(cache_hlsl.contains("gi_surfel_lod_presence : register(t17, space1)") \
+			and cache_hlsl.contains("present_levels & (1u << level)"),
+		"HLSL cache lookups use the matching read-only LOD summary")
+	require(summary_glsl.contains("binding = 17") \
+			and summary_glsl.contains("gi_surfel_counters.values[1]") \
+			and summary_glsl.contains("record.normal_valid.w >= 0.5") \
+			and summary_glsl.contains("record.state.z == 0u") \
+			and summary_glsl.contains("atomicOr(group_levels") \
+			and summary_glsl.contains("atomicOr(gi_surfel_lod_presence.levels"),
+		"the summary scans only bounded active records and publishes group-local LOD bits")
+	require(gpu_source.contains("U.storage_buffer(17, state.lod_presence)") \
+			and gpu_source.contains("U.storage_buffer(17, lod_presence)") \
+			and gpu_source.contains("state.lod_presence_frame = frame_token") \
+			and gpu_source.contains("state.lod_presence_dirty = true") \
+			and gpu_source.contains("lod_presence_mask = presence_bytes.decode_u32(0)"),
+		"the host owns, rebuilds, and binds the summary buffer before trace use")
+
+func _test_adaptive_layout_contracts() -> void:
+	require(AdaptiveLayout.level_radius(0.15, 0, true) == 0.15 \
+			and AdaptiveLayout.level_radius(0.15, 1, true) == 0.3,
+		"adaptive placement keeps its fine radius and uses a bounded 2x coarse level")
+	var pixel_footprint_per_meter := 2.0 * tan(deg_to_rad(25.0)) / 480.0
+	var old_anchor_pixel_footprint := pixel_footprint_per_meter * 6.0
+	var reconstructed_anchor_pixel_footprint := pixel_footprint_per_meter * 13.0
+	require(AdaptiveLayout.LOD_TARGET_PIXELS == 8.0 \
+			and AdaptiveLayout.level_for_footprint(old_anchor_pixel_footprint, 0.15, true, 0) == 0 \
+			and AdaptiveLayout.level_for_footprint(reconstructed_anchor_pixel_footprint, 0.15, true, 0) == 1,
+		"maintenance changes LOD from reconstructed triangle depth, not the old anchor depth")
+	require(AdaptiveLayout.level_for_footprint(0.023, 0.15, true, 0) == 0 \
+			and AdaptiveLayout.level_for_footprint(0.024, 0.15, true, 0) == 1 \
+			and AdaptiveLayout.level_for_footprint(0.015, 0.15, true, 1) == 1 \
+			and AdaptiveLayout.level_for_footprint(0.014, 0.15, true, 1) == 0,
+		"existing anchors use LOD hysteresis to avoid near/far thrashing")
+	var local_positions: Array[Dictionary] = [{}, {}, {}, {}]
+	for phase in AdaptiveLayout.TILE_REPRESENTATIVE_PHASE_COUNT:
+		var quadrants: Dictionary = {}
+		for candidate in AdaptiveLayout.TILE_REPRESENTATIVE_COUNT:
+			var representative: Vector2i = AdaptiveLayout.tile_representative_offset(candidate, phase)
+			var quadrant := Vector2i(representative.x / 8, representative.y / 8)
+			quadrants[quadrant] = true
+			local_positions[candidate][Vector2i(representative.x % 8,
+				representative.y % 8)] = true
+			require(representative.x >= 0 and representative.x < AdaptiveLayout.TILE_SIZE \
+					and representative.y >= 0 and representative.y < AdaptiveLayout.TILE_SIZE,
+				"rotating coverage representatives stay inside their 16x16 tile")
+		require(quadrants.size() == AdaptiveLayout.TILE_REPRESENTATIVE_COUNT,
+			"each tile pass samples one representative from each 8x8 quadrant")
+	for candidate in AdaptiveLayout.TILE_REPRESENTATIVE_COUNT:
+		require(local_positions[candidate].size() == AdaptiveLayout.TILE_REPRESENTATIVE_PHASE_COUNT,
+			"each quadrant representative reaches all 64 local pixel offsets")
+	var visit_tile_count := 7
+	var visit_work_count := 3
+	var visit_target_tile := 5
+	var visit_cursor := 0
+	var target_offsets: Dictionary = {}
+	var visit_frame_limit := ceili(float(visit_tile_count
+			* AdaptiveLayout.TILE_REPRESENTATIVE_PHASE_COUNT) / float(visit_work_count))
+	for _frame in visit_frame_limit:
+		for sample_index in visit_work_count:
+			var absolute_visit := visit_cursor + sample_index
+			var tile_index := absolute_visit % visit_tile_count
+			if tile_index == visit_target_tile:
+				var phase := AdaptiveLayout.tile_representative_phase(
+						visit_cursor, sample_index, visit_tile_count)
+				var offset := AdaptiveLayout.tile_representative_offset(0, phase)
+				target_offsets[Vector2i(offset.x % 8, offset.y % 8)] = true
+		visit_cursor = AdaptiveLayout.advance_tile_cursor(
+				visit_cursor, visit_work_count, visit_tile_count)
+	require(target_offsets.size() == AdaptiveLayout.TILE_REPRESENTATIVE_PHASE_COUNT,
+		"a static tile reaches every quadrant pixel within 64 full tile sweeps")
+	var parity_tile_count := 8
+	var parity_work_count := 4
+	var parity_target_tile := 6
+	var parity_cursor := 0
+	var parity_offsets: Dictionary = {}
+	var parity_frame_limit := ceili(float(parity_tile_count
+			* AdaptiveLayout.TILE_REPRESENTATIVE_PHASE_COUNT) / float(parity_work_count))
+	for _frame in parity_frame_limit:
+		for sample_index in parity_work_count:
+			var absolute_visit := parity_cursor + sample_index
+			if absolute_visit % parity_tile_count == parity_target_tile:
+				var phase := AdaptiveLayout.tile_representative_phase(
+						parity_cursor, sample_index, parity_tile_count)
+				var offset := AdaptiveLayout.tile_representative_offset(0, phase)
+				parity_offsets[Vector2i(offset.x % 8, offset.y % 8)] = true
+		parity_cursor = AdaptiveLayout.advance_tile_cursor(
+				parity_cursor, parity_work_count, parity_tile_count)
+	require(parity_offsets.size() == AdaptiveLayout.TILE_REPRESENTATIVE_PHASE_COUNT,
+		"a tile revisited every other frame still reaches all 64 offsets")
+	require(AdaptiveLayout.least_covered_tile_candidate(
+			PackedFloat32Array([1.0, 0.0, 0.5, 1.0]), PackedByteArray([1, 1, 1, 1]), 3) == 1 \
+			and AdaptiveLayout.least_covered_tile_candidate(
+			PackedFloat32Array([0.0, 0.0, 0.0, 0.0]), PackedByteArray([1, 1, 1, 1]), 2) == 2 \
+			and AdaptiveLayout.least_covered_tile_candidate(
+			PackedFloat32Array([0.0, 0.25, 0.5, 0.75]), PackedByteArray([0, 1, 1, 1]), 0) == 1 \
+			and AdaptiveLayout.least_covered_tile_candidate(
+			PackedFloat32Array([2.0, 0.0, 0.5, 1.0]), PackedByteArray([1, 1, 1, 1]), 0) == 1 \
+			and AdaptiveLayout.least_covered_tile_candidate(
+			PackedFloat32Array([2.0, 2.0, 2.0, 2.0]), PackedByteArray([1, 1, 1, 1]), 0) == -1,
+		"tile seeding chooses the lowest supported candidate with a rotating deterministic tie break")
+	require(not AdaptiveLayout.surface_tracking_changed(-1, 4) \
+			and not AdaptiveLayout.surface_tracking_changed(4, 4) \
+			and AdaptiveLayout.surface_tracking_changed(4, 5),
+		"only a changed established SurfaceTracking revision forces same-frame relocation")
+	require(AdaptiveLayout.maintenance_dispatch_count(65536, 4096, true) == 65536 \
+			and AdaptiveLayout.maintenance_dispatch_count(65536, 4096, false) == 2048 \
+			and AdaptiveLayout.maintenance_dispatch_count(1000, 100, false) == 100 \
+			and AdaptiveLayout.maintenance_dispatch_count(0, 100, true) == 0,
+		"motion relocation is a bounded full sweep, while camera-only LOD work is chunked")
+	var uniform_guide := PackedByteArray()
+	uniform_guide.resize(AdaptiveLayout.GUIDE_BINS)
+	for index in uniform_guide.size():
+		uniform_guide[index] = 1
+	var uniform_probability := AdaptiveLayout.guide_bin_probability(uniform_guide, 0)
+	require(absf(uniform_probability - 1.0 / 16.0) < 1e-6 \
+			and absf(AdaptiveLayout.mixture_pdf(0.2, uniform_probability, 0.5) - 0.2) < 1e-6,
+		"uniform guide mass reduces to the cosine PDF")
+	var concentrated_guide := PackedByteArray()
+	concentrated_guide.resize(AdaptiveLayout.GUIDE_BINS)
+	concentrated_guide[0] = 255
+	var integrated_mixture := 0.0
+	for bin_index in AdaptiveLayout.GUIDE_BINS:
+		var probability := AdaptiveLayout.guide_bin_probability(concentrated_guide, bin_index)
+		var mixture_probability := 0.25 / 16.0 + 0.75 * probability
+		integrated_mixture += mixture_probability
+		var ratio := AdaptiveLayout.mixture_pdf(0.2, probability, 0.25) / 0.2
+		require(ratio >= 0.25 - 1e-6,
+			"the guided proposal keeps the configured cosine support floor")
+	require(absf(integrated_mixture - 1.0) < 1e-6 \
+			and absf(AdaptiveLayout.mixture_pdf(0.2, 0.0, 1.0) - 0.2) < 1e-6,
+		"the mixed 4x4 guide PDF remains normalized and alpha=1 is cosine sampling")
+	require(AdaptiveLayout.ray_strategy_counts(1, true, 2, 1.0) == Vector2i(1, 0) \
+			and AdaptiveLayout.ray_strategy_counts(3, true, 2, 1.0) == Vector2i(2, 1) \
+			and AdaptiveLayout.ray_strategy_counts(4, true, 2, 1.0) == Vector2i(2, 2) \
+			and AdaptiveLayout.ray_strategy_counts(4, true, 0, 1.0) == Vector2i(4, 0),
+		"odd and low ray budgets retain matching cosine/NEE strategy counts")
 
 func _snapshot_for_volume(volume_id: int) -> Dictionary:
 	for snapshot in Runtime.snapshots():

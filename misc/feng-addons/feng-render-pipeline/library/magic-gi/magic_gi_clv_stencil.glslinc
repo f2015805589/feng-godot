@@ -1,0 +1,90 @@
+// Geometry-only interpolation stencils. A recycled cell is rebuilt before its
+// tag is published; light changes reuse the same visible probes and weights.
+// Overflow retains the complete gather instead of truncating its contributors.
+layout(set = 0, binding = 12, std430) buffer Stencils { uint words[]; } clv_stencils;
+const int CLV_STENCIL_CAPACITY = 16;
+const int CLV_STENCIL_WORDS = 4 + CLV_STENCIL_CAPACITY * 3;
+uint clv_stencil_base;
+int clv_stencil_count;
+int clv_stencil_begin;
+int clv_stencil_narrow_count;
+int clv_stencil_neighborhood;
+
+void clv_stencil_reset(ivec3 slot, int axis) {
+	clv_stencil_base = uint(((slot.z * config.resolution + slot.y)
+			* config.resolution + slot.x) * CLV_FACE_SLOT_COUNT + axis) * uint(CLV_STENCIL_WORDS);
+	clv_stencil_count = 0;
+	clv_stencil_neighborhood = 0;
+}
+
+void clv_stencil_begin_neighborhood() {
+	clv_stencil_begin = clv_stencil_count;
+	if (clv_stencil_neighborhood++ == 1) { clv_stencil_narrow_count = clv_stencil_count; }
+}
+
+void clv_stencil_record(int probe, float secondary_weight, float sky_weight) {
+	if (clv_stencil_count >= CLV_STENCIL_CAPACITY) {
+		clv_stencil_count = CLV_STENCIL_CAPACITY + 1;
+		return;
+	}
+	uint entry = clv_stencil_base + 4u + uint(clv_stencil_count++ * 3);
+	clv_stencils.words[entry] = uint(probe);
+	clv_stencils.words[entry + 1u] = floatBitsToUint(secondary_weight);
+	clv_stencils.words[entry + 2u] = floatBitsToUint(sky_weight);
+}
+
+void clv_stencil_normalize(float secondary_total, float sky_total) {
+	if (clv_stencil_count > CLV_STENCIL_CAPACITY) { return; }
+	for (int i = clv_stencil_begin; i < clv_stencil_count; i++) {
+		uint entry = clv_stencil_base + 4u + uint(i * 3);
+		clv_stencils.words[entry + 1u] = floatBitsToUint(
+				uintBitsToFloat(clv_stencils.words[entry + 1u]) / max(secondary_total, 1e-7));
+		clv_stencils.words[entry + 2u] = floatBitsToUint(
+				uintBitsToFloat(clv_stencils.words[entry + 2u]) / max(sky_total, 1e-7));
+	}
+}
+
+void clv_stencil_blend(float narrow_mix) {
+	if (clv_stencil_count > CLV_STENCIL_CAPACITY) { return; }
+	for (int i = 0; i < clv_stencil_count; i++) {
+		float weight = i < clv_stencil_narrow_count ? narrow_mix : 1.0 - narrow_mix;
+		uint entry = clv_stencil_base + 4u + uint(i * 3);
+		for (uint component = 1u; component <= 2u; component++) {
+			clv_stencils.words[entry + component] = floatBitsToUint(
+					uintBitsToFloat(clv_stencils.words[entry + component]) * weight);
+		}
+	}
+}
+
+void clv_stencil_publish(float proxy, float candidate, float visible) {
+	clv_stencils.words[clv_stencil_base] = uint(clv_stencil_count);
+	clv_stencils.words[clv_stencil_base + 1u] = uint(proxy);
+	clv_stencils.words[clv_stencil_base + 2u] = floatBitsToUint(candidate);
+	clv_stencils.words[clv_stencil_base + 3u] = floatBitsToUint(visible);
+}
+
+bool clv_stencil_relight(out vec4 coefficients[18], out float candidate, out float visible) {
+	uint count = clv_stencils.words[clv_stencil_base];
+	if (count > uint(CLV_STENCIL_CAPACITY)) { return false; }
+	for (int k = 0; k < 18; k++) { coefficients[k] = vec4(0.0); }
+	for (uint i = 0u; i < count; i++) {
+		uint entry = clv_stencil_base + 4u + i * 3u;
+		uint probe = clv_stencils.words[entry];
+		if (probe >= uint(directional_lighting.values.length() / 20)) { return false; }
+		float secondary_weight = uintBitsToFloat(clv_stencils.words[entry + 1u]);
+		float sky_weight = uintBitsToFloat(clv_stencils.words[entry + 2u]);
+		for (int k = 0; k < 9; k++) {
+			coefficients[k] += directional_lighting.values[probe * 20u + uint(k)] * secondary_weight;
+			coefficients[k + 9] += directional_lighting.values[probe * 20u + uint(k + 9)] * sky_weight;
+		}
+	}
+	coefficients[0].w = float(clv_stencils.words[clv_stencil_base + 1u]);
+	candidate = uintBitsToFloat(clv_stencils.words[clv_stencil_base + 2u]);
+	visible = uintBitsToFloat(clv_stencils.words[clv_stencil_base + 3u]);
+	return true;
+}
+
+#define MAGIC_GI_GATHER_BEGIN() clv_stencil_begin_neighborhood()
+#define MAGIC_GI_GATHER_RECORD(probe, secondary, sky) clv_stencil_record(probe, secondary, sky)
+#define MAGIC_GI_GATHER_NORMALIZE(secondary, sky) clv_stencil_normalize(secondary, sky)
+#define MAGIC_GI_GATHER_BLEND(narrow_mix) clv_stencil_blend(narrow_mix)

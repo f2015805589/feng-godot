@@ -4,5 +4,6 @@ config/name="RenderDoc UI test"
 [rendering]
 renderer/rendering_method="frp"
 rendering_device/driver.windows="d3d12"
+rendering_device/d3d12/agility_sdk_version=0
 [editor_plugins]
 enabled=PackedStringArray("res://addons/feng-renderdoc-capture/plugin.cfg", "res://addons/test_driver/plugin.cfg")

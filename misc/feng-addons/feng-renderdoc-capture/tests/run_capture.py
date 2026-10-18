@@ -2,6 +2,8 @@
 
 import ctypes
 from ctypes import wintypes
+import configparser
+import json
 import os
 from pathlib import Path
 import shutil
@@ -85,6 +87,9 @@ while pending:
         visible_vt.append(browser.IsAPIEventVisible(action.eventId))
 assert visible_vt and all(visible_vt), "Idle VT pass is hidden by the analyzer"
 ''' + "Path(" + repr(str(BASE / "idle-vt-visible.txt")) + ").write_text('PASS visible idle VT marker', encoding='utf-8')\n")
+    script.write("\n" + (Path(__file__).parent / "validate_view.py").read_text(encoding="utf-8"))
+    script.write("\npyrenderdoc.Extensions().GetMiniQtHelper().InvokeOntoUIThread("
+                 "lambda: validate_view(pyrenderdoc, " + repr(str(BASE / "capture-view.json")) + "))\n")
 for name in ["config", "cache"]:
     (BASE / name).mkdir()
 ENV = dict(os.environ, APPDATA=str(BASE / "config"), LOCALAPPDATA=str(BASE / "cache"))
@@ -169,11 +174,14 @@ startup.wShowWindow = 0
 checked = False
 analyzer = None
 with (BASE / "ui.log").open("wb") as log:
-    editor = subprocess.Popen([
+    command = [
         os.environ.get("FENG_TEST_EDITOR", str(REPO / "bin/godot.windows.editor.x86_64.exe")),
         "--editor", "--path", str(PROJECT), "--resolution", "800x600",
         "--position", "-32000,-32000",
-    ], env=ENV, stdout=log, stderr=log, startupinfo=startup)
+    ]
+    if os.environ.get("FENG_TEST_GPU_INDEX"):
+        command += ["--gpu-index", os.environ["FENG_TEST_GPU_INDEX"]]
+    editor = subprocess.Popen(command, env=ENV, stdout=log, stderr=log, startupinfo=startup)
     try:
         deadline = time.monotonic() + 65
         while editor.poll() is None and time.monotonic() < deadline:
@@ -196,17 +204,22 @@ with (BASE / "ui.log").open("wb") as log:
                 assert all(path.is_file() and path.stat().st_size > 0 for path in captures)
                 gui_exe = Path(args[0])
                 subprocess.run([str(gui_exe.with_name("renderdoccmd.exe")), "thumb", "--out=" + str(BASE / "current_editor.png"), str(captures[0])], check=True, capture_output=True)
+                capture_config = configparser.ConfigParser()
+                capture_config.read(PROJECT / "capture_result.cfg", encoding="utf-8")
                 events = validate_capture(captures[0], gui_exe.with_name("renderdoccmd.exe"), BASE,
-                                          explicit=ENV.get("FENG_TEST_VT_WORK") != "1")
+                                          explicit=ENV.get("FENG_TEST_VT_WORK") != "1",
+                                          expected_sky_label=capture_config.get("pipeline", "sky_label").strip('"'))
                 if ENV.get("FENG_TEST_VT_WORK") == "1":
                     assert any("::Dispatch" in draw["operation"]
                                and any("Bake / Invalidate Pages" in label for label in draw["path"])
                                and any("VT Idle Marker" in label for label in draw["path"])
                                for draw in events["scene_draws"]), "VT page baker dispatch missing"
                 # Replay may compile the VT compute shader on first open.
-                ui_deadline = time.monotonic() + 25
-                while not (BASE / "idle-vt-visible.txt").is_file() and time.monotonic() < ui_deadline:
+                ui_deadline = time.monotonic() + 50
+                while (not (BASE / "idle-vt-visible.txt").is_file() or not (BASE / "capture-view.json").is_file()) and time.monotonic() < ui_deadline:
                     time.sleep(0.1)
+                view_result = json.loads((BASE / "capture-view.json").read_text(encoding="utf-8"))
+                assert view_result["status"] == "PASS", view_result
                 close_test_gui(analyzer)
                 assert_attached(editor.pid)
                 (PROJECT / "capture_analyzer_closed").write_text("ok", encoding="utf-8")
@@ -217,6 +230,8 @@ with (BASE / "ui.log").open("wb") as log:
             editor.wait(timeout=25)
         assert editor.poll() == 0, "Editor did not exit cleanly; log: " + str(BASE / "ui.log")
     finally:
+        if analyzer is not None and psutil.pid_exists(analyzer):
+            close_test_gui(analyzer)
         if editor.poll() is None:
             editor.terminate()
             editor.wait(5)

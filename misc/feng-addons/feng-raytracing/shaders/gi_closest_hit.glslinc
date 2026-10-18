@@ -70,6 +70,7 @@ const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
 const uint GI_RAY_MODE_REFLECTION = 2u;
 const uint GI_MATERIAL_HAS_ALBEDO_TEXTURE = 1u;
 const uint GI_MATERIAL_TWO_SIDED = 2u;
+const uint GI_SURFACE_NEE_UNSAMPLED = 1u;
 const uint GI_DIRECTIONAL_CAPACITY = 8u;
 const uint GI_DIRECTIONAL_STRIDE_VEC4 = 29u;
 const uint GI_MATERIAL_WORD_STRIDE = 20u;
@@ -230,6 +231,7 @@ void main() {
 	uint index_base_byte = gi_surfaces.words[row_word + 1u];
 	uint index_count = gi_surfaces.words[row_word + 2u];
 	uint material_index = gi_surfaces.words[row_word + 3u];
+	uint surface_flags = gi_surfaces.words[row_word + 4u];
 	if (uint(gl_PrimitiveID) > 0xffffffffu / 3u
 			|| uint(gl_PrimitiveID) * 3u + 2u >= index_count) {
 		gi_payload.radiance = vec3(0.0);
@@ -276,6 +278,7 @@ void main() {
 				uintBitsToFloat(uint(gl_PrimitiveID)),
 				uintBitsToFloat(gi_surfaces.words[row_word + 5u]));
 		gi_payload.hit_distance = gl_HitTEXT;
+		gi_payload.ray_pdf = uintBitsToFloat(packUnorm2x16(gi_barycentrics));
 		return;
 	}
 	#endif
@@ -298,14 +301,78 @@ void main() {
 	}
 	vec3 diffuse_reflectance = albedo * (1.0 - metallic);
 	vec3 outgoing_radiance = max(emission_color, vec3(0.0)) * max(emission_energy, 0.0);
+	#if FENG_GI_SURFEL_CACHE
+	if (gi_payload.flags == GI_RAY_MODE_SURFEL_PROBE) {
+		float total_power = gi_emitters.rows[0].x;
+		float emitter_count = gi_emitters.rows[0].y;
+		vec3 local_area = cross(position1 - position0, position2 - position0);
+		mat3 world_to_object = mat3(gl_WorldToObjectEXT);
+		vec3 world_area_vector = transpose(world_to_object) * local_area;
+		float world_area = 0.5 * length(world_area_vector) / max(abs(determinant(world_to_object)), 1e-12);
+		vec3 emitter_normal = normalize(world_area_vector);
+		float cosine_light = dot(emitter_normal, -gl_WorldRayDirectionEXT);
+		if ((material_flags & GI_MATERIAL_TWO_SIDED) != 0u) cosine_light = abs(cosine_light);
+		float emission_luminance = dot(outgoing_radiance, vec3(0.2126, 0.7152, 0.0722));
+		if ((surface_flags & GI_SURFACE_NEE_UNSAMPLED) == 0u
+				&& emitter_count > 0.0 && world_area > 1e-10 && !isnan(world_area) && !isinf(world_area)
+				&& gl_HitTEXT < max(gi_frame.data.trace_parameters.x, 0.1)) {
+			outgoing_radiance *= gi_surfel_probe_emission_uniform_weight(
+				emission_luminance, total_power, gl_HitTEXT, cosine_light);
+		}
+	}
+	#endif
 
-    if (gi_payload.flags == 0u && gi_frame.data.generation_history_flags.y == 0u && gi_emitters.rows[0].x > 0.0) {
+    if (gi_payload.flags == 0u && gi_frame.data.generation_history_flags.y == 0u
+			&& (surface_flags & GI_SURFACE_NEE_UNSAMPLED) == 0u && gi_emitters.rows[0].x > 0.0) {
         vec3 emitter_normal = normalize(transpose(mat3(gl_WorldToObjectEXT)) * cross(position1 - position0, position2 - position0));
         float cosine = abs(dot(emitter_normal, -gl_WorldRayDirectionEXT));
         float luminance = dot(outgoing_radiance, vec3(0.2126, 0.7152, 0.0722));
         float light_pdf = luminance / gi_emitters.rows[0].x * gl_HitTEXT * gl_HitTEXT / max(cosine, 1e-8);
         outgoing_radiance *= gi_payload.ray_pdf / max(gi_payload.ray_pdf + light_pdf, 1e-12);
     }
+	#if FENG_GI_SURFEL_CACHE
+	if (gi_payload.flags == GI_RAY_MODE_SURFEL && gi_frame.data.generation_history_flags.y == 0u
+			&& (surface_flags & GI_SURFACE_NEE_UNSAMPLED) == 0u) {
+		float total_power = gi_emitters.rows[0].x;
+		float emitter_count_value = gi_emitters.rows[0].y;
+		uint emitter_count = emitter_count_value > 0.0 && !isnan(emitter_count_value)
+				&& !isinf(emitter_count_value) ? uint(emitter_count_value) : 0u;
+		uint budget = uint(clamp(round(gi_frame.data.trace_parameters.z), 1.0, 32.0));
+		uint n_cos;
+		uint n_nee;
+		gi_surfel_split_ray_budget(true, emitter_count, total_power, budget, n_cos, n_nee);
+		float p_cos = gi_payload.ray_pdf;
+		float emission_luminance = dot(outgoing_radiance, vec3(0.2126, 0.7152, 0.0722));
+		if (n_nee > 0u && emission_luminance > 0.0 && !isnan(emission_luminance)
+				&& !isinf(emission_luminance) && p_cos >= 0.0 && !isnan(p_cos) && !isinf(p_cos)) {
+			float max_distance = max(gi_frame.data.trace_parameters.x, 0.1);
+			mat3 world_to_object = mat3(gl_WorldToObjectEXT);
+			vec3 local_area_vector = cross(position1 - position0, position2 - position0);
+			vec3 world_area_vector = transpose(world_to_object) * local_area_vector;
+			// This determinant-scaled normal is equivalent in magnitude to crossing
+			// the two ObjectToWorld-transformed triangle edges.
+			float world_area = 0.5 * length(world_area_vector) / abs(determinant(world_to_object));
+			vec3 emitter_normal = normalize(world_area_vector);
+			float cos_light = abs(dot(emitter_normal, -gl_WorldRayDirectionEXT));
+			float hit_distance_squared = gl_HitTEXT * gl_HitTEXT;
+			// Match the emitter table builder and the NEE sampler support exactly:
+			// enabled emission is serialized as nonzero outgoing_radiance, and only
+			// finite world triangles above its area cutoff are present in the table.
+			if (world_area > 1e-10 && !isnan(world_area) && !isinf(world_area)
+					&& hit_distance_squared > 9e-6 && gl_HitTEXT < max_distance
+					&& cos_light > 1e-6 && !isnan(cos_light) && !isinf(cos_light)) {
+				float p_light = (emission_luminance / total_power) * gl_HitTEXT * gl_HitTEXT
+						/ cos_light;
+				float denominator = float(n_cos) * p_cos + float(n_nee) * p_light;
+				// A zero/invalid light PDF leaves the cosine estimate untouched.
+				if (p_light > 0.0 && !isnan(p_light) && !isinf(p_light)
+						&& denominator > 1e-12 && !isnan(denominator) && !isinf(denominator)) {
+					outgoing_radiance *= (float(n_cos) * p_cos) / denominator;
+				}
+			}
+		}
+	}
+	#endif
 	uint sun_index = gi_frame.data.sun_view_generation_sky_array.x;
 	uint full_layer_mask = gi_surfaces.words[row_word + 5u];
 	if (gi_payload.flags == GI_RAY_MODE_REFLECTION) {
@@ -384,18 +451,31 @@ void main() {
 		}
 	}
 	#if FENG_GI_SURFEL_CACHE
-	if (gi_payload.flags == GI_RAY_MODE_SURFEL) {
+	if (gi_payload.flags == GI_RAY_MODE_SURFEL || gi_payload.flags == GI_RAY_MODE_SURFEL_PROBE) {
 		vec3 world_hit = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
 		uint surfel_seed = gi_hash(instance_index * 0x9e3779b9u ^ uint(gl_PrimitiveID) * 0x85ebca6bu
 				^ floatBitsToUint(gi_barycentrics.x) ^ floatBitsToUint(gi_barycentrics.y));
-		vec3 incident_over_pi = surfel_local_incident(world_hit, world_normal, full_layer_mask,
+		vec3 direct_incident_over_pi = surfel_local_incident(world_hit, world_normal, full_layer_mask,
 				uvec3(gi_surfel_config.light_counts.yzw), surfel_seed);
-		vec3 previous_irradiance_over_pi;
-		if (gi_surfel_lookup_previous(world_hit, world_normal, full_layer_mask,
-				gi_surfel_config.limits.w, previous_irradiance_over_pi)) {
-			incident_over_pi += previous_irradiance_over_pi;
+		float surface_coverage = 0.0;
+		float surface_age = 0.0;
+		float hit_distance = 0.0;
+		vec3 cached_irradiance_over_pi = vec3(0.0);
+		gi_surfel_lookup_visible(world_hit, world_normal, full_layer_mask,
+				gi_surfel_config.limits.w, cached_irradiance_over_pi,
+				surface_coverage, surface_age, hit_distance);
+		if (gi_payload.flags == GI_RAY_MODE_SURFEL && surface_coverage < 1.0) {
+			vec3 probe_irradiance_over_pi;
+			float probe_coverage;
+			float probe_age;
+			if (gi_surfel_probe_lookup(world_hit, world_normal, full_layer_mask,
+					gi_surfel_config.limits.w,
+					probe_irradiance_over_pi, probe_coverage, probe_age) && probe_coverage > 0.0) {
+				gi_surfel_probe_combine(cached_irradiance_over_pi, surface_coverage,
+						probe_irradiance_over_pi, probe_coverage);
+			}
 		}
-		outgoing_radiance += diffuse_reflectance * incident_over_pi;
+		outgoing_radiance += diffuse_reflectance * (direct_incident_over_pi + cached_irradiance_over_pi);
 		gi_payload.radiance = gi_finite_nonnegative(outgoing_radiance);
 		gi_payload.hit_distance = gl_HitTEXT;
 		return;

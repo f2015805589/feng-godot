@@ -118,10 +118,17 @@ func _on_capture_pressed() -> void:
 
 func _open_capture(p_gui: String, p_capture: String) -> void:
 	var view_script := ProjectSettings.globalize_path(get_script().resource_path.get_base_dir().path_join("renderdoc_view.py"))
-	if OS.create_process(p_gui, PackedStringArray(["--ui-python", view_script, p_capture])) <= 0:
+	if not FileAccess.file_exists(view_script):
+		_warning("RenderDoc viewer script is missing. Reinstall the plugin. Capture saved to " + p_capture)
+		return
+	# Replay with the GUI shipped beside the library that captured this frame.
+	# Changing editor settings must not mix two installed RenderDoc versions.
+	var mounted_gui := FengRenderDoc.get_dll_path().get_base_dir().path_join(p_gui.get_file())
+	var gui := mounted_gui if FileAccess.file_exists(mounted_gui) else p_gui
+	if OS.create_process(gui, PackedStringArray(["--ui-python", view_script, p_capture])) <= 0:
 		_warning("Could not launch RenderDoc. Capture saved to " + p_capture)
 		return
-	_status("Rendered frame opened in RenderDoc.")
+	_status("Rendered frame opened in RenderDoc. GPU timings are measured when supported.")
 
 
 func _status(message: String) -> void:

@@ -1,0 +1,419 @@
+#ifndef FENG_GI_SURFEL_PROBE_GLSLINC
+#define FENG_GI_SURFEL_PROBE_GLSLINC
+
+const uint GI_SURFEL_PROBE_COUNT = 1536u;
+const uint GI_SURFEL_PROBE_LEVELS = 3u;
+const uint GI_SURFEL_PROBE_CLIP_SIZE = 8u;
+const uint GI_RAY_MODE_SURFEL_PROBE = 144u;
+const float GI_SURFEL_PROBE_INV_FOUR_PI = 0.07957747154594767;
+const float GI_SURFEL_PROBE_Y0 = 0.28209479177387814;
+const float GI_SURFEL_PROBE_Y1 = 0.4886025119029199;
+
+uint gi_hash(uint value);
+
+struct FENGGISurfelProbeRecord {
+	ivec4 cell_level;
+	vec4 sh_coefficients[4]; // Real orthonormal l<=1 coefficients of unexposed radiance.
+	vec4 depth_mean[2]; // +X,-X,+Y,-Y; then +Z,-Z and two unused values.
+	vec4 depth_second_moment[2];
+	uvec4 meta; // Warmup count (0..4), last frame, packed depth counts 0..3, counts 4..5.
+	uvec4 reserved; // x: contiguous sphere-sample ordinal; remaining words reserved.
+};
+
+layout(set = 1, binding = 11, std430) buffer FENGGISurfelProbeRecords {
+	FENGGISurfelProbeRecord records[];
+} gi_surfel_probe_records;
+layout(set = 1, binding = 12, std140) uniform FENGGISurfelProbeConfig {
+	ivec4 starts[3];
+	vec4 spacing;
+	uvec4 budget; // Configured updates, reserved-adjusted surface upper bound, Pmax, rays per surface.
+} gi_surfel_probe_config;
+
+uint gi_surfel_probe_reserve_actual(uint active_count) {
+	uint updates = gi_surfel_probe_config.budget.x;
+	uint effective_updates = min(gi_surfel_probe_config.budget.y, updates);
+	uint reserve_max = updates - effective_updates;
+	uint reserve_actual = min(reserve_max, active_count / 8u);
+	uint surface_rays = max(gi_surfel_probe_config.budget.w, 1u);
+	if ((surface_rays & 1u) != 0u) reserve_actual &= ~1u;
+	return reserve_actual;
+}
+
+uint gi_surfel_probe_surface_budget(uint active_count) {
+	uint updates = gi_surfel_probe_config.budget.x;
+	uint bounded_active = min(updates, active_count);
+	return bounded_active - gi_surfel_probe_reserve_actual(bounded_active);
+}
+
+uint gi_surfel_probe_depth_count(FENGGISurfelProbeRecord record, uint bin) {
+	uint packed_counts = bin < 4u ? record.meta.z : record.meta.w;
+	uint local_bin = bin < 4u ? bin : bin - 4u;
+	return (packed_counts >> (local_bin * 8u)) & 0xffu;
+}
+
+uint gi_surfel_probe_depth_bin(vec3 direction) {
+	vec3 absolute_direction = abs(direction);
+	uint axis = absolute_direction.y > absolute_direction.x ? 1u : 0u;
+	if (absolute_direction.z > absolute_direction[int(axis)]) axis = 2u;
+	return axis * 2u + (direction[int(axis)] < 0.0 ? 1u : 0u);
+}
+
+float gi_surfel_probe_depth_plausibility(FENGGISurfelProbeRecord record,
+		vec3 probe_to_receiver, float receiver_distance, float level_spacing) {
+	// Depth statistics only rank the two candidates; the ray test remains authoritative.
+	uint bin = gi_surfel_probe_depth_bin(probe_to_receiver);
+	uint count = gi_surfel_probe_depth_count(record, bin);
+	if (count < 4u) return 1.0;
+	int group = int(bin / 4u);
+	int component = int(bin & 3u);
+	float mean_distance = record.depth_mean[group][component];
+	float second_moment = record.depth_second_moment[group][component];
+	if (!(mean_distance >= 0.0) || isnan(mean_distance) || isinf(mean_distance)
+			|| !(second_moment >= 0.0) || isnan(second_moment) || isinf(second_moment)) return 1.0;
+	float variance_floor = max(0.0004, level_spacing * level_spacing * 0.0025);
+	float variance = max(second_moment - mean_distance * mean_distance, variance_floor);
+	float beyond_mean = max(receiver_distance - mean_distance, 0.0);
+	return max(0.05, variance / (variance + beyond_mean * beyond_mean));
+}
+
+uint gi_surfel_probe_actual_slots(uint active_count) {
+	uint reserve_actual = gi_surfel_probe_reserve_actual(min(
+			gi_surfel_probe_config.budget.x, active_count));
+	uint max_rays = gi_surfel_probe_config.budget.z;
+	uint rays_per_surface = max(gi_surfel_probe_config.budget.w, 1u);
+	uint actual_rays = min(max_rays, reserve_actual * rays_per_surface);
+	return actual_rays / 2u;
+}
+
+ivec3 gi_surfel_probe_cell(vec3 world_position, float spacing) {
+	vec3 cell = floor(world_position / spacing);
+	return ivec3(clamp(cell, vec3(-1000000000.0), vec3(1000000000.0)));
+}
+
+uint gi_surfel_probe_record_index(uint level, ivec3 cell, out bool inside_clip) {
+	inside_clip = false;
+	if (level >= GI_SURFEL_PROBE_LEVELS) return 0u;
+	ivec3 local_cell = cell - gi_surfel_probe_config.starts[level].xyz;
+	if (any(lessThan(local_cell, ivec3(0))) || any(greaterThanEqual(local_cell, ivec3(8)))) return 0u;
+	inside_clip = true;
+	ivec3 slot = cell & ivec3(7);
+	return level * 512u + uint(slot.x + slot.y * 8 + slot.z * 64);
+}
+
+vec3 gi_surfel_probe_center(ivec3 cell, uint level) {
+	float level_spacing = gi_surfel_probe_config.spacing[level];
+	return (vec3(cell) + vec3(0.5)) * level_spacing;
+}
+
+bool gi_surfel_probe_inside_owner(vec3 world_position) {
+	vec3 local_position = (gi_surfel_config.world_to_owner * vec4(world_position, 1.0)).xyz;
+	vec3 half_extent = gi_surfel_config.owner_size_cell_radius.xyz * 0.5;
+	return all(not(isnan(local_position))) && all(not(isinf(local_position)))
+			&& all(lessThanEqual(abs(local_position), half_extent));
+}
+
+vec3 gi_surfel_probe_evaluate(FENGGISurfelProbeRecord record, vec3 normal) {
+	vec3 n = normalize(normal);
+	vec3 basis = vec3(GI_SURFEL_PROBE_Y1) * n;
+	vec3 value = record.sh_coefficients[0].rgb * GI_SURFEL_PROBE_Y0
+			+ (record.sh_coefficients[1].rgb * basis.x
+			+ record.sh_coefficients[2].rgb * basis.y
+			+ record.sh_coefficients[3].rgb * basis.z) * (2.0 / 3.0);
+	return all(not(isnan(value))) && all(not(isinf(value))) ? max(value, vec3(0.0)) : vec3(0.0);
+}
+
+bool gi_surfel_probe_visible(vec3 receiver, vec3 receiver_normal,
+		vec3 probe_position, uint layer_mask) {
+	vec3 normal_length = receiver_normal;
+	float normal_squared = dot(normal_length, normal_length);
+	if (layer_mask == 0u || !(normal_squared > 1e-12) || isnan(normal_squared)
+			|| isinf(normal_squared) || any(isnan(receiver)) || any(isinf(receiver))
+			|| any(isnan(probe_position)) || any(isinf(probe_position))) return false;
+	vec3 normal = normal_length * inversesqrt(normal_squared);
+	vec3 start = receiver + normal * 0.001;
+	vec3 segment = probe_position - start;
+	float distance_squared = dot(segment, segment);
+	if (!(distance_squared > 9e-6) || isnan(distance_squared) || isinf(distance_squared)) return false;
+	float distance = sqrt(distance_squared);
+	float ray_max = distance - 0.002;
+	if (!(ray_max > 0.001)) return false;
+	shadow_payload.radiance = vec3(0.0);
+	shadow_payload.flags = GI_RAY_MODE_SURFEL_LOCAL_VISIBILITY;
+	shadow_payload.hit_distance = 0.0;
+	shadow_payload.ray_pdf = uintBitsToFloat(layer_mask);
+	traceRayEXT(gi_scene_tlas,
+		gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+		0x01u, 0u, 0u, 1u, start, 0.001, segment / distance, ray_max, 1);
+	return shadow_payload.radiance.x > 0.5;
+}
+
+bool gi_surfel_probe_lookup(vec3 world_position, vec3 normal, uint layer_mask, uint frame_token,
+		out vec3 irradiance_over_pi, out float coverage, out float age_min) {
+	irradiance_over_pi = vec3(0.0);
+	coverage = 0.0;
+	age_min = 600.0;
+	if (gi_surfel_probe_config.budget.z == 0u || !gi_surfel_probe_inside_owner(world_position)
+			|| any(isnan(normal)) || any(isinf(normal))) return false;
+	vec3 n = normalize(normal);
+	uint selected_index[2] = uint[2](GI_SURFEL_PROBE_COUNT, GI_SURFEL_PROBE_COUNT);
+	float selected_geometry[2] = float[2](0.0, 0.0);
+	float selected_score[2] = float[2](0.0, 0.0);
+	float selected_edge[2] = float[2](0.0, 0.0);
+	float selected_age[2] = float[2](600.0, 600.0);
+	for (uint level = 0u; level < GI_SURFEL_PROBE_LEVELS; level++) {
+		float level_spacing = gi_surfel_probe_config.spacing[level];
+		vec3 grid = world_position / level_spacing - vec3(0.5);
+		ivec3 base_cell = ivec3(floor(grid));
+		vec3 fraction = fract(grid);
+		ivec3 start_cell = gi_surfel_probe_config.starts[level].xyz;
+		vec3 clip_position = world_position / level_spacing - vec3(start_cell);
+		float edge_cells = min(min(min(clip_position.x, 8.0 - clip_position.x),
+				min(clip_position.y, 8.0 - clip_position.y)),
+				min(clip_position.z, 8.0 - clip_position.z));
+		float edge_envelope = clamp(edge_cells / 1.5, 0.0, 1.0);
+		float level_priority = 1.0 / float(1u << level);
+		for (int corner = 0; corner < 8; corner++) {
+			ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+			float geometry_weight = (offset.x == 0 ? 1.0 - fraction.x : fraction.x)
+					* (offset.y == 0 ? 1.0 - fraction.y : fraction.y)
+					* (offset.z == 0 ? 1.0 - fraction.z : fraction.z);
+			if (!(geometry_weight > 1e-6) || !(edge_envelope > 0.0)) continue;
+			ivec3 cell = base_cell + offset;
+			bool inside_clip;
+			uint index = gi_surfel_probe_record_index(level, cell, inside_clip);
+			if (!inside_clip) continue;
+			FENGGISurfelProbeRecord record = gi_surfel_probe_records.records[index];
+			if (any(notEqual(record.cell_level, ivec4(cell, int(level)))) || record.meta.x == 0u) continue;
+			uint age = frame_token - record.meta.y;
+			if (age >= 600u) continue;
+			vec3 probe_position = gi_surfel_probe_center(cell, level);
+			vec3 delta = probe_position - world_position;
+			if (dot(n, delta) < -level_spacing * 0.1
+					|| !gi_surfel_probe_inside_owner(probe_position)) continue;
+			vec3 probe_to_receiver = world_position - probe_position;
+			float receiver_distance = length(probe_to_receiver);
+			float depth_plausibility = gi_surfel_probe_depth_plausibility(
+				record, probe_to_receiver, receiver_distance, level_spacing);
+			float score = geometry_weight * level_priority * depth_plausibility * edge_envelope;
+			for (int slot = 0; slot < 2; slot++) {
+				if (score > selected_score[slot]
+						|| (score == selected_score[slot] && index < selected_index[slot])) {
+					for (int shift = 1; shift > slot; shift--) {
+						selected_index[shift] = selected_index[shift - 1];
+						selected_geometry[shift] = selected_geometry[shift - 1];
+						selected_score[shift] = selected_score[shift - 1];
+						selected_edge[shift] = selected_edge[shift - 1];
+						selected_age[shift] = selected_age[shift - 1];
+					}
+					selected_index[slot] = index;
+					selected_geometry[slot] = geometry_weight;
+					selected_score[slot] = score;
+					selected_edge[slot] = edge_envelope;
+					selected_age[slot] = float(age);
+					break;
+				}
+			}
+		}
+	}
+	float geometry_sum = selected_geometry[0] + selected_geometry[1];
+	if (!(geometry_sum > 1e-8)) return false;
+	float visible_weight_sum = 0.0;
+	vec3 visible_irradiance_sum = vec3(0.0);
+	for (int slot = 0; slot < 2; slot++) {
+		uint index = selected_index[slot];
+		if (!(selected_geometry[slot] > 0.0) || index >= GI_SURFEL_PROBE_COUNT) continue;
+		FENGGISurfelProbeRecord record = gi_surfel_probe_records.records[index];
+		ivec3 cell = record.cell_level.xyz;
+		uint level = uint(record.cell_level.w);
+		vec3 probe_position = gi_surfel_probe_center(cell, level);
+		if (!gi_surfel_probe_visible(world_position, n, probe_position, layer_mask)) continue;
+		float confidence = clamp(float(record.meta.x) * 0.25, 0.0, 1.0);
+		float recency = clamp(1.0 - selected_age[slot] / 600.0, 0.0, 1.0);
+		float weight = selected_geometry[slot] / geometry_sum * confidence * recency * selected_edge[slot];
+		if (!(weight > 0.0)) continue;
+		visible_weight_sum += weight;
+		visible_irradiance_sum += gi_surfel_probe_evaluate(record, n) * weight;
+		age_min = min(age_min, selected_age[slot]);
+	}
+	coverage = clamp(visible_weight_sum, 0.0, 1.0);
+	if (!(coverage > 1e-6)) return false;
+	irradiance_over_pi = visible_irradiance_sum / visible_weight_sum;
+	return all(not(isnan(irradiance_over_pi))) && all(not(isinf(irradiance_over_pi)));
+}
+
+void gi_surfel_probe_combine(inout vec3 surface_irradiance, inout float surface_coverage,
+		vec3 probe_irradiance, float probe_coverage) {
+	float surface_weight = clamp(surface_coverage, 0.0, 1.0);
+	float probe_weight = (1.0 - surface_weight) * clamp(probe_coverage, 0.0, 1.0);
+	float combined_coverage = surface_weight + probe_weight;
+	if (combined_coverage > 1e-6) {
+		surface_irradiance = (surface_irradiance * surface_weight + probe_irradiance * probe_weight)
+				/ combined_coverage;
+		surface_coverage = combined_coverage;
+	}
+}
+
+float gi_surfel_probe_emission_uniform_weight(float emission_luminance,
+		float total_power, float hit_distance, float cosine_light) {
+	float p_light = 0.0;
+	if (emission_luminance > 0.0 && total_power > 1e-12 && hit_distance > 0.003
+			&& cosine_light > 1e-6 && !isnan(emission_luminance) && !isinf(emission_luminance)
+			&& !isnan(total_power) && !isinf(total_power) && !isnan(hit_distance)
+			&& !isinf(hit_distance) && !isnan(cosine_light) && !isinf(cosine_light)) {
+		p_light = (emission_luminance / total_power) * hit_distance * hit_distance / cosine_light;
+	}
+	float p_uniform = GI_SURFEL_PROBE_INV_FOUR_PI;
+	float denominator = p_uniform + p_light;
+	return p_light > 0.0 && denominator > 1e-12 && !isnan(denominator) && !isinf(denominator)
+			? p_uniform / denominator : 1.0;
+}
+
+#if FENG_GI_SURFEL_RAYGEN
+vec3 gi_surfel_sample_3d(uint sample_index, uint scramble);
+
+void gi_surfel_probe_store_depth_count(inout FENGGISurfelProbeRecord record,
+		uint bin, uint count) {
+	uint local_bin = bin < 4u ? bin : bin - 4u;
+	uint shift = local_bin * 8u;
+	uint mask = 0xffu << shift;
+	if (bin < 4u) record.meta.z = (record.meta.z & ~mask) | ((count & 0xffu) << shift);
+	else record.meta.w = (record.meta.w & ~mask) | ((count & 0xffu) << shift);
+}
+
+void gi_surfel_probe_update(uint launch_index) {
+	uint active_count = min(gi_surfel_config.limits.x, gi_surfel_load_counter(1u));
+	uint slots = gi_surfel_probe_actual_slots(active_count);
+	if (launch_index >= slots) return;
+	uint cursor = gi_surfel_load_counter(5u) % GI_SURFEL_PROBE_COUNT;
+	uint probe_index = (cursor + launch_index) % GI_SURFEL_PROBE_COUNT;
+	uint level = probe_index / 512u;
+	uint local_index = probe_index - level * 512u;
+	ivec3 slot = ivec3(int(local_index & 7u), int((local_index >> 3u) & 7u), int((local_index >> 6u) & 7u));
+	ivec3 start_cell = gi_surfel_probe_config.starts[level].xyz;
+	ivec3 local_cell = (slot - (start_cell & ivec3(7))) & ivec3(7);
+	ivec3 cell = start_cell + local_cell;
+	vec3 origin = gi_surfel_probe_center(cell, level);
+	if (!gi_surfel_probe_inside_owner(origin)) return;
+	FENGGISurfelProbeRecord record = gi_surfel_probe_records.records[probe_index];
+	bool same_cell = all(equal(record.cell_level, ivec4(cell, int(level)))) && record.meta.x > 0u;
+	if (!same_cell) {
+		record.cell_level = ivec4(cell, int(level));
+		for (int coefficient = 0; coefficient < 4; coefficient++) record.sh_coefficients[coefficient] = vec4(0.0);
+		record.depth_mean[0] = vec4(0.0);
+		record.depth_mean[1] = vec4(0.0);
+		record.depth_second_moment[0] = vec4(0.0);
+		record.depth_second_moment[1] = vec4(0.0);
+		record.meta = uvec4(0u);
+		record.reserved = uvec4(0u);
+	}
+	uint sample_index = record.reserved.x;
+	uint scramble = gi_hash(uint(cell.x) * 0x9e3779b9u ^ uint(cell.y) * 0x85ebca6bu
+			^ uint(cell.z) * 0xc2b2ae35u ^ level * 0x27d4eb2fu);
+	vec3 uniform_sample = gi_surfel_sample_3d(sample_index, gi_hash(scramble ^ 0x243f6a88u));
+	float z = 1.0 - 2.0 * uniform_sample.x;
+	float radial = sqrt(max(0.0, 1.0 - z * z));
+	float phi = 6.28318530718 * uniform_sample.y;
+	vec3 direction = vec3(radial * cos(phi), radial * sin(phi), z);
+	gi_payload.radiance = vec3(0.0);
+	gi_payload.flags = GI_RAY_MODE_SURFEL_PROBE;
+	gi_payload.hit_distance = 0.0;
+	gi_payload.ray_pdf = GI_SURFEL_PROBE_INV_FOUR_PI;
+	float max_distance = max(gi_surfel_config.control.x, 0.1);
+	traceRayEXT(gi_scene_tlas, gl_RayFlagsNoneEXT, 0x01u, 0u, 0u, 0u,
+		origin, 0.001, direction, max_distance, 0);
+	vec3 sphere_radiance = all(not(isnan(gi_payload.radiance))) && all(not(isinf(gi_payload.radiance)))
+			? max(gi_payload.radiance, vec3(0.0)) : vec3(0.0);
+	float hit_distance = gi_payload.hit_distance > 0.0 && !isnan(gi_payload.hit_distance)
+			&& !isinf(gi_payload.hit_distance) ? min(gi_payload.hit_distance, max_distance) : max_distance;
+	vec3 sh_estimate[4];
+	float basis[4] = float[4](GI_SURFEL_PROBE_Y0, GI_SURFEL_PROBE_Y1 * direction.x,
+			GI_SURFEL_PROBE_Y1 * direction.y, GI_SURFEL_PROBE_Y1 * direction.z);
+	for (int coefficient = 0; coefficient < 4; coefficient++) {
+		sh_estimate[coefficient] = sphere_radiance * (basis[coefficient] / GI_SURFEL_PROBE_INV_FOUR_PI);
+	}
+	float total_power = gi_emitters.rows[0].x;
+	float emitter_count_value = gi_emitters.rows[0].y;
+	uint emitter_count = total_power > 1e-12 && emitter_count_value > 0.0
+			&& !isnan(emitter_count_value) && !isinf(emitter_count_value)
+			? uint(emitter_count_value) : 0u;
+	if (emitter_count > 0u && !isnan(total_power) && !isinf(total_power)) {
+		vec3 nee_sample = gi_surfel_sample_3d(sample_index, gi_hash(scramble ^ 0xb7e15162u));
+		float target = nee_sample.x * total_power;
+		uint lo = 0u;
+		uint hi = emitter_count - 1u;
+		while (lo < hi) {
+			uint middle = (lo + hi) / 2u;
+			if (gi_emitters.rows[1u + middle * 5u].w < target) lo = middle + 1u;
+			else hi = middle;
+		}
+		uint row = 1u + lo * 5u;
+		vec4 vertex = gi_emitters.rows[row];
+		vec4 edge1 = gi_emitters.rows[row + 1u];
+		vec4 edge2 = gi_emitters.rows[row + 2u];
+		vec3 emitted = max(gi_emitters.rows[row + 3u].xyz, vec3(0.0));
+		vec3 light_normal = normalize(gi_emitters.rows[row + 4u].xyz);
+		float root_u = sqrt(nee_sample.y);
+		vec3 light_point = vertex.xyz + edge1.xyz * (root_u * (1.0 - nee_sample.z))
+				+ edge2.xyz * (root_u * nee_sample.z);
+		vec3 delta = light_point - origin;
+		float distance_squared = dot(delta, delta);
+		if (distance_squared > 9e-6 && !isnan(distance_squared) && !isinf(distance_squared)) {
+			float light_distance = sqrt(distance_squared);
+			vec3 light_direction = delta / light_distance;
+			float cos_light = dot(light_normal, -light_direction);
+			if (edge2.w > 0.5) cos_light = abs(cos_light);
+			if (cos_light > 1e-6 && edge1.w > 0.0 && total_power > 1e-12
+					&& light_distance < max_distance && all(not(isnan(emitted))) && all(not(isinf(emitted)))) {
+				float p_light = (edge1.w / total_power) * distance_squared / cos_light;
+				float p_uniform = GI_SURFEL_PROBE_INV_FOUR_PI;
+				float denominator = p_uniform + p_light;
+				if (p_light > 0.0 && !isnan(p_light) && !isinf(p_light)
+						&& denominator > 1e-12 && !isnan(denominator) && !isinf(denominator)) {
+					shadow_payload.radiance = vec3(0.0);
+					shadow_payload.flags = 8u;
+					shadow_payload.hit_distance = 0.0;
+					shadow_payload.ray_pdf = 0.0;
+					traceRayEXT(gi_scene_tlas,
+						gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+						0x01u, 0u, 0u, 1u, origin, 0.001, light_direction,
+						light_distance - 0.001, 1);
+					float visible = clamp(shadow_payload.radiance.x, 0.0, 1.0);
+					float nee_scale = visible / denominator;
+					float nee_basis[4] = float[4](GI_SURFEL_PROBE_Y0,
+							GI_SURFEL_PROBE_Y1 * light_direction.x,
+							GI_SURFEL_PROBE_Y1 * light_direction.y,
+							GI_SURFEL_PROBE_Y1 * light_direction.z);
+					for (int coefficient = 0; coefficient < 4; coefficient++) {
+						sh_estimate[coefficient] += emitted * (nee_basis[coefficient] * nee_scale);
+					}
+				}
+			}
+		}
+	}
+	uint count = min(record.meta.x, 4u);
+	float alpha = count < 4u ? 1.0 / float(count + 1u) : 0.25;
+	for (int coefficient = 0; coefficient < 4; coefficient++) {
+		vec3 safe_estimate = all(not(isnan(sh_estimate[coefficient]))) && all(not(isinf(sh_estimate[coefficient])))
+				? sh_estimate[coefficient] : vec3(0.0);
+		record.sh_coefficients[coefficient].rgb = mix(record.sh_coefficients[coefficient].rgb,
+				safe_estimate, alpha);
+		record.sh_coefficients[coefficient].a = 0.0;
+	}
+	uint depth_bin = gi_surfel_probe_depth_bin(direction);
+	uint depth_count = gi_surfel_probe_depth_count(record, depth_bin);
+	float depth_alpha = depth_count < 4u ? 1.0 / float(depth_count + 1u) : 0.25;
+	int depth_group = int(depth_bin / 4u);
+	int depth_component = int(depth_bin & 3u);
+	record.depth_mean[depth_group][depth_component] = mix(
+		record.depth_mean[depth_group][depth_component], hit_distance, depth_alpha);
+	record.depth_second_moment[depth_group][depth_component] = mix(
+		record.depth_second_moment[depth_group][depth_component], hit_distance * hit_distance, depth_alpha);
+	gi_surfel_probe_store_depth_count(record, depth_bin, min(depth_count + 1u, 255u));
+	record.meta.x = min(count + 1u, 4u);
+	record.meta.y = gi_surfel_config.limits.w;
+	record.reserved.x = sample_index + 1u;
+	gi_surfel_probe_records.records[probe_index] = record;
+}
+#endif
+
+#endif // FENG_GI_SURFEL_PROBE_GLSLINC

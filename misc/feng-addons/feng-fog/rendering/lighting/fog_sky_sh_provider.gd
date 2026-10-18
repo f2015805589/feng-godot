@@ -500,6 +500,12 @@ func _metadata_matches_frame(p_frame: Dictionary, p_metadata: Dictionary) -> boo
 	if owner_id <= 0 or int(p_metadata.get("provider_id", 0)) != owner_id \
 			or int(p_metadata.get("source_revision", -1)) != int(p_frame.get("sky_light_source_revision", -2)):
 		return false
+	# Source identity stays stable across realtime captures. When providers expose
+	# a content revision, require the metadata and frame to reference that same
+	# radiance; older hand-authored metadata without the field remains supported.
+	if p_metadata.has("radiance_revision") \
+			and int(p_metadata.get("radiance_revision", -1)) != int(p_frame.get("sky_light_revision", -2)):
+		return false
 	var metadata_energy := float(p_metadata.get("radiance_energy", -1.0))
 	var frame_energy := float(p_frame.get("sky_light_energy", -2.0))
 	var metadata_exposure := float(p_metadata.get("captured_exposure", 0.0))

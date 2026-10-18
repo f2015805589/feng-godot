@@ -1,37 +1,61 @@
 @tool
 extends RefCounted
-## Bounded camera-relative clipmaps. World-cell tags make scrolling and partial
-## lighting refreshes safe: consumers reject stale cells rather than reuse light.
+## Bounded camera-relative clipmaps. A stable nonzero geometry token owns cell tags;
+## lighting-content revisions only enqueue bounded refreshes and do not invalidate geometry.
 
 const U = preload("../rd/uniforms.gd")
 const FillShader: RDShaderFile = preload("../library/magic-gi/magic_gi_clv_fill.glsl")
+const CertifyShader: RDShaderFile = preload("../library/magic-gi/magic_gi_clv_certify.glsl")
 const RESOLUTION := 16
 const LEVELS := 3
 const MAX_JOBS := 512
 const MAX_PAGE_EPOCHS := 256
+const LAYOUT_VERSION := 8
+const RADIANCE_COEFFICIENT_COLUMNS := 18
+const CLV_FACE_COUNT := 3
+const CLV_FACE_SLOT_COLUMNS := 22
+const SURFACE_METADATA_COLUMN := 18
+const SURFACE_ANCHOR_COLUMN := 19
+const DIFFUSE_PROJECTION_COLUMN := 20
+const CLV_TEXTURE_COLUMNS := CLV_FACE_COUNT * CLV_FACE_SLOT_COLUMNS
+const TAG_COLUMNS := 1
+const RGBA32_TEXEL_BYTES := 16
+const PARAMETER_BUFFER_BYTES := 80
+const JOB_RECORD_BYTES := 16
+const FALLBACK_CLUSTER_BUFFER_BYTES := 16
+const STENCIL_CAPACITY := 16
+const STENCIL_WORDS := 4 + STENCIL_CAPACITY * 3
+const STENCIL_BUFFER_BYTES := RESOLUTION * RESOLUTION * RESOLUTION * LEVELS * CLV_FACE_COUNT * STENCIL_WORDS * 4
 var texture := RID()
 var tags := RID()
+var support := RID()
 var parameters := RID()
 var sampler := RID()
 var _jobs := RID()
+var _stencils := RID()
 var _probe_cluster_fallback := RID()
 var _shader := RID()
 var _pipeline := RID()
+var _certify_shader := RID()
+var _certify_pipeline := RID()
 var _origins: Array[Vector3i] = []
 var _pending: Array[Vector4i] = []
 var _pending_set: Dictionary = {}
 var _cursor := 0
-var _refresh_epoch := -1
+var _geometry_epoch := -1
+var _content_revision := -1
 var _spacing := 0.0
 var _page_epochs: Dictionary = {}
 var _page_epoch_clock := 0
 
 func create(rd: RenderingDevice) -> bool:
-	texture = _texture(rd, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, 19)
-	tags = _texture(rd, RenderingDevice.DATA_FORMAT_R32G32B32A32_SINT, 1)
-	parameters = rd.uniform_buffer_create(80)
-	_jobs = rd.storage_buffer_create(MAX_JOBS * 16)
-	_probe_cluster_fallback = rd.storage_buffer_create(16,
+	texture = _texture(rd, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT, CLV_TEXTURE_COLUMNS)
+	tags = _texture(rd, RenderingDevice.DATA_FORMAT_R32G32B32A32_SINT, TAG_COLUMNS)
+	support = _texture(rd, RenderingDevice.DATA_FORMAT_R32_UINT, 1)
+	parameters = rd.uniform_buffer_create(PARAMETER_BUFFER_BYTES)
+	_jobs = rd.storage_buffer_create(MAX_JOBS * JOB_RECORD_BYTES)
+	_stencils = rd.storage_buffer_create(STENCIL_BUFFER_BYTES)
+	_probe_cluster_fallback = rd.storage_buffer_create(FALLBACK_CLUSTER_BUFFER_BYTES,
 		PackedInt32Array([1, 0, 0, 0]).to_byte_array())
 	var state := RDSamplerState.new()
 	state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
@@ -40,21 +64,27 @@ func create(rd: RenderingDevice) -> bool:
 	_shader = rd.shader_create_from_spirv(FillShader.get_spirv(), "Magic GI CLV Fill")
 	if _shader.is_valid():
 		_pipeline = rd.compute_pipeline_create(_shader)
+	_certify_shader = rd.shader_create_from_spirv(CertifyShader.get_spirv(), "Magic GI CLV Support")
+	if _certify_shader.is_valid():
+		_certify_pipeline = rd.compute_pipeline_create(_certify_shader)
 	for rid in owned_rids():
 		if not rid.is_valid():
 			return false
 	rd.texture_clear(tags, Color(0, 0, 0, 0), 0, 1, 0, 1)
+	rd.texture_clear(support, Color(0, 0, 0, 0), 0, 1, 0, 1)
 	return true
 
-func update(rd: RenderingDevice, camera: Vector3, base_spacing: float, epoch: int,
-		bake: Dictionary, directional: RefCounted, ubo: RID, nearest_sampler: RID,
-		budget := 256) -> bool:
-	# Tags bind each physical cell to its logical world-cell coordinates and
-	# lighting epoch. A spacing change reinterprets those same coordinates, so
-	# invalidate old tags before the partial refill can expose stale coefficients.
-	if not _origins.is_empty() and not is_equal_approx(_spacing, base_spacing) and tags.is_valid():
+func update(rd: RenderingDevice, camera: Vector3, base_spacing: float,
+		geometry_epoch: int, content_revision: int, bake: Dictionary,
+		directional: RefCounted, ubo: RID, nearest_sampler: RID, budget := 256) -> bool:
+	# Tags validate geometry/layout only. Keep valid lighting visible while a
+	# content refresh advances fairly through the bounded queue.
+	var geometry_changed := _origins.is_empty() or _geometry_epoch != geometry_epoch \
+			or not is_equal_approx(_spacing, base_spacing)
+	if geometry_changed and not _origins.is_empty() and tags.is_valid():
 		rd.texture_clear(tags, Color(0, 0, 0, 0), 0, 1, 0, 1)
-	queue_updates(camera, base_spacing, epoch)
+	queue_updates(camera, base_spacing, geometry_epoch)
+	queue_content_refresh(content_revision)
 	var selected := take_jobs(clampi(budget, 1, MAX_JOBS))
 	var bytes := PackedByteArray()
 	for cell in selected:
@@ -67,13 +97,13 @@ func update(rd: RenderingDevice, camera: Vector3, base_spacing: float, epoch: in
 			U.storage_buffer(4, directional.lighting), U.storage_buffer(5, _jobs),
 			U.image(6, texture), U.image(7, tags), U.uniform_buffer(8, ubo),
 			U.storage_buffer(9, bake.index_entries),
-			U.storage_buffer(10, _cluster_buffer(bake))])
+			U.storage_buffer(10, _cluster_buffer(bake)), U.image(11, support), U.storage_buffer(12, _stencils)])
 		if not uniforms.is_valid():
 			# Requeue the failed dispatch; unpublished tags still reject those cells.
 			for cell in selected:
 				_enqueue(cell)
 			return false
-		var push := PackedInt32Array([selected.size(), RESOLUTION, epoch]).to_byte_array()
+		var push := PackedInt32Array([selected.size(), RESOLUTION, geometry_epoch]).to_byte_array()
 		push.append_array(PackedFloat32Array([base_spacing]).to_byte_array())
 		rd.draw_command_begin_label("Magic GI CLV Fill", Color(0.3, 0.7, 0.9))
 		var list := rd.compute_list_begin()
@@ -83,27 +113,28 @@ func update(rd: RenderingDevice, camera: Vector3, base_spacing: float, epoch: in
 		rd.compute_list_dispatch(list, (selected.size() + 63) / 64, 1, 1)
 		rd.compute_list_end()
 		rd.draw_command_end_label()
+		if not _certify_jobs(rd, selected.size(), push, bake):
+			requeue_jobs(selected)
+			return false
 	var constants := PackedByteArray()
 	for origin in _origins:
 		constants.append_array(PackedInt32Array([origin.x, origin.y, origin.z, 0]).to_byte_array())
 	constants.append_array(PackedFloat32Array([base_spacing, 0, 0, 0]).to_byte_array())
-	constants.append_array(PackedInt32Array([RESOLUTION, LEVELS, epoch, 1]).to_byte_array())
+	constants.append_array(PackedInt32Array([RESOLUTION, LEVELS, geometry_epoch, LAYOUT_VERSION]).to_byte_array())
 	return rd.buffer_update(parameters, 0, constants.size(), constants) == OK
 
-## Scheduler is pure CPU state, also used by scrolling/epoch tests without a GPU.
-func queue_updates(camera: Vector3, base_spacing: float, epoch: int,
-		reset_epoch_immediately := false) -> void:
+## Scheduler is pure CPU state, also used by scrolling/geometry-token tests without a GPU.
+func queue_updates(camera: Vector3, base_spacing: float, geometry_epoch: int) -> void:
 	var reset := not is_equal_approx(_spacing, base_spacing) or _origins.is_empty()
-	# Continuous light animation must not restart at the first fine slab forever.
-	# Finish the current fair sweep, then refresh any cells from previous epochs.
-	reset = reset or (epoch != _refresh_epoch \
-			and (reset_epoch_immediately or _pending_set.is_empty()))
+	# A geometry-token change means existing tags cannot describe this bake.
+	# Lighting revisions use queue_content_refresh() and never restart this sweep.
+	reset = reset or geometry_epoch != _geometry_epoch
 	if reset:
 		_pending.clear()
 		_pending_set.clear()
 		_cursor = 0
 	if reset:
-		_refresh_epoch = epoch
+		_geometry_epoch = geometry_epoch
 	_spacing = base_spacing
 	for level in LEVELS:
 		var step := base_spacing * float(1 << level)
@@ -145,6 +176,19 @@ func queue_updates(camera: Vector3, base_spacing: float, epoch: int,
 			_pending_set[cell] = true
 		_cursor = 0
 
+
+## Content changes enqueue another full fair sweep without invalidating tags or
+## clearing pending work. Each selected batch uses the latest lighting buffers.
+func queue_content_refresh(content_revision: int) -> int:
+	if content_revision == _content_revision or _origins.size() != LEVELS:
+		return 0
+	_content_revision = content_revision
+	var enqueued := 0
+	for level in LEVELS:
+		var origin := _origins[level]
+		enqueued += _enqueue_box(origin, origin + Vector3i.ONE * RESOLUTION, level)
+	return enqueued
+
 func take_jobs(budget: int) -> Array[Vector4i]:
 	var selected: Array[Vector4i] = []
 	while selected.size() < budget and _cursor < _pending.size():
@@ -158,19 +202,26 @@ func take_jobs(budget: int) -> Array[Vector4i]:
 		_cursor = 0
 	return selected
 
-## Refill only this page's cells when its immutable data/light token changes.
-## Camera entering slabs continue to use queue_updates() and the same per-cell
-## owner dispatch path; page residency changes never invalidate the whole CLV.
-func queue_page_revision(page_key: String, core_bounds: AABB, base_spacing: float, page_token: int) -> int:
+## Refill only this page's cells when its geometry or lighting content changes.
+## Only geometry_token is written to tags; content updates keep current valid
+## coefficients visible while the bounded refresh queue catches up.
+func queue_page_revision(page_key: String, core_bounds: AABB, base_spacing: float,
+		geometry_token: int, content_revision := 0) -> int:
 	if page_key.is_empty() or _origins.size() != LEVELS or core_bounds.size == Vector3.ZERO:
 		return 0
 	_page_epoch_clock += 1
 	var existing: Dictionary = _page_epochs.get(page_key, {})
-	if int(existing.get("token", 0x7fffffff)) == page_token:
+	var had_entry := existing.has("geometry_token")
+	var geometry_changed := not had_entry \
+			or int(existing.get("geometry_token", -1)) != geometry_token
+	var content_changed := not had_entry \
+			or int(existing.get("content_revision", -1)) != content_revision
+	if not geometry_changed and not content_changed:
 		existing["last_used"] = _page_epoch_clock
 		_page_epochs[page_key] = existing
 		return 0
-	_page_epochs[page_key] = {"token": page_token, "last_used": _page_epoch_clock}
+	_page_epochs[page_key] = {"geometry_token": geometry_token,
+		"content_revision": content_revision, "last_used": _page_epoch_clock}
 	_trim_page_epochs(page_key)
 	var enqueued := 0
 	for level in LEVELS:
@@ -204,7 +255,7 @@ func requeue_jobs(cells: Array[Vector4i]) -> void:
 
 
 func dispatch_page_jobs(rd: RenderingDevice, selected: Array[Vector4i], base_spacing: float,
-		page_token: int, bake: Dictionary, directional: RefCounted, ubo: RID,
+		geometry_token: int, bake: Dictionary, directional: RefCounted, ubo: RID,
 		nearest_sampler: RID) -> bool:
 	if selected.is_empty():
 		return true
@@ -220,11 +271,11 @@ func dispatch_page_jobs(rd: RenderingDevice, selected: Array[Vector4i], base_spa
 		U.storage_buffer(4, directional.lighting), U.storage_buffer(5, _jobs),
 		U.image(6, texture), U.image(7, tags), U.uniform_buffer(8, ubo),
 		U.storage_buffer(9, bake.index_entries),
-		U.storage_buffer(10, _cluster_buffer(bake))])
+		U.storage_buffer(10, _cluster_buffer(bake)), U.image(11, support), U.storage_buffer(12, _stencils)])
 	if not uniforms.is_valid():
 		requeue_jobs(selected)
 		return false
-	var push := PackedInt32Array([selected.size(), RESOLUTION, page_token]).to_byte_array()
+	var push := PackedInt32Array([selected.size(), RESOLUTION, geometry_token]).to_byte_array()
 	push.append_array(PackedFloat32Array([base_spacing]).to_byte_array())
 	var list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, _pipeline)
@@ -232,20 +283,40 @@ func dispatch_page_jobs(rd: RenderingDevice, selected: Array[Vector4i], base_spa
 	rd.compute_list_set_push_constant(list, push, push.size())
 	rd.compute_list_dispatch(list, (selected.size() + 63) / 64, 1, 1)
 	rd.compute_list_end()
+	if not _certify_jobs(rd, selected.size(), push, bake):
+		requeue_jobs(selected)
+		return false
 	return true
 
 
-func update_parameters(rd: RenderingDevice, base_spacing: float, manifest_epoch: int) -> bool:
+func _certify_jobs(rd: RenderingDevice, job_count: int, push: PackedByteArray, bake: Dictionary) -> bool:
+	var uniforms := UniformSetCacheRD.get_cache(_certify_shader, 0, [
+		U.image(0, texture), U.image(1, tags), U.image(2, support), U.storage_buffer(3, _jobs),
+		U.storage_buffer(4, bake.visibility_nodes), U.storage_buffer(5, bake.visibility_triangles)])
+	if not uniforms.is_valid():
+		return false
+	rd.draw_command_begin_label("Magic GI CLV Support", Color(0.3, 0.7, 0.9))
+	var list := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(list, _certify_pipeline)
+	rd.compute_list_bind_uniform_set(list, uniforms, 0)
+	rd.compute_list_set_push_constant(list, push, push.size())
+	rd.compute_list_dispatch(list, (job_count * 8 + 63) / 64, 1, 1)
+	rd.compute_list_end()
+	rd.draw_command_end_label()
+	return true
+
+
+func update_parameters(rd: RenderingDevice, base_spacing: float, geometry_epoch: int) -> bool:
 	var constants := PackedByteArray()
 	for origin in _origins:
 		constants.append_array(PackedInt32Array([origin.x, origin.y, origin.z, 0]).to_byte_array())
 	constants.append_array(PackedFloat32Array([base_spacing, 0, 0, 0]).to_byte_array())
-	constants.append_array(PackedInt32Array([RESOLUTION, LEVELS, manifest_epoch, 1]).to_byte_array())
+	constants.append_array(PackedInt32Array([RESOLUTION, LEVELS, geometry_epoch, LAYOUT_VERSION]).to_byte_array())
 	return rd.buffer_update(parameters, 0, constants.size(), constants) == OK
 
 
-func set_expected_page_epoch(rd: RenderingDevice, page_token: int) -> bool:
-	return rd.buffer_update(parameters, 72, 4, PackedInt32Array([page_token]).to_byte_array()) == OK
+func set_expected_page_epoch(rd: RenderingDevice, geometry_token: int) -> bool:
+	return rd.buffer_update(parameters, 72, 4, PackedInt32Array([geometry_token]).to_byte_array()) == OK
 
 
 func retain_page_epochs(page_keys: PackedStringArray) -> void:
@@ -273,9 +344,48 @@ func _trim_page_epochs(protected_key: String) -> void:
 		_page_epochs.erase(oldest_key)
 
 
+static func estimate_gpu_bytes_breakdown() -> Dictionary:
+	var coefficient_dimensions: Vector3i = _texture_dimensions(CLV_TEXTURE_COLUMNS)
+	var tag_dimensions: Vector3i = _texture_dimensions(TAG_COLUMNS)
+	var coefficient_texture_bytes: int = coefficient_dimensions.x * coefficient_dimensions.y \
+			* coefficient_dimensions.z * RGBA32_TEXEL_BYTES
+	var tag_texture_bytes: int = tag_dimensions.x * tag_dimensions.y \
+			* tag_dimensions.z * RGBA32_TEXEL_BYTES
+	var jobs_buffer_bytes: int = MAX_JOBS * JOB_RECORD_BYTES
+	var support_texture_bytes := RESOLUTION * RESOLUTION * RESOLUTION * LEVELS * 4
+	var total_bytes: int = coefficient_texture_bytes + tag_texture_bytes \
+			+ support_texture_bytes + PARAMETER_BUFFER_BYTES + jobs_buffer_bytes + FALLBACK_CLUSTER_BUFFER_BYTES + STENCIL_BUFFER_BYTES
+	return {
+		"coefficient_texture_dimensions": coefficient_dimensions,
+		"coefficient_texture_format": "R32G32B32A32_SFLOAT",
+		"coefficient_texture_bytes": coefficient_texture_bytes,
+		"face_count": CLV_FACE_COUNT,
+		"face_slot_columns": CLV_FACE_SLOT_COLUMNS,
+		"radiance_coefficient_columns_per_face": RADIANCE_COEFFICIENT_COLUMNS,
+		"surface_metadata_column_per_face": SURFACE_METADATA_COLUMN,
+		"surface_anchor_column_per_face": SURFACE_ANCHOR_COLUMN,
+		"diffuse_projection_column_per_face": DIFFUSE_PROJECTION_COLUMN,
+		"support_texture_bytes": support_texture_bytes,
+		"stencil_buffer_bytes": STENCIL_BUFFER_BYTES,
+		"tag_texture_dimensions": tag_dimensions,
+		"tag_texture_format": "R32G32B32A32_SINT",
+		"tag_texture_bytes": tag_texture_bytes,
+		"parameter_buffer_bytes": PARAMETER_BUFFER_BYTES,
+		"jobs_buffer_bytes": jobs_buffer_bytes,
+		"fallback_cluster_buffer_bytes": FALLBACK_CLUSTER_BUFFER_BYTES,
+		"size_bearing_rids": ["texture", "tags", "support", "parameters", "_jobs", "_stencils", "_probe_cluster_fallback"],
+		# Driver-managed sampler/shader/pipeline objects have no byte-size query in RD.
+		"opaque_driver_rids": ["sampler", "_shader", "_pipeline", "_certify_shader", "_certify_pipeline"],
+		"total_bytes": total_bytes,
+		"layout_version": LAYOUT_VERSION,
+	}
+
 static func estimate_gpu_bytes() -> int:
-	return RESOLUTION * RESOLUTION * LEVELS * 19 * 16 \
-		+ RESOLUTION * RESOLUTION * LEVELS * 16 + 80 + MAX_JOBS * 16 + 16
+	return RESOLUTION * RESOLUTION * RESOLUTION * LEVELS * CLV_TEXTURE_COLUMNS * RGBA32_TEXEL_BYTES \
+			+ RESOLUTION * RESOLUTION * RESOLUTION * LEVELS * TAG_COLUMNS * RGBA32_TEXEL_BYTES \
+			+ RESOLUTION * RESOLUTION * RESOLUTION * LEVELS * 4 \
+			+ PARAMETER_BUFFER_BYTES + MAX_JOBS * JOB_RECORD_BYTES \
+			+ FALLBACK_CLUSTER_BUFFER_BYTES + STENCIL_BUFFER_BYTES
 
 func _enqueue_box(lower: Vector3i, upper: Vector3i, level: int) -> int:
 	var added := 0
@@ -323,8 +433,8 @@ static func focus_for_bounds(camera: Vector3, bounds: AABB, spacing: float) -> V
 	return focus
 
 func owned_rids() -> Array[RID]:
-	return [texture, tags, parameters, sampler, _jobs, _probe_cluster_fallback,
-		_pipeline, _shader]
+	return [texture, tags, support, parameters, sampler, _jobs, _stencils, _probe_cluster_fallback,
+		_pipeline, _shader, _certify_pipeline, _certify_shader]
 
 
 func _cluster_buffer(bake: Dictionary) -> RID:
@@ -337,9 +447,15 @@ static func _texture(rd: RenderingDevice, format_value: int, columns: int) -> RI
 	var format := RDTextureFormat.new()
 	format.texture_type = RenderingDevice.TEXTURE_TYPE_3D
 	format.format = format_value
-	format.width = RESOLUTION * columns
-	format.height = RESOLUTION
-	format.depth = RESOLUTION * LEVELS
+	var dimensions: Vector3i = _texture_dimensions(columns)
+	format.width = dimensions.x
+	format.height = dimensions.y
+	format.depth = dimensions.z
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice.TEXTURE_USAGE_STORAGE_BIT \
 		| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT | RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT
+	if format_value == RenderingDevice.DATA_FORMAT_R32_UINT:
+		format.usage_bits |= RenderingDevice.TEXTURE_USAGE_STORAGE_ATOMIC_BIT
 	return rd.texture_create(format, RDTextureView.new(), [])
+
+static func _texture_dimensions(columns: int) -> Vector3i:
+	return Vector3i(RESOLUTION * columns, RESOLUTION, RESOLUTION * LEVELS)

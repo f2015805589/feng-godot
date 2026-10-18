@@ -1,4 +1,10 @@
 // One reconstruction kernel for direct evaluation and CLV filling.
+#ifndef MAGIC_GI_GATHER_BEGIN
+#define MAGIC_GI_GATHER_BEGIN()
+#define MAGIC_GI_GATHER_RECORD(probe, secondary, sky)
+#define MAGIC_GI_GATHER_NORMALIZE(secondary, sky)
+#define MAGIC_GI_GATHER_BLEND(narrow_mix)
+#endif
 #ifndef MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT
 #define MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT 16
 #endif
@@ -10,9 +16,13 @@ const float SURFACE_FALLBACK_COVERAGE_HIGH = 0.05;
 
 bool probe_connection_visible(vec3 sample_position, vec3 world, int receiver_triangle,
 		int receiver_patch, bool curved_patch, vec3 biased_world, int endpoint_triangle) {
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+	return true; // Distance-moment visibility is applied to each lighting weight below.
+#else
 	return params.control.w <= 0.5 || !(segment_blocked(sample_position, world, receiver_triangle,
 			curved_patch ? receiver_patch : 0) || (curved_patch
 			&& segment_blocked(sample_position, biased_world, endpoint_triangle, 0)));
+#endif
 }
 
 void accumulate_probe_lighting(int probe, float normal_match, float weight, float visibility,
@@ -65,13 +75,15 @@ void accumulate_probe_lighting(int probe, float normal_match, float weight, floa
 			primary_sky_indirect += response * visible_sky_weight;
 		}
 		primary_sky_weight += visible_sky_weight;
+		MAGIC_GI_GATHER_RECORD(probe, weight * visibility, visible_sky_weight);
 	}
 }
 
 void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_triangle,
 		bool angular, bool directional_source, bool wide_surface_fallback, bool same_patch_only,
 		out vec4 coefficients[18], out float candidate_weight, out float visible_support_weight,
-		out float coverage_confidence) {
+		out float coverage_confidence, bool candidate_only) {
+	MAGIC_GI_GATHER_BEGIN();
 	if (angular) { for (int k = 0; k < 18; k++) { coefficients[k] = vec4(0.0); } }
 	else { coefficients[0] = vec4(0.0); coefficients[9] = vec4(0.0); }
 	float receiving_basis[9];
@@ -88,6 +100,8 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 	candidate_weight = 0.0;
 	visible_support_weight = 0.0;
 	coverage_confidence = 0.0;
+	float proxy_score = 1e30;
+	int visibility_probe = -1;
 	int selected_probe[MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT];
 	float selected_score[MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT];
 	float selected_weight[MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT];
@@ -104,6 +118,9 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 	vec3 biased_world = world + normal_world * receiver_bias;
 	int endpoint_triangle = receiver_triangle;
 	bool clearance_resolved = false;
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+	clearance_resolved = true;
+#endif
 	int receiver_patch = receiver_triangle >= 0 ? int(visibility_geometry.triangles[receiver_triangle * 3 + 2].w) : 0;
 	if (params.control.w > 0.5) {
 		biased_world = world;
@@ -203,6 +220,7 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 								&& int(surface_record.w) == receiver_patch && normal_match < 0.95
 								&& sample_plane_distance < -0.00001 && receiver_signed_plane_distance > 0.00001
 								&& plane_residual < spacing * 0.15;
+#ifndef MAGIC_GI_BAKED_VISIBILITY
 						if (curved_patch && !clearance_resolved && !wide_surface_fallback) {
 							// Curved receivers may interpolate around their own continuous patch.
 							// This endpoint is only used after a direct check against other patches.
@@ -219,6 +237,7 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 							endpoint_triangle = clearance > 0.00001 ? -1 : receiver_triangle;
 							clearance_resolved = true;
 						}
+#endif
 						vec3 candidate_target = params.control.w > 0.5 && !curved_patch ? world : biased_world;
 						vec3 visibility_delta = candidate_target - sample_position;
 						float distance_squared = dot(visibility_delta, visibility_delta);
@@ -229,6 +248,7 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 						float weight = gate * cell_window * density_window * inversesqrt(kernel_epsilon + score);
 						if (directional_source) { weight *= max(normal_record.w * normal_record.w, 1e-6); }
 						candidate_weight += weight;
+						if (candidate_only && candidate_weight > 0.0) { return; }
 						if (wide_surface_fallback) {
 							int insert_at = MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT;
 							for (int selected = 0; selected < MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT; selected++) {
@@ -260,9 +280,17 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 						}
 						float visibility_distance = length(visibility_delta);
 						float visibility = 1.0;
-						if (params.control.w < 0.5 && visibility_distance > 1e-6) {
+						if (visibility_distance > 1e-6
+#ifndef MAGIC_GI_BAKED_VISIBILITY
+								&& params.control.w < 0.5
+#endif
+								) {
 							vec2 moments = sample_visibility_moments(probe, visibility_delta / visibility_distance);
 							visibility = chebyshev_visibility(moments, visibility_distance, variance_floor);
+						}
+						if (angular && weight * visibility > 1e-10 && score < proxy_score) {
+							proxy_score = score;
+							visibility_probe = probe;
 						}
 						accumulate_probe_lighting(probe, normal_match, weight, visibility, score,
 								kernel_epsilon, gate * cell_window * density_window, angular,
@@ -298,6 +326,7 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 					&& int(surface_record.w) == receiver_patch && normal_match < 0.95
 					&& sample_plane_distance < -0.00001 && receiver_signed_plane_distance > 0.00001
 					&& plane_residual < spacing * 0.15;
+#ifndef MAGIC_GI_BAKED_VISIBILITY
 			if (curved_patch && !clearance_resolved) {
 				float clearance = spacing * 0.3;
 				int clearance_triangle;
@@ -312,24 +341,43 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 				endpoint_triangle = clearance > 0.00001 ? -1 : receiver_triangle;
 				clearance_resolved = true;
 			}
+#endif
 			if (!probe_connection_visible(sample_position, world, receiver_triangle,
 					receiver_patch, curved_patch, biased_world, endpoint_triangle)) {
 				continue;
 			}
-			visible_probe_count++;
 			float weight = selected_weight[selected];
-			accumulate_probe_lighting(probe, normal_match, weight, 1.0,
+			float visibility = 1.0;
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+			vec3 visibility_delta = world - sample_position;
+			float visibility_distance = length(visibility_delta);
+			if (visibility_distance > 1e-6) {
+				visibility = chebyshev_visibility(sample_visibility_moments(probe,
+						visibility_delta / visibility_distance), visibility_distance, variance_floor);
+			}
+#endif
+			if (visibility <= 0.0001) { continue; }
+			visible_probe_count++;
+			if (angular && selected_score[selected] < proxy_score) {
+				proxy_score = selected_score[selected];
+				visibility_probe = probe;
+			}
+			accumulate_probe_lighting(probe, normal_match, weight, visibility,
 					selected_score[selected], kernel_epsilon, selected_coverage[selected],
 					angular, directional_source, receiving_basis, coefficients, indirect,
 					unoccluded_weight, primary_sky_indirect, primary_sky_weight,
 					visible_support_weight, coverage_confidence);
 		}
 	}
+	MAGIC_GI_GATHER_NORMALIZE(unoccluded_weight, primary_sky_weight);
 	if (angular) {
 		for (int k = 0; k < 9; k++) {
 			coefficients[k] /= max(unoccluded_weight, 1e-7);
 			coefficients[k + 9] /= max(primary_sky_weight, 1e-7);
 		}
+		// Radiance uses RGB only. The first coefficient's unused alpha keeps
+		// one real visible probe as the baked distance-moment reference.
+		coefficients[0].w = float(visibility_probe + 1);
 	} else {
 		coefficients[0] = vec4(indirect / max(unoccluded_weight, 1e-7), 0.0);
 		coefficients[9] = vec4(primary_sky_indirect / max(primary_sky_weight, 1e-7), 0.0);
@@ -341,15 +389,16 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 // complete static BVH can request a same-patch wide gather.
 void gather_probe_field(vec3 world, vec3 normal_world, int receiver_triangle,
 		bool angular, bool directional_source, out vec4 coefficients[18],
-		out float candidate_weight, out float visible_support_weight) {
+		out float candidate_weight, out float visible_support_weight, bool candidate_only) {
 	float narrow_candidate_weight = 0.0;
 	float narrow_visible_support_weight = 0.0;
 	float narrow_coverage_confidence = 0.0;
 	gather_probe_neighborhood(world, normal_world, receiver_triangle, angular, directional_source,
 			false, false, coefficients, narrow_candidate_weight,
-			narrow_visible_support_weight, narrow_coverage_confidence);
+			narrow_visible_support_weight, narrow_coverage_confidence, candidate_only);
 	candidate_weight = narrow_candidate_weight;
 	visible_support_weight = narrow_visible_support_weight;
+	if (candidate_only && narrow_candidate_weight > 0.0) { return; }
 	int receiver_patch = receiver_triangle >= 0
 			? int(visibility_geometry.triangles[receiver_triangle * 3 + 2].w) : 0;
 	if (!directional_source || params.control.w < 0.5 || receiver_patch <= 0
@@ -363,13 +412,14 @@ void gather_probe_field(vec3 world, vec3 normal_world, int receiver_triangle,
 	float wide_coverage_confidence = 0.0;
 	gather_probe_neighborhood(world, normal_world, receiver_triangle, angular, directional_source,
 			true, true, wide_coefficients, wide_candidate_weight,
-			wide_visible_support_weight, wide_coverage_confidence);
+			wide_visible_support_weight, wide_coverage_confidence, candidate_only);
 	// Preserve the original candidate accumulator whenever the narrow geometric
 	// neighborhood contains any candidate. If it is empty, same-patch wide geometry
 	// can establish support even when every checked connection is blocked.
 	if (narrow_candidate_weight <= 0.0) {
 		candidate_weight = wide_candidate_weight;
 	}
+	if (candidate_only) { return; }
 	if (wide_visible_support_weight <= 1e-10) {
 		return;
 	}
@@ -377,10 +427,14 @@ void gather_probe_field(vec3 world, vec3 normal_world, int receiver_triangle,
 	float narrow_mix = smoothstep(SURFACE_FALLBACK_COVERAGE_LOW,
 			SURFACE_FALLBACK_COVERAGE_HIGH, narrow_coverage_confidence);
 	float wide_mix = 1.0 - narrow_mix;
+	MAGIC_GI_GATHER_BLEND(narrow_mix);
 	if (angular) {
+		float visibility_proxy = coefficients[0].w > 0.0 && narrow_mix >= 0.5
+				? coefficients[0].w : wide_coefficients[0].w;
 		for (int k = 0; k < 18; k++) {
 			coefficients[k] = wide_coefficients[k] * wide_mix + coefficients[k] * narrow_mix;
 		}
+		coefficients[0].w = visibility_proxy;
 	} else {
 		coefficients[0] = wide_coefficients[0] * wide_mix + coefficients[0] * narrow_mix;
 		coefficients[9] = wide_coefficients[9] * wide_mix + coefficients[9] * narrow_mix;

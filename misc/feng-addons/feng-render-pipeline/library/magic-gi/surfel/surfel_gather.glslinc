@@ -9,6 +9,8 @@ layout(set = 0, binding = 33) uniform sampler2D gi_surfel_gather_albedo;
 layout(set = 0, binding = 34) uniform sampler2D gi_surfel_gather_orm;
 layout(set = 0, binding = 35) uniform sampler2D gi_surfel_gather_sky_diffuse;
 layout(set = 0, binding = 36) uniform sampler2D gi_surfel_gather_diffuse_ao;
+layout(set = 0, binding = 38, rgba16f) uniform writeonly image2D gi_surfel_gather_auxiliary;
+layout(set = 0, binding = 39, rgba16f) uniform writeonly image2D gi_surfel_gather_final_output;
 layout(set = 0, binding = 37, std140) uniform FENGGISurfelGatherParameters {
 	vec4 values; // Strength, SkyLight replacement enabled, frame token, reserved.
 } gi_surfel_gather_parameters;
@@ -16,40 +18,45 @@ layout(set = 0, binding = 37, std140) uniform FENGGISurfelGatherParameters {
 const uint GI_SURFEL_GATHER_MATERIAL_MODEL_MASK = 0x0fu;
 const uint GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL = 0u;
 
-void gi_surfel_gather() {
-	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
-	ivec2 extent = imageSize(gi_surfel_gather_color);
-	if (any(greaterThanEqual(pixel, extent))) return;
-	imageStore(gi_surfel_gather_output, pixel, vec4(0.0));
+bool gi_surfel_gather_read_geometry(ivec2 pixel, ivec2 extent,
+		out vec3 world_position, out vec3 normal, out vec4 orm) {
+	world_position = vec3(0.0);
+	normal = vec3(0.0);
+	orm = vec4(0.0);
+	if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, extent))) return false;
 	float depth = texelFetch(gi_surfel_gather_depth, pixel, 0).r;
-	if (!(depth > 0.0) || isnan(depth) || isinf(depth)) return;
-	vec4 orm = texelFetch(gi_surfel_gather_orm, pixel, 0);
+	if (!(depth > 0.0) || isnan(depth) || isinf(depth)) return false;
+	orm = texelFetch(gi_surfel_gather_orm, pixel, 0);
 	uint material_model = uint(round(clamp(orm.a, 0.0, 1.0) * 255.0))
 			& GI_SURFEL_GATHER_MATERIAL_MODEL_MASK;
-	if (material_model == GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL) return;
+	if (material_model == GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL) return false;
 	vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
 	vec4 view_h = gi_frame.data.inverse_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
-	if (!(abs(view_h.w) > 1e-8) || isnan(view_h.w) || isinf(view_h.w)) return;
+	if (!(abs(view_h.w) > 1e-8) || isnan(view_h.w) || isinf(view_h.w)) return false;
 	vec3 view_position = view_h.xyz / view_h.w;
-	vec3 world_position = (gi_frame.data.view_to_world * vec4(view_position, 1.0)).xyz;
+	world_position = (gi_frame.data.view_to_world * vec4(view_position, 1.0)).xyz;
+	if (any(isnan(world_position)) || any(isinf(world_position))) return false;
 	vec3 owner_local = (gi_surfel_config.world_to_owner * vec4(world_position, 1.0)).xyz;
 	vec3 half_extent = gi_surfel_config.owner_size_cell_radius.xyz * 0.5;
 	// TAA inverse projection can round an edge sample a few float ULPs outside.
 	vec3 bounds_epsilon = max(half_extent, vec3(1.0)) * 1.9073486328125e-6;
-	if (any(greaterThan(abs(owner_local), half_extent + bounds_epsilon))) return;
-	vec3 normal_view = texelFetch(gi_surfel_gather_normal, pixel, 0).xyz * 2.0 - 1.0;
-	float normal_length = length(normal_view);
-	if (!(normal_length > 1e-6) || isnan(normal_length) || isinf(normal_length)) return;
-	vec3 normal = normalize(mat3(gi_frame.data.view_to_world) * (normal_view / normal_length));
-	vec3 incident_over_pi;
-	float coverage;
-	float age;
-	uint frame_token = gi_surfel_config.limits.w;
-	if (!gi_surfel_lookup_visible(world_position, normal, 0xffffffffu, frame_token,
-			incident_over_pi, coverage, age) || !(coverage > 0.0)) return;
+	if (any(greaterThan(abs(owner_local), half_extent + bounds_epsilon))) return false;
+	vec3 normal_encoded = texelFetch(gi_surfel_gather_normal, pixel, 0).xyz * 2.0 - 1.0;
+	float normal_length = length(normal_encoded);
+	if (!(normal_length > 1e-6) || isnan(normal_length) || isinf(normal_length)) return false;
+	vec3 view_normal = normal_encoded / normal_length;
+	normal = normalize(mat3(gi_frame.data.view_to_world) * view_normal);
+	return all(not(isnan(normal))) && all(not(isinf(normal)));
+}
+
+void gi_surfel_gather_compose(ivec2 pixel, ivec2 extent, vec3 incident_over_pi,
+		float coverage, float age, bool has_support, vec4 orm) {
+	imageStore(gi_surfel_gather_output, pixel, vec4(0.0));
+	if (!has_support || !(coverage > 0.0)) return;
 	float strength = max(gi_surfel_gather_parameters.values.x, 0.0);
 	float pre_exposure = max(gi_frame.data.size_exposure.z, 0.0);
 	float scene_normalization = max(gi_frame.data.size_exposure.w, 0.0);
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
 	float ao = clamp(orm.r, 0.0, 1.0);
 	float diffuse_ao = textureLod(gi_surfel_gather_diffuse_ao, uv, 0.0).r;
 	if (isnan(diffuse_ao) || isinf(diffuse_ao)) diffuse_ao = 1.0;
@@ -79,6 +86,91 @@ void gi_surfel_gather() {
 	} else {
 		imageStore(gi_surfel_gather_output, pixel, vec4(contribution, ownership_weight));
 	}
+}
+
+void gi_surfel_gather() {
+	ivec2 extent = imageSize(gi_surfel_gather_color);
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+	if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, extent))) return;
+	vec3 world_position;
+	vec3 normal;
+	vec4 orm;
+	if (!gi_surfel_gather_read_geometry(pixel, extent, world_position, normal, orm)) {
+		imageStore(gi_surfel_gather_output, pixel, vec4(0.0));
+		return;
+	}
+	vec3 incident_over_pi = vec3(0.0);
+	float coverage = 0.0;
+	float age = 0.0;
+	float hit_distance = 0.0;
+	bool has_support = gi_surfel_lookup_visible(world_position, normal, 0xffffffffu,
+		gi_surfel_config.limits.w, incident_over_pi, coverage, age, hit_distance) && coverage > 0.0;
+	if (coverage < 1.0) {
+		vec3 probe_irradiance_over_pi;
+		float probe_coverage;
+		float probe_age;
+		if (gi_surfel_probe_lookup(world_position, normal, 0xffffffffu,
+				gi_surfel_config.limits.w, probe_irradiance_over_pi, probe_coverage, probe_age)
+				&& probe_coverage > 0.0) {
+			bool had_surface_support = has_support;
+			gi_surfel_probe_combine(incident_over_pi, coverage,
+					probe_irradiance_over_pi, probe_coverage);
+			age = had_surface_support ? min(age, probe_age) : probe_age;
+			has_support = coverage > 0.0;
+		}
+	}
+	gi_surfel_gather_compose(pixel, extent, incident_over_pi,
+		coverage, age, has_support, orm);
+}
+
+void gi_surfel_gather_nrd() {
+	ivec2 output_extent = imageSize(gi_surfel_gather_output);
+	ivec2 full_extent = textureSize(gi_surfel_gather_depth, 0);
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+	if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, output_extent))) return;
+	ivec2 guide_pixel = min(ivec2((vec2(pixel) + 0.5) / vec2(output_extent)
+			* vec2(full_extent)), full_extent - ivec2(1));
+	// The later full-resolution compose replaces this sidecar. Clear the mapped
+	// guide texel here so mode 3 keeps the same reflected output binding as mode 1.
+	imageStore(gi_surfel_gather_final_output, guide_pixel, vec4(0.0));
+	vec3 world_position;
+	vec3 normal;
+	vec4 orm;
+	if (!gi_surfel_gather_read_geometry(guide_pixel, full_extent, world_position, normal, orm)) {
+		imageStore(gi_surfel_gather_output, pixel, vec4(0.0));
+		imageStore(gi_surfel_gather_auxiliary, pixel, vec4(0.0));
+		return;
+	}
+	vec3 incident_over_pi = vec3(0.0);
+	float coverage = 0.0;
+	float age = 0.0;
+	float hit_distance = max(gi_surfel_config.control.x, 0.1);
+	bool has_support = gi_surfel_lookup_visible(world_position, normal, 0xffffffffu,
+		gi_surfel_config.limits.w, incident_over_pi, coverage, age, hit_distance)
+			&& coverage > 0.0;
+	if (coverage < 1.0) {
+		vec3 probe_irradiance_over_pi;
+		float probe_coverage;
+		float probe_age;
+		if (gi_surfel_probe_lookup(world_position, normal, 0xffffffffu,
+				gi_surfel_config.limits.w, probe_irradiance_over_pi, probe_coverage, probe_age)
+				&& probe_coverage > 0.0) {
+		bool had_surface_support = has_support;
+		gi_surfel_probe_combine(incident_over_pi, coverage,
+				probe_irradiance_over_pi, probe_coverage);
+		age = had_surface_support ? min(age, probe_age) : probe_age;
+		has_support = coverage > 0.0;
+		}
+	}
+	if (!has_support) {
+		imageStore(gi_surfel_gather_output, pixel, vec4(0.0));
+		imageStore(gi_surfel_gather_auxiliary, pixel, vec4(0.0));
+		return;
+	}
+	imageStore(gi_surfel_gather_output, pixel,
+		vec4(max(incident_over_pi, vec3(0.0)) * 0.001, clamp(coverage, 0.0, 1.0)));
+	imageStore(gi_surfel_gather_auxiliary, pixel,
+		vec4(hit_distance, age, 1.0, 0.0));
 }
 
 #endif // FENG_GI_SURFEL_GATHER_GLSLINC

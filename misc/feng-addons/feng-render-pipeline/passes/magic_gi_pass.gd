@@ -14,6 +14,7 @@ const PageResidency = preload("magic_gi_page_residency.gd")
 const PageUpload = preload("magic_gi_page_upload.gd")
 const ProbeClusters = preload("magic_gi_probe_clusters.gd")
 const SurfelGPU = preload("magic_gi_surfel_gpu.gd")
+const SurfelNRD = preload("magic_gi_surfel_nrd.gd")
 const RTGI_RUNTIME_PATH := "res://addons/feng-raytracing/scene/feng_rt_gi_runtime.gd"
 const MAGIC_GI_OUTPUT: StringName = &"magic_gi"
 const IndirectGISelection = preload("../pipeline/indirect_gi_selection.gd")
@@ -64,6 +65,8 @@ var _replacement_request_prepared := false
 var _frame_replacement_enabled := false
 var _replacement_bridge_warning_shown := false
 var _frame_diffuse_ao_texture := RID()
+var _frame_input_bindings: Dictionary = {}
+var _frame_view_matrices: Dictionary = {}
 var _diffuse_ao_white := RID()
 var _diffuse_ao_view_cache: Dictionary = {}
 var _diffuse_ao_cache_clock := 0
@@ -89,11 +92,14 @@ var _probe_cluster_payload_cache_clock := 0
 var _probe_cluster_debug_frame := -1
 var _probe_cluster_debug_bound_keys: Dictionary = {}
 var _surfel_gpu: RefCounted
+var _surfel_nrd: RefCounted
 var _frame_surfel_inputs: Array[Dictionary] = []
 var _frame_rtgi_snapshot: Dictionary = {}
 var _surfel_runtime_start_queued := false
 var _surfel_request_prepared := false
 var _surfel_replacement_requested := false
+var _surfel_nrd_frame_active := false
+var _surfel_nrd_frame_fallback_reason := ""
 var _surfel_warnings: Dictionary = {}
 var _rtgi_runtime_script: Script
 var _rtgi_runtime_script_checked := false
@@ -105,6 +111,8 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_frame_surfel_inputs.clear()
 	_frame_rtgi_snapshot.clear()
 	_frame_diffuse_ao_texture = RID()
+	_surfel_nrd_frame_active = false
+	_surfel_nrd_frame_fallback_reason = ""
 	var rd := RenderingServer.get_rendering_device()
 	if rd != null and not _diffuse_ao_view_cache.is_empty():
 		_prune_diffuse_ao_view_cache(rd)
@@ -117,6 +125,7 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 		_surfel_request_prepared = false
 		_surfel_replacement_requested = false
 		_frame_replacement_enabled = false
+		_release_surfel_nrd_if_active()
 		_clear_magic_gi_output(ctx)
 		return
 	_frame_diffuse_ao_texture = ctx.get_diffuse_ambient_occlusion_texture() if ctx != null else RID()
@@ -145,6 +154,15 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_frame_rtgi_snapshot.clear()
 	_surfel_request_prepared = false
 	_surfel_replacement_requested = false
+
+func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> void:
+	# Page dispatches share a view's G-buffer bindings and camera matrices. Keep
+	# this reuse inside one invocation so captures and resized viewports stay fresh.
+	_frame_input_bindings.clear()
+	_frame_view_matrices.clear()
+	super._frp_execute_with_snapshot(ctx, snapshot)
+	_frame_input_bindings.clear()
+	_frame_view_matrices.clear()
 
 func _get_scene_exposure_normalization(ctx: FRPPassContext) -> float:
 	if ctx == null:
@@ -288,6 +306,7 @@ func _init() -> void:
 	inputs = _make_inputs()
 	outputs = _make_outputs()
 	_surfel_gpu = SurfelGPU.new()
+	_surfel_nrd = SurfelNRD.new()
 	_sky_diffuse_input = TextureInput.new()
 	_sky_diffuse_input.binding = 12
 	_sky_diffuse_input.source = TextureInput.Source.CUSTOM
@@ -387,7 +406,10 @@ func _make_inputs() -> Array[TextureInput]:
 	contribution.custom_scope = NativeSpec.SCOPE_PIPELINE
 	contribution.custom_name = MAGIC_GI_OUTPUT
 	contribution.binding_type = TextureInput.BindingType.STORAGE_IMAGE
-	return [color, depth, normal, albedo, orm, contribution]
+	var motion := TextureInput.new()
+	motion.binding = 6
+	motion.source = TextureInput.Source.MOTION_VECTORS
+	return [color, depth, normal, albedo, orm, contribution, motion]
 
 func _make_outputs() -> Array[OutputDeclaration]:
 	var output := OutputDeclaration.new()
@@ -416,10 +438,14 @@ func _render_surfel(buffers: RenderSceneBuffersRD, view: int, device: RenderingD
 		# The RTGI scene snapshot is published asynchronously. During its initial
 		# warmup there is no Surfel contribution yet; keep the output neutral and
 		# leave native Sky diffuse in charge without reporting a missing bridge.
+		_surfel_nrd_frame_fallback_reason = "Waiting for the RT geometry snapshot"
 		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		_release_surfel_nrd_if_active()
 		return
 	if _frame_surfel_inputs.size() <= view:
+		_surfel_nrd_frame_fallback_reason = "FRP frame inputs are unavailable"
 		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		_release_surfel_nrd_if_active()
 		_warn_surfel_once("frame-input", "Surfel GI frame inputs are unavailable for this view.")
 		return
 	var frame: Dictionary = _frame_surfel_inputs[view]
@@ -432,29 +458,116 @@ func _render_surfel(buffers: RenderSceneBuffersRD, view: int, device: RenderingD
 	snapshot.merge(_frame_snapshot, true)
 	snapshot["valid"] = geometry_ready
 	if not bool(frame.get("valid", false)) or int(frame.get("abi_version", 0)) != 1:
+		_surfel_nrd_frame_fallback_reason = "FRP frame-input contract is invalid"
 		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
+		_release_surfel_nrd_if_active()
 		_warn_surfel_once("frame-contract", "Surfel GI received an invalid FRP frame-input packet.")
 		return
 	var frame_token := int(frame.get("frame_generation", Engine.get_frames_drawn()))
-	var current_revision: int = -1
-	if _surfel_gpu != null:
-		current_revision = int(_surfel_gpu.call("get_resource_revision"))
 	var textures: Array[RID] = [depth, normal, albedo, orm]
 	var pass_strength := float(_frame_parameters.x) if _frame_parameters is Vector4 else float(parameters.x)
+	var full_size := buffers.get_internal_size()
+	var settings_value: Variant = snapshot.get("surfel_settings", {})
+	var settings: Dictionary = settings_value if settings_value is Dictionary else {}
+	var nrd_requested := int(settings.get("denoiser", 0)) == 0
+	var motion: RID = inputs[6].get_texture(buffers, view) if inputs.size() > 6 else RID()
+	var nrd_target: Dictionary = {}
+	var nrd_revision_before := int(_surfel_nrd.call("get_resource_revision")) \
+			if _surfel_nrd != null else -1
+	if nrd_requested and not motion.is_valid():
+		_surfel_nrd_frame_fallback_reason = "FRP motion-vector attachment is unavailable"
+		_warn_surfel_once("nrd-motion-input", "Surfel NRD RELAX requires FRP motion vectors; using the World Cache gather path for this frame.")
+	elif nrd_requested and _surfel_nrd != null:
+		var render_target: RID = buffers.get_render_target()
+		var render_target_id := int(frame.get("render_target_id",
+			render_target.get_id() if render_target.is_valid() else 0))
+		nrd_target = _surfel_nrd.call("prepare_view", device, frame, snapshot,
+			full_size, render_target_id, int(frame.get("view_index", view)), motion)
+	elif _surfel_nrd != null:
+		_release_surfel_nrd_if_active()
+	var nrd_active := bool(nrd_target.get("active", false))
+	if nrd_requested and not nrd_active:
+		var fallback_reason := str(nrd_target.get("reason", ""))
+		if fallback_reason.is_empty():
+			fallback_reason = _surfel_nrd_frame_fallback_reason
+		if fallback_reason.is_empty():
+			fallback_reason = str(_surfel_nrd.get("error") \
+				if _surfel_nrd != null else "NRD adapter is unavailable")
+		_surfel_nrd_frame_fallback_reason = fallback_reason
+		_warn_surfel_once("nrd-fallback:" + fallback_reason,
+			"Surfel NRD RELAX is unavailable; using the World Cache gather path: %s" % fallback_reason)
+	elif not nrd_requested:
+		_surfel_nrd_frame_fallback_reason = "World Cache denoiser selected"
+	var gpu_revision_before := int(_surfel_gpu.call("get_resource_revision")) \
+			if _surfel_gpu != null else -1
 	var succeeded: bool = _surfel_gpu != null and bool(_surfel_gpu.call("render", device,
 		snapshot, frame, textures, color, output, sky_diffuse, _frame_diffuse_ao_texture,
-		buffers.get_internal_size(), pass_strength, _frame_replacement_enabled, frame_token))
-	if _surfel_gpu != null and int(_surfel_gpu.call("get_resource_revision")) != current_revision:
+		full_size, pass_strength, _frame_replacement_enabled, frame_token,
+		nrd_target if nrd_active else {}))
+	var gpu_revision_synced := gpu_revision_before
+	var gpu_revision_after_gather := int(_surfel_gpu.call("get_resource_revision")) \
+			if _surfel_gpu != null else gpu_revision_before
+	if gpu_revision_after_gather != gpu_revision_before:
 		_sync_owned_rid_snapshot()
+		gpu_revision_synced = gpu_revision_after_gather
+	if succeeded and nrd_active and _surfel_nrd != null:
+		succeeded = bool(_surfel_nrd.call("resolve_view", frame, snapshot, full_size,
+			textures, motion, color, output, sky_diffuse, _frame_diffuse_ao_texture,
+			pass_strength, _frame_replacement_enabled, frame_token, nrd_target))
+		if succeeded:
+			_surfel_nrd_frame_active = true
+		else:
+			var nrd_failure := str(_surfel_nrd.get("error"))
+			_surfel_nrd_frame_fallback_reason = nrd_failure
+			succeeded = bool(_surfel_gpu.call("render", device, snapshot, frame, textures,
+				color, output, sky_diffuse, _frame_diffuse_ao_texture, full_size,
+				pass_strength, _frame_replacement_enabled, frame_token, {}))
+			_warn_surfel_once("nrd-dispatch-fallback:" + nrd_failure,
+				"Surfel NRD RELAX dispatch failed; using the World Cache gather path: %s" % nrd_failure)
+	elif not succeeded and nrd_active and _surfel_gpu != null:
+		var gather_failure := str(_surfel_gpu.get("error"))
+		_surfel_nrd_frame_fallback_reason = gather_failure
+		_surfel_nrd.call("invalidate_view", nrd_target, gather_failure)
+		succeeded = bool(_surfel_gpu.call("render", device, snapshot, frame, textures,
+			color, output, sky_diffuse, _frame_diffuse_ao_texture, full_size,
+			pass_strength, _frame_replacement_enabled, frame_token, {}))
+		if succeeded:
+			_warn_surfel_once("nrd-gather-fallback:" + gather_failure,
+				"Surfel NRD gather failed; using the World Cache gather path: %s" % gather_failure)
+	var gpu_revision_after_render := int(_surfel_gpu.call("get_resource_revision")) \
+			if _surfel_gpu != null else gpu_revision_synced
+	if gpu_revision_after_render != gpu_revision_synced:
+		_sync_owned_rid_snapshot()
+	if _surfel_nrd != null and int(_surfel_nrd.call("get_resource_revision")) != nrd_revision_before:
+		_sync_owned_rid_snapshot()
+	if nrd_requested and not _surfel_nrd_frame_active and _surfel_nrd_frame_fallback_reason.is_empty():
+		_surfel_nrd_frame_fallback_reason = "World Cache gather path is active"
 	if not succeeded:
 		device.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		var reason := str(_surfel_gpu.get("error")) if _surfel_gpu != null else "Surfel helper is unavailable"
 		_warn_surfel_once("render:" + reason, "Surfel GI is inactive: %s" % reason)
 
 func get_surfel_debug_info(cache_key := "", readback_counters := false) -> Dictionary:
-	if _surfel_gpu == null or not _surfel_gpu.has_method("get_debug_info"):
-		return {"available": false}
-	return _surfel_gpu.call("get_debug_info", cache_key, readback_counters)
+	var result: Dictionary = _surfel_gpu.call("get_debug_info", cache_key, readback_counters) \
+			if _surfel_gpu != null and _surfel_gpu.has_method("get_debug_info") else {"available": false}
+	var nrd_info: Dictionary = _surfel_nrd.call("get_debug_info") \
+			if _surfel_nrd != null and _surfel_nrd.has_method("get_debug_info") else {"available": false}
+	nrd_info["history_available"] = bool(nrd_info.get("active", false))
+	nrd_info["active"] = _surfel_nrd_frame_active
+	result["nrd"] = nrd_info
+	result["denoiser_active"] = _surfel_nrd_frame_active
+	if not bool(result["denoiser_active"]):
+		result["denoiser_fallback_reason"] = _surfel_nrd_frame_fallback_reason \
+				if not _surfel_nrd_frame_fallback_reason.is_empty() \
+				else str(nrd_info.get("error", "World Cache gather selected"))
+	return result
+
+func _release_surfel_nrd_if_active() -> void:
+	if _surfel_nrd == null or not _surfel_nrd.has_method("has_owned_resources") \
+			or not bool(_surfel_nrd.call("has_owned_resources")):
+		return
+	_surfel_nrd.call("release_all")
+	_sync_owned_rid_snapshot()
 
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray(["parameters"])
@@ -466,11 +579,28 @@ func refresh_resource_flags() -> void:
 	access_resolved_depth = true
 	needs_normal_roughness = true
 	super.refresh_resource_flags()
+	needs_motion_vectors = true
+
+func _validate_runtime_inputs(buffers: RenderSceneBuffersRD, view: int) -> bool:
+	# The declaration requests velocity generation for NRD. Keep the input optional
+	# here so legacy render paths can use the exact World Cache gather if FRP cannot
+	# provide it; _render_surfel gates NRD on the actual RID.
+	for declaration in inputs:
+		if declaration == null:
+			_report("Texture declarations cannot be null.")
+			return false
+		if declaration.source == TextureInput.Source.MOTION_VECTORS:
+			continue
+		if not declaration.get_texture(buffers, view).is_valid():
+			_report("Texture is unavailable for binding %d." % declaration.binding)
+			return false
+	return true
 
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
 	if bool(_frame_snapshot.get("surfel", false)):
 		_render_surfel(buffers, view, rd)
 		return
+	_release_surfel_nrd_if_active()
 	var resolved_parameters: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
 	var replacement_eligible := _replacement_requested(_frame_snapshot, resolved_parameters.x)
 	var sky_diffuse: RID = _sky_diffuse_input.get_texture(buffers, view)
@@ -509,13 +639,24 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var directional: RefCounted = cached.get("directional")
 	if directional != null and bool(_frame_snapshot.get("use_clv", true)):
 		var clip_key := "%d:%d:%s" % [buffers.get_instance_id(), view, cache_key]
+		if _clipmaps.has(clip_key):
+			var old_entry: Dictionary = _clipmaps[clip_key]
+			if not _clipmap_layout_is_current(old_entry):
+				var old_cache: RefCounted = old_entry.get("cache")
+				if old_cache != null:
+					_free_rids(rd, old_cache.owned_rids())
+				_clipmaps.erase(clip_key)
+				_sync_owned_rid_snapshot()
 		if not _clipmaps.has(clip_key):
 			var clipmap := ClipmapCache.new()
 			if not clipmap.create(rd):
 				_free_rids(rd, clipmap.owned_rids())
 				rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 				return
-			_clipmaps[clip_key] = {"cache": clipmap, "owner": weakref(buffers), "last_used": _cache_clock, "bake": cache_key}
+			_clipmaps[clip_key] = {"cache": clipmap, "owner": weakref(buffers),
+				"last_used": _cache_clock, "bake": cache_key,
+				"layout_version": ClipmapCache.LAYOUT_VERSION,
+				"gpu_bytes": ClipmapCache.estimate_gpu_bytes()}
 			_sync_owned_rid_snapshot()
 		var entry: Dictionary = _clipmaps[clip_key]
 		entry.last_used = _cache_clock
@@ -533,8 +674,12 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		if clv_cluster_buffer != cached.get("probe_clusters", RID()):
 			clv_bake = cached.duplicate(false)
 			clv_bake["probe_clusters"] = clv_cluster_buffer
+		var geometry_epoch := _nonstream_clv_geometry_epoch(
+				_frame_snapshot, cache_key, int(cached.get("data_id", -1)), version)
+		var content_revision := _nonstream_clv_content_revision(
+				_frame_snapshot, cached, int(directional.epoch))
 		if not entry.cache.update(rd, focus, spacing,
-				directional.epoch, clv_bake, directional, _ubo, _sampler,
+				geometry_epoch, content_revision, clv_bake, directional, _ubo, _sampler,
 				int(_frame_snapshot.get("clv_cells_per_frame", 256))):
 			rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 			return
@@ -1132,14 +1277,49 @@ func _stream_owner_page_key(snapshot: Dictionary, page: Dictionary) -> String:
 		int(snapshot.get("volume_id", -1)), str(page.get("page_key", ""))]
 
 
-func _stream_page_epoch(snapshot: Dictionary, page: Dictionary,
+func _nonzero_clv_epoch(value: int) -> int:
+	var token := value & 0x7fffffff
+	return 1 if token == 0 else token
+
+
+func _nonstream_clv_geometry_epoch(snapshot: Dictionary, cache_key: String,
+		data_id: int, version: int) -> int:
+	# This token describes the immutable bake whose geometry generated the cache.
+	# Lighting revisions belong to the refresh queue and must not invalidate tags.
+	return _nonzero_clv_epoch(hash([int(snapshot.get("world_id", -1)),
+		int(snapshot.get("volume_id", -1)), cache_key, data_id, version,
+		float(snapshot.get("clv_cell_size", 0.5)), ClipmapCache.LAYOUT_VERSION]))
+
+
+func _nonstream_clv_content_revision(snapshot: Dictionary, cached: Dictionary,
 		directional_epoch: int) -> int:
-	return int(hash([int(snapshot.get("world_id", -1)),
+	return int(hash([directional_epoch,
+		str(snapshot.get("emission_identity", "")),
+		int(snapshot.get("emission_revision", 0)),
+		str(cached.get("emission_identity", "")),
+		int(cached.get("emission_revision", -1))]) & 0x7fffffff)
+
+
+func _stream_manifest_geometry_epoch(snapshot: Dictionary, spacing: float) -> int:
+	return _nonzero_clv_epoch(hash([int(snapshot.get("world_id", -1)),
+		int(snapshot.get("volume_id", -1)), str(snapshot.get("manifest_key", "")),
+		str(snapshot.get("generation", "")), spacing, ClipmapCache.LAYOUT_VERSION]))
+
+
+func _stream_page_geometry_epoch(snapshot: Dictionary, page: Dictionary,
+		spacing: float) -> int:
+	return _nonzero_clv_epoch(hash([int(snapshot.get("world_id", -1)),
 		int(snapshot.get("volume_id", -1)), str(snapshot.get("manifest_key", "")),
 		str(snapshot.get("generation", "")),
 		str(page.get("page_key", "")), str(page.get("identity", "")),
-		int(page.get("version", -1)), int(page.get("emission_revision", 0)),
-		directional_epoch]) & 0x7fffffff)
+		str(page.get("content_hash", "")), int(page.get("version", -1)),
+		spacing, ClipmapCache.LAYOUT_VERSION]))
+
+
+func _stream_page_content_revision(page: Dictionary, directional_epoch: int) -> int:
+	return int(hash([directional_epoch,
+		str(page.get("emission_identity", "")),
+		int(page.get("emission_revision", page.get("revision", 0)))]) & 0x7fffffff)
 
 
 func _project_streamed_pages(pages: Array[Dictionary], projection: Projection,
@@ -1318,18 +1498,18 @@ func _prepare_stream_page_for_view(root_snapshot: Dictionary, page: Dictionary,
 	_frame_snapshot = page_snapshot
 	_frame_replacement_enabled = previous_replacement \
 			and bool(page_snapshot.get("replacement_enabled", true))
-	if not _update_frame_ubo(page_snapshot, _frame_scene_data, view, rd):
-		_frame_snapshot = previous_snapshot
-		_frame_replacement_enabled = previous_replacement
-		return {}
 	if not _update_stream_emission_texture(cache_key, page_snapshot, rd):
 		_frame_snapshot = previous_snapshot
 		_frame_replacement_enabled = previous_replacement
 		return {"page": page, "snapshot": page_snapshot, "emission_pending": true}
-	if not _update_probe_lighting(cache_key, page_snapshot, rd):
-		_frame_snapshot = previous_snapshot
-		_frame_replacement_enabled = previous_replacement
-		return {}
+	# Relighting consumes the frame UBO only when its sources changed. Pixel
+	# application and CLV jobs prepare their own view/page UBO before dispatch.
+	if cached.get("lighting_sources", []) != _probe_lighting_sources(cached, page_snapshot):
+		if not _update_frame_ubo(page_snapshot, _frame_scene_data, view, rd) \
+				or not _update_probe_lighting(cache_key, page_snapshot, rd):
+			_frame_snapshot = previous_snapshot
+			_frame_replacement_enabled = previous_replacement
+			return {}
 	cached = _bake_resources[cache_key]
 	cached["published_page"] = page.duplicate(false)
 	cached["last_used"] = _cache_clock
@@ -1380,7 +1560,7 @@ func _stream_clipmap_reserve_bytes() -> int:
 	if _probe_cluster_fallback.is_valid():
 		result += 16
 	if not _clv_fallback.is_empty():
-		result += 16 + 16 + 80 + 320
+		result += 16 + 16 + 4 + 80 + 320
 	return result
 
 
@@ -1400,11 +1580,14 @@ func _ensure_streamed_clipmap_cache(buffers: RenderSceneBuffersRD, view: int,
 	if _clipmaps.has(clip_key):
 		var existing: Dictionary = _clipmaps[clip_key]
 		var owner_ref: WeakRef = existing.get("owner")
-		if owner_ref != null and owner_ref.get_ref() == buffers:
+		if owner_ref != null and owner_ref.get_ref() == buffers \
+				and _clipmap_layout_is_current(existing):
 			existing["last_used"] = frame_token
 			_clipmaps[clip_key] = existing
 			return existing.cache
-		_free_rids(rd, existing.cache.owned_rids())
+		var old_cache: RefCounted = existing.get("cache")
+		if old_cache != null:
+			_free_rids(rd, old_cache.owned_rids())
 		_clipmaps.erase(clip_key)
 		_sync_owned_rid_snapshot()
 	var clipmap := ClipmapCache.new()
@@ -1413,9 +1596,30 @@ func _ensure_streamed_clipmap_cache(buffers: RenderSceneBuffersRD, view: int,
 		return null
 	_clipmaps[clip_key] = {"cache": clipmap, "owner": weakref(buffers),
 		"last_used": frame_token, "gpu_bytes": ClipmapCache.estimate_gpu_bytes(),
-		"streamed": true, "bake": ""}
+		"layout_version": ClipmapCache.LAYOUT_VERSION, "streamed": true, "bake": ""}
 	_sync_owned_rid_snapshot()
 	return clipmap
+
+
+func _clipmap_layout_is_current(entry: Dictionary) -> bool:
+	return int(entry.get("layout_version", -1)) == ClipmapCache.LAYOUT_VERSION \
+			and int(entry.get("gpu_bytes", -1)) == ClipmapCache.estimate_gpu_bytes()
+
+
+static func _valid_clv_focus_bounds(bounds: AABB) -> bool:
+	return bounds.position.is_finite() and bounds.size.is_finite() \
+			and bounds.size.x >= 0.0 and bounds.size.y >= 0.0 and bounds.size.z >= 0.0
+
+
+static func _union_clv_source_bounds(source_bounds: Array[AABB]) -> AABB:
+	var result := AABB()
+	var has_bounds := false
+	for bounds in source_bounds:
+		if not _valid_clv_focus_bounds(bounds):
+			continue
+		result = result.merge(bounds) if has_bounds else bounds
+		has_bounds = true
+	return result if has_bounds else AABB(Vector3.ZERO, Vector3.ONE * -1.0)
 
 
 func _update_streamed_clipmap(buffers: RenderSceneBuffersRD, view: int,
@@ -1424,6 +1628,7 @@ func _update_streamed_clipmap(buffers: RenderSceneBuffersRD, view: int,
 	if ready_pages.is_empty():
 		return null
 	var pages_with_directional: Array[Dictionary] = []
+	var source_bounds_for_focus: Array[AABB] = []
 	var pages_by_key: Dictionary = {}
 	for page in ready_pages:
 		var cache_key := str(page.get("_cache_key", ""))
@@ -1436,6 +1641,11 @@ func _update_streamed_clipmap(buffers: RenderSceneBuffersRD, view: int,
 		if page_key.is_empty():
 			continue
 		pages_with_directional.append(page)
+		var source_bounds_value: Variant = cached.get("source_bounds", AABB())
+		if source_bounds_value is AABB:
+			var source_bounds: AABB = source_bounds_value
+			if _valid_clv_focus_bounds(source_bounds):
+				source_bounds_for_focus.append(source_bounds)
 		pages_by_key[page_key] = page
 	if pages_with_directional.is_empty():
 		return null
@@ -1451,10 +1661,12 @@ func _update_streamed_clipmap(buffers: RenderSceneBuffersRD, view: int,
 	_clipmaps[clip_key] = entry
 	var clipmap: RefCounted = clipmap_value
 	var spacing := float(root_snapshot.get("clv_cell_size", 0.5))
-	var manifest_epoch := int(hash([int(root_snapshot.get("world_id", -1)),
-		int(root_snapshot.get("volume_id", -1)), str(root_snapshot.get("manifest_key", "")),
-		str(root_snapshot.get("generation", ""))]) & 0x7fffffff)
-	clipmap.queue_updates(camera, spacing, manifest_epoch, true)
+	var manifest_epoch := _stream_manifest_geometry_epoch(root_snapshot, spacing)
+	var focus := camera
+	var focus_bounds := _union_clv_source_bounds(source_bounds_for_focus)
+	if _valid_clv_focus_bounds(focus_bounds):
+		focus = ClipmapCache.focus_for_bounds(camera, focus_bounds, spacing)
+	clipmap.queue_updates(focus, spacing, manifest_epoch)
 	if not clipmap.update_parameters(rd, spacing, manifest_epoch):
 		return null
 	var retained_keys := PackedStringArray()
@@ -1463,10 +1675,11 @@ func _update_streamed_clipmap(buffers: RenderSceneBuffersRD, view: int,
 		var cache_key := str(page.get("_cache_key", ""))
 		var cached: Dictionary = _bake_resources[cache_key]
 		var directional: RefCounted = cached.get("directional")
-		var token := _stream_page_epoch(root_snapshot, page, directional.epoch)
+		var geometry_epoch := _stream_page_geometry_epoch(root_snapshot, page, spacing)
+		var content_revision := _stream_page_content_revision(page, int(directional.epoch))
 		retained_keys.append(page_key)
 		clipmap.queue_page_revision(page_key, page.get("core_bounds", AABB()),
-				spacing, token)
+				spacing, geometry_epoch, content_revision)
 	clipmap.retain_page_epochs(retained_keys)
 	var jobs: Array[Vector4i] = clipmap.take_jobs(clampi(
 		int(root_snapshot.get("clv_cells_per_frame", 256)), 32, 512))
@@ -1504,12 +1717,12 @@ func _update_streamed_clipmap(buffers: RenderSceneBuffersRD, view: int,
 			continue
 		var cached: Dictionary = _bake_resources[page_cache_key]
 		var directional: RefCounted = cached.get("directional")
-		var token := _stream_page_epoch(root_snapshot, owner_page, directional.epoch)
+		var geometry_epoch := _stream_page_geometry_epoch(root_snapshot, owner_page, spacing)
 		var selected_cells: Array[Vector4i] = []
 		for cell in grouped[page_key]:
 			selected_cells.append(cell)
-		if not clipmap.set_expected_page_epoch(rd, token) \
-				or not clipmap.dispatch_page_jobs(rd, selected_cells, spacing, token,
+		if not clipmap.set_expected_page_epoch(rd, geometry_epoch) \
+				or not clipmap.dispatch_page_jobs(rd, selected_cells, spacing, geometry_epoch,
 					cached, directional, _ubo, _sampler):
 			clipmap.requeue_jobs(selected_cells)
 		_frame_snapshot = previous_snapshot
@@ -1542,8 +1755,9 @@ func _render_stream_page(buffers: RenderSceneBuffersRD, view: int, rd: Rendering
 	var directional: RefCounted = cached.get("directional")
 	if _frame_clipmap != null and directional != null \
 			and bool(snapshot.get("use_clv", true)):
-		var token := _stream_page_epoch(root_snapshot, page, directional.epoch)
-		if not _frame_clipmap.set_expected_page_epoch(rd, token):
+		var geometry_epoch := _stream_page_geometry_epoch(root_snapshot, page,
+				float(root_snapshot.get("clv_cell_size", 0.5)))
+		if not _frame_clipmap.set_expected_page_epoch(rd, geometry_epoch):
 			_frame_clipmap = null
 	else:
 		_frame_clipmap = null
@@ -1679,6 +1893,10 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 	if not upload is Dictionary:
 		_report("The selected Magic GI bake is invalid or stale; rebake it with the current PRT format.")
 		return false
+	var source_bounds_value: Variant = upload.get("surface_bounds")
+	if not source_bounds_value is AABB or not _valid_clv_focus_bounds(source_bounds_value):
+		_report("The selected Magic GI bake has no finite surface-sample bounds; rebake it with the current PRT format.")
+		return false
 	var transfer_value: Variant = upload.get("transfer_image")
 	var primary_sky_value: Variant = upload.get("primary_sky_image")
 	var geometry_value: Variant = upload.get("geometry_image")
@@ -1736,10 +1954,7 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 	var emission_rid := _create_image_texture(rd, emission_image, RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT,
 			RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT)
 	var lighting_rid := rd.storage_buffer_create(probe_count * 32)
-	var source_positions: PackedVector3Array = data.get("positions")
-	var source_bounds := AABB(source_positions[0], Vector3.ZERO)
-	for position in source_positions:
-		source_bounds = source_bounds.expand(position)
+	var source_bounds: AABB = source_bounds_value
 	var directional: RefCounted
 	if data.get("directional") != null:
 		directional = DirectionalCache.new()
@@ -1798,11 +2013,15 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 
 ## Relight each probe only when its sources change. Geometry filtering remains in
 ## the surface gather; this cache is independent of camera, exposure and material.
-func _update_probe_lighting(cache_key: String, snapshot: Dictionary, rd: RenderingDevice) -> bool:
-	var cached: Dictionary = _bake_resources[cache_key]
-	var sources := [snapshot.get("lighting", PackedFloat32Array()),
+func _probe_lighting_sources(cached: Dictionary, snapshot: Dictionary) -> Array:
+	return [snapshot.get("lighting", PackedFloat32Array()),
 		snapshot.get("sky_lighting", PackedFloat32Array()),
 		cached["emission_identity"], cached["emission_revision"]]
+
+
+func _update_probe_lighting(cache_key: String, snapshot: Dictionary, rd: RenderingDevice) -> bool:
+	var cached: Dictionary = _bake_resources[cache_key]
+	var sources := _probe_lighting_sources(cached, snapshot)
 	if cached.get("lighting_sources", []) == sources:
 		return true
 	if not _ensure_sampler(rd):
@@ -1940,8 +2159,15 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 	if scene_data == null or view >= scene_data.get_view_count():
 		return false
 	var cached: Dictionary = _bake_resources[str(snapshot.get("cache_key", ""))]
-	var inverse_view_projection: Projection = scene_data.get_view_projection(view).inverse()
-	var camera: Transform3D = scene_data.get_cam_transform()
+	var view_matrices: Array = _frame_view_matrices.get(view, [])
+	if view_matrices.is_empty():
+		var projection_values := PackedFloat32Array()
+		_append_projection(projection_values, scene_data.get_view_projection(view).inverse())
+		var camera: Transform3D = scene_data.get_cam_transform()
+		var camera_values := PackedFloat32Array()
+		_append_transform(camera_values, Transform3D(camera.basis.orthonormalized(), camera.origin))
+		view_matrices = [projection_values, camera_values]
+		_frame_view_matrices[view] = view_matrices
 	var dimensions: Vector3i = cached["grid_dims"]
 	var lighting: Variant = snapshot.get("lighting", PackedFloat32Array())
 	if not lighting is PackedFloat32Array or lighting.size() != 27:
@@ -1951,11 +2177,11 @@ func _update_frame_ubo(snapshot: Dictionary, scene_data: RenderSceneData, view: 
 		sky_lighting = PackedFloat32Array()
 		sky_lighting.resize(27)
 	var values := PackedFloat32Array()
-	_append_projection(values, inverse_view_projection)
+	values.append_array(view_matrices[0])
 	var bake_data: Resource = snapshot["data"]
 	var world_to_grid: Transform3D = bake_data.get("world_to_grid")
 	_append_transform(values, world_to_grid)
-	_append_transform(values, Transform3D(camera.basis.orthonormalized(), camera.origin))
+	values.append_array(view_matrices[1])
 	values.append_array(PackedFloat32Array([float(dimensions.x), float(dimensions.y), float(dimensions.z), float(cached["probe_count"])]))
 	values.append_array(PackedFloat32Array([
 		float(snapshot.get("strength", 1.0)),
@@ -1978,11 +2204,11 @@ func _commit_frame_ubo(values: PackedFloat32Array, ubo_size: int, rd: RenderingD
 	return succeeded
 
 func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> Dictionary:
-	var binding_data := super._collect_bindings(buffers, view, rd)
+	var binding_data := _collect_frame_input_bindings(buffers, view, rd)
 	if _binding_error or _frame_snapshot.is_empty():
 		return binding_data
 	var cache_key := str(_frame_snapshot.get("cache_key", ""))
-	if not _bake_resources.has(cache_key) or not _ensure_sampler(rd):
+	if not _bake_resources.has(cache_key):
 		_binding_error = true
 		return binding_data
 	var cached: Dictionary = _bake_resources[cache_key]
@@ -1990,51 +2216,16 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	if not cluster_buffer.is_valid():
 		_binding_error = true
 		return binding_data
-	var uniforms: Array[RDUniform] = binding_data["uniforms"]
-	var sky_diffuse: RID = _sky_diffuse_input.get_texture(buffers, view)
-	if not sky_diffuse.is_valid():
-		sky_diffuse = _ensure_zero_sky_diffuse(rd)
-	if not sky_diffuse.is_valid():
-		_binding_error = true
-		_report("Cannot create the zero SkyLight diffuse fallback texture.")
-		return binding_data
-	for spec in [
-		{"binding": 7, "texture": cached["geometry"]},
-		{"binding": 8, "texture": cached["indices"]},
-		{"binding": 12, "texture": sky_diffuse},
-		{"binding": 13, "texture": cached["visibility_moments"]},
-	]:
-		var uniform := RDUniform.new()
-		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-		uniform.binding = int(spec["binding"])
-		uniform.add_id(_sampler)
-		uniform.add_id(spec["texture"])
-		uniforms.append(uniform)
-	var diffuse_ao := _get_diffuse_ao_view(buffers, view, rd)
-	if not diffuse_ao.is_valid():
-		diffuse_ao = _ensure_white_diffuse_ao(rd)
-	if not diffuse_ao.is_valid():
-		_binding_error = true
-		_report("Cannot create the neutral diffuse AO texture.")
-		return binding_data
-	var diffuse_ao_uniform := RDUniform.new()
-	diffuse_ao_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
-	diffuse_ao_uniform.binding = DIFFUSE_AO_BINDING
-	diffuse_ao_uniform.add_id(_sampler)
-	diffuse_ao_uniform.add_id(diffuse_ao)
-	uniforms.append(diffuse_ao_uniform)
-	for spec in [
-		{"binding": 14, "buffer": cached["visibility_nodes"]},
-		{"binding": 15, "buffer": cached["visibility_triangles"]},
-		{"binding": 17, "buffer": cached["probe_lighting"]},
-		{"binding": 22, "buffer": cached["index_entries"]},
-		{"binding": PROBE_CLUSTER_BINDING, "buffer": cluster_buffer},
-	]:
-		var uniform := RDUniform.new()
-		uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-		uniform.binding = int(spec["binding"])
-		uniform.add_id(spec["buffer"])
-		uniforms.append(uniform)
+	var uniforms: Array[RDUniform] = binding_data["uniforms"].duplicate()
+	if cached.get("apply_sampler", RID()) != _sampler or cached.get("apply_cluster", RID()) != cluster_buffer:
+		cached["apply_uniforms"] = [U.sampled(7, _sampler, cached["geometry"]),
+			U.sampled(8, _sampler, cached["indices"]), U.sampled(13, _sampler, cached["visibility_moments"]),
+			U.storage_buffer(14, cached["visibility_nodes"]), U.storage_buffer(15, cached["visibility_triangles"]),
+			U.storage_buffer(17, cached["probe_lighting"]), U.storage_buffer(22, cached["index_entries"]),
+			U.storage_buffer(PROBE_CLUSTER_BINDING, cluster_buffer)]
+		cached["apply_sampler"] = _sampler
+		cached["apply_cluster"] = cluster_buffer
+	uniforms.append_array(cached["apply_uniforms"])
 	uniforms.append(_ubo_uniform(UBO_BINDING))
 	if not _ensure_clv_fallback(rd):
 		_binding_error = true
@@ -2048,6 +2239,8 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		_frame_clipmap.texture if _frame_clipmap != null else _clv_fallback.texture))
 	uniforms.append(U.sampled(20, _sampler, _frame_clipmap.tags if _frame_clipmap != null else _clv_fallback.tags))
 	uniforms.append(U.uniform_buffer(21, _frame_clipmap.parameters if _frame_clipmap != null else _clv_fallback.parameters))
+	uniforms.append(U.sampled(25, _sampler,
+		_frame_clipmap.support if _frame_clipmap != null else _clv_fallback.support))
 	if not _page_params_ubo.is_valid():
 		_binding_error = true
 		return binding_data
@@ -2055,6 +2248,33 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	binding_data["uniforms"] = uniforms
 	_record_probe_cluster_binding(cache_key)
 	return binding_data
+
+
+func _collect_frame_input_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> Dictionary:
+	_binding_error = false
+	if _frame_input_bindings.has(view):
+		return _frame_input_bindings[view].duplicate()
+	var binding_data := super._collect_bindings(buffers, view, rd)
+	if _binding_error or _frame_snapshot.is_empty():
+		return binding_data
+	if not _ensure_sampler(rd):
+		_binding_error = true
+		return binding_data
+	var sky_diffuse: RID = _sky_diffuse_input.get_texture(buffers, view)
+	if not sky_diffuse.is_valid():
+		sky_diffuse = _ensure_zero_sky_diffuse(rd)
+	var diffuse_ao := _get_diffuse_ao_view(buffers, view, rd)
+	if not diffuse_ao.is_valid():
+		diffuse_ao = _ensure_white_diffuse_ao(rd)
+	if not sky_diffuse.is_valid() or not diffuse_ao.is_valid():
+		_binding_error = true
+		_report("Cannot create the neutral SkyLight or diffuse AO fallback texture.")
+		return binding_data
+	var uniforms: Array[RDUniform] = binding_data["uniforms"]
+	uniforms.append(U.sampled(12, _sampler, sky_diffuse))
+	uniforms.append(U.sampled(DIFFUSE_AO_BINDING, _sampler, diffuse_ao))
+	_frame_input_bindings[view] = binding_data
+	return binding_data.duplicate()
 
 
 func _cluster_binding_for_cache(cached: Dictionary, rd: RenderingDevice) -> RID:
@@ -2085,8 +2305,11 @@ func _ensure_clv_fallback(rd: RenderingDevice) -> bool:
 	var texture := rd.texture_create(format, RDTextureView.new(), [zero])
 	format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SINT
 	var tags := rd.texture_create(format, RDTextureView.new(), [zero])
+	format.format = RenderingDevice.DATA_FORMAT_R32_UINT
+	zero.resize(4)
+	var support := rd.texture_create(format, RDTextureView.new(), [zero])
 	zero.resize(80)
-	_clv_fallback = {"texture": texture, "tags": tags,
+	_clv_fallback = {"texture": texture, "tags": tags, "support": support,
 		"parameters": rd.uniform_buffer_create(80, zero), "lighting": rd.storage_buffer_create(320)}
 	for rid: RID in _clv_fallback.values():
 		if not rid.is_valid():
@@ -2229,6 +2452,8 @@ func _current_owned_rids() -> Array[RID]:
 	var rids: Array[RID] = []
 	if _surfel_gpu != null and _surfel_gpu.has_method("get_all_rids"):
 		rids.append_array(_surfel_gpu.call("get_all_rids"))
+	if _surfel_nrd != null and _surfel_nrd.has_method("get_all_rids"):
+		rids.append_array(_surfel_nrd.call("get_all_rids"))
 	rids.append_array(_raster_pipelines.values())
 	rids.append_array([_compute_pipeline, _shader, _sampler, _ubo])
 	rids.append_array([_relight_pipeline, _relight_shader])
@@ -2269,7 +2494,10 @@ func _take_owned_rids() -> Array[RID]:
 	var owned_rids: Array[RID] = super.call("_current_owned_rids")
 	if _surfel_gpu != null and _surfel_gpu.has_method("take_owned_rids"):
 		owned_rids.append_array(_surfel_gpu.call("take_owned_rids"))
+	if _surfel_nrd != null and _surfel_nrd.has_method("take_owned_rids"):
+		owned_rids.append_array(_surfel_nrd.call("take_owned_rids"))
 	_surfel_gpu = null
+	_surfel_nrd = null
 	_bake_resources.clear()
 	_page_uploads.clear()
 	_page_ready_by_key.clear()
@@ -2289,6 +2517,8 @@ func _take_owned_rids() -> Array[RID]:
 	_zero_sky_diffuse = RID()
 	_diffuse_ao_white = RID()
 	_frame_diffuse_ao_texture = RID()
+	_frame_input_bindings.clear()
+	_frame_view_matrices.clear()
 	_diffuse_ao_view_cache.clear()
 	_probe_cluster_payload_cache.clear()
 	_probe_cluster_payload_cache_bytes = 0

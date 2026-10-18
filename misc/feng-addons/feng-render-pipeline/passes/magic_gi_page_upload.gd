@@ -115,10 +115,20 @@ func begin(rd: RenderingDevice, page: Dictionary, new_cache_key: String) -> bool
 	_upload_tasks.append({"kind": "texture_bytes", "name": "indices", "bytes": index_bytes,
 		"dims": dims, "sparse": bool(_upload.get("sparse_indices", false))})
 	_allocation_tasks.append({"kind": "buffer", "name": "probe_lighting", "size": probe_count * 32})
-	var source_bounds_value: Variant = page.get("support_bounds", page.get("core_bounds", AABB()))
-	if not source_bounds_value is AABB or source_bounds_value.size == Vector3.ZERO:
-		return _fail("Page descriptor has no finite support bounds.")
+	var source_bounds_value: Variant
+	var has_surface_sample_bounds := _upload.has("surface_bounds")
+	var has_legacy_bounds := page.has("support_bounds") or page.has("core_bounds")
+	if has_surface_sample_bounds:
+		source_bounds_value = _upload.get("surface_bounds")
+	else:
+		# Older worker bundles did not include exact sample bounds. Keep their
+		# historical conservative support bounds without reading the Data arrays.
+		source_bounds_value = page.get("support_bounds", page.get("core_bounds", AABB()))
+	if not source_bounds_value is AABB or (not has_surface_sample_bounds and not has_legacy_bounds):
+		return _fail("Page descriptor has no surface-sample bounds or legacy support bounds.")
 	var source_bounds: AABB = source_bounds_value
+	if not _valid_source_bounds(source_bounds):
+		return _fail("Page descriptor has malformed or non-finite source bounds.")
 	cache = {
 		"data_id": _data.get_instance_id(), "version": int(page.get("version", _data.get("bake_version"))),
 		"source_bounds": source_bounds, "grid_dims": dims,
@@ -139,6 +149,11 @@ func begin(rd: RenderingDevice, page: Dictionary, new_cache_key: String) -> bool
 		"last_used": 0, "stream_page": true,
 	}
 	return true
+
+
+static func _valid_source_bounds(bounds: AABB) -> bool:
+	return bounds.position.is_finite() and bounds.size.is_finite() \
+			and bounds.size.x >= 0.0 and bounds.size.y >= 0.0 and bounds.size.z >= 0.0
 
 
 func _fail(message: String) -> bool:

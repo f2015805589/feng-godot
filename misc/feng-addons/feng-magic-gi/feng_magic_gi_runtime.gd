@@ -511,9 +511,12 @@ static func _publish() -> void:
 			# version tracks every setting for snapshot publication. layout_version
 			# alone keys GPU allocation and temporal-light history.
 			var surfel_version := hash([volume.global_transform, volume.size, surfel_settings])
-			var surfel_layout_version := hash([volume.global_transform, volume.size,
+			var surfel_layout_version := hash(["surfel-layout-v5-lod-presence",
+				volume.global_transform, volume.size,
 				surfel_settings.get("surfel_radius", 0.15),
-				surfel_settings.get("max_surfels", 65536)])
+				surfel_settings.get("max_surfels", 65536),
+				surfel_settings.get("adaptive_distribution_enabled", true),
+				8.0, 4]) # LOD pixel support and per-tile coverage representatives.
 			result.append({
 				"mode": int(volume.gi_mode),
 				"surfel": true,

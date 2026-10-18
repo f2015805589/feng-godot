@@ -159,6 +159,10 @@ var _bound_resources: Array[Resource] = []
 var _snapshot_worlds: Script
 var _registered_targets: Array[RID] = []
 var _last_registration_signature: Array = []
+var _source_registration_revision := 0
+var _last_source_registration_identity: Array = []
+var _output_source_identity: Array = []
+var _capture_submitted_source_identity: Array = []
 var _current_world_id := 0
 var _last_radiance_basis := Basis.IDENTITY
 var _last_environment_identity: Array = []
@@ -342,6 +346,7 @@ func _try_load_baked_radiance(force: bool = false) -> void:
 		_external_radiance_enabled = true
 	if NativeAdapter.set_cubemap_radiance(_output_sky, bake_data.radiance):
 		_output_source_mode = source_mode
+		_output_source_identity = _baked_source_identity()
 		_bake_loaded = true
 		_native_radiance_ready = false
 		_native_radiance_revision = -1
@@ -610,7 +615,8 @@ func _feng_sky_light_volumetric_metadata() -> Dictionary:
 	return {
 		"ready": is_ready,
 		"provider_id": get_instance_id(),
-		"source_revision": _native_radiance_revision if is_ready else -1,
+		"source_revision": _current_source_registration_revision() if is_ready else -1,
+		"radiance_revision": _native_radiance_revision if is_ready else -1,
 		"radiance_energy": radiance_energy,
 		"volumetric_scattering_intensity": volumetric_scattering_intensity,
 		"captured_exposure": _native_radiance_exposure if is_ready else 1.0,
@@ -648,6 +654,7 @@ func _sync_active_source() -> void:
 		if _cubemap_dirty:
 			var revision_before_cubemap := NativeAdapter.external_radiance_revision(_output_sky)
 			if NativeAdapter.set_cubemap_radiance(_output_sky, cubemap):
+				_output_source_identity = _cubemap_source_identity()
 				_cubemap_dirty = false
 				_capture_request_pending = false
 				_capture_native_config_dirty = true
@@ -709,6 +716,7 @@ func _sync_active_source() -> void:
 		if NativeAdapter.request_capture(_capture_probe):
 			_capture_request_pending = false
 			_capture_in_flight = true
+			_capture_submitted_source_identity = _capture_source_identity()
 			_capture_fog_effect_prepared = false
 			_capture_submitted_revision = revision_before_capture
 			_capture_snapshot_after_inflight = false
@@ -730,6 +738,8 @@ func _replace_output_sky_for_source_change() -> void:
 		NativeAdapter.enable_external_radiance(old_output, false)
 	_output_sky = Sky.new()
 	_output_source_mode = source_mode
+	_output_source_identity.clear()
+	_capture_submitted_source_identity.clear()
 	_configure_output_sky_radiance_size()
 	_external_radiance_enabled = false
 	_native_radiance_ready = false
@@ -941,13 +951,17 @@ func _reset_capture_in_flight() -> void:
 	_capture_in_flight = false
 	_capture_submitted_revision = -1
 	_capture_snapshot_after_inflight = false
+	_capture_submitted_source_identity.clear()
 
 
 func _complete_inflight_capture(now_msec: int) -> void:
 	if not _capture_in_flight:
 		return
+	if not _capture_submitted_source_identity.is_empty():
+		_output_source_identity = _capture_submitted_source_identity.duplicate()
 	_capture_in_flight = false
 	_capture_submitted_revision = -1
+	_capture_submitted_source_identity.clear()
 	_next_capture_msec = now_msec + int(capture_interval * 1000.0)
 	if _capture_request_pending and _capture_snapshot_after_inflight:
 		_capture_environment_snapshot_pending = true
@@ -1058,8 +1072,9 @@ func _sync_frp_sources() -> void:
 	if not _native_radiance_ready or _native_radiance_revision < 0 \
 			or not NativeAdapter.supports_frp_registration():
 		return
+	var source_revision := _current_source_registration_revision()
 	var signature: Array = [
-		_native_radiance_revision, _native_radiance_exposure,
+		source_revision, _native_radiance_revision, _native_radiance_exposure,
 		radiance_energy, _radiance_rotation()]
 	var needs_all_targets := signature != _last_registration_signature
 	var all_registered := true
@@ -1068,13 +1083,44 @@ func _sync_frp_sources() -> void:
 			continue
 		if NativeAdapter.register_frp_source(target, get_instance_id(), _output_sky,
 				radiance_energy, _radiance_rotation(), _native_radiance_exposure,
-				_native_radiance_revision):
+				source_revision):
 			if not _registered_targets.has(target):
 				_registered_targets.append(target)
 		else:
 			all_registered = false
 	if all_registered:
 		_last_registration_signature = signature
+
+
+func _current_source_registration_revision() -> int:
+	# This token identifies the active source attached to the output Sky. It is
+	# intentionally independent of the native radiance content revision, which
+	# advances on ordinary realtime captures.
+	var identity: Array = [_resource_instance_id(_output_sky),
+			int(_output_source_mode), _output_source_identity.duplicate()]
+	if identity != _last_source_registration_identity:
+		_source_registration_revision += 1
+		_last_source_registration_identity = identity
+	return _source_registration_revision
+
+
+func _resource_instance_id(resource: Object) -> int:
+	return resource.get_instance_id() if resource != null and is_instance_valid(resource) else 0
+
+
+func _capture_source_identity() -> Array:
+	return ["captured", int(source_mode), _capture_environment_id,
+			_resource_instance_id(_bound_capture_sky)]
+
+
+func _cubemap_source_identity() -> Array:
+	return ["cubemap", _resource_instance_id(cubemap)]
+
+
+func _baked_source_identity() -> Array:
+	var radiance: Cubemap = bake_data.radiance \
+			if bake_data != null and is_instance_valid(bake_data) else null
+	return ["baked", _resource_instance_id(bake_data), _resource_instance_id(radiance)]
 
 
 func _clear_render_target_routes() -> void:

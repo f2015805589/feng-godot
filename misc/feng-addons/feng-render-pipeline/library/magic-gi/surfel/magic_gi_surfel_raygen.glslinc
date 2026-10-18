@@ -1,7 +1,14 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 
+#ifndef FENG_GI_SURFEL_MODE
+#define FENG_GI_SURFEL_MODE 0
+#endif
+
 layout(set = 0, binding = 0) uniform accelerationStructureEXT gi_scene_tlas;
+layout(set = 0, binding = 25, std430) readonly buffer FENGGISurfelEmitters {
+	vec4 rows[];
+} gi_emitters;
 struct GIPathPayload {
 	vec3 radiance;
 	uint flags;
@@ -24,6 +31,8 @@ layout(set = 0, binding = 20, std140) uniform GIFrame {
 	GIFrameData data;
 } gi_frame;
 
+vec3 gi_surfel_sample_3d(uint sample_index, uint scramble);
+
 // FENG_GI_SURFEL_CACHE_AND_GATHER_INCLUDES
 
 layout(set = 1, binding = 6, std430) buffer FENGGISurfelUpdateQueue {
@@ -37,7 +46,6 @@ layout(set = 1, binding = 8, std430) buffer FENGGISurfelProcessedBits {
 } gi_surfel_processed_bits;
 
 const float GI_INV_PI = 0.3183098861837907;
-const uint GI_SURFEL_UNKNOWN_INSTANCE = 0xffffffffu;
 
 uint gi_hash(uint value) {
 	value ^= value >> 16u;
@@ -47,10 +55,7 @@ uint gi_hash(uint value) {
 	return value ^ (value >> 16u);
 }
 
-float gi_random(inout uint state) {
-	state = gi_hash(state);
-	return float(state) * (1.0 / 4294967296.0);
-}
+// FENG_GI_SURFEL_FILTER_INCLUDE
 
 vec3 gi_surfel_cosine_direction(vec3 normal, float u, float v) {
 	float radius = sqrt(u);
@@ -62,24 +67,143 @@ vec3 gi_surfel_cosine_direction(vec3 normal, float u, float v) {
 	return normalize(tangent * local_direction.x + bitangent * local_direction.y + normal * local_direction.z);
 }
 
+vec3 gi_surfel_sample_guided_direction(uint record_index, vec3 normal,
+		vec3 sample_value, out float pdf, out uint bin_index) {
+	float alpha = gi_surfel_config.guide.x > 0.5
+			? clamp(gi_surfel_config.guide.y, 0.25, 1.0) : 1.0;
+	float u;
+	float v;
+	if (sample_value.x < alpha || alpha >= 1.0) {
+		u = sample_value.x / alpha;
+		v = sample_value.y;
+	} else {
+		uint total_mass = gi_surfel_guide_previous.values[record_index * 5u + 4u];
+		float bin_selector = (sample_value.x - alpha) / max(1.0 - alpha, 1e-6);
+		float target = bin_selector * float(max(total_mass, 1u));
+		uint selected = 15u;
+		float cumulative = 0.0;
+		for (uint bin = 0u; bin < 16u; bin++) {
+			cumulative += float(gi_surfel_guide_mass(record_index, bin, false));
+			if (target < cumulative) { selected = bin; break; }
+		}
+		uint total = max(total_mass, 1u);
+		if (total_mass == 0u) selected = min(uint(bin_selector * 16.0), 15u);
+		u = (float(selected & 3u) + sample_value.y) * 0.25;
+		v = (float(selected >> 2u) + sample_value.z) * 0.25;
+	}
+	vec3 direction = gi_surfel_cosine_direction(normal, u, v);
+	bin_index = gi_surfel_guide_bin(direction, normal);
+	pdf = gi_surfel_guide_q(direction, normal, record_index);
+	return direction;
+}
+
+void gi_surfel_publish_guide(uint record_index, float bin_energy[16]) {
+	if (gi_surfel_config.guide.x < 0.5) return;
+	float energy_sum = 0.0;
+	for (uint bin = 0u; bin < 16u; bin++) energy_sum += max(bin_energy[bin], 0.0);
+	uint previous_total = gi_surfel_guide_previous.values[record_index * 5u + 4u];
+	float previous_sum = float(previous_total);
+	float packed_mass[16];
+	float total_mass = 0.0;
+	for (uint bin = 0u; bin < 16u; bin++) {
+		float previous = previous_sum > 0.0
+				? float(gi_surfel_guide_mass(record_index, bin, false)) / previous_sum : 1.0 / 16.0;
+		float observed = energy_sum > 1e-12 ? max(bin_energy[bin], 0.0) / energy_sum : 1.0 / 16.0;
+		float mass = max(mix(previous, observed, 0.25), 1.0 / 255.0);
+		packed_mass[bin] = mass;
+		total_mass += mass;
+	}
+	uvec4 packed = uvec4(0u);
+	uint quantized_total = 0u;
+	for (uint bin = 0u; bin < 16u; bin++) {
+		uint mass = uint(clamp(round(packed_mass[bin] / total_mass * 255.0), 1.0, 255.0));
+		uint word = bin >> 2u;
+		uint shift = (bin & 3u) * 8u;
+		packed[word] |= mass << shift;
+		quantized_total += mass;
+	}
+	gi_surfel_store_guide_next(record_index, packed, quantized_total);
+}
+
+// PBRT/Joe-Kuo direction numbers for the first three Sobol dimensions.
+// Keep all 32 bits: later direction words can affect the high-24 returned bits.
+const uint GI_SURFEL_SOBOL_DIRECTIONS[96] = uint[96](
+	0x80000000u, 0x40000000u, 0x20000000u, 0x10000000u, 0x08000000u, 0x04000000u,
+	0x02000000u, 0x01000000u, 0x00800000u, 0x00400000u, 0x00200000u, 0x00100000u,
+	0x00080000u, 0x00040000u, 0x00020000u, 0x00010000u, 0x00008000u, 0x00004000u,
+	0x00002000u, 0x00001000u, 0x00000800u, 0x00000400u, 0x00000200u, 0x00000100u,
+	0x00000080u, 0x00000040u, 0x00000020u, 0x00000010u, 0x00000008u, 0x00000004u,
+	0x00000002u, 0x00000001u,
+	0x80000000u, 0xc0000000u, 0xa0000000u, 0xf0000000u, 0x88000000u, 0xcc000000u,
+	0xaa000000u, 0xff000000u, 0x80800000u, 0xc0c00000u, 0xa0a00000u, 0xf0f00000u,
+	0x88880000u, 0xcccc0000u, 0xaaaa0000u, 0xffff0000u, 0x80008000u, 0xc000c000u,
+	0xa000a000u, 0xf000f000u, 0x88008800u, 0xcc00cc00u, 0xaa00aa00u, 0xff00ff00u,
+	0x80808080u, 0xc0c0c0c0u, 0xa0a0a0a0u, 0xf0f0f0f0u, 0x88888888u, 0xccccccccu,
+	0xaaaaaaaau, 0xffffffffu,
+	0x80000000u, 0xc0000000u, 0x60000000u, 0x90000000u, 0xe8000000u, 0x5c000000u,
+	0x8e000000u, 0xc5000000u, 0x68800000u, 0x9cc00000u, 0xee600000u, 0x55900000u,
+	0x80680000u, 0xc09c0000u, 0x60ee0000u, 0x90550000u, 0xe8808000u, 0x5cc0c000u,
+	0x8e606000u, 0xc5909000u, 0x6868e800u, 0x9c9c5c00u, 0xeeee8e00u, 0x5555c500u,
+	0x8000e880u, 0xc0005cc0u, 0x60008e60u, 0x9000c590u, 0xe8006868u, 0x5c009c9cu,
+	0x8e00eeeeu, 0xc5005555u
+);
+
+uint gi_surfel_sobol_word(uint sample_index, uint dimension_offset) {
+	uint word = 0u;
+	for (uint bit = 0u; bit < 32u; bit++) {
+		if ((sample_index & (1u << bit)) != 0u) {
+			word ^= GI_SURFEL_SOBOL_DIRECTIONS[dimension_offset + bit];
+		}
+	}
+	return word;
+}
+
+vec3 gi_surfel_sample_3d(uint sample_index, uint scramble) {
+	// Digital shifts are independent for each dimension and for cosine/NEE.
+	// The sequence index is strategy_count * state.w + strategy_ordinal, so
+	// ordinals form one contiguous Sobol stream across successful updates.
+	// Conversion uses the high 24 bits while indexing all 32 direction bits.
+	uint sobol_x = gi_surfel_sobol_word(sample_index, 0u)
+			^ gi_hash(scramble ^ 0x13198a2eu);
+	uint sobol_y = gi_surfel_sobol_word(sample_index, 32u)
+			^ gi_hash(scramble ^ 0x03707344u);
+	uint sobol_z = gi_surfel_sobol_word(sample_index, 64u)
+			^ gi_hash(scramble ^ 0xa4093822u);
+	const float inverse_24 = 1.0 / 16777216.0;
+	return vec3(float(sobol_x >> 8u), float(sobol_y >> 8u), float(sobol_z >> 8u))
+			* inverse_24;
+}
+
 void gi_surfel_invalidate(uint index, uint launch_index) {
 	gi_surfel_store_response_next(index, vec4(0.0));
+	gi_surfels.records[index].state.y = 0u;
 	gi_surfel_pending_results.values[launch_index].w = 2u;
 }
 
 void main() {
-	if (gi_frame.data.generation_history_flags.z == 1u) {
-		gi_surfel_gather();
-		return;
-	}
+#if FENG_GI_SURFEL_MODE == 1
+	gi_surfel_gather();
+#elif FENG_GI_SURFEL_MODE == 2
+	gi_surfel_filter_update(gl_LaunchIDEXT.x);
+#elif FENG_GI_SURFEL_MODE == 3
+	gi_surfel_gather_nrd();
+#elif FENG_GI_SURFEL_MODE == 4
+	gi_surfel_probe_update(gl_LaunchIDEXT.x);
+#else
 	uint capacity = gi_surfel_config.limits.x;
 	uint active_count = min(capacity, gi_surfel_load_counter(1u));
-	uint update_count = min(gi_surfel_config.limits.z, active_count);
+	uint update_count = gi_surfel_probe_surface_budget(active_count);
 	uint launch_index = gl_LaunchIDEXT.x;
 	gi_surfel_pending_results.values[launch_index] = uvec4(0u);
 	gi_surfel_update_queue.indices[capacity + launch_index] = 0xffffffffu;
 	if (capacity == 0u || update_count == 0u || launch_index >= update_count) return;
-	uint queued_count = min(gi_surfel_load_counter(3u), update_count);
+	// When the whole active set fits, walk it directly. Otherwise cap urgent
+	// first-light work so at least one quarter of the budget rotates old records.
+	bool direct_ring = active_count <= update_count;
+	uint urgent_limit = direct_ring ? 0u : update_count - update_count / 4u;
+	uint queued_count = direct_ring ? 0u : min(gi_surfel_load_counter(3u), urgent_limit);
+	uint ring_count = update_count - queued_count;
+	uint ring_cursor = gi_surfel_load_counter(4u) % active_count;
 	uint index = 0xffffffffu;
 	if (launch_index < queued_count) {
 		uint queued_index = gi_surfel_update_queue.indices[launch_index];
@@ -89,15 +213,12 @@ void main() {
 			if ((atomicOr(gi_surfel_processed_bits.values[word], bit) & bit) == 0u) index = queued_index;
 		}
 	} else {
-		uint start = (gi_frame.data.generation_history_flags.x + launch_index - queued_count) % active_count;
-		for (uint offset = 0u; offset < active_count; offset++) {
-			uint candidate = (start + offset) % active_count;
+		uint ring_lane = launch_index - queued_count;
+		if (ring_lane < ring_count) {
+			uint candidate = (ring_cursor + ring_lane) % active_count;
 			uint word = candidate >> 5u;
 			uint bit = 1u << (candidate & 31u);
-			if ((atomicOr(gi_surfel_processed_bits.values[word], bit) & bit) == 0u) {
-				index = candidate;
-				break;
-			}
+			if ((atomicOr(gi_surfel_processed_bits.values[word], bit) & bit) == 0u) index = candidate;
 		}
 	}
 	gi_surfel_update_queue.indices[capacity + launch_index] = index;
@@ -126,39 +247,168 @@ void main() {
 	uint hit_instance = floatBitsToUint(gi_payload.radiance.x);
 	uint hit_primitive = floatBitsToUint(gi_payload.radiance.y);
 	uint hit_layer_mask = floatBitsToUint(gi_payload.radiance.z);
+	if (hit_instance >= gi_surfel_config.adaptive.w) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
+	uvec4 surface_identity = gi_surface_tracking.rows[hit_instance].identity;
+	if ((surface_identity.w & 1u) == 0u) {
+		gi_surfel_invalidate(index, launch_index);
+		return;
+	}
 	if (record.surface.z != GI_SURFEL_UNKNOWN_INSTANCE
 			&& (record.surface.z != hit_instance || record.surface.w != hit_primitive)) {
 		gi_surfel_invalidate(index, launch_index);
 		return;
 	}
+	// Keep the barycentric surface anchor after validation so the bounded maintenance
+	// pass can follow rigid and deforming geometry without CPU readback.
+	gi_surfel_tracking.values[index] = uvec4(floatBitsToUint(gi_payload.ray_pdf),
+		surface_identity.x, gi_surfel_tracking.values[index].z,
+		gi_surfel_tracking_token(surface_identity));
 	uint ray_count = uint(clamp(round(gi_frame.data.trace_parameters.z), 1.0, 32.0));
-	uint seed = gi_hash(index * 0x9e3779b9u ^ frame_token * 0x85ebca6bu
-			^ gi_frame.data.generation_history_flags.x);
-	float rotation_u = gi_random(seed);
-	float rotation_v = gi_random(seed);
-	vec3 incident_over_pi = vec3(0.0);
+	float total_power = gi_emitters.rows[0].x;
+	float emitter_count_value = gi_emitters.rows[0].y;
+	uint emitter_count = emitter_count_value > 0.0 && !isnan(emitter_count_value)
+			&& !isinf(emitter_count_value) ? uint(emitter_count_value) : 0u;
+	uint n_cos;
+	uint n_nee;
+	gi_surfel_split_ray_budget(gi_frame.data.generation_history_flags.y == 0u,
+		emitter_count, total_power, ray_count, n_cos, n_nee);
+	uint sample_scramble = gi_hash(index * 0x9e3779b9u ^ hit_instance * 0x85ebca6bu
+			^ hit_primitive * 0xc2b2ae35u);
+	uint cosine_scramble = gi_hash(sample_scramble ^ 0x243f6a88u);
+	uint nee_scramble = gi_hash(sample_scramble ^ 0xb7e15162u);
+	vec3 cosine_sum = vec3(0.0);
+	vec3 nee_sum = vec3(0.0);
+	float cosine_hit_distance_sum = 0.0;
+	float guide_bin_energy[16];
+	for (uint bin = 0u; bin < 16u; bin++) guide_bin_energy[bin] = 0.0;
 	float max_distance = max(gi_surfel_config.control.x, 0.1);
-	for (uint ray_index = 0u; ray_index < ray_count; ray_index++) {
-		float u = fract((float(ray_index) + 0.5) / float(ray_count) + rotation_u);
-		float v = fract(rotation_v + float(ray_index) * 0.61803398875);
-		vec3 direction = gi_surfel_cosine_direction(normal, u, v);
+	for (uint ray_index = 0u; ray_index < n_cos; ray_index++) {
+		uint sample_index = record.state.w * n_cos + ray_index;
+		vec3 sample_value = gi_surfel_sample_3d(sample_index, cosine_scramble);
+		float sample_pdf;
+		uint guide_bin;
+		vec3 direction = gi_surfel_sample_guided_direction(index, normal,
+				sample_value, sample_pdf, guide_bin);
+		float p_cos = max(dot(normal, direction), 0.0) * GI_INV_PI;
+		if (!(sample_pdf > 0.0) || isnan(sample_pdf) || isinf(sample_pdf)) continue;
 		gi_payload.radiance = vec3(0.0);
 		gi_payload.flags = GI_RAY_MODE_SURFEL;
 		gi_payload.hit_distance = 0.0;
-		gi_payload.ray_pdf = max(dot(normal, direction), 0.0) * GI_INV_PI;
+		gi_payload.ray_pdf = sample_pdf;
 		traceRayEXT(gi_scene_tlas, gl_RayFlagsNoneEXT, 0x01u, 0u, 0u, 0u,
 			record.position_radius.xyz + normal * 0.002, 0.001, direction, max_distance, 0);
+		float hit_distance = gi_payload.hit_distance;
+		if (!(hit_distance > 0.0) || isnan(hit_distance) || isinf(hit_distance)) {
+			hit_distance = max_distance;
+		}
+		cosine_hit_distance_sum += hit_distance;
 		if (all(not(isnan(gi_payload.radiance))) && all(not(isinf(gi_payload.radiance)))
 					&& all(greaterThanEqual(gi_payload.radiance, vec3(0.0)))) {
-			incident_over_pi += gi_payload.radiance;
+			vec3 sample_contribution = gi_payload.radiance * (p_cos / sample_pdf);
+			cosine_sum += sample_contribution;
+			guide_bin_energy[guide_bin] += max(dot(sample_contribution,
+					vec3(0.2126, 0.7152, 0.0722)), 0.0) / float(max(n_cos, 1u));
 		}
 	}
-	incident_over_pi /= float(max(ray_count, 1u));
+	cosine_sum /= float(max(n_cos, 1u));
+	for (uint nee_index = 0u; nee_index < n_nee; nee_index++) {
+		uint sample_index = record.state.w * n_nee + nee_index;
+		vec3 sample_value = gi_surfel_sample_3d(sample_index, nee_scramble);
+		float target = sample_value.x * total_power;
+		uint lo = 0u;
+		uint hi = emitter_count - 1u;
+		while (lo < hi) {
+			uint middle = (lo + hi) / 2u;
+			if (gi_emitters.rows[1u + middle * 5u].w < target) lo = middle + 1u;
+			else hi = middle;
+		}
+		uint row = 1u + lo * 5u;
+		vec4 vertex = gi_emitters.rows[row];
+		vec4 edge1 = gi_emitters.rows[row + 1u];
+		vec4 edge2 = gi_emitters.rows[row + 2u];
+		vec3 emitted = max(gi_emitters.rows[row + 3u].xyz, vec3(0.0));
+		vec3 light_normal = normalize(gi_emitters.rows[row + 4u].xyz);
+		float root_u = sqrt(sample_value.y);
+		float bary_v = sample_value.z;
+		vec3 origin = record.position_radius.xyz + normal * 0.002;
+		vec3 delta = vertex.xyz + edge1.xyz * (root_u * (1.0 - bary_v))
+				+ edge2.xyz * (root_u * bary_v) - origin;
+		float distance_squared = dot(delta, delta);
+		if (!(distance_squared > 9e-6) || isnan(distance_squared) || isinf(distance_squared)) continue;
+		float light_distance = sqrt(distance_squared);
+		if (!(light_distance < max_distance) || isnan(light_distance) || isinf(light_distance)) continue;
+		vec3 light_direction = delta / light_distance;
+		float cos_light = dot(light_normal, -light_direction);
+		if (edge2.w > 0.5) cos_light = abs(cos_light);
+		float cos_receiver = max(dot(normal, light_direction), 0.0);
+		if (!(cos_receiver > 0.0) || !(cos_light > 1e-6)
+				|| !(edge1.w > 0.0) || !(total_power > 1e-12)) continue;
+		float p_light = (edge1.w / total_power) * distance_squared / cos_light;
+		float p_cos = cos_receiver * GI_INV_PI;
+		float guided_pdf = gi_surfel_guide_q(light_direction, normal, index);
+		float denominator = float(n_cos) * guided_pdf + float(n_nee) * p_light;
+		if (!(p_light > 0.0) || isnan(p_light) || isinf(p_light)
+				|| !(denominator > 1e-12) || isnan(denominator) || isinf(denominator)
+				|| any(isnan(emitted)) || any(isinf(emitted))) continue;
+		float nee_weight = float(n_nee) * p_light / denominator;
+		gi_payload.radiance = vec3(0.0);
+		gi_payload.flags = 8u;
+		gi_payload.hit_distance = 0.0;
+		gi_payload.ray_pdf = 0.0;
+		traceRayEXT(gi_scene_tlas,
+			gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+			0x01u, 0u, 0u, 1u, origin, 0.001, light_direction,
+			light_distance - 0.001, 0);
+		float visibility = clamp(gi_payload.radiance.x, 0.0, 1.0);
+		vec3 nee_contribution = emitted * (visibility * (p_cos / p_light) * nee_weight);
+		nee_sum += nee_contribution;
+		uint nee_bin = gi_surfel_guide_bin(light_direction, normal);
+		guide_bin_energy[nee_bin] += max(dot(nee_contribution,
+				vec3(0.2126, 0.7152, 0.0722)), 0.0) / float(max(n_nee, 1u));
+	}
+	vec3 incident_over_pi = cosine_sum + nee_sum / float(max(n_nee, 1u));
+	gi_surfel_publish_guide(index, guide_bin_energy);
 	vec4 old_response = gi_surfel_load_response_previous(index);
-	float history = old_response.w > 0.5 ? clamp(gi_surfel_config.control.y, 0.0, 0.99) : 0.0;
+	const float short_alpha = 0.25;
+	vec4 old_statistics = gi_surfel_load_statistics(index);
+	vec4 statistics = vec4(incident_over_pi, 0.0);
+	float sample_rgb_second_moment = dot(incident_over_pi, incident_over_pi) / 3.0;
+	if (record.state.w == 0u || old_response.w < 0.5) {
+		statistics.a = sample_rgb_second_moment;
+	} else {
+		statistics.rgb = mix(old_statistics.rgb, incident_over_pi, short_alpha);
+		statistics.a = mix(old_statistics.a, sample_rgb_second_moment, short_alpha);
+	}
+	gi_surfel_store_statistics(index, statistics);
+	float base_history = old_response.w > 0.5
+			? clamp(gi_surfel_config.control.y, 0.0, 0.99) : 0.0;
+	float history = base_history;
+	if (old_response.w > 0.5) {
+		float variance = max(statistics.a - dot(statistics.rgb, statistics.rgb) / 3.0, 0.0);
+		float innovation = length(statistics.rgb - old_response.rgb) * 0.5773502691896258;
+		float scale = max(sqrt(max(statistics.a, 0.0)), 1e-3);
+		float sigma = sqrt(variance + pow(scale * 0.02, 2.0));
+		float z_score = innovation / max(sigma, 1e-6);
+		float threshold = clamp(gi_surfel_config.guide.z, 0.5, 2.0);
+		float change_confidence = smoothstep(threshold, threshold * 2.0, z_score);
+		float fast_history = min(base_history, clamp(gi_surfel_config.guide.w, 0.0, 0.99));
+		history = mix(base_history, fast_history, change_confidence);
+	}
 	vec3 filtered = mix(incident_over_pi, max(old_response.rgb, vec3(0.0)), history);
 	gi_surfel_store_response_next(index, vec4(filtered, 1.0));
+	float sample_hit_distance = cosine_hit_distance_sum / float(max(n_cos, 1u));
+	float previous_hit_distance = uintBitsToFloat(record.state.y);
+	if (!(previous_hit_distance > 0.0) || isnan(previous_hit_distance)
+			|| isinf(previous_hit_distance) || old_response.w < 0.5) {
+		previous_hit_distance = sample_hit_distance;
+	}
+	gi_surfels.records[index].state.y = floatBitsToUint(mix(
+		sample_hit_distance, previous_hit_distance, base_history));
 	gi_surfel_pending_results.values[launch_index] = uvec4(hit_instance, hit_primitive,
 			hit_layer_mask, 1u);
 	atomicAdd(gi_surfel_counters.values[2], 1u);
+#endif
 }

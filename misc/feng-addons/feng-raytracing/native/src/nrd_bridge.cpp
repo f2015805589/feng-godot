@@ -15,6 +15,8 @@ using namespace godot;
 // CPU-only adapter. RenderingDevice owns all GPU resources and synchronization.
 class FengNRDBridge : public RefCounted {
 	GDCLASS(FengNRDBridge, RefCounted)
+	static constexpr int MOTION_MODE_WORLD = 0;
+	static constexpr int MOTION_MODE_SCREEN = 1;
 	nrd::Instance *instance = nullptr;
 	static constexpr nrd::Identifier identifier = 0;
 	static PackedByteArray bytes(const void *data, size_t size) {
@@ -77,6 +79,7 @@ protected:
 	static void _bind_methods() {
 		ClassDB::bind_method(D_METHOD("initialize"), &FengNRDBridge::initialize);
 		ClassDB::bind_method(D_METHOD("get_layout"), &FengNRDBridge::get_layout);
+		ClassDB::bind_method(D_METHOD("get_motion_capabilities"), &FengNRDBridge::get_motion_capabilities);
 		ClassDB::bind_method(D_METHOD("get_dispatches", "frame"), &FengNRDBridge::get_dispatches);
 	}
 public:
@@ -90,6 +93,9 @@ public:
 		nrd::RelaxSettings settings;
 		settings.enableAntiFirefly = true;
 		return nrd::SetDenoiserSettings(*instance, identifier, &settings) == nrd::Result::SUCCESS;
+	}
+	int get_motion_capabilities() const {
+		return (1 << MOTION_MODE_WORLD) | (1 << MOTION_MODE_SCREEN);
 	}
 	Dictionary get_layout() const {
 		Dictionary result;
@@ -119,6 +125,8 @@ public:
 	Array get_dispatches(const Dictionary &frame) {
 		Array result;
 		if (!instance) return result;
+		const int motion_mode = int(frame.get("motion_mode", MOTION_MODE_WORLD));
+		if (motion_mode != MOTION_MODE_WORLD && motion_mode != MOTION_MODE_SCREEN) return result;
 		nrd::CommonSettings settings;
 		matrix(settings.viewToClipMatrix, frame["projection"]);
 		matrix(settings.viewToClipMatrixPrev, frame["previous_projection"]);
@@ -135,8 +143,15 @@ public:
 		}
 		settings.frameIndex = int64_t(frame["index"]);
 		settings.timeDeltaBetweenFrames = double(frame.get("delta_ms", 16.6667));
-		settings.isMotionVectorInWorldSpace = true;
-		settings.motionVectorScale[2] = 1.0f;
+		if (motion_mode == MOTION_MODE_SCREEN) {
+			settings.isMotionVectorInWorldSpace = false;
+			settings.motionVectorScale[0] = 1.0f;
+			settings.motionVectorScale[1] = 1.0f;
+			settings.motionVectorScale[2] = 0.0f;
+		} else {
+			settings.isMotionVectorInWorldSpace = true;
+			settings.motionVectorScale[2] = 1.0f;
+		}
 		settings.accumulationMode = bool(frame["reset"]) ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
 		if (nrd::SetCommonSettings(*instance, settings) != nrd::Result::SUCCESS) return result;
 		const nrd::DispatchDesc *dispatches = nullptr;

@@ -6,7 +6,7 @@ struct FENGGISurfelRecord {
 	vec4 normal_valid;
 	ivec4 cell_last_seen;
 	uvec4 surface;
-	uvec4 state;
+	uvec4 state; // Queue token, mean cosine first-hit distance bits, invalid flag, successful update sequence.
 };
 
 layout(set = 1, binding = 0, std430) buffer FENGGISurfelRecords {
@@ -21,6 +21,35 @@ layout(set = 1, binding = 2, std430) buffer FENGGISurfelResponsePrevious {
 layout(set = 1, binding = 3, std430) buffer FENGGISurfelResponseNext {
 	vec4 values[];
 } gi_surfel_response_next;
+layout(set = 1, binding = 9, std430) buffer FENGGISurfelResponseFiltered {
+	vec4 values[];
+} gi_surfel_response_filtered;
+layout(set = 1, binding = 10, std430) buffer FENGGISurfelStatistics {
+	vec4 values[]; // Short-term mean RGB and E[dot(sample RGB, sample RGB) / 3].
+} gi_surfel_statistics;
+layout(set = 1, binding = 13, std430) buffer FENGGISurfelTracking {
+	uvec4 values[]; // Packed barycentrics, surface generation, LOD, source revision.
+} gi_surfel_tracking;
+layout(set = 1, binding = 14, std430) readonly buffer FENGGISurfelGuidePrevious {
+	uint values[]; // Five words per record: 16 packed bin masses plus metadata.
+} gi_surfel_guide_previous;
+layout(set = 1, binding = 15, std430) buffer FENGGISurfelGuideNext {
+	uint values[];
+} gi_surfel_guide_next;
+layout(set = 1, binding = 16, std430) buffer FENGGISurfelFreeIndices {
+	uint values[];
+} gi_surfel_free_indices;
+layout(set = 1, binding = 17, std430) readonly buffer FENGGISurfelLODPresence {
+	uint levels;
+} gi_surfel_lod_presence;
+struct FENGGISurfaceTrackingRow {
+	mat4 local_to_world;
+	vec4 normal_to_world_columns[3];
+	uvec4 identity;
+};
+layout(set = 0, binding = 40, std430) readonly buffer FENGGISurfaceTracking {
+	FENGGISurfaceTrackingRow rows[];
+} gi_surface_tracking;
 layout(set = 1, binding = 4, std140) uniform FENGGISurfelConfig {
 	mat4 world_to_owner;
 	mat4 owner_to_world;
@@ -28,6 +57,8 @@ layout(set = 1, binding = 4, std140) uniform FENGGISurfelConfig {
 	uvec4 limits; // capacity, hash mask, update budget, frame token.
 	uvec4 light_counts; // directional, omni, spot, area.
 	vec4 control; // max distance, history weight, seed count, debug view.
+	uvec4 adaptive; // enabled, tile count, tile cursor, stable SurfaceTracking row count.
+	vec4 guide; // enabled, cosine floor, change z threshold, fast-history target.
 } gi_surfel_config;
 layout(set = 1, binding = 5, std430) buffer FENGGISurfelCounters {
 	uint values[];
@@ -36,6 +67,7 @@ layout(set = 1, binding = 5, std430) buffer FENGGISurfelCounters {
 const uint GI_SURFEL_SLOT_EMPTY = 0xffffffffu;
 const uint GI_SURFEL_SLOT_TOMBSTONE = 0xfffffffeu;
 const uint GI_SURFEL_SLOT_LOCKED = 0xfffffffdu;
+const uint GI_SURFEL_UNKNOWN_INSTANCE = 0xffffffffu;
 const uint GI_SURFEL_MAX_HASH_PROBES = 8u;
 const uint GI_SURFEL_TTL_FRAMES = 600u;
 const uint GI_RAY_MODE_SURFEL = 16u;
@@ -43,6 +75,19 @@ const uint GI_RAY_MODE_SURFEL_VALIDATE = 32u;
 const uint GI_RAY_MODE_SURFEL_LOCAL_VISIBILITY = 65u;
 const float GI_SURFEL_INV_PI = 0.3183098861837907;
 const int GI_SURFEL_VISIBLE_TOP_K = 4;
+
+void gi_surfel_split_ray_budget(bool emitter_nee_enabled, uint emitter_count,
+		float total_power, uint budget, out uint n_cos, out uint n_nee) {
+	n_cos = budget;
+	n_nee = 0u;
+	if (!emitter_nee_enabled || emitter_count == 0u || budget < 2u
+			|| !(total_power > 1e-12) || isnan(total_power) || isinf(total_power)) {
+		return;
+	}
+	// Odd budgets keep the extra sample in the cosine strategy.
+	n_nee = budget / 2u;
+	n_cos = budget - n_nee;
+}
 
 FENGGISurfelRecord gi_surfel_load_record(uint index) {
 	return gi_surfels.records[index];
@@ -52,8 +97,111 @@ vec4 gi_surfel_load_response_previous(uint index) {
 	return gi_surfel_response_previous.values[index];
 }
 
+vec4 gi_surfel_load_response_filtered(uint index) {
+	return gi_surfel_response_filtered.values[index];
+}
+
 void gi_surfel_store_response_next(uint index, vec4 value) {
 	gi_surfel_response_next.values[index] = value;
+}
+
+void gi_surfel_store_response_filtered(uint index, vec4 value) {
+	gi_surfel_response_filtered.values[index] = value;
+}
+
+vec4 gi_surfel_load_statistics(uint index) {
+	return gi_surfel_statistics.values[index];
+}
+
+uint gi_surfel_tracking_token(uvec4 identity) {
+	// Exact motion revision rejects anchors at their old world transform until
+	// this frame's maintenance sweep has re-anchored them. Slot generation
+	// separately rejects recycled or geometry-replaced SurfaceTracking rows.
+	return identity.z;
+}
+
+bool gi_surfel_tracking_matches(uint record_index, FENGGISurfelRecord record) {
+	uint surface_slot = record.surface.z;
+	uvec4 anchor = gi_surfel_tracking.values[record_index];
+	if (surface_slot >= gi_surfel_config.adaptive.w) return false;
+	uvec4 identity = gi_surface_tracking.rows[surface_slot].identity;
+	return (identity.w & 1u) != 0u && identity.x == anchor.y
+			&& gi_surfel_tracking_token(identity) == anchor.w;
+}
+
+uint gi_surfel_pop_free_index() {
+	uint free_count = atomicAdd(gi_surfel_counters.values[6], 0u);
+	for (uint attempt = 0u; attempt < 32u && free_count > 0u; attempt++) {
+		uint previous = atomicCompSwap(gi_surfel_counters.values[6], free_count, free_count - 1u);
+		if (previous == free_count) return gi_surfel_free_indices.values[free_count - 1u];
+		free_count = previous;
+	}
+	return GI_SURFEL_SLOT_EMPTY;
+}
+
+void gi_surfel_push_free_index(uint record_index) {
+	uint slot = atomicAdd(gi_surfel_counters.values[6], 1u);
+	if (slot < gi_surfel_config.limits.x) {
+		gi_surfel_free_indices.values[slot] = record_index;
+	} else {
+		atomicMin(gi_surfel_counters.values[6], gi_surfel_config.limits.x);
+	}
+}
+
+void gi_surfel_store_statistics(uint index, vec4 value) {
+	gi_surfel_statistics.values[index] = value;
+}
+
+uvec4 gi_surfel_load_tracking(uint index) {
+	return gi_surfel_tracking.values[index];
+}
+
+void gi_surfel_store_tracking(uint index, uvec4 value) {
+	gi_surfel_tracking.values[index] = value;
+}
+
+uint gi_surfel_guide_mass(uint index, uint bin_index, bool next) {
+	uint packed = next ? gi_surfel_guide_next.values[index * 5u + (bin_index >> 2u)]
+			: gi_surfel_guide_previous.values[index * 5u + (bin_index >> 2u)];
+	return (packed >> ((bin_index & 3u) * 8u)) & 255u;
+}
+
+void gi_surfel_store_guide_next(uint index, uvec4 packed_bins, uint metadata) {
+	uint base = index * 5u;
+	gi_surfel_guide_next.values[base + 0u] = packed_bins.x;
+	gi_surfel_guide_next.values[base + 1u] = packed_bins.y;
+	gi_surfel_guide_next.values[base + 2u] = packed_bins.z;
+	gi_surfel_guide_next.values[base + 3u] = packed_bins.w;
+	gi_surfel_guide_next.values[base + 4u] = metadata;
+}
+
+uint gi_surfel_guide_bin(vec3 direction, vec3 normal) {
+	vec3 n = normalize(normal);
+	vec3 helper = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tangent = normalize(cross(helper, n));
+	vec3 bitangent = cross(n, tangent);
+	vec3 d = normalize(direction);
+	float z = dot(d, n);
+	if (!(z > 0.0)) return 0u;
+	float u = clamp(1.0 - z * z, 0.0, 0.99999994);
+	float phi = fract(atan(dot(d, bitangent), dot(d, tangent)) * 0.15915494309189535 + 1.0);
+	uint x = min(uint(u * 4.0), 3u);
+	uint y = min(uint(phi * 4.0), 3u);
+	return y * 4u + x;
+}
+
+float gi_surfel_guide_q(vec3 direction, vec3 normal, uint record_index) {
+	vec3 n = normalize(normal);
+	vec3 d = normalize(direction);
+	float cosine_pdf = max(dot(n, d), 0.0) * GI_SURFEL_INV_PI;
+	if (!(cosine_pdf > 0.0) || gi_surfel_config.guide.x < 0.5) return cosine_pdf;
+	uint selected_bin = gi_surfel_guide_bin(d, n);
+	uint total_mass = gi_surfel_guide_previous.values[record_index * 5u + 4u];
+	if (total_mass == 0u) return cosine_pdf;
+	float p_guide = cosine_pdf * 16.0
+			* float(gi_surfel_guide_mass(record_index, selected_bin, false)) / float(total_mass);
+	float alpha = clamp(gi_surfel_config.guide.y, 0.25, 1.0);
+	return max(alpha * cosine_pdf + (1.0 - alpha) * p_guide, 0.25 * cosine_pdf);
 }
 
 uint gi_surfel_load_counter(uint index) {
@@ -119,9 +267,10 @@ bool gi_surfel_connection_visible(vec3 receiver_position, vec3 receiver_normal,
 	return shadow_payload.radiance.x > 0.5;
 }
 
-uint gi_surfel_hash_cell(ivec3 cell) {
+uint gi_surfel_hash_cell(ivec3 cell, uint level) {
 	uvec3 value = uvec3(cell);
-	uint hash_value = value.x * 0x9e3779b9u ^ value.y * 0x85ebca6bu ^ value.z * 0xc2b2ae35u;
+	uint hash_value = value.x * 0x9e3779b9u ^ value.y * 0x85ebca6bu
+			^ value.z * 0xc2b2ae35u ^ level * 0x27d4eb2fu;
 	hash_value ^= hash_value >> 16u;
 	hash_value *= 0x7feb352du;
 	hash_value ^= hash_value >> 15u;
@@ -129,98 +278,171 @@ uint gi_surfel_hash_cell(ivec3 cell) {
 	return hash_value ^ (hash_value >> 16u);
 }
 
-ivec3 gi_surfel_cell_for_world(vec3 world_position) {
+float gi_surfel_radius_for_level(uint level) {
+	return max(gi_surfel_config.owner_size_cell_radius.w
+			* (level == 0u ? 1.0 : 2.0), 0.001);
+}
+
+ivec3 gi_surfel_cell_for_world(vec3 world_position, uint level) {
 	vec3 owner_origin = gi_surfel_config.owner_to_world[3].xyz;
-	float cell_size = max(2.0 * gi_surfel_config.owner_size_cell_radius.w, 0.002);
+	float radius = gi_surfel_radius_for_level(level);
+	float cell_size = max(2.0 * radius, 0.002);
 	return ivec3(floor((world_position - owner_origin) / cell_size));
 }
 
-bool gi_surfel_record_matches(uint record_index, ivec3 cell, vec3 world_position,
-		vec3 normal, uint layer_mask, uint frame_token, out vec3 response, out float age) {
-	response = vec3(0.0);
+bool gi_surfel_response_filtered_valid(uint record_index) {
+	return gi_surfel_response_filtered.values[record_index].a > 0.5;
+}
+
+bool gi_surfel_candidate_weight(uint record_index, ivec3 cell, vec3 world_position,
+		vec3 normal, uint layer_mask, uint frame_token, uint level,
+		out float weight, out float age) {
+	weight = 0.0;
 	age = 1e20;
-	if (record_index >= gi_surfel_config.limits.x) {
-		return false;
-	}
+	if (record_index >= gi_surfel_config.limits.x) return false;
 	FENGGISurfelRecord record = gi_surfel_load_record(record_index);
 	if (record.normal_valid.w < 0.5 || record.state.z != 0u
+			|| record.surface.z == GI_SURFEL_UNKNOWN_INSTANCE
+			|| record.surface.w == GI_SURFEL_UNKNOWN_INSTANCE
 			|| any(notEqual(record.cell_last_seen.xyz, cell))
-			|| (record.surface.x & layer_mask) == 0u) {
-		return false;
-	}
+			|| gi_surfel_tracking.values[record_index].z != level
+			|| !gi_surfel_tracking_matches(record_index, record)
+			|| (record.surface.x & layer_mask) == 0u) return false;
 	uint frame_age = frame_token - uint(record.cell_last_seen.w);
-	if (frame_age > GI_SURFEL_TTL_FRAMES) {
-		return false;
-	}
+	if (frame_age > GI_SURFEL_TTL_FRAMES) return false;
 	vec3 record_normal = normalize(record.normal_valid.xyz);
 	float normal_match = dot(record_normal, normal);
 	vec3 delta = world_position - record.position_radius.xyz;
 	float radius = max(record.position_radius.w, 0.001);
+	float distance_squared = dot(delta, delta);
 	if (normal_match < 0.88 || abs(dot(delta, record_normal)) > radius * 0.28
-			|| dot(delta, delta) > radius * radius * 6.25) {
-		return false;
-	}
-	vec4 stored_response = gi_surfel_load_response_previous(record_index);
-	response = max(stored_response.rgb, vec3(0.0));
-	if (stored_response.a < 0.5) {
-		return false;
-	}
+			|| distance_squared > radius * radius * 6.25) return false;
+	// The producer writes finite RGB whenever alpha marks a response valid.
+	if (!gi_surfel_response_filtered_valid(record_index)) return false;
+	float distance_weight = max(1.0 - sqrt(distance_squared) / (radius * 2.5), 0.0);
+	float normal_weight = max(normal_match, 0.0);
+	float age_weight = 1.0 - smoothstep(float(GI_SURFEL_TTL_FRAMES) * 0.5,
+			float(GI_SURFEL_TTL_FRAMES), float(frame_age));
+	weight = distance_weight * distance_weight * pow(normal_weight, 8.0) * age_weight;
+	if (!(weight > 0.0) || isnan(weight) || isinf(weight)) return false;
 	age = float(frame_age);
 	return true;
 }
 
+float gi_surfel_lookup_cell_min_distance_squared(ivec3 cell, vec3 world_position,
+		uint level) {
+	vec3 owner_origin = gi_surfel_config.owner_to_world[3].xyz;
+	float radius = gi_surfel_config.owner_size_cell_radius.w * (level == 0u ? 1.0 : 2.0);
+	float cell_size = max(2.0 * radius, 0.002);
+	vec3 cell_minimum = owner_origin + vec3(cell) * cell_size;
+	vec3 cell_maximum = cell_minimum + vec3(cell_size);
+	vec3 epsilon = max(max(abs(cell_minimum), abs(cell_maximum)), vec3(1.0))
+			* 1.9073486328125e-6;
+	cell_minimum -= epsilon;
+	cell_maximum += epsilon;
+	vec3 nearest = max(max(cell_minimum - world_position,
+			world_position - cell_maximum), vec3(0.0));
+	return dot(nearest, nearest);
+}
+
+bool gi_surfel_lookup_cell_may_change(ivec3 cell, vec3 world_position,
+		uint level, float eligible_weight_sum, float age_min, int top_count, float worst_weight) {
+	if (eligible_weight_sum < 1.0 || age_min != 0.0
+			|| top_count < GI_SURFEL_VISIBLE_TOP_K) return true;
+	float radius = max(gi_surfel_config.owner_size_cell_radius.w * (level == 0u ? 1.0 : 2.0), 0.001);
+	float distance_fraction = sqrt(gi_surfel_lookup_cell_min_distance_squared(cell, world_position, level))
+			/ (radius * 2.5);
+	float distance_weight = max(1.0 - distance_fraction, 0.0);
+	float maximum_weight = distance_weight * distance_weight;
+	// Preserve boundary and ranking ties despite float rounding in cell bounds.
+	return maximum_weight * 1.001 >= worst_weight;
+}
+
+int gi_surfel_lookup_center_first_offset(int order) {
+	return order == 0 ? 0 : (order == 1 ? -1 : 1);
+}
+
 bool gi_surfel_lookup_visible(vec3 world_position, vec3 normal, uint layer_mask,
-		uint frame_token, out vec3 response, out float coverage, out float age_min) {
+		uint frame_token, out vec3 response, out float coverage, out float age_min,
+		out float mean_hit_distance) {
 	response = vec3(0.0);
 	coverage = 0.0;
 	age_min = float(GI_SURFEL_TTL_FRAMES);
-	ivec3 center_cell = gi_surfel_cell_for_world(world_position);
+	mean_hit_distance = max(gi_surfel_config.control.x, 0.1);
 	uint top_record[GI_SURFEL_VISIBLE_TOP_K];
 	float top_weight[GI_SURFEL_VISIBLE_TOP_K];
-	vec3 top_response[GI_SURFEL_VISIBLE_TOP_K];
+	uint top_visit_order[GI_SURFEL_VISIBLE_TOP_K];
 	for (int index = 0; index < GI_SURFEL_VISIBLE_TOP_K; index++) {
 		top_record[index] = gi_surfel_config.limits.x;
 		top_weight[index] = 0.0;
-		top_response[index] = vec3(0.0);
+		top_visit_order[index] = 0xffffffffu;
 	}
 	float eligible_weight_sum = 0.0;
-	for (int z = -1; z <= 1; z++) {
-		for (int y = -1; y <= 1; y++) {
-			for (int x = -1; x <= 1; x++) {
-				ivec3 cell = center_cell + ivec3(x, y, z);
-				uint slot = gi_surfel_hash_cell(cell) & gi_surfel_config.limits.y;
+	int top_count = 0;
+	uint present_levels = gi_surfel_lod_presence.levels;
+	for (uint level = 0u; level < (gi_surfel_config.adaptive.x != 0u ? 2u : 1u); level++) {
+		if ((present_levels & (1u << level)) == 0u) continue;
+		ivec3 center_cell = gi_surfel_cell_for_world(world_position, level);
+		for (int z_order = 0; z_order < 3; z_order++) {
+			int z = gi_surfel_lookup_center_first_offset(z_order);
+			for (int y_order = 0; y_order < 3; y_order++) {
+				int y = gi_surfel_lookup_center_first_offset(y_order);
+				for (int x_order = 0; x_order < 3; x_order++) {
+				int x = gi_surfel_lookup_center_first_offset(x_order);
+				ivec3 cell_offset = ivec3(x, y, z);
+				ivec3 cell = center_cell + cell_offset;
+				if (!gi_surfel_lookup_cell_may_change(cell, world_position, level,
+						eligible_weight_sum, age_min, top_count,
+						top_weight[GI_SURFEL_VISIBLE_TOP_K - 1])) continue;
+				uint slot = gi_surfel_hash_cell(cell, level) & gi_surfel_config.limits.y;
 				for (uint probe = 0u; probe < GI_SURFEL_MAX_HASH_PROBES; probe++) {
 					uint record_index = gi_surfel_hash.slots[slot];
 					if (record_index == GI_SURFEL_SLOT_EMPTY) {
 						break;
 					}
 					if (record_index < gi_surfel_config.limits.x) {
-						vec3 candidate_response;
+						float candidate_weight;
 						float age;
-						if (gi_surfel_record_matches(record_index, cell, world_position, normal,
-								layer_mask, frame_token, candidate_response, age)) {
-							FENGGISurfelRecord record = gi_surfel_load_record(record_index);
-							float radius = max(record.position_radius.w, 0.001);
-							vec3 delta = world_position - record.position_radius.xyz;
-							float distance_weight = max(1.0 - length(delta) / (radius * 2.5), 0.0);
-							float normal_weight = max(dot(normalize(record.normal_valid.xyz), normal), 0.0);
-							float age_weight = 1.0 - smoothstep(float(GI_SURFEL_TTL_FRAMES) * 0.5,
-									float(GI_SURFEL_TTL_FRAMES), age);
-							float weight = distance_weight * distance_weight
-									* pow(normal_weight, 8.0) * age_weight;
-							if (weight > 0.0 && !isnan(weight) && !isinf(weight)) {
-								eligible_weight_sum += weight;
+						if (gi_surfel_candidate_weight(record_index, cell, world_position, normal,
+								layer_mask, frame_token, level, candidate_weight, age)) {
+							FENGGISurfelRecord candidate_record = gi_surfel_load_record(record_index);
+							bool duplicate_lod_anchor = false;
+							if (level > 0u) {
+								for (int existing = 0; existing < GI_SURFEL_VISIBLE_TOP_K; existing++) {
+									uint existing_index = top_record[existing];
+									if (existing_index >= gi_surfel_config.limits.x) continue;
+									FENGGISurfelRecord existing_record = gi_surfel_load_record(existing_index);
+									float duplicate_radius = min(candidate_record.position_radius.w,
+											existing_record.position_radius.w) * 0.35;
+									vec3 anchor_delta = candidate_record.position_radius.xyz
+											- existing_record.position_radius.xyz;
+									if (candidate_record.surface.z == existing_record.surface.z
+											&& candidate_record.surface.w == existing_record.surface.w
+											&& dot(anchor_delta, anchor_delta)
+												< duplicate_radius * duplicate_radius) {
+										duplicate_lod_anchor = true;
+										break;
+									}
+								}
+							}
+							if (!duplicate_lod_anchor) {
+								eligible_weight_sum += candidate_weight;
 								age_min = min(age_min, age);
+								uint legacy_cell_priority = uint((z + 1) * 9 + (y + 1) * 3 + (x + 1));
+								uint visit_order = legacy_cell_priority * GI_SURFEL_MAX_HASH_PROBES + probe;
 								for (int top = 0; top < GI_SURFEL_VISIBLE_TOP_K; top++) {
-									if (weight > top_weight[top]) {
+									if (candidate_weight > top_weight[top]
+											|| (candidate_weight == top_weight[top]
+											&& visit_order < top_visit_order[top])) {
 										for (int shift = GI_SURFEL_VISIBLE_TOP_K - 1; shift > top; shift--) {
 											top_record[shift] = top_record[shift - 1];
 											top_weight[shift] = top_weight[shift - 1];
-											top_response[shift] = top_response[shift - 1];
+											top_visit_order[shift] = top_visit_order[shift - 1];
 										}
 										top_record[top] = record_index;
-										top_weight[top] = weight;
-										top_response[top] = candidate_response;
+										top_weight[top] = candidate_weight;
+										top_visit_order[top] = visit_order;
+										if (top_count < GI_SURFEL_VISIBLE_TOP_K) top_count++;
 										break;
 									}
 								}
@@ -228,6 +450,7 @@ bool gi_surfel_lookup_visible(vec3 world_position, vec3 normal, uint layer_mask,
 						}
 					}
 					slot = (slot + 1u) & gi_surfel_config.limits.y;
+				}
 				}
 			}
 		}
@@ -238,6 +461,7 @@ bool gi_surfel_lookup_visible(vec3 world_position, vec3 normal, uint layer_mask,
 	}
 	float visible_weight_sum = 0.0;
 	vec3 visible_response_sum = vec3(0.0);
+	float visible_hit_distance_sum = 0.0;
 	for (int index = 0; index < GI_SURFEL_VISIBLE_TOP_K; index++) {
 		if (!(top_weight[index] > 0.0) || top_record[index] >= gi_surfel_config.limits.x) {
 			continue;
@@ -245,12 +469,23 @@ bool gi_surfel_lookup_visible(vec3 world_position, vec3 normal, uint layer_mask,
 		FENGGISurfelRecord record = gi_surfel_load_record(top_record[index]);
 		if (gi_surfel_connection_visible(world_position, normal, record.position_radius.xyz,
 				record.normal_valid.xyz, layer_mask)) {
-			visible_response_sum += top_response[index] * top_weight[index];
-			visible_weight_sum += top_weight[index];
+			vec4 stored_response = gi_surfel_load_response_filtered(top_record[index]);
+			if (all(not(isnan(stored_response.rgb))) && all(not(isinf(stored_response.rgb)))
+					&& stored_response.a > 0.5) {
+				visible_response_sum += max(stored_response.rgb, vec3(0.0)) * top_weight[index];
+				float record_hit_distance = uintBitsToFloat(record.state.y);
+				if (!(record_hit_distance > 0.0) || isnan(record_hit_distance)
+						|| isinf(record_hit_distance)) {
+					record_hit_distance = max(gi_surfel_config.control.x, 0.1);
+				}
+				visible_hit_distance_sum += record_hit_distance * top_weight[index];
+				visible_weight_sum += top_weight[index];
+			}
 		}
 	}
 	if (visible_weight_sum > 1e-6) {
 		response = visible_response_sum / visible_weight_sum;
+		mean_hit_distance = visible_hit_distance_sum / visible_weight_sum;
 	}
 	return true;
 }
@@ -259,8 +494,9 @@ bool gi_surfel_lookup_previous(vec3 world_position, vec3 normal, uint layer_mask
 		uint frame_token, out vec3 response) {
 	float coverage;
 	float age;
+	float hit_distance;
 	return gi_surfel_lookup_visible(world_position, normal, layer_mask,
-			frame_token, response, coverage, age) && coverage > 0.0;
+			frame_token, response, coverage, age, hit_distance) && coverage > 0.0;
 }
 
 #endif // FENG_GI_SURFEL_CACHE_GLSLINC

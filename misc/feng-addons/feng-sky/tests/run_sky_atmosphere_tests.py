@@ -197,6 +197,12 @@ def main() -> None:
     validate_scratch_tree(project)
     run(
         [str(editor), "--headless", "--path", str(project), "--script",
+         "res://addons/feng-sky/tests/test_sky_light_source_epoch.gd"],
+        "headless SkyLight source epoch tests", project, env, "SKY LIGHT SOURCE EPOCH PASS",
+    )
+    validate_scratch_tree(project)
+    run(
+        [str(editor), "--headless", "--path", str(project), "--script",
          "res://addons/feng-sky/tests/test_sky_optimization.gd"],
         "headless Sky optimization tests", project, env, "SKY OPTIMIZATION PASS",
     )

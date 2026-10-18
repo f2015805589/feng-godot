@@ -1,0 +1,464 @@
+#ifndef FENG_GI_SURFEL_PROBE_HLSLINC
+#define FENG_GI_SURFEL_PROBE_HLSLINC
+
+static const uint GI_SURFEL_PROBE_COUNT = 1536u;
+static const uint GI_SURFEL_PROBE_LEVELS = 3u;
+static const uint GI_SURFEL_PROBE_CLIP_SIZE = 8u;
+static const uint GI_RAY_MODE_SURFEL_PROBE = 144u;
+static const float GI_SURFEL_PROBE_INV_FOUR_PI = 0.07957747154594767f;
+static const float GI_SURFEL_PROBE_Y0 = 0.28209479177387814f;
+static const float GI_SURFEL_PROBE_Y1 = 0.4886025119029199f;
+
+uint gi_hash(uint value);
+static const uint GI_SURFEL_PROBE_RECORD_STRIDE = 176u;
+
+struct FENGGISurfelProbeRecord {
+	int4 cell_level;
+	float4 sh_coefficients[4];
+	float4 depth_mean[2];
+	float4 depth_second_moment[2];
+	uint4 meta;
+	uint4 reserved;
+};
+
+RWByteAddressBuffer gi_surfel_probe_records : register(u11, space1);
+cbuffer FENGGISurfelProbeConfig : register(b12, space1) {
+	int4 gi_surfel_probe_starts[3];
+	float4 gi_surfel_probe_spacing;
+	uint4 gi_surfel_probe_budget; // Configured updates, reserved-adjusted surface upper bound, Pmax, rays per surface.
+};
+
+FENGGISurfelProbeRecord gi_surfel_probe_load_record(uint index) {
+	uint offset = index * GI_SURFEL_PROBE_RECORD_STRIDE;
+	FENGGISurfelProbeRecord record;
+	record.cell_level = asint(gi_surfel_probe_records.Load4(offset));
+	[unroll] for (uint coefficient = 0u; coefficient < 4u; coefficient++) {
+		record.sh_coefficients[coefficient] = asfloat(gi_surfel_probe_records.Load4(offset + 16u + coefficient * 16u));
+	}
+	record.depth_mean[0] = asfloat(gi_surfel_probe_records.Load4(offset + 80u));
+	record.depth_mean[1] = asfloat(gi_surfel_probe_records.Load4(offset + 96u));
+	record.depth_second_moment[0] = asfloat(gi_surfel_probe_records.Load4(offset + 112u));
+	record.depth_second_moment[1] = asfloat(gi_surfel_probe_records.Load4(offset + 128u));
+	record.meta = gi_surfel_probe_records.Load4(offset + 144u);
+	record.reserved = gi_surfel_probe_records.Load4(offset + 160u);
+	return record;
+}
+
+void gi_surfel_probe_store_record(uint index, FENGGISurfelProbeRecord record) {
+	uint offset = index * GI_SURFEL_PROBE_RECORD_STRIDE;
+	gi_surfel_probe_records.Store4(offset, asuint(record.cell_level));
+	[unroll] for (uint coefficient = 0u; coefficient < 4u; coefficient++) {
+		gi_surfel_probe_records.Store4(offset + 16u + coefficient * 16u, asuint(record.sh_coefficients[coefficient]));
+	}
+	gi_surfel_probe_records.Store4(offset + 80u, asuint(record.depth_mean[0]));
+	gi_surfel_probe_records.Store4(offset + 96u, asuint(record.depth_mean[1]));
+	gi_surfel_probe_records.Store4(offset + 112u, asuint(record.depth_second_moment[0]));
+	gi_surfel_probe_records.Store4(offset + 128u, asuint(record.depth_second_moment[1]));
+	gi_surfel_probe_records.Store4(offset + 144u, record.meta);
+	gi_surfel_probe_records.Store4(offset + 160u, record.reserved);
+}
+
+uint gi_surfel_probe_reserve_actual(uint active_count) {
+	uint updates = gi_surfel_probe_budget.x;
+	uint effective_updates = min(gi_surfel_probe_budget.y, updates);
+	uint reserve_max = updates - effective_updates;
+	uint surface_rays = max(gi_surfel_probe_budget.w, 1u);
+	uint reserve_actual = min(reserve_max, active_count / 8u);
+	if ((surface_rays & 1u) != 0u) reserve_actual &= ~1u;
+	return reserve_actual;
+}
+
+uint gi_surfel_probe_surface_budget(uint active_count) {
+	uint updates = gi_surfel_probe_budget.x;
+	uint bounded_active = min(updates, active_count);
+	return bounded_active - gi_surfel_probe_reserve_actual(bounded_active);
+}
+
+uint gi_surfel_probe_actual_slots(uint active_count) {
+	uint reserve_actual = gi_surfel_probe_reserve_actual(min(gi_surfel_probe_budget.x, active_count));
+	uint actual_rays = min(gi_surfel_probe_budget.z,
+			reserve_actual * max(gi_surfel_probe_budget.w, 1u));
+	return actual_rays / 2u;
+}
+
+uint gi_surfel_probe_depth_count(FENGGISurfelProbeRecord record, uint bin) {
+	uint packed_counts = bin < 4u ? record.meta.z : record.meta.w;
+	uint local_bin = bin < 4u ? bin : bin - 4u;
+	return (packed_counts >> (local_bin * 8u)) & 0xffu;
+}
+
+uint gi_surfel_probe_depth_bin(float3 direction) {
+	float3 absolute_direction = abs(direction);
+	uint axis = absolute_direction.y > absolute_direction.x ? 1u : 0u;
+	if (absolute_direction.z > absolute_direction[axis]) axis = 2u;
+	return axis * 2u + (direction[axis] < 0.0f ? 1u : 0u);
+}
+
+float gi_surfel_probe_depth_plausibility(FENGGISurfelProbeRecord record,
+		float3 probe_to_receiver, float receiver_distance, float level_spacing) {
+	// Depth statistics only rank the two candidates; the ray test remains authoritative.
+	uint bin = gi_surfel_probe_depth_bin(probe_to_receiver);
+	if (gi_surfel_probe_depth_count(record, bin) < 4u) return 1.0f;
+	uint group = bin / 4u;
+	uint component = bin & 3u;
+	float mean_distance = record.depth_mean[group][component];
+	float second_moment = record.depth_second_moment[group][component];
+	if (!(mean_distance >= 0.0f) || !isfinite(mean_distance)
+			|| !(second_moment >= 0.0f) || !isfinite(second_moment)) return 1.0f;
+	float variance_floor = max(0.0004f, level_spacing * level_spacing * 0.0025f);
+	float variance = max(second_moment - mean_distance * mean_distance, variance_floor);
+	float beyond_mean = max(receiver_distance - mean_distance, 0.0f);
+	return max(0.05f, variance / (variance + beyond_mean * beyond_mean));
+}
+
+int3 gi_surfel_probe_cell(float3 world_position, float spacing) {
+	float3 cell = floor(world_position / spacing);
+	return (int3)clamp(cell, -1000000000.0f, 1000000000.0f);
+}
+
+uint gi_surfel_probe_record_index(uint level, int3 cell, out bool inside_clip) {
+	inside_clip = false;
+	if (level >= GI_SURFEL_PROBE_LEVELS) return 0u;
+	int3 local_cell = cell - gi_surfel_probe_starts[level].xyz;
+	if (any(local_cell < 0) || any(local_cell >= 8)) return 0u;
+	inside_clip = true;
+	int3 slot = cell & int3(7, 7, 7);
+	return level * 512u + (uint)(slot.x + slot.y * 8 + slot.z * 64);
+}
+
+float3 gi_surfel_probe_center(int3 cell, uint level) {
+	return ((float3)cell + 0.5f) * gi_surfel_probe_spacing[level];
+}
+
+bool gi_surfel_probe_inside_owner(float3 world_position) {
+	float3 local_position = mul(gi_surfel_world_to_owner, float4(world_position, 1.0f)).xyz;
+	float3 half_extent = gi_surfel_owner_size_cell_radius.xyz * 0.5f;
+	return all(isfinite(local_position)) && all(abs(local_position) <= half_extent);
+}
+
+float3 gi_surfel_probe_evaluate(FENGGISurfelProbeRecord record, float3 normal) {
+	float3 n = normalize(normal);
+	float3 basis = GI_SURFEL_PROBE_Y1 * n;
+	float3 value = record.sh_coefficients[0].rgb * GI_SURFEL_PROBE_Y0
+			+ (record.sh_coefficients[1].rgb * basis.x
+			+ record.sh_coefficients[2].rgb * basis.y
+			+ record.sh_coefficients[3].rgb * basis.z) * (2.0f / 3.0f);
+	return all(isfinite(value)) ? max(value, 0.0f) : 0.0f;
+}
+
+bool gi_surfel_probe_visible(float3 receiver, float3 receiver_normal,
+		float3 probe_position, uint layer_mask) {
+	float normal_squared = dot(receiver_normal, receiver_normal);
+	if (layer_mask == 0u || !(normal_squared > 1e-12f) || !isfinite(normal_squared)
+			|| !all(isfinite(receiver)) || !all(isfinite(probe_position))) return false;
+	float3 normal = receiver_normal * rsqrt(normal_squared);
+	float3 start = receiver + normal * 0.001f;
+	float3 segment = probe_position - start;
+	float distance_squared = dot(segment, segment);
+	if (!(distance_squared > 9e-6f) || !isfinite(distance_squared)) return false;
+	float distance = sqrt(distance_squared);
+	float ray_max = distance - 0.002f;
+	if (!(ray_max > 0.001f)) return false;
+	GIPathPayload local_payload;
+	local_payload.radiance = 0.0f;
+	local_payload.flags = GI_RAY_MODE_SURFEL_LOCAL_VISIBILITY;
+	local_payload.hit_distance = 0.0f;
+	local_payload.ray_pdf = asfloat(layer_mask);
+	RayDesc ray;
+	ray.Origin = start;
+	ray.TMin = 0.001f;
+	ray.Direction = segment / distance;
+	ray.TMax = ray_max;
+	TraceRay(gi_scene_tlas, RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
+			| RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0x01, 0, 0, 1, ray, local_payload);
+	return local_payload.radiance.x > 0.5f;
+}
+
+bool gi_surfel_probe_lookup(float3 world_position, float3 normal, uint layer_mask, uint frame_token,
+		out float3 irradiance_over_pi, out float coverage, out float age_min) {
+	irradiance_over_pi = 0.0f;
+	coverage = 0.0f;
+	age_min = 600.0f;
+	if (gi_surfel_probe_budget.z == 0u || !gi_surfel_probe_inside_owner(world_position)
+			|| !all(isfinite(normal))) return false;
+	float3 n = normalize(normal);
+	uint selected_index[2] = { GI_SURFEL_PROBE_COUNT, GI_SURFEL_PROBE_COUNT };
+	float selected_geometry[2] = { 0.0f, 0.0f };
+	float selected_score[2] = { 0.0f, 0.0f };
+	float selected_edge[2] = { 0.0f, 0.0f };
+	float selected_age[2] = { 600.0f, 600.0f };
+	[loop] for (uint level = 0u; level < GI_SURFEL_PROBE_LEVELS; level++) {
+		float level_spacing = gi_surfel_probe_spacing[level];
+		float3 grid = world_position / level_spacing - 0.5f;
+		int3 base_cell = (int3)floor(grid);
+		float3 fraction = frac(grid);
+		int3 start_cell = gi_surfel_probe_starts[level].xyz;
+		float3 clip_position = world_position / level_spacing - (float3)start_cell;
+		float edge_cells = min(min(min(clip_position.x, 8.0f - clip_position.x),
+				min(clip_position.y, 8.0f - clip_position.y)),
+				min(clip_position.z, 8.0f - clip_position.z));
+		float edge_envelope = saturate(edge_cells / 1.5f);
+		float level_priority = 1.0f / (float)(1u << level);
+		[unroll] for (int corner = 0; corner < 8; corner++) {
+			int3 offset = int3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+			float geometry_weight = (offset.x == 0 ? 1.0f - fraction.x : fraction.x)
+					* (offset.y == 0 ? 1.0f - fraction.y : fraction.y)
+					* (offset.z == 0 ? 1.0f - fraction.z : fraction.z);
+			if (!(geometry_weight > 1e-6f) || !(edge_envelope > 0.0f)) continue;
+			int3 cell = base_cell + offset;
+			bool inside_clip;
+			uint index = gi_surfel_probe_record_index(level, cell, inside_clip);
+			if (!inside_clip) continue;
+			FENGGISurfelProbeRecord record = gi_surfel_probe_load_record(index);
+			if (any(record.cell_level != int4(cell, (int)level)) || record.meta.x == 0u) continue;
+			uint age = frame_token - record.meta.y;
+			if (age >= 600u) continue;
+			float3 probe_position = gi_surfel_probe_center(cell, level);
+			float3 delta = probe_position - world_position;
+			if (dot(n, delta) < -level_spacing * 0.1f || !gi_surfel_probe_inside_owner(probe_position)) continue;
+			float3 probe_to_receiver = world_position - probe_position;
+			float receiver_distance = length(probe_to_receiver);
+			float depth_plausibility = gi_surfel_probe_depth_plausibility(
+				record, probe_to_receiver, receiver_distance, level_spacing);
+			float score = geometry_weight * level_priority * depth_plausibility * edge_envelope;
+			[unroll] for (int slot = 0; slot < 2; slot++) {
+				if (score > selected_score[slot]
+						|| (score == selected_score[slot] && index < selected_index[slot])) {
+					[unroll] for (int shift = 1; shift > slot; shift--) {
+						selected_index[shift] = selected_index[shift - 1];
+						selected_geometry[shift] = selected_geometry[shift - 1];
+						selected_score[shift] = selected_score[shift - 1];
+						selected_edge[shift] = selected_edge[shift - 1];
+						selected_age[shift] = selected_age[shift - 1];
+					}
+					selected_index[slot] = index;
+					selected_geometry[slot] = geometry_weight;
+					selected_score[slot] = score;
+					selected_edge[slot] = edge_envelope;
+					selected_age[slot] = (float)age;
+					break;
+				}
+			}
+		}
+	}
+	float geometry_sum = selected_geometry[0] + selected_geometry[1];
+	if (!(geometry_sum > 1e-8f)) return false;
+	float visible_weight_sum = 0.0f;
+	float3 visible_irradiance_sum = 0.0f;
+	[unroll] for (int slot = 0; slot < 2; slot++) {
+		uint index = selected_index[slot];
+		if (!(selected_geometry[slot] > 0.0f) || index >= GI_SURFEL_PROBE_COUNT) continue;
+		FENGGISurfelProbeRecord record = gi_surfel_probe_load_record(index);
+		int3 cell = record.cell_level.xyz;
+		uint level = (uint)record.cell_level.w;
+		float3 probe_position = gi_surfel_probe_center(cell, level);
+		if (!gi_surfel_probe_visible(world_position, n, probe_position, layer_mask)) continue;
+		float confidence = saturate((float)record.meta.x * 0.25f);
+		float recency = saturate(1.0f - selected_age[slot] / 600.0f);
+		float weight = selected_geometry[slot] / geometry_sum * confidence * recency * selected_edge[slot];
+		if (!(weight > 0.0f)) continue;
+		visible_weight_sum += weight;
+		visible_irradiance_sum += gi_surfel_probe_evaluate(record, n) * weight;
+		age_min = min(age_min, selected_age[slot]);
+	}
+	coverage = saturate(visible_weight_sum);
+	if (!(coverage > 1e-6f)) return false;
+	irradiance_over_pi = visible_irradiance_sum / visible_weight_sum;
+	return all(isfinite(irradiance_over_pi));
+}
+
+void gi_surfel_probe_combine(inout float3 surface_irradiance, inout float surface_coverage,
+		float3 probe_irradiance, float probe_coverage) {
+	float surface_weight = saturate(surface_coverage);
+	float probe_weight = (1.0f - surface_weight) * saturate(probe_coverage);
+	float combined_coverage = surface_weight + probe_weight;
+	if (combined_coverage > 1e-6f) {
+		surface_irradiance = (surface_irradiance * surface_weight + probe_irradiance * probe_weight)
+				/ combined_coverage;
+		surface_coverage = combined_coverage;
+	}
+}
+
+float gi_surfel_probe_emission_uniform_weight(float emission_luminance,
+		float total_power, float hit_distance, float cosine_light) {
+	float p_light = 0.0f;
+	if (emission_luminance > 0.0f && total_power > 1e-12f && hit_distance > 0.003f
+			&& cosine_light > 1e-6f && isfinite(emission_luminance) && isfinite(total_power)
+			&& isfinite(hit_distance) && isfinite(cosine_light)) {
+		p_light = (emission_luminance / total_power) * hit_distance * hit_distance / cosine_light;
+	}
+	float p_uniform = GI_SURFEL_PROBE_INV_FOUR_PI;
+	float denominator = p_uniform + p_light;
+	return p_light > 0.0f && denominator > 1e-12f && isfinite(denominator)
+			? p_uniform / denominator : 1.0f;
+}
+
+#if FENG_GI_SURFEL_RAYGEN
+float3 gi_surfel_sample_3d(uint sample_index, uint scramble);
+
+float4 gi_surfel_probe_emitter_row(uint index) {
+#if FENG_GI_SURFEL_RAYGEN
+	return asfloat(gi_surfel_emitters.Load4(index * 16u));
+#else
+	return asfloat(gi_emitters.Load4(index * 16u));
+#endif
+}
+
+void gi_surfel_probe_store_depth_count(inout FENGGISurfelProbeRecord record,
+		uint bin, uint count) {
+	uint local_bin = bin < 4u ? bin : bin - 4u;
+	uint shift = local_bin * 8u;
+	uint mask = 0xffu << shift;
+	if (bin < 4u) record.meta.z = (record.meta.z & ~mask) | ((count & 0xffu) << shift);
+	else record.meta.w = (record.meta.w & ~mask) | ((count & 0xffu) << shift);
+}
+
+void gi_surfel_probe_update(uint launch_index) {
+	uint active_count = min(gi_surfel_limits.x, gi_surfel_load_counter(1u));
+	uint slots = gi_surfel_probe_actual_slots(active_count);
+	if (launch_index >= slots) return;
+	uint cursor = gi_surfel_load_counter(5u) % GI_SURFEL_PROBE_COUNT;
+	uint probe_index = (cursor + launch_index) % GI_SURFEL_PROBE_COUNT;
+	uint level = probe_index / 512u;
+	uint local_index = probe_index - level * 512u;
+	int3 slot = int3((int)(local_index & 7u), (int)((local_index >> 3u) & 7u), (int)((local_index >> 6u) & 7u));
+	int3 start_cell = gi_surfel_probe_starts[level].xyz;
+	int3 local_cell = (slot - (start_cell & int3(7, 7, 7))) & int3(7, 7, 7);
+	int3 cell = start_cell + local_cell;
+	float3 origin = gi_surfel_probe_center(cell, level);
+	if (!gi_surfel_probe_inside_owner(origin)) return;
+	FENGGISurfelProbeRecord record = gi_surfel_probe_load_record(probe_index);
+	bool same_cell = all(record.cell_level == int4(cell, (int)level)) && record.meta.x > 0u;
+	if (!same_cell) {
+		record.cell_level = int4(cell, (int)level);
+		[unroll] for (uint coefficient = 0u; coefficient < 4u; coefficient++) record.sh_coefficients[coefficient] = 0.0f;
+		record.depth_mean[0] = 0.0f;
+		record.depth_mean[1] = 0.0f;
+		record.depth_second_moment[0] = 0.0f;
+		record.depth_second_moment[1] = 0.0f;
+		record.meta = 0u;
+		record.reserved = 0u;
+	}
+	uint sample_index = record.reserved.x;
+	uint scramble = gi_hash(asuint(cell.x) * 0x9e3779b9u ^ asuint(cell.y) * 0x85ebca6bu
+			^ asuint(cell.z) * 0xc2b2ae35u ^ level * 0x27d4eb2fu);
+	float3 uniform_sample = gi_surfel_sample_3d(sample_index, gi_hash(scramble ^ 0x243f6a88u));
+	float z = 1.0f - 2.0f * uniform_sample.x;
+	float radial = sqrt(max(0.0f, 1.0f - z * z));
+	float phi = 6.28318530718f * uniform_sample.y;
+	float3 direction = float3(radial * cos(phi), radial * sin(phi), z);
+	GIPathPayload probe_payload;
+	probe_payload.radiance = 0.0f;
+	probe_payload.flags = GI_RAY_MODE_SURFEL_PROBE;
+	probe_payload.hit_distance = 0.0f;
+	probe_payload.ray_pdf = GI_SURFEL_PROBE_INV_FOUR_PI;
+	float max_distance = max(gi_surfel_control.x, 0.1f);
+	RayDesc sphere_ray;
+	sphere_ray.Origin = origin;
+	sphere_ray.TMin = 0.001f;
+	sphere_ray.Direction = direction;
+	sphere_ray.TMax = max_distance;
+	TraceRay(gi_scene_tlas, RAY_FLAG_NONE, 0x01, 0, 0, 0, sphere_ray, probe_payload);
+	float3 sphere_radiance = all(isfinite(probe_payload.radiance)) ? max(probe_payload.radiance, 0.0f) : 0.0f;
+	float hit_distance = probe_payload.hit_distance > 0.0f && isfinite(probe_payload.hit_distance)
+			? min(probe_payload.hit_distance, max_distance) : max_distance;
+	float3 sh_estimate[4];
+	float basis[4] = { GI_SURFEL_PROBE_Y0, GI_SURFEL_PROBE_Y1 * direction.x,
+			GI_SURFEL_PROBE_Y1 * direction.y, GI_SURFEL_PROBE_Y1 * direction.z };
+	[unroll] for (uint coefficient = 0u; coefficient < 4u; coefficient++) {
+		sh_estimate[coefficient] = sphere_radiance * (basis[coefficient] / GI_SURFEL_PROBE_INV_FOUR_PI);
+	}
+	float4 emitter_header = gi_surfel_probe_emitter_row(0u);
+	float total_power = emitter_header.x;
+	uint emitter_count = total_power > 1e-12f && emitter_header.y > 0.0f && isfinite(emitter_header.y)
+			? (uint)emitter_header.y : 0u;
+	if (emitter_count > 0u && isfinite(total_power)) {
+		float3 nee_sample = gi_surfel_sample_3d(sample_index, gi_hash(scramble ^ 0xb7e15162u));
+		float target = nee_sample.x * total_power;
+		uint lo = 0u;
+		uint hi = emitter_count - 1u;
+		[loop] while (lo < hi) {
+			uint middle = (lo + hi) / 2u;
+			if (gi_surfel_probe_emitter_row(1u + middle * 5u).w < target) lo = middle + 1u;
+			else hi = middle;
+		}
+		uint row = 1u + lo * 5u;
+		float4 vertex = gi_surfel_probe_emitter_row(row);
+		float4 edge1 = gi_surfel_probe_emitter_row(row + 1u);
+		float4 edge2 = gi_surfel_probe_emitter_row(row + 2u);
+		float3 emitted = max(gi_surfel_probe_emitter_row(row + 3u).xyz, 0.0f);
+		float3 light_normal = normalize(gi_surfel_probe_emitter_row(row + 4u).xyz);
+		float root_u = sqrt(nee_sample.y);
+		float3 light_point = vertex.xyz + edge1.xyz * (root_u * (1.0f - nee_sample.z))
+				+ edge2.xyz * (root_u * nee_sample.z);
+		float3 delta = light_point - origin;
+		float distance_squared = dot(delta, delta);
+		if (distance_squared > 9e-6f && isfinite(distance_squared)) {
+			float light_distance = sqrt(distance_squared);
+			float3 light_direction = delta / light_distance;
+			float cos_light = dot(light_normal, -light_direction);
+			if (edge2.w > 0.5f) cos_light = abs(cos_light);
+			if (cos_light > 1e-6f && edge1.w > 0.0f && total_power > 1e-12f
+					&& light_distance < max_distance && all(isfinite(emitted))) {
+				float p_light = (edge1.w / total_power) * distance_squared / cos_light;
+				float p_uniform = GI_SURFEL_PROBE_INV_FOUR_PI;
+				float denominator = p_uniform + p_light;
+				if (p_light > 0.0f && isfinite(p_light) && denominator > 1e-12f && isfinite(denominator)) {
+					GIPathPayload shadow_payload;
+					shadow_payload.radiance = 0.0f;
+					shadow_payload.flags = 8u;
+					shadow_payload.hit_distance = 0.0f;
+					shadow_payload.ray_pdf = 0.0f;
+					RayDesc shadow_ray;
+					shadow_ray.Origin = origin;
+					shadow_ray.TMin = 0.001f;
+					shadow_ray.Direction = light_direction;
+					shadow_ray.TMax = light_distance - 0.001f;
+					TraceRay(gi_scene_tlas, RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
+							| RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0x01, 0, 0, 1,
+							shadow_ray, shadow_payload);
+					float nee_scale = saturate(shadow_payload.radiance.x) / denominator;
+					float nee_basis[4] = { GI_SURFEL_PROBE_Y0,
+							GI_SURFEL_PROBE_Y1 * light_direction.x,
+							GI_SURFEL_PROBE_Y1 * light_direction.y,
+							GI_SURFEL_PROBE_Y1 * light_direction.z };
+					[unroll] for (uint coefficient = 0u; coefficient < 4u; coefficient++) {
+						sh_estimate[coefficient] += emitted * (nee_basis[coefficient] * nee_scale);
+					}
+				}
+			}
+		}
+	}
+	uint count = min(record.meta.x, 4u);
+	float alpha = count < 4u ? 1.0f / (float)(count + 1u) : 0.25f;
+	[unroll] for (uint coefficient = 0u; coefficient < 4u; coefficient++) {
+		float3 safe_estimate = all(isfinite(sh_estimate[coefficient]))
+				? sh_estimate[coefficient] : 0.0f;
+		record.sh_coefficients[coefficient].rgb = lerp(record.sh_coefficients[coefficient].rgb,
+				safe_estimate, alpha);
+		record.sh_coefficients[coefficient].a = 0.0f;
+	}
+	uint depth_bin = gi_surfel_probe_depth_bin(direction);
+	uint packed_counts = depth_bin < 4u ? record.meta.z : record.meta.w;
+	uint local_bin = depth_bin < 4u ? depth_bin : depth_bin - 4u;
+	uint depth_count = (packed_counts >> (local_bin * 8u)) & 0xffu;
+	float depth_alpha = depth_count < 4u ? 1.0f / (float)(depth_count + 1u) : 0.25f;
+	uint depth_group = depth_bin / 4u;
+	uint depth_component = depth_bin & 3u;
+	record.depth_mean[depth_group][depth_component] = lerp(
+		record.depth_mean[depth_group][depth_component], hit_distance, depth_alpha);
+	record.depth_second_moment[depth_group][depth_component] = lerp(
+		record.depth_second_moment[depth_group][depth_component], hit_distance * hit_distance, depth_alpha);
+	uint shift = local_bin * 8u;
+	uint mask = 0xffu << shift;
+	uint next_packed = (packed_counts & ~mask) | ((min(depth_count + 1u, 255u) & 0xffu) << shift);
+	if (depth_bin < 4u) record.meta.z = next_packed;
+	else record.meta.w = next_packed;
+	record.meta.x = min(count + 1u, 4u);
+	record.meta.y = gi_surfel_limits.w;
+	record.reserved.x = sample_index + 1u;
+	gi_surfel_probe_store_record(probe_index, record);
+}
+#endif
+
+#endif // FENG_GI_SURFEL_PROBE_HLSLINC

@@ -40,10 +40,8 @@ func _run():
 	assert(compositor != null)
 	var renderer := compositor.renderer as FengRenderer
 	assert(renderer != null)
-	# Exercise the authored native/custom list that the RenderDoc validator
-	# expects: the VT pass is moved to slot 0 and renamed, Sky stays in slot 4, and
-	# the Tint library effect is inserted after Sky so it reads a colour that a
-	# producer already wrote (a custom pass before GBuffer is rejected).
+	# Reorder VT without moving Sky ahead of its lighting/reflection producers.
+	# Insert a named library effect after the scene colour has been produced.
 	var authored: Array[FengPass] = []
 	var sky: FengBuiltinPass = null
 	var vt: FengBuiltinPass = null
@@ -71,9 +69,8 @@ func _run():
 	# pass; the validator requires the idle VT label at position 0.
 	authored.erase(vt)
 	authored.insert(0, vt)
-	authored.erase(sky)
-	authored.insert(4, sky)
-	authored.insert(5, tint)
+	var sky_index := authored.find(sky)
+	authored.insert(sky_index + 1, tint)
 	# There are no registered VT producers in this fixture. Keep this enabled
 	# and rename it so the capture proves an idle configured pass still emits its
 	# authored label without submitting page work.
@@ -82,9 +79,9 @@ func _run():
 	renderer.passes = authored
 	renderer.apply(compositor)
 	await get_tree().process_frame
-	assert(renderer.passes.find(sky) == 4)
+	assert(renderer.passes.find(sky) == sky_index)
 	assert(renderer.passes.find(vt) == 0)
-	assert(renderer.passes.find(tint) == 5)
+	assert(renderer.passes.find(tint) == sky_index + 1)
 	assert(vt.resource_name == "VT Idle Marker")
 	assert(tint.resource_name == "RenderDoc Tint 中文")
 	var pending: Array[Node] = [get_tree().root]
@@ -178,6 +175,9 @@ func _run():
 	result.set_value("capture", "pid", OS.get_process_id())
 	result.set_value("capture", "overlay", FengRenderDoc.get_overlay_bits())
 	result.set_value("pipeline", "sky_index", renderer.passes.find(sky))
+	for label in renderer._build_schedule().names:
+		if str(label).ends_with(" Sky"):
+			result.set_value("pipeline", "sky_label", label)
 	result.set_value("pipeline", "tint_name", tint.resource_name)
 	result.set_value("pipeline", "viewport_update_mode", viewport_3d.get_update_mode())
 	result.save("res://capture_result.cfg")

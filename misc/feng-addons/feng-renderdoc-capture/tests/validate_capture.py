@@ -7,7 +7,8 @@ import subprocess
 import xml.etree.ElementTree as ET
 
 
-def validate_capture(capture, renderdoccmd, output_dir, custom_name="RenderDoc Tint 中文", explicit=True):
+def validate_capture(capture, renderdoccmd, output_dir, custom_name="RenderDoc Tint 中文", explicit=True,
+                     expected_sky_label=None):
     output_dir = Path(output_dir)
     xml_path = output_dir / "capture.zip.xml"
     subprocess.run([str(renderdoccmd), "convert", "-f", str(capture),
@@ -106,7 +107,8 @@ def validate_capture(capture, renderdoccmd, output_dir, custom_name="RenderDoc T
     assert present, "Capture contains no presentation"
     assert any("GBuffer" in label for draw in draws if draw["indices"] > 6
                for label in draw["path"]), "Scene mesh draw is missing from GBuffer"
-    assert any("Deferred Lighting" in label for draw in draws if "::Draw" in draw["operation"]
+    assert any(label in ("Deferred Lighting", "Render FRP Lighting Pass")
+               for draw in draws if "::Draw" in draw["operation"]
                for label in draw["path"]), "Deferred lighting draw is missing"
     if explicit:
         orders = [order for order in scene_orders if order]
@@ -124,10 +126,15 @@ def validate_capture(capture, renderdoccmd, output_dir, custom_name="RenderDoc T
             any(label.endswith("VT Idle Marker") for label in draw["path"])
             for draw in draws
         ), "Idle VT marker unexpectedly submitted draw/dispatch work"
-        assert "04 Sky" in labels, "Moved Sky pass does not match its configured position"
+        if expected_sky_label is not None:
+            assert expected_sky_label in labels, "Sky pass does not match its configured position"
         assert any(label.endswith(custom_name) for label in labels), "Custom Unicode pass name is missing"
         assert any(any(label.endswith(custom_name) for label in draw["path"])
                    for draw in draws), "Named custom pass contains no draw/dispatch"
+        assert any(any(position == sky_position + 1 and name == custom_name for position, name in order)
+                   for order in orders for sky_position, name in order if name == "Sky"), (
+            "Custom pass is not immediately after the authored Sky pass"
+        )
     result = {"capture": str(capture), "scene_orders": scene_orders, "scene_draws": draws}
     (output_dir / "capture-events.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

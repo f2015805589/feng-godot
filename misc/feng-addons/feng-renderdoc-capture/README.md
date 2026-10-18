@@ -33,6 +33,25 @@ visible so the extension can resolve its API. `FENG_RENDERDOC_PATH` can point at
 a portable installation root. Build-local `bin/tools/RenderDoc/` is untracked.
 The toolbar reports startup failures from `FengRenderDoc.get_mount_status()`.
 
+## GPU timings
+
+The captured frame opens with GPU action durations when timing is available.
+The clock in the Event Browser measures them again. These values come from
+RenderDoc's GPU timestamp counters, not the time spent saving the capture.
+
+On Windows, D3D12 counters require **Developer Mode** in Windows Settings.
+Without it, the plugin keeps capture inspection available and shows a notice
+instead of issuing the counter request that makes RenderDoc lose its replay
+device. Use **Windows Settings**, enable Developer Mode, then **Retry GPU
+timing**. The plugin never changes this system setting. Remote replay keeps
+RenderDoc's manual clock; enable Developer Mode on the remote Windows machine
+for D3D12.
+
+Captures open with the GUI adjacent to the loaded RenderDoc library when
+available, keeping capture and replay on the same installed version.
+For Vulkan, register the capture layer from that same installation before
+starting the editor.
+
 ## Capture lifecycle
 
 The immediate capture draws one frame synchronously. Its queued fallback retains
@@ -85,6 +104,12 @@ plugin reload and launch argument forwarding:
 
 ```sh
 python misc/scripts/test_feng_tools_lifecycle.py --editor /path/to/feng-godot
+```
+
+The timing prerequisite checks run without a graphics device:
+
+```sh
+python misc/feng-addons/feng-renderdoc-capture/tests/test_timing_policy.py
 ```
 
 Add `--driver vulkan` for GPU execution. The Windows/D3D12 integration test needs

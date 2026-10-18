@@ -1,12 +1,13 @@
 layout(set = 0, binding = 18, std430) readonly buffer DirectionalLighting { vec4 values[]; } directional_lighting;
 layout(set = 0, binding = 19) uniform sampler3D clv_texture;
 layout(set = 0, binding = 20) uniform isampler3D clv_tags;
+layout(set = 0, binding = 25) uniform usampler3D clv_support;
 layout(set = 0, binding = 21, std140) uniform ClipmapParameters {
 	ivec4 origins[3]; vec4 spacing; ivec4 control;
 } clv;
-
 const int CLV_SAMPLE_EXACT = 0;
 const int CLV_SAMPLE_FULL = 1;
+const int CLV_SAMPLE_FILTERED = 2;
 const int CLV_REJECT_NONE = 0;
 const int CLV_REJECT_DISABLED = 1;
 const int CLV_REJECT_OUTSIDE = 2;
@@ -16,10 +17,205 @@ const int CLV_REJECT_NO_EXACT_SUPPORT = 5;
 const int CLV_REJECT_NO_EXACT_CANDIDATE = 6;
 const int CLV_REJECT_OUTSIDE_BAKE_GRID = 7;
 const int CLV_REJECT_INCOMPLETE_SUPPORT = 8;
+const int CLV_REJECT_UNCERTIFIED = 9;
 
 const float CLV_QUERY_PLANE_EPSILON = 1e-4;
 const float CLV_QUERY_AXIS_EPSILON = 1e-4;
 const int CLV_QUERY_MAX_BOUNDARY_STEPS = 8;
+
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+float clv_probe_visibility(int probe, vec3 receiver);
+#endif
+
+// The producer proves all eight same-plane corners together. A matching receiver
+// only checks the logical owner, plane and certified-box intersection here.
+bool sample_clv_certified(vec3 world, vec3 normal, out vec3 secondary, out vec3 primary,
+		out int selected_level, out vec3 cell_fraction) {
+	secondary = vec3(0.0); primary = vec3(0.0);
+	selected_level = -1; cell_fraction = vec3(0.0);
+	if (clv.control.w != CLV_LAYOUT_VERSION || !visibility_finite_vec3(world)
+			|| !visibility_finite_vec3(normal)) { return false; }
+	int axis = clv_dominant_absolute_normal_axis(normal);
+	int resolution = clv.control.x;
+	for (int level = 0; level < min(clv.control.y, 3); level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
+		ivec3 base = ivec3(floor(position));
+		ivec3 relative = base - clv.origins[level].xyz;
+		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		if (any(equal(physical, ivec3(resolution - 1)))) { continue; }
+		ivec3 slot = physical + ivec3(0, 0, level * resolution);
+		ivec4 tag = texelFetch(clv_tags, slot, 0);
+		if (any(notEqual(tag.xyz, base)) || tag.w != clv.control.z
+				|| (texelFetch(clv_support, slot, 0).r & (1u << uint(axis))) == 0u) { continue; }
+		vec4 metadata = texelFetch(clv_texture,
+				slot + ivec3(clv_face_column(axis, CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0);
+		vec4 anchor = texelFetch(clv_texture,
+				slot + ivec3(clv_face_column(axis, CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0);
+		vec3 normal_delta = normal - metadata.xyz;
+		// Accommodate GBuffer normal quantization; curved/normal-mapped surfaces
+		// with a distinct normal continue through the directional SH reconstruction.
+		if (dot(normal_delta, normal_delta) > CLV_DIFFUSE_NORMAL_ERROR_SQUARED) { continue; }
+		vec3 center = (vec3(base) + 0.5) * step_size;
+		float magnitude = max(step_size, max(max(abs(center.x), abs(center.y)), abs(center.z)));
+		float margin = max(1e-5, magnitude * 1.9073486328125e-6);
+		float tolerance = max(1e-5, step_size * 1e-4) + margin;
+		if (abs(dot(world - anchor.xyz, metadata.xyz)) > tolerance
+				|| any(lessThan(world, center - vec3(0.75 * step_size + margin)))
+				|| any(greaterThan(world, center + vec3(1.75 * step_size + margin)))) { continue; }
+		cell_fraction = fract(position);
+		vec3 coordinate = vec3(slot) + cell_fraction + 0.5;
+		vec3 extent = vec3(textureSize(clv_texture, 0));
+		secondary = max(textureLod(clv_texture, (coordinate + vec3(
+				clv_face_column(axis, CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent, 0.0).rgb, vec3(0.0));
+		primary = max(textureLod(clv_texture, (coordinate + vec3(
+				clv_face_column(axis, CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent, 0.0).rgb, vec3(0.0));
+		selected_level = level;
+		return true;
+	}
+	return false;
+}
+
+// Geometry identity is supplied by the world cache, never a pixel BVH query.
+// Hints keep the reconstructed GBuffer point; they only select a compatible
+// baked surface family. Uncertified connections still use probe distance moments.
+int clv_receiver_hint(vec3 world, vec3 normal) {
+	if (clv.control.w != CLV_LAYOUT_VERSION || !visibility_finite_vec3(world)
+			|| !visibility_finite_vec3(normal)) { return -1; }
+	int resolution = clv.control.x;
+	int axis = clv_dominant_absolute_normal_axis(normal);
+	for (int level = 0; level < min(clv.control.y, 3); level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		vec3 logical = floor(world / step_size);
+		ivec3 center = ivec3(logical);
+		ivec3 base = ivec3(floor(world / step_size - 0.5));
+		for (int candidate = 0; candidate < 9; candidate++) {
+			ivec3 cell = candidate == 0 ? center
+					: base + ivec3((candidate - 1) & 1, ((candidate - 1) >> 1) & 1, (candidate - 1) >> 2);
+			if (any(lessThan(cell, clv.origins[level].xyz))
+					|| any(greaterThanEqual(cell, clv.origins[level].xyz + resolution))) { continue; }
+			ivec3 slot = ((cell % resolution) + resolution) % resolution;
+			slot.z += level * resolution;
+			ivec4 tag = texelFetch(clv_tags, slot, 0);
+			if (any(notEqual(tag.xyz, cell)) || tag.w != clv.control.z) { continue; }
+			vec4 metadata = texelFetch(clv_texture,
+					slot + ivec3(clv_face_column(axis, CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0);
+			if (!(metadata.w > 0.0) || dot(metadata.xyz, normal) < 0.9) { continue; }
+			vec4 anchor = texelFetch(clv_texture,
+					slot + ivec3(clv_face_column(axis, CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0);
+			float id = abs(anchor.w);
+			if (isnan(id) || isinf(id) || id < 1.0 || floor(id) != id
+					|| id > float(visibility_geometry.triangles.length() / 3)
+					|| abs(dot(world - anchor.xyz, metadata.xyz)) > step_size * 0.15) { continue; }
+			int triangle = int(id) - 1;
+			if (visibility_geometry.triangles[triangle * 3 + 2].w == metadata.w) { return triangle; }
+		}
+	}
+	return -1;
+}
+
+// A fill-time box certificate excludes foreign geometry in front of this
+// plane. Intersect the stored finite triangle from its front side: holes,
+// silhouettes, grazing rays and uncertified cells retain the GBuffer point.
+bool clv_cached_receiver(vec3 world, vec3 direction, float radius, vec3 shading_normal,
+		out vec3 receiver, out int receiver_triangle) {
+	receiver = world;
+	receiver_triangle = -1;
+	if (clv.control.w != CLV_LAYOUT_VERSION || !(radius > 0.0)
+			|| !visibility_finite_vec3(world) || !visibility_finite_vec3(direction)
+			|| !visibility_finite_vec3(shading_normal)) { return false; }
+	vec3 origin = world - direction * radius;
+	vec3 target = world + direction * radius;
+	int axis = clv_dominant_absolute_normal_axis(shading_normal);
+	int resolution = clv.control.x;
+	for (int level = 0; level < min(clv.control.y, 3); level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) { return false; }
+		vec3 logical = floor(world / step_size);
+		if (any(lessThan(logical, vec3(clv.origins[level].xyz)))
+				|| any(greaterThanEqual(logical, vec3(clv.origins[level].xyz + resolution)))) { continue; }
+		ivec3 cell = ivec3(logical);
+		ivec3 slot = ((cell % resolution) + resolution) % resolution;
+		slot.z += level * resolution;
+		ivec4 tag = texelFetch(clv_tags, slot, 0);
+		if (any(notEqual(tag.xyz, cell)) || tag.w != clv.control.z) { continue; }
+		vec4 anchor = texelFetch(clv_texture,
+				slot + ivec3(clv_face_column(axis, CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0);
+		if (isnan(anchor.w) || isinf(anchor.w) || anchor.w < 1.0
+				|| anchor.w > float(visibility_geometry.triangles.length() / 3)
+				|| floor(anchor.w) != anchor.w || !visibility_finite_vec3(anchor.xyz)) { continue; }
+		vec4 metadata = texelFetch(clv_texture,
+				slot + ivec3(clv_face_column(axis, CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0);
+		int triangle = int(anchor.w) - 1;
+		vec4 a_record = visibility_geometry.triangles[triangle * 3];
+		vec4 edge1 = visibility_geometry.triangles[triangle * 3 + 1];
+		vec4 edge2 = visibility_geometry.triangles[triangle * 3 + 2];
+		if (!(metadata.w > 0.0) || metadata.w != edge2.w
+				|| !visibility_finite_vec3(metadata.xyz) || dot(metadata.xyz, shading_normal) < 0.9) { continue; }
+		vec3 geometric_normal = cross(edge2.xyz, edge1.xyz);
+		float normal_length_squared = dot(geometric_normal, geometric_normal);
+		if (!(normal_length_squared > 1e-12) || !visibility_finite_vec3(geometric_normal)) { continue; }
+		geometric_normal *= inversesqrt(normal_length_squared);
+		if (dot(geometric_normal, metadata.xyz) < 0.9999
+				|| dot(direction, geometric_normal) >= -0.00001) { continue; }
+		vec3 center = (logical + 0.5) * step_size;
+		float margin = max(1e-5, max(step_size, max(max(abs(center.x), abs(center.y)), abs(center.z)))
+				* 1.9073486328125e-6);
+		float plane_tolerance = max(1e-5, step_size * 1e-4) + margin;
+		vec3 half_extent = vec3(1.75 * step_size + margin);
+		if (any(greaterThan(abs(origin - center), half_extent))
+				|| any(greaterThan(abs(target - center), half_extent))
+				|| dot(origin - anchor.xyz, geometric_normal) <= plane_tolerance) { continue; }
+		vec3 p = cross(direction, edge2.xyz);
+		float determinant = dot(edge1.xyz, p);
+		if (determinant == 0.0 || abs(determinant) < edge1.w) { continue; }
+		vec3 from_a = origin - a_record.xyz;
+		float u = dot(from_a, p) / determinant;
+		vec3 q = cross(from_a, edge1.xyz);
+		float v = dot(direction, q) / determinant;
+		float distance = dot(edge2.xyz, q) / determinant;
+		if (u < -1e-6 || v < -1e-6 || u + v > 1.000001
+				|| !(distance > 0.00001) || !(distance < radius * 2.0)) { continue; }
+		vec3 hit = a_record.xyz + edge1.xyz * u + edge2.xyz * v;
+		if (!visibility_finite_vec3(hit)
+				|| abs(dot(hit - anchor.xyz, geometric_normal)) > plane_tolerance) { continue; }
+		receiver = hit;
+		receiver_triangle = triangle;
+		return true;
+	}
+	return false;
+}
+
+bool clv_receiver_geometric_axis(int receiver_triangle, int receiver_patch, out int axis) {
+	axis = -1;
+	int triangle_count = visibility_geometry.triangles.length() / 3;
+	if (receiver_triangle < 0 || receiver_triangle >= triangle_count) { return false; }
+	int triangle = receiver_triangle * 3;
+	vec4 edge1_record = visibility_geometry.triangles[triangle + 1];
+	vec4 edge2_record = visibility_geometry.triangles[triangle + 2];
+	vec3 edge1 = edge1_record.xyz;
+	vec3 edge2 = edge2_record.xyz;
+	float receiver_patch_value = edge2_record.w;
+	if (!all(not(isnan(edge1))) || !all(not(isinf(edge1)))
+			|| !all(not(isnan(edge2))) || !all(not(isinf(edge2)))
+			|| isnan(receiver_patch_value) || isinf(receiver_patch_value)
+			|| abs(receiver_patch_value) > 2147480000.0
+			|| floor(receiver_patch_value) != receiver_patch_value) {
+		return false;
+	}
+	int triangle_patch = int(receiver_patch_value);
+	if (receiver_patch > 0 && triangle_patch != receiver_patch) { return false; }
+	vec3 geometric_normal = cross(edge2, edge1);
+	float normal_length_squared = dot(geometric_normal, geometric_normal);
+	if (!all(not(isnan(geometric_normal))) || !all(not(isinf(geometric_normal)))
+			|| !(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared)) {
+		return false;
+	}
+	axis = clv_dominant_absolute_normal_axis(geometric_normal);
+	return axis >= 0 && axis < CLV_FACE_SLOT_COUNT;
+}
 
 bool clv_finite_vec3(vec3 value) {
 	return !any(isnan(value)) && !any(isinf(value));
@@ -123,9 +319,18 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 	cache_weight = 0.0; complete_support = false;
 	selected_level = -1; sample_status = CLV_SAMPLE_EXACT;
 	reject_reason = CLV_REJECT_NONE; cell_fraction = vec3(0.0);
-	if (clv.control.w == 0) {
+	if (clv.control.w != CLV_LAYOUT_VERSION) {
 		if (collect_diagnostics) { reject_reason = CLV_REJECT_DISABLED; }
 		return false;
+	}
+	int receiver_axis = -1;
+	if (!clv_receiver_geometric_axis(receiver_triangle, receiver_patch, receiver_axis)) {
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+		receiver_axis = clv_dominant_absolute_normal_axis(normal);
+#else
+		if (collect_diagnostics) { reject_reason = CLV_REJECT_NO_VALID_CORNERS; }
+		return false;
+#endif
 	}
 	int resolution = clv.control.x;
 	float y[9]; diffuse_basis(normal, y);
@@ -151,14 +356,22 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 		int valid_mask = 0;
 		bool all_metadata_valid = true;
 		bool all_positive_metadata_valid = true;
+		bool aligned_normals = true;
 		float coverage = 0.0;
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+		float filtered_weights[8];
+		float visible_coverage = 0.0;
+		float maximum_visibility = 0.0;
+#endif
 		for (int z = 0; z < 2; z++) for (int yy = 0; yy < 2; yy++) for (int x = 0; x < 2; x++) {
 			ivec3 offset = ivec3(x, yy, z);
 			ivec3 logical_cell = base + offset;
 			ivec3 wrapped = ((logical_cell % resolution) + resolution) % resolution;
 			ivec3 slot = wrapped + ivec3(0, 0, level * resolution);
 			ivec4 tag = texelFetch(clv_tags, slot, 0);
-			vec4 metadata = texelFetch(clv_texture, slot + ivec3(18 * resolution, 0, 0), 0);
+			int metadata_column = clv_face_column(receiver_axis, CLV_FACE_METADATA_COLUMN);
+			vec4 metadata = texelFetch(clv_texture,
+					slot + ivec3(metadata_column * resolution, 0, 0), 0);
 			int surface_patch = int(metadata.w);
 			bool corner_valid;
 			// Keep every validity term explicit: a positive valid weight contributes to
@@ -177,10 +390,29 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 			if (corner_valid) {
 				valid_mask |= 1 << (x | (yy << 1) | (z << 2));
 				coverage += corner_weight;
+				if (corner_weight > 0.0) {
+					vec3 normal_delta = metadata.xyz - normal;
+					aligned_normals = aligned_normals
+							&& dot(normal_delta, normal_delta) <= CLV_DIFFUSE_NORMAL_ERROR_SQUARED;
+				}
 			}
 		}
 		if (coverage <= 0.0) { continue; }
 		if (collect_diagnostics) { found_valid_corner = true; }
+		// Incomplete positive-weight support cannot be consumed by interpolation.
+		// Return exact before launching LOS work for corners that cannot affect output.
+		if (!all_positive_metadata_valid) {
+#ifndef MAGIC_GI_BAKED_VISIBILITY
+			cache_weight = clamp(coverage, 0.0, 1.0);
+			if (collect_diagnostics) {
+				selected_level = level;
+				cell_fraction = fraction;
+				sample_status = CLV_SAMPLE_EXACT;
+				reject_reason = CLV_REJECT_INCOMPLETE_SUPPORT;
+			}
+			return false;
+#endif
+		}
 		// Geometry guards apply to valid, positive-weight contributors; any blocked
 		// contributor rejects this entire clipmap level.
 		bool geometry_clear = true;
@@ -188,15 +420,57 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 		for (int yy = 0; yy < 2 && geometry_clear; yy++)
 		for (int x = 0; x < 2; x++) {
 			int corner_index = x | (yy << 1) | (z << 2);
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+			filtered_weights[corner_index] = 0.0;
+#endif
 			float corner_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
 					* (yy == 0 ? 1.0 - fraction.y : fraction.y)
 					* (z == 0 ? 1.0 - fraction.z : fraction.z);
 			if ((valid_mask & (1 << corner_index)) == 0 || !(corner_weight > 0.0)) { continue; }
 			ivec3 corner_cell = base + ivec3(x, yy, z);
 			vec3 corner = (vec3(corner_cell) + 0.5) * step_size;
+			ivec3 wrapped_corner = ((corner_cell % resolution) + resolution) % resolution;
+			ivec3 corner_slot = wrapped_corner + ivec3(0, 0, level * resolution);
+			int metadata_column = clv_face_column(receiver_axis, CLV_FACE_METADATA_COLUMN);
+			int anchor_column = clv_face_column(receiver_axis, CLV_FACE_ANCHOR_COLUMN);
+			vec4 corner_metadata = texelFetch(clv_texture,
+					corner_slot + ivec3(metadata_column * resolution, 0, 0), 0);
+			vec4 surface_anchor = texelFetch(clv_texture,
+					corner_slot + ivec3(anchor_column * resolution, 0, 0), 0);
+			bool corner_patch_valid = !isnan(corner_metadata.w) && !isinf(corner_metadata.w)
+					&& abs(corner_metadata.w) <= 2147480000.0
+					&& floor(corner_metadata.w) == corner_metadata.w;
+			if (corner_patch_valid && clv_surface_box_certificate_contains(world, corner, corner_cell,
+					step_size, surface_anchor, corner_metadata.xyz, receiver_triangle,
+					receiver_patch, int(corner_metadata.w))) {
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+				filtered_weights[corner_index] = corner_weight;
+				visible_coverage += corner_weight;
+				maximum_visibility = 1.0;
+#endif
+				continue;
+			}
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+			float proxy = texelFetch(clv_texture,
+					corner_slot + ivec3(clv_face_column(receiver_axis, 0) * resolution, 0, 0), 0).w;
+			if (isnan(proxy) || isinf(proxy) || proxy < 1.0 || floor(proxy) != proxy
+					|| proxy > float(directional_lighting.values.length() / 20)) { continue; }
+			float visibility = clv_probe_visibility(int(proxy) - 1, world);
+			if (isnan(visibility) || isinf(visibility)) { continue; }
+			filtered_weights[corner_index] = corner_weight * clamp(visibility, 0.0, 1.0);
+			visible_coverage += filtered_weights[corner_index];
+			maximum_visibility = max(maximum_visibility, visibility);
+#else
 			bool blocked = segment_blocked(corner, world, receiver_triangle, 0);
 			if (blocked) { geometry_clear = false; break; }
+#endif
 		}
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+		// Distance moments filter interpolation; they are not an extra AO layer.
+		// Reject uniformly uncertain support before normalizing its weights.
+		if (visible_coverage <= 1e-6 || maximum_visibility < 0.1) { continue; }
+		all_metadata_valid = all_metadata_valid && visible_coverage > 0.999999;
+#endif
 		if (!geometry_clear) {
 			if (collect_diagnostics) { found_blocked_geometry = true; }
 			continue;
@@ -205,21 +479,24 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 			selected_level = level;
 			cell_fraction = fraction;
 		}
-		if (!all_positive_metadata_valid) {
-			cache_weight = clamp(coverage, 0.0, 1.0);
-			if (collect_diagnostics) {
-				sample_status = CLV_SAMPLE_EXACT;
-				reject_reason = CLV_REJECT_INCOMPLETE_SUPPORT;
-			}
-			return false;
-		}
 		if (all_metadata_valid && !seam) {
 			vec3 coordinate = vec3(physical) + fraction + 0.5;
 			coordinate.z += float(level * resolution);
 			vec3 extent = vec3(textureSize(clv_texture, 0));
-			for (int k = 0; k < 9; k++) {
-				secondary += textureLod(clv_texture, (coordinate + vec3(k * resolution, 0, 0)) / extent, 0.0).rgb * y[k];
-				primary += textureLod(clv_texture, (coordinate + vec3((k + 9) * resolution, 0, 0)) / extent, 0.0).rgb * y[k];
+			if (aligned_normals) {
+				secondary = textureLod(clv_texture, (coordinate + vec3(
+						clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent, 0.0).rgb;
+				primary = textureLod(clv_texture, (coordinate + vec3(
+						clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent, 0.0).rgb;
+			} else for (int k = 0; k < 9; k++) {
+				int secondary_column = clv_face_column(receiver_axis, k);
+				int primary_column = clv_face_column(receiver_axis, k + 9);
+				secondary += textureLod(clv_texture,
+						(coordinate + vec3(secondary_column * resolution, 0, 0))
+						/ extent, 0.0).rgb * y[k];
+				primary += textureLod(clv_texture,
+						(coordinate + vec3(primary_column * resolution, 0, 0))
+						/ extent, 0.0).rgb * y[k];
 			}
 			cache_weight = 1.0;
 			complete_support = true;
@@ -234,12 +511,24 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 				float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
 						* (yy == 0 ? 1.0 - fraction.y : fraction.y)
 						* (z == 0 ? 1.0 - fraction.z : fraction.z);
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+				weight = filtered_weights[corner_index] / visible_coverage;
+#endif
 				if (weight <= 0.0) { continue; }
 				vec3 corner_secondary = vec3(0.0);
 				vec3 corner_primary = vec3(0.0);
-				for (int k = 0; k < 9; k++) {
-					corner_secondary += texelFetch(clv_texture, slot + ivec3(k * resolution, 0, 0), 0).rgb * y[k];
-					corner_primary += texelFetch(clv_texture, slot + ivec3((k + 9) * resolution, 0, 0), 0).rgb * y[k];
+				if (aligned_normals) {
+					corner_secondary = texelFetch(clv_texture, slot + ivec3(
+							clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0), 0).rgb;
+					corner_primary = texelFetch(clv_texture, slot + ivec3(
+							clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0), 0).rgb;
+				} else for (int k = 0; k < 9; k++) {
+					int secondary_column = clv_face_column(receiver_axis, k);
+					int primary_column = clv_face_column(receiver_axis, k + 9);
+					corner_secondary += texelFetch(clv_texture,
+							slot + ivec3(secondary_column * resolution, 0, 0), 0).rgb * y[k];
+					corner_primary += texelFetch(clv_texture,
+							slot + ivec3(primary_column * resolution, 0, 0), 0).rgb * y[k];
 				}
 				secondary += corner_secondary * weight;
 				primary += corner_primary * weight;
@@ -247,8 +536,12 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 			cache_weight = 1.0;
 			complete_support = true;
 		}
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+		cache_weight = clamp(visible_coverage, 0.0, 1.0);
+		complete_support = all_positive_metadata_valid && visible_coverage > 0.999999;
+#endif
 		if (collect_diagnostics) {
-			sample_status = CLV_SAMPLE_FULL;
+			sample_status = complete_support ? CLV_SAMPLE_FULL : CLV_SAMPLE_FILTERED;
 		}
 		secondary = max(secondary, vec3(0.0)); primary = max(primary, vec3(0.0));
 		return cache_weight > 0.0;

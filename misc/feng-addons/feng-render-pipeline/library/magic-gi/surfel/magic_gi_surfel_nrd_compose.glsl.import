@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://b54pwgx87hcxc"
+path="res://.godot/imported/magic_gi_surfel_nrd_compose.glsl-a500927a88d7a48d8a492f62a9fffeef.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/surfel/magic_gi_surfel_nrd_compose.glsl"
+dest_files=["res://.godot/imported/magic_gi_surfel_nrd_compose.glsl-a500927a88d7a48d8a492f62a9fffeef.res"]
+
+[params]
+

@@ -1,0 +1,152 @@
+#version 450
+
+// Morph and skin into the same storage/AS-input vertex buffer consumed by
+// closest-hit and BLAS builds. Surface rows and source arrays are immutable
+// for a topology generation; only the compact weights/palette state changes.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BaseVertices {
+	uint words[];
+} base_vertices;
+layout(set = 0, binding = 1, std430) writeonly buffer DeformedVertices {
+	uint words[];
+} deformed_vertices;
+layout(set = 0, binding = 2, std430) readonly buffer SkinData {
+	uint words[];
+} skin_data;
+layout(set = 0, binding = 3, std430) readonly buffer BlendData {
+	uint words[];
+} blend_data;
+layout(set = 0, binding = 4, std430) readonly buffer DeformationState {
+	uint words[];
+} deformation_state;
+layout(set = 0, binding = 5, std430) readonly buffer SurfaceMetadata {
+	uint words[];
+} surface_metadata;
+
+layout(push_constant, std430) uniform DeformPush {
+	uvec4 dispatch; // global vertex base, vertex count, stable surface slot, reserved
+} deform_push;
+
+vec3 load_vertex3(uint word_offset) {
+	return uintBitsToFloat(uvec3(base_vertices.words[word_offset + 0u],
+			base_vertices.words[word_offset + 1u], base_vertices.words[word_offset + 2u]));
+}
+
+vec4 load_state4(uint float_offset) {
+	return uintBitsToFloat(uvec4(deformation_state.words[float_offset + 0u],
+			deformation_state.words[float_offset + 1u], deformation_state.words[float_offset + 2u],
+			deformation_state.words[float_offset + 3u]));
+}
+
+bool gi_deform_finite3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 gi_deform_safe_normalize(vec3 value, vec3 fallback_normal) {
+	float value_length_squared = dot(value, value);
+	if (gi_deform_finite3(value) && value_length_squared > 1e-20
+			&& !isnan(value_length_squared) && !isinf(value_length_squared)) {
+		return value * inversesqrt(value_length_squared);
+	}
+	float fallback_length_squared = dot(fallback_normal, fallback_normal);
+	if (gi_deform_finite3(fallback_normal) && fallback_length_squared > 1e-20
+			&& !isnan(fallback_length_squared) && !isinf(fallback_length_squared)) {
+		return fallback_normal * inversesqrt(fallback_length_squared);
+	}
+	return vec3(0.0, 1.0, 0.0);
+}
+
+void main() {
+	uint local_vertex = gl_GlobalInvocationID.x;
+	if (local_vertex >= deform_push.dispatch.y) {
+		return;
+	}
+	uint slot_word = deform_push.dispatch.z * 16u;
+	uint vertex_word = (deform_push.dispatch.x + local_vertex) * 8u;
+	vec3 position = load_vertex3(vertex_word);
+	vec3 normal = load_vertex3(vertex_word + 3u);
+	// CPU snapshot validation rejects invalid source data; keep a finite GPU
+	// fallback too, so a corrupt runtime value can never poison the BLAS input.
+	if (!gi_deform_finite3(position)) {
+		position = vec3(0.0);
+	}
+	vec3 source_fallback_position = position;
+	vec3 source_fallback_normal = gi_deform_safe_normalize(normal, vec3(0.0, 1.0, 0.0));
+	normal = source_fallback_normal;
+	uint blend_count = surface_metadata.words[slot_word + 4u];
+	uint state_weight_base = surface_metadata.words[slot_word + 5u];
+	uint flags = surface_metadata.words[slot_word + 10u];
+	if ((flags & 2u) != 0u) {
+		uint blend_base = surface_metadata.words[slot_word + 3u];
+		uint total_vertices = surface_metadata.words[slot_word + 1u];
+		float total_weight = 0.0;
+		vec3 blended_position = vec3(0.0);
+		vec3 blended_normal = vec3(0.0);
+		for (uint shape_index = 0u; shape_index < blend_count; shape_index++) {
+			float weight = uintBitsToFloat(deformation_state.words[state_weight_base + shape_index]);
+			if (isnan(weight) || isinf(weight) || abs(weight) <= 1e-8) {
+				continue;
+			}
+			uint shape_float = blend_base + (shape_index * total_vertices + local_vertex) * 6u;
+			blended_position += uintBitsToFloat(uvec3(blend_data.words[shape_float + 0u],
+					blend_data.words[shape_float + 1u], blend_data.words[shape_float + 2u])) * weight;
+			blended_normal += uintBitsToFloat(uvec3(blend_data.words[shape_float + 3u],
+					blend_data.words[shape_float + 4u], blend_data.words[shape_float + 5u])) * weight;
+			total_weight += weight;
+		}
+		if (surface_metadata.words[slot_word + 9u] == 0u) {
+			position *= 1.0 - total_weight;
+			normal *= 1.0 - total_weight;
+		}
+		vec3 morphed_position = position + blended_position;
+		if (gi_deform_finite3(morphed_position)) {
+			position = morphed_position;
+		}
+		normal = gi_deform_safe_normalize(normal + blended_normal, source_fallback_normal);
+	}
+	if ((flags & 1u) != 0u) {
+		uint skin_base = surface_metadata.words[slot_word + 2u] + local_vertex * 16u;
+		uint palette_base = surface_metadata.words[slot_word + 6u];
+		uint bone_count = surface_metadata.words[slot_word + 7u];
+		uint bones_per_vertex = min(surface_metadata.words[slot_word + 8u], 8u);
+		vec3 skinned_position = vec3(0.0);
+		vec3 skinned_normal = vec3(0.0);
+		float total_weight = 0.0;
+		for (uint influence = 0u; influence < bones_per_vertex; influence++) {
+			uint bone = skin_data.words[skin_base + influence];
+			float weight = uintBitsToFloat(skin_data.words[skin_base + 8u + influence]);
+			if (!(weight > 0.0) || isnan(weight) || isinf(weight) || bone >= bone_count) {
+				continue;
+			}
+			uint matrix_base = palette_base + bone * 16u;
+			vec4 input_position = vec4(position, 1.0);
+			vec4 input_normal = vec4(normal, 0.0);
+			vec4 row0 = load_state4(matrix_base + 0u);
+			vec4 row1 = load_state4(matrix_base + 4u);
+			vec4 row2 = load_state4(matrix_base + 8u);
+			skinned_position += vec3(dot(input_position, row0), dot(input_position, row1),
+				dot(input_position, row2)) * weight;
+			skinned_normal += vec3(dot(input_normal, row0), dot(input_normal, row1),
+				dot(input_normal, row2)) * weight;
+			total_weight += weight;
+		}
+		if (total_weight > 1e-8 && !isnan(total_weight) && !isinf(total_weight)
+				&& gi_deform_finite3(skinned_position)) {
+			position = skinned_position;
+			normal = gi_deform_safe_normalize(skinned_normal, source_fallback_normal);
+		}
+	}
+	if (!gi_deform_finite3(position)) {
+		position = source_fallback_position;
+	}
+	normal = gi_deform_safe_normalize(normal, source_fallback_normal);
+	deformed_vertices.words[vertex_word + 0u] = floatBitsToUint(position.x);
+	deformed_vertices.words[vertex_word + 1u] = floatBitsToUint(position.y);
+	deformed_vertices.words[vertex_word + 2u] = floatBitsToUint(position.z);
+	deformed_vertices.words[vertex_word + 3u] = floatBitsToUint(normal.x);
+	deformed_vertices.words[vertex_word + 4u] = floatBitsToUint(normal.y);
+	deformed_vertices.words[vertex_word + 5u] = floatBitsToUint(normal.z);
+	deformed_vertices.words[vertex_word + 6u] = base_vertices.words[vertex_word + 6u];
+	deformed_vertices.words[vertex_word + 7u] = base_vertices.words[vertex_word + 7u];
+}

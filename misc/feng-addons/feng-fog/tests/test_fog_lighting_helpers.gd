@@ -17,7 +17,8 @@ class FakeSkyProvider extends Node3D:
 		pass
 
 	func _feng_sky_light_volumetric_metadata() -> Dictionary:
-		return {"ready": true, "source_revision": 12, "volumetric_scattering_intensity": 1.5}
+		return {"ready": true, "source_revision": 5, "radiance_revision": 12,
+				"volumetric_scattering_intensity": 1.5}
 
 	func _feng_sky_light_runtime_snapshot() -> Dictionary:
 		readback_requested = true
@@ -116,7 +117,8 @@ func _test_sky_source_metadata_matching() -> void:
 	var provider = SkySH.new()
 	var frame := {
 		"sky_light_source_owner_id": 81,
-		"sky_light_source_revision": 12,
+		"sky_light_source_revision": 5,
+		"sky_light_revision": 12,
 		"sky_light_energy": 2.0,
 		"sky_captured_exposure": 1.25,
 		"sky_light_rotation": Basis.IDENTITY,
@@ -124,13 +126,26 @@ func _test_sky_source_metadata_matching() -> void:
 	var metadata := {
 		"ready": true,
 		"provider_id": 81,
-		"source_revision": 12,
+		"source_revision": 5,
+		"radiance_revision": 12,
 		"radiance_energy": 2.0,
 		"captured_exposure": 1.25,
 		"rotation": Basis.IDENTITY,
 	}
 	_require(provider._metadata_matches_frame(frame, metadata),
 			"volumetric source metadata matches the explicit native frame")
+	frame["sky_light_revision"] = 13
+	metadata["radiance_revision"] = 13
+	_require(provider._metadata_matches_frame(frame, metadata),
+			"new radiance content remains valid while the source identity epoch is stable")
+	metadata["radiance_revision"] = 12
+	_require(not provider._metadata_matches_frame(frame, metadata),
+			"stale radiance content is rejected even when the source identity epoch matches")
+	metadata.erase("radiance_revision")
+	_require(provider._metadata_matches_frame(frame, metadata),
+			"legacy metadata without a content revision remains backward compatible")
+	frame["sky_light_revision"] = 12
+	metadata["radiance_revision"] = 12
 	metadata["radiance_energy"] = 2.1
 	_require(not provider._metadata_matches_frame(frame, metadata),
 			"stale energy metadata cannot apply to a different frame light value")

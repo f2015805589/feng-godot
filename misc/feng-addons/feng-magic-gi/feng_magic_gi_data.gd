@@ -526,6 +526,9 @@ func make_runtime_atlas_image() -> Image:
 func make_render_upload() -> Dictionary:
 	if format_version < MOMENT_FORMAT_VERSION or not is_valid():
 		return {}
+	var surface_bounds := surface_sample_bounds(surface_positions)
+	if not _valid_surface_sample_bounds(surface_bounds):
+		return {}
 	# A stale v5 remains a diagnostic preview with its original moment weighting.
 	# Matching v5 resources are upgraded before publication. These empty traversal
 	# buffers are upload-only and never pretend to be persisted v6 geometry.
@@ -553,8 +556,27 @@ func make_render_upload() -> Dictionary:
 		"index_bytes": index_bytes,
 		"sparse_indices": adaptive_placement,
 		"index_entries": cell_indices.to_byte_array() if adaptive_placement else PackedInt32Array([0]).to_byte_array(),
-		"emission_image": emission_image
+		"emission_image": emission_image,
+		"surface_bounds": surface_bounds
 	}
+
+## Exact bounds of the persisted world-space surface anchors. This is computed
+## while the immutable upload bundle is prepared, so the render-thread uploader
+## never walks probe arrays or mistakes a streamed support halo for page bounds.
+static func surface_sample_bounds(samples: PackedVector3Array) -> AABB:
+	if samples.is_empty() or not samples[0].is_finite():
+		return AABB(Vector3.ZERO, Vector3.ONE * -1.0)
+	var bounds := AABB(samples[0], Vector3.ZERO)
+	for index in range(1, samples.size()):
+		var sample := samples[index]
+		if not sample.is_finite():
+			return AABB(Vector3.ZERO, Vector3.ONE * -1.0)
+		bounds = bounds.expand(sample)
+	return bounds
+
+static func _valid_surface_sample_bounds(bounds: AABB) -> bool:
+	return bounds.position.is_finite() and bounds.size.is_finite() \
+			and bounds.size.x >= 0.0 and bounds.size.y >= 0.0 and bounds.size.z >= 0.0
 
 ## Packs already-composed per-probe RGB emission into one RGBAF texel per probe.
 ## An empty payload is an all-zero atlas, which also covers legacy v2 resources.

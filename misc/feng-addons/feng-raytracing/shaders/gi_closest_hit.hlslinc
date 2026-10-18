@@ -91,6 +91,8 @@ static const uint GI_RAY_MODE_SUN_VISIBILITY = 1u;
 static const uint GI_RAY_MODE_REFLECTION = 2u;
 static const uint GI_RAY_MODE_MISS = 4u;
 static const uint GI_MATERIAL_HAS_ALBEDO_TEXTURE = 1u;
+static const uint GI_MATERIAL_TWO_SIDED = 2u;
+static const uint GI_SURFACE_NEE_UNSAMPLED = 1u;
 static const uint GI_DIRECTIONAL_CAPACITY = 8u;
 static const uint GI_MATERIAL_WORD_STRIDE = 20u;
 static const uint GI_MATERIAL_ROW_BYTES = GI_MATERIAL_WORD_STRIDE * 4u;
@@ -243,6 +245,7 @@ void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAt
 	uint index_base_byte = gi_surfaces.Load(row_byte + 4u);
 	uint index_count = gi_surfaces.Load(row_byte + 8u);
 	uint material_index = gi_surfaces.Load(row_byte + 12u);
+	uint surface_flags = gi_surfaces.Load(row_byte + 16u);
 	uint primitive = PrimitiveIndex();
 	if (index_count % 3u != 0u || primitive >= index_count / 3u) {
 		payload.radiance = 0.0f;
@@ -289,6 +292,8 @@ void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAt
 		payload.radiance = float3(asfloat(InstanceID()), asfloat(PrimitiveIndex()),
 				asfloat(gi_surfaces.Load(row_byte + 20u)));
 		payload.hit_distance = RayTCurrent();
+		uint2 packed_barycentric = (uint2)round(saturate(attributes.barycentrics) * 65535.0f);
+		payload.ray_pdf = asfloat((packed_barycentric.x & 0xffffu) | (packed_barycentric.y << 16u));
 		return;
 	}
 	#endif
@@ -311,14 +316,80 @@ void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAt
 	}
 	float3 diffuse_reflectance = albedo * (1.0f - metallic);
 	float3 outgoing_radiance = max(emission_color, 0.0f) * max(emission_energy, 0.0f);
+	#if FENG_GI_SURFEL_CACHE
+	if (payload.flags == GI_RAY_MODE_SURFEL_PROBE) {
+		float total_power = gi_emitter_row(0u).x;
+		float emitter_count_value = gi_emitter_row(0u).y;
+		uint emitter_count = emitter_count_value > 0.0f && isfinite(emitter_count_value)
+				? (uint)emitter_count_value : 0u;
+		float3x3 world_to_object = (float3x3)WorldToObject3x4();
+		float3 local_area = cross(position1 - position0, position2 - position0);
+		float3 world_area_vector = mul(local_area, world_to_object);
+		float world_area = 0.5f * length(world_area_vector)
+				/ max(abs(determinant(world_to_object)), 1e-12f);
+		float cosine_light = dot(normalize(world_area_vector), -WorldRayDirection());
+		if ((material_flags & GI_MATERIAL_TWO_SIDED) != 0u) cosine_light = abs(cosine_light);
+		float emission_luminance = dot(outgoing_radiance, float3(0.2126f, 0.7152f, 0.0722f));
+		if ((surface_flags & GI_SURFACE_NEE_UNSAMPLED) == 0u
+				&& emitter_count > 0u && world_area > 1e-10f && isfinite(world_area)
+				&& RayTCurrent() < max(gi_frame.trace_parameters.x, 0.1f)) {
+			outgoing_radiance *= gi_surfel_probe_emission_uniform_weight(
+					emission_luminance, total_power, RayTCurrent(), cosine_light);
+		}
+	}
+	#endif
 
-    if (payload.flags == 0u && gi_frame.generation_history_flags.y == 0u && gi_emitter_row(0).x > 0.0) {
+    if (payload.flags == 0u && gi_frame.generation_history_flags.y == 0u
+			&& (surface_flags & GI_SURFACE_NEE_UNSAMPLED) == 0u && gi_emitter_row(0).x > 0.0) {
         float3 emitter_normal = normalize(mul(cross(position1 - position0, position2 - position0), (float3x3)WorldToObject3x4()));
         float cosine = abs(dot(emitter_normal, -WorldRayDirection()));
         float luminance = dot(outgoing_radiance, float3(0.2126, 0.7152, 0.0722));
         float light_pdf = luminance / gi_emitter_row(0).x * RayTCurrent() * RayTCurrent() / max(cosine, 1e-8);
         outgoing_radiance *= payload.ray_pdf / max(payload.ray_pdf + light_pdf, 1e-12);
     }
+	#if FENG_GI_SURFEL_CACHE
+	if (payload.flags == GI_RAY_MODE_SURFEL && gi_frame.generation_history_flags.y == 0u
+			&& (surface_flags & GI_SURFACE_NEE_UNSAMPLED) == 0u) {
+		float total_power = gi_emitter_row(0u).x;
+		float emitter_count_value = gi_emitter_row(0u).y;
+		uint emitter_count = emitter_count_value > 0.0f && isfinite(emitter_count_value)
+				? (uint)emitter_count_value : 0u;
+		uint budget = (uint)clamp(round(gi_frame.trace_parameters.z), 1.0f, 32.0f);
+		uint n_cos;
+		uint n_nee;
+		gi_surfel_split_ray_budget(true, emitter_count, total_power, budget, n_cos, n_nee);
+		float p_cos = payload.ray_pdf;
+		float emission_luminance = dot(outgoing_radiance, float3(0.2126f, 0.7152f, 0.0722f));
+		if (n_nee > 0u && emission_luminance > 0.0f && isfinite(emission_luminance)
+				&& p_cos >= 0.0f && isfinite(p_cos)) {
+			float max_distance = max(gi_frame.trace_parameters.x, 0.1f);
+			float3x3 world_to_object = (float3x3)WorldToObject3x4();
+			float3 local_area_vector = cross(position1 - position0, position2 - position0);
+			float3 world_area_vector = mul(local_area_vector, world_to_object);
+			// This determinant-scaled normal is equivalent in magnitude to crossing
+			// the two ObjectToWorld-transformed triangle edges.
+			float world_area = 0.5f * length(world_area_vector) / abs(determinant(world_to_object));
+			float3 emitter_normal = normalize(world_area_vector);
+			float cos_light = abs(dot(emitter_normal, -WorldRayDirection()));
+			float hit_distance_squared = RayTCurrent() * RayTCurrent();
+			// Match the emitter table builder and the NEE sampler support exactly:
+			// enabled emission is serialized as nonzero outgoing_radiance, and only
+			// finite world triangles above its area cutoff are present in the table.
+			if (world_area > 1e-10f && isfinite(world_area)
+					&& hit_distance_squared > 9e-6f && RayTCurrent() < max_distance
+					&& cos_light > 1e-6f && isfinite(cos_light)) {
+				float p_light = (emission_luminance / total_power) * RayTCurrent() * RayTCurrent()
+						/ cos_light;
+				float denominator = (float)n_cos * p_cos + (float)n_nee * p_light;
+				// A zero/invalid light PDF leaves the cosine estimate untouched.
+				if (p_light > 0.0f && isfinite(p_light)
+						&& denominator > 1e-12f && isfinite(denominator)) {
+					outgoing_radiance *= ((float)n_cos * p_cos) / denominator;
+				}
+			}
+		}
+	}
+	#endif
 
 	uint sun_index = gi_frame.sun_view_generation_sky_array.x;
 	uint full_layer_mask = gi_surfaces.Load(row_byte + 20u);
@@ -400,18 +471,31 @@ void FengGIClosestHit(inout GIPathPayload payload, BuiltInTriangleIntersectionAt
 		}
 	}
 	#if FENG_GI_SURFEL_CACHE
-	if (payload.flags == GI_RAY_MODE_SURFEL) {
+	if (payload.flags == GI_RAY_MODE_SURFEL || payload.flags == GI_RAY_MODE_SURFEL_PROBE) {
 		float3 world_hit = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
 		uint surfel_seed = gi_hash(InstanceID() * 0x9e3779b9u ^ PrimitiveIndex() * 0x85ebca6bu
 				^ asuint(attributes.barycentrics.x) ^ asuint(attributes.barycentrics.y));
-		float3 incident_over_pi = surfel_local_incident(world_hit, world_normal, full_layer_mask,
+		float3 direct_incident_over_pi = surfel_local_incident(world_hit, world_normal, full_layer_mask,
 				gi_surfel_light_counts.yzw, surfel_seed);
-		float3 previous_irradiance_over_pi;
-		if (gi_surfel_lookup_previous(world_hit, world_normal, full_layer_mask,
-				gi_surfel_limits.w, previous_irradiance_over_pi)) {
-			incident_over_pi += previous_irradiance_over_pi;
+		float3 cached_irradiance_over_pi = 0.0f;
+		float surface_coverage = 0.0f;
+		float surface_age = 0.0f;
+		float mean_hit_distance = 0.0f;
+		gi_surfel_lookup_visible(world_hit, world_normal, full_layer_mask,
+				gi_surfel_limits.w, cached_irradiance_over_pi, surface_coverage,
+				surface_age, mean_hit_distance);
+		if (payload.flags == GI_RAY_MODE_SURFEL && surface_coverage < 1.0f) {
+			float3 probe_irradiance_over_pi;
+			float probe_coverage;
+			float probe_age;
+			if (gi_surfel_probe_lookup(world_hit, world_normal, full_layer_mask,
+					gi_surfel_limits.w, probe_irradiance_over_pi,
+					probe_coverage, probe_age) && probe_coverage > 0.0f) {
+				gi_surfel_probe_combine(cached_irradiance_over_pi, surface_coverage,
+						probe_irradiance_over_pi, probe_coverage);
+			}
 		}
-		outgoing_radiance += diffuse_reflectance * incident_over_pi;
+		outgoing_radiance += diffuse_reflectance * (direct_incident_over_pi + cached_irradiance_over_pi);
 		payload.radiance = gi_finite_nonnegative(outgoing_radiance);
 		payload.hit_distance = RayTCurrent();
 		return;

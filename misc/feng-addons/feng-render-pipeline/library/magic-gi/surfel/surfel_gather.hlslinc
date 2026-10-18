@@ -3,6 +3,8 @@
 
 RWTexture2D<float4> gi_surfel_gather_color : register(u29, space0);
 RWTexture2D<float4> gi_surfel_gather_output : register(u30, space0);
+RWTexture2D<float4> gi_surfel_gather_auxiliary : register(u38, space0);
+RWTexture2D<float4> gi_surfel_gather_final_output : register(u39, space0);
 Texture2D<float> gi_surfel_gather_depth : register(t31, space0);
 Texture2D<float4> gi_surfel_gather_normal : register(t32, space0);
 Texture2D<float4> gi_surfel_gather_albedo : register(t33, space0);
@@ -17,43 +19,45 @@ cbuffer FENGGISurfelGatherParameters : register(b37, space0) {
 static const uint GI_SURFEL_GATHER_MATERIAL_MODEL_MASK = 0x0fu;
 static const uint GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL = 0u;
 
-void gi_surfel_gather() {
-	uint2 dispatch_pixel = DispatchRaysIndex().xy;
-	uint width;
-	uint height;
-	gi_surfel_gather_color.GetDimensions(width, height);
-	if (dispatch_pixel.x >= width || dispatch_pixel.y >= height) return;
-	int2 pixel = (int2)dispatch_pixel;
-	gi_surfel_gather_output[pixel] = 0.0f;
+bool gi_surfel_gather_read_geometry(int2 pixel, uint2 extent,
+		out float3 world_position, out float3 normal, out float4 orm) {
+	world_position = 0.0f;
+	normal = 0.0f;
+	orm = 0.0f;
+	if (any(pixel < 0) || any((uint2)pixel >= extent)) return false;
 	float depth = gi_surfel_gather_depth.Load(int3(pixel, 0));
-	if (!(depth > 0.0f) || !isfinite(depth)) return;
-	float4 orm = gi_surfel_gather_orm.Load(int3(pixel, 0));
+	if (!(depth > 0.0f) || !isfinite(depth)) return false;
+	orm = gi_surfel_gather_orm.Load(int3(pixel, 0));
 	uint material_model = (uint)round(saturate(orm.a) * 255.0f)
 			& GI_SURFEL_GATHER_MATERIAL_MODEL_MASK;
-	if (material_model == GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL) return;
-	float2 uv = (float2(dispatch_pixel) + 0.5f) / float2(width, height);
+	if (material_model == GI_SURFEL_GATHER_UNLIT_MATERIAL_MODEL) return false;
+	float2 uv = ((float2)pixel + 0.5f) / (float2)extent;
 	float4 view_h = mul(gi_frame.inverse_projection, float4(uv * 2.0f - 1.0f, depth, 1.0f));
-	if (!(abs(view_h.w) > 1e-8f) || !isfinite(view_h.w)) return;
+	if (!(abs(view_h.w) > 1e-8f) || !isfinite(view_h.w)) return false;
 	float3 view_position = view_h.xyz / view_h.w;
-	float3 world_position = mul(gi_frame.view_to_world, float4(view_position, 1.0f)).xyz;
+	world_position = mul(gi_frame.view_to_world, float4(view_position, 1.0f)).xyz;
+	if (!all(isfinite(world_position))) return false;
 	float3 owner_local = mul(gi_surfel_world_to_owner, float4(world_position, 1.0f)).xyz;
 	float3 half_extent = gi_surfel_owner_size_cell_radius.xyz * 0.5f;
 	// TAA inverse projection can round an edge sample a few float ULPs outside.
 	float3 bounds_epsilon = max(half_extent, float3(1.0f, 1.0f, 1.0f)) * 1.9073486328125e-6f;
-	if (any(abs(owner_local) > half_extent + bounds_epsilon)) return;
-	float3 normal_view = gi_surfel_gather_normal.Load(int3(pixel, 0)).xyz * 2.0f - 1.0f;
-	float normal_length = length(normal_view);
-	if (!(normal_length > 1e-6f) || !isfinite(normal_length)) return;
-	float3 normal = normalize(mul((float3x3)gi_frame.view_to_world, normal_view / normal_length));
-	float3 incident_over_pi;
-	float coverage;
-	float age;
-	uint frame_token = gi_surfel_limits.w;
-	if (!gi_surfel_lookup_visible(world_position, normal, 0xffffffffu, frame_token,
-			incident_over_pi, coverage, age) || !(coverage > 0.0f)) return;
+	if (any(abs(owner_local) > half_extent + bounds_epsilon)) return false;
+	float3 normal_encoded = gi_surfel_gather_normal.Load(int3(pixel, 0)).xyz * 2.0f - 1.0f;
+	float normal_length = length(normal_encoded);
+	if (!(normal_length > 1e-6f) || !isfinite(normal_length)) return false;
+	float3 view_normal = normal_encoded / normal_length;
+	normal = normalize(mul((float3x3)gi_frame.view_to_world, view_normal));
+	return all(isfinite(normal));
+}
+
+void gi_surfel_gather_compose(int2 pixel, uint2 extent, float3 incident_over_pi,
+		float coverage, float age, bool has_support, float4 orm) {
+	gi_surfel_gather_output[pixel] = 0.0f;
+	if (!has_support || !(coverage > 0.0f)) return;
 	float strength = max(gi_surfel_gather_values.x, 0.0f);
 	float pre_exposure = max(gi_frame.size_exposure.z, 0.0f);
 	float scene_normalization = max(gi_frame.size_exposure.w, 0.0f);
+	float2 uv = ((float2)pixel + 0.5f) / (float2)extent;
 	float ao = saturate(orm.r);
 	float diffuse_ao = gi_surfel_gather_diffuse_ao.SampleLevel(
 			gi_surfel_gather_diffuse_ao_sampler, uv, 0.0f);
@@ -83,6 +87,99 @@ void gi_surfel_gather() {
 	} else {
 		gi_surfel_gather_output[pixel] = float4(contribution, ownership_weight);
 	}
+}
+
+void gi_surfel_gather() {
+	uint width;
+	uint height;
+	gi_surfel_gather_color.GetDimensions(width, height);
+	uint2 extent = uint2(width, height);
+	int2 pixel = (int2)DispatchRaysIndex().xy;
+	if (any((uint2)pixel >= extent)) return;
+	float3 world_position;
+	float3 normal;
+	float4 orm;
+	if (!gi_surfel_gather_read_geometry(pixel, extent, world_position, normal, orm)) {
+		gi_surfel_gather_output[pixel] = 0.0f;
+		return;
+	}
+	float3 incident_over_pi = 0.0f;
+	float coverage = 0.0f;
+	float age = 0.0f;
+	float hit_distance = 0.0f;
+	bool has_support = gi_surfel_lookup_visible(world_position, normal, 0xffffffffu,
+		gi_surfel_limits.w, incident_over_pi, coverage, age, hit_distance) && coverage > 0.0f;
+	if (coverage < 1.0f) {
+		float3 probe_irradiance_over_pi;
+		float probe_coverage;
+		float probe_age;
+		if (gi_surfel_probe_lookup(world_position, normal, 0xffffffffu,
+				gi_surfel_limits.w, probe_irradiance_over_pi, probe_coverage, probe_age)
+				&& probe_coverage > 0.0f) {
+			bool had_surface_support = has_support;
+			gi_surfel_probe_combine(incident_over_pi, coverage,
+					probe_irradiance_over_pi, probe_coverage);
+			age = had_surface_support ? min(age, probe_age) : probe_age;
+			has_support = coverage > 0.0f;
+		}
+	}
+	gi_surfel_gather_compose(pixel, extent, incident_over_pi,
+		coverage, age, has_support, orm);
+}
+
+void gi_surfel_gather_nrd() {
+	uint output_width;
+	uint output_height;
+	gi_surfel_gather_output.GetDimensions(output_width, output_height);
+	uint full_width;
+	uint full_height;
+	gi_surfel_gather_depth.GetDimensions(full_width, full_height);
+	uint2 output_extent = uint2(output_width, output_height);
+	uint2 full_extent = uint2(full_width, full_height);
+	int2 pixel = (int2)DispatchRaysIndex().xy;
+	if (any((uint2)pixel >= output_extent)) return;
+	int2 guide_pixel = min((int2)(((float2)pixel + 0.5f) / (float2)output_extent
+			* (float2)full_extent), (int2)full_extent - 1);
+	// The later full-resolution compose replaces this sidecar. Clear the mapped
+	// guide texel here so mode 3 keeps the same reflected output binding as mode 1.
+	gi_surfel_gather_final_output[guide_pixel] = 0.0f;
+	float3 world_position;
+	float3 normal;
+	float4 orm;
+	if (!gi_surfel_gather_read_geometry(guide_pixel, full_extent, world_position, normal, orm)) {
+		gi_surfel_gather_output[pixel] = 0.0f;
+		gi_surfel_gather_auxiliary[pixel] = 0.0f;
+		return;
+	}
+	float3 incident_over_pi = 0.0f;
+	float coverage = 0.0f;
+	float age = 0.0f;
+	float hit_distance = max(gi_surfel_control.x, 0.1f);
+	bool has_support = gi_surfel_lookup_visible(world_position, normal, 0xffffffffu,
+		gi_surfel_limits.w, incident_over_pi, coverage, age, hit_distance)
+			&& coverage > 0.0f;
+	if (coverage < 1.0f) {
+		float3 probe_irradiance_over_pi;
+		float probe_coverage;
+		float probe_age;
+		if (gi_surfel_probe_lookup(world_position, normal, 0xffffffffu,
+				gi_surfel_limits.w, probe_irradiance_over_pi, probe_coverage, probe_age)
+				&& probe_coverage > 0.0f) {
+			bool had_surface_support = has_support;
+			gi_surfel_probe_combine(incident_over_pi, coverage,
+					probe_irradiance_over_pi, probe_coverage);
+			age = had_surface_support ? min(age, probe_age) : probe_age;
+			has_support = coverage > 0.0f;
+		}
+	}
+	if (!has_support) {
+		gi_surfel_gather_output[pixel] = 0.0f;
+		gi_surfel_gather_auxiliary[pixel] = 0.0f;
+		return;
+	}
+	gi_surfel_gather_output[pixel] = float4(max(incident_over_pi, 0.0f) * 0.001f,
+			saturate(coverage));
+	gi_surfel_gather_auxiliary[pixel] = float4(hit_distance, age, 1.0f, 0.0f);
 }
 
 #endif // FENG_GI_SURFEL_GATHER_HLSLINC

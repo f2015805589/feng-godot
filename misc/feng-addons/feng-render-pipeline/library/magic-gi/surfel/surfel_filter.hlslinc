@@ -1,0 +1,247 @@
+#ifndef FENG_GI_SURFEL_FILTER_HLSLINC
+#define FENG_GI_SURFEL_FILTER_HLSLINC
+
+static const uint GI_SURFEL_FILTER_MAX_NEIGHBORS = 16u;
+static const float GI_SURFEL_FILTER_SUPPORT_RADII = 3.5f;
+static const float GI_SURFEL_FILTER_NORMAL_COSINE = 0.995f;
+static const float GI_SURFEL_FILTER_CELL_EPSILON = 1.9073486328125e-6f;
+
+float gi_surfel_filter_sample_variance(uint index) {
+	float4 statistics = gi_surfel_load_statistics(index);
+	return max(statistics.a - dot(statistics.rgb, statistics.rgb) / 3.0f, 0.0f);
+}
+
+bool gi_surfel_filter_cell_can_contribute(int3 cell, float3 center_position,
+		float3 center_normal, float support_squared, float current_worst_weight, uint level) {
+	float3 owner_origin = mul(gi_surfel_owner_to_world, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+	float cell_size = max(2.0f * gi_surfel_radius_for_level(level), 0.002f);
+	float3 cell_minimum = owner_origin + (float3)cell * cell_size;
+	float3 cell_maximum = cell_minimum + cell_size;
+	float3 bounds_epsilon = max(max(abs(cell_minimum), abs(cell_maximum)), float3(1.0f, 1.0f, 1.0f))
+			* GI_SURFEL_FILTER_CELL_EPSILON;
+	cell_minimum -= bounds_epsilon;
+	cell_maximum += bounds_epsilon;
+	float3 nearest = max(max(cell_minimum - center_position,
+			center_position - cell_maximum), 0.0f);
+	float minimum_distance_squared = dot(nearest, nearest);
+	if (!(minimum_distance_squared < support_squared)) return false;
+	float3 from_center_minimum = cell_minimum - center_position;
+	float3 from_center_maximum = cell_maximum - center_position;
+	float plane_minimum = min(center_normal.x * from_center_minimum.x,
+			center_normal.x * from_center_maximum.x)
+		+ min(center_normal.y * from_center_minimum.y,
+			center_normal.y * from_center_maximum.y)
+		+ min(center_normal.z * from_center_minimum.z,
+			center_normal.z * from_center_maximum.z);
+	float plane_maximum = max(center_normal.x * from_center_minimum.x,
+			center_normal.x * from_center_maximum.x)
+		+ max(center_normal.y * from_center_minimum.y,
+			center_normal.y * from_center_maximum.y)
+		+ max(center_normal.z * from_center_minimum.z,
+			center_normal.z * from_center_maximum.z);
+	float plane_tolerance = max(0.0005f, gi_surfel_owner_size_cell_radius.w * 0.05f);
+	if (plane_minimum > plane_tolerance || plane_maximum < -plane_tolerance) return false;
+	float distance_fraction = sqrt(minimum_distance_squared / support_squared);
+	float compact_upper = max(1.0f - distance_fraction, 0.0f);
+	compact_upper = compact_upper * compact_upper * compact_upper * compact_upper
+			* (1.0f + 4.0f * distance_fraction);
+	// Normalized float normals can dot a few ULPs above one; retain a conservative bound.
+	return compact_upper * 1.001f >= current_worst_weight;
+}
+
+bool gi_surfel_filter_candidate(uint index, int3 cell, FENGGISurfelRecord center,
+		float3 center_normal, float support_squared, uint frame_token, uint level,
+		out float weight) {
+	weight = 0.0f;
+	if (index >= gi_surfel_limits.x) return false;
+	FENGGISurfelRecord candidate = gi_surfel_load_record(index);
+	if (candidate.normal_valid.w < 0.5f || candidate.state.z != 0u
+			|| candidate.surface.z == GI_SURFEL_UNKNOWN_INSTANCE
+			|| candidate.surface.w == GI_SURFEL_UNKNOWN_INSTANCE
+			|| any(candidate.cell_last_seen.xyz != cell)
+			|| gi_surfel_load_tracking(index).z != level
+			|| !gi_surfel_tracking_matches(index, candidate)
+			|| (candidate.surface.x & center.surface.x) == 0u) return false;
+	uint frame_age = frame_token - (uint)candidate.cell_last_seen.w;
+	if (frame_age > GI_SURFEL_TTL_FRAMES) return false;
+	float3 candidate_normal = normalize(candidate.normal_valid.xyz);
+	float normal_match = dot(center_normal, candidate_normal);
+	if (normal_match < GI_SURFEL_FILTER_NORMAL_COSINE) return false;
+	float3 delta = candidate.position_radius.xyz - center.position_radius.xyz;
+	float distance_squared = dot(delta, delta);
+	if (!(distance_squared > 1e-10f) || !(distance_squared < support_squared)) return false;
+	float plane_tolerance = max(0.0005f, gi_surfel_owner_size_cell_radius.w * 0.05f);
+	if (abs(dot(delta, center_normal)) > plane_tolerance
+			|| abs(dot(-delta, candidate_normal)) > plane_tolerance) return false;
+	float distance_fraction = sqrt(distance_squared / support_squared);
+	float compact = max(1.0f - distance_fraction, 0.0f);
+	compact = compact * compact * compact * compact * (1.0f + 4.0f * distance_fraction);
+	float normal_weight = pow(saturate(normal_match), 32.0f);
+	float age_weight = 1.0f - smoothstep((float)GI_SURFEL_TTL_FRAMES * 0.5f,
+			(float)GI_SURFEL_TTL_FRAMES, (float)frame_age);
+	weight = compact * normal_weight * age_weight;
+	if (!(weight > 0.0f) || !isfinite(weight)) return false;
+	float4 raw = gi_surfel_load_response_previous(index);
+	return raw.a > 0.5f && all(isfinite(raw.rgb));
+}
+
+bool gi_surfel_filter_heap_is_worse(float weight_a, uint index_a,
+		float weight_b, uint index_b) {
+	return weight_a < weight_b || (weight_a == weight_b && index_a > index_b);
+}
+
+bool gi_surfel_filter_heap_is_better(float weight_a, uint index_a,
+		float weight_b, uint index_b) {
+	return weight_a > weight_b || (weight_a == weight_b && index_a < index_b);
+}
+
+int gi_surfel_filter_center_first_offset(int order) {
+	return order == 0 ? 0 : (order == 1 ? -1 : (order == 2 ? 1 : (order == 3 ? -2 : 2)));
+}
+
+void gi_surfel_filter_update(uint launch_index) {
+	uint capacity = gi_surfel_limits.x;
+	uint update_count = min(gi_surfel_probe_budget.x, capacity);
+	uint active_count = min(capacity, gi_surfel_load_counter(1u));
+	uint surface_budget = gi_surfel_probe_surface_budget(active_count);
+	if (launch_index >= update_count || launch_index >= surface_budget) return;
+	uint index = gi_surfel_raygen_load_update_queue(capacity + launch_index);
+	if (index >= capacity || gi_surfel_raygen_load_pending_status(launch_index) != 1u) return;
+	FENGGISurfelRecord center = gi_surfel_load_record(index);
+	float4 center_raw = gi_surfel_load_response_previous(index);
+	if (center.normal_valid.w < 0.5f || center.state.z != 0u
+			|| center.surface.z == GI_SURFEL_UNKNOWN_INSTANCE
+			|| center.surface.w == GI_SURFEL_UNKNOWN_INSTANCE
+			|| center_raw.a < 0.5f || !all(isfinite(center_raw.rgb))) {
+		gi_surfel_store_response_filtered(index, 0.0f);
+		return;
+	}
+	float3 center_normal = normalize(center.normal_valid.xyz);
+	float radius = max(center.position_radius.w, 0.001f);
+	float support = GI_SURFEL_FILTER_SUPPORT_RADII * radius;
+	float support_squared = support * support;
+	uint frame_token = gi_surfel_limits.w;
+	int3 center_cell = center.cell_last_seen.xyz;
+	uint center_level = gi_surfel_load_tracking(index).z;
+	uint neighbor_indices[GI_SURFEL_FILTER_MAX_NEIGHBORS];
+	float neighbor_weights[GI_SURFEL_FILTER_MAX_NEIGHBORS];
+	[unroll] for (int i = 0; i < GI_SURFEL_FILTER_MAX_NEIGHBORS; i++) {
+		neighbor_indices[i] = capacity;
+		neighbor_weights[i] = 0.0f;
+	}
+	int heap_count = 0;
+	[unroll] for (int z_order = 0; z_order < 5; z_order++) {
+		int z = gi_surfel_filter_center_first_offset(z_order);
+		[unroll] for (int y_order = 0; y_order < 5; y_order++) {
+			int y = gi_surfel_filter_center_first_offset(y_order);
+			[unroll] for (int x_order = 0; x_order < 5; x_order++) {
+				int x = gi_surfel_filter_center_first_offset(x_order);
+				int3 cell = center_cell + int3(x, y, z);
+				float worst_weight = heap_count == GI_SURFEL_FILTER_MAX_NEIGHBORS
+						? neighbor_weights[0] : 0.0f;
+				if (!gi_surfel_filter_cell_can_contribute(cell, center.position_radius.xyz,
+						center_normal, support_squared, worst_weight, center_level)) continue;
+				uint slot = gi_surfel_hash_cell(cell, center_level) & gi_surfel_limits.y;
+				[loop] for (uint probe = 0u; probe < GI_SURFEL_MAX_HASH_PROBES; probe++) {
+					uint candidate_index = gi_surfel_load_hash(slot);
+					if (candidate_index == GI_SURFEL_SLOT_EMPTY) break;
+					if (candidate_index < capacity && candidate_index != index) {
+						float candidate_weight;
+						if (gi_surfel_filter_candidate(candidate_index, cell, center,
+								center_normal, support_squared, frame_token, center_level,
+								candidate_weight)) {
+							if (heap_count < GI_SURFEL_FILTER_MAX_NEIGHBORS) {
+								int node = heap_count;
+								neighbor_indices[node] = candidate_index;
+								neighbor_weights[node] = candidate_weight;
+								heap_count++;
+								[loop] for (int step = 0; step < 4; step++) {
+									if (node <= 0) break;
+									int parent = (node - 1) / 2;
+									if (!gi_surfel_filter_heap_is_worse(neighbor_weights[node],
+											neighbor_indices[node], neighbor_weights[parent],
+											neighbor_indices[parent])) break;
+									uint swap_index = neighbor_indices[parent];
+									float swap_weight = neighbor_weights[parent];
+									neighbor_indices[parent] = neighbor_indices[node];
+									neighbor_weights[parent] = neighbor_weights[node];
+									neighbor_indices[node] = swap_index;
+									neighbor_weights[node] = swap_weight;
+									node = parent;
+								}
+							} else if (gi_surfel_filter_heap_is_better(candidate_weight,
+									candidate_index, neighbor_weights[0], neighbor_indices[0])) {
+								neighbor_indices[0] = candidate_index;
+								neighbor_weights[0] = candidate_weight;
+								int node = 0;
+								[loop] for (int step = 0; step < 4; step++) {
+									int left = node * 2 + 1;
+									if (left >= GI_SURFEL_FILTER_MAX_NEIGHBORS) break;
+									int worse_child = left;
+									int right = left + 1;
+									if (right < GI_SURFEL_FILTER_MAX_NEIGHBORS
+											&& gi_surfel_filter_heap_is_worse(neighbor_weights[right],
+												neighbor_indices[right], neighbor_weights[left],
+												neighbor_indices[left])) worse_child = right;
+									if (!gi_surfel_filter_heap_is_worse(neighbor_weights[worse_child],
+											neighbor_indices[worse_child], neighbor_weights[node],
+											neighbor_indices[node])) break;
+									uint swap_index = neighbor_indices[worse_child];
+									float swap_weight = neighbor_weights[worse_child];
+									neighbor_indices[worse_child] = neighbor_indices[node];
+									neighbor_weights[worse_child] = neighbor_weights[node];
+									neighbor_indices[node] = swap_index;
+									neighbor_weights[node] = swap_weight;
+									node = worse_child;
+								}
+							}
+						}
+					}
+					slot = (slot + 1u) & gi_surfel_limits.y;
+				}
+			}
+		}
+	}
+	float geometry_weight_sum = 0.0f;
+	float3 weighted_delta = 0.0f;
+	float center_variance = gi_surfel_filter_sample_variance(index);
+	float center_effective_samples = clamp((float)max(center.state.w, 1u), 1.0f, 7.0f);
+	float center_max_rgb = max(center_raw.r, max(center_raw.g, center_raw.b));
+	[unroll] for (int i = 0; i < GI_SURFEL_FILTER_MAX_NEIGHBORS; i++) {
+		uint neighbor_index = neighbor_indices[i];
+		if (!(neighbor_weights[i] > 0.0f) || neighbor_index >= capacity) continue;
+		FENGGISurfelRecord neighbor = gi_surfel_load_record(neighbor_index);
+		uint common_layer = center.surface.x & neighbor.surface.x;
+		if (!gi_surfel_connection_visible(center.position_radius.xyz, center_normal,
+				neighbor.position_radius.xyz, neighbor.normal_valid.xyz, common_layer)) continue;
+		float4 neighbor_raw = gi_surfel_load_response_previous(neighbor_index);
+		if (neighbor_raw.a < 0.5f || !all(isfinite(neighbor_raw.rgb))) continue;
+		float geometry_weight = neighbor_weights[i];
+		float neighbor_variance = gi_surfel_filter_sample_variance(neighbor_index);
+		float neighbor_effective_samples = clamp((float)max(neighbor.state.w, 1u), 1.0f, 7.0f);
+		float pair_noise = sqrt(max(center_variance / center_effective_samples
+				+ neighbor_variance / neighbor_effective_samples, 0.0f));
+		float neighbor_max_rgb = max(neighbor_raw.r, max(neighbor_raw.g, neighbor_raw.b));
+		float pair_scale = max(max(center_max_rgb, neighbor_max_rgb), 1e-3f);
+		float signal_difference = length(neighbor_raw.rgb - center_raw.rgb) * 0.57735026919f;
+		float relative_noise = pair_noise / pair_scale;
+		float noise_strength = saturate((relative_noise - 0.01f) / 0.10f);
+		float signal_excess = max(signal_difference - 2.0f * pair_noise - 0.01f * pair_scale, 0.0f);
+		float signal_confidence = saturate(signal_excess / max(signal_difference, 0.01f * pair_scale));
+		float pair_share = 0.9f * noise_strength * (1.0f - signal_confidence);
+		geometry_weight_sum += geometry_weight;
+		weighted_delta += geometry_weight * pair_share * (neighbor_raw.rgb - center_raw.rgb);
+	}
+	if (!(geometry_weight_sum > 1e-6f)) {
+		gi_surfel_store_response_filtered(index, float4(center_raw.rgb, 1.0f));
+		return;
+	}
+	float3 filtered = max(center_raw.rgb + weighted_delta / geometry_weight_sum, 0.0f);
+	if (!all(isfinite(filtered))) {
+		gi_surfel_store_response_filtered(index, 0.0f);
+		return;
+	}
+	gi_surfel_store_response_filtered(index, float4(filtered, 1.0f));
+}
+
+#endif // FENG_GI_SURFEL_FILTER_HLSLINC

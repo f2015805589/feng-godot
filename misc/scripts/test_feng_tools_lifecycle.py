@@ -54,7 +54,8 @@ def main() -> int:
             config = project / "project.godot"
             config.write_text(config.read_text().replace('enabled=PackedStringArray()',
                 'enabled=PackedStringArray("res://addons/lifecycle-test/plugin.cfg")'), encoding="utf-8")
-        result = subprocess.run(base + extra, env=env, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(base + extra, env=env, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=120)
         output = result.stdout + result.stderr
         (project / (stage + ".log")).write_text(output, encoding="utf-8")
         errors = [line for line in output.splitlines() if "ERROR:" in line or "leaked" in line.lower()
@@ -78,7 +79,7 @@ def main() -> int:
     result = subprocess.run([binary, "--headless", "--path", str(project),
         "--script", "res://arguments.gd", "--audio-driver", "Dummy", "--",
         "--probe-user-arg", "spaces 中文"], cwd=project, env=env, capture_output=True,
-        text=True, timeout=30)
+        text=True, encoding="utf-8", errors="replace", timeout=30)
     output = result.stdout + result.stderr
     (project / "arguments.log").write_text(output, encoding="utf-8")
     if result.returncode or "ERROR:" in output or "PASS RenderDoc relaunch" not in output:

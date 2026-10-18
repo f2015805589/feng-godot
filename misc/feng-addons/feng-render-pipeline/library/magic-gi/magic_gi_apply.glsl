@@ -1,7 +1,9 @@
 #[compute]
 #version 450
+// CLV ABI 8: certified interpolation with shared normal-error bounds.
 #define MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT 16
 #define MAGIC_GI_WIDE_VISIBLE_PROBE_LIMIT 8
+#define MAGIC_GI_BAKED_VISIBILITY
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -121,6 +123,19 @@ float chebyshev_visibility(vec2 moments, float receiver_distance, float variance
 	return bound * bound;
 }
 
+float clv_probe_visibility(int probe, vec3 receiver) {
+	ivec2 xy = ivec2((probe % 32) * 3 + 1, probe / 32);
+	vec3 delta = receiver - texelFetch(geometry_atlas, xy, 0).xyz;
+	float distance = length(delta);
+	if (distance <= 1e-6) { return 1.0; }
+	float spacing = max(params.control.y, 0.001);
+	float visibility = chebyshev_visibility(sample_visibility_moments(probe, delta / distance),
+			distance, max(0.0001, spacing * spacing * 0.0001));
+	return visibility * visibility * visibility;
+}
+
+#include "magic_gi_clv_layout.glslinc"
+
 #define MAGIC_INDEX_BINDING 22
 #define MAGIC_CLUSTER_BINDING 24
 #include "magic_gi_index.glslinc"
@@ -156,6 +171,7 @@ vec3 clv_reject_color(int reason) {
 		case CLV_REJECT_NO_EXACT_CANDIDATE: return vec3(0.18, 0.18, 0.18);
 		case CLV_REJECT_OUTSIDE_BAKE_GRID: return vec3(0.1, 0.65, 0.8);
 		case CLV_REJECT_INCOMPLETE_SUPPORT: return vec3(1.0, 0.45, 0.02);
+		case CLV_REJECT_UNCERTIFIED: return vec3(0.2, 0.7, 0.7);
 	}
 	return vec3(0.0);
 }
@@ -179,6 +195,9 @@ vec3 clv_debug_color(int view, int sample_status, int reject_reason,
 		}
 		if (sample_status == CLV_SAMPLE_FULL) {
 			return vec3(0.05, 0.9, 0.12);
+		}
+		if (sample_status == CLV_SAMPLE_FILTERED) {
+			return mix(vec3(1.0, 0.55, 0.04), vec3(0.05, 0.9, 0.12), clamp(coverage, 0.0, 1.0));
 		}
 		return clv_reject_color(reject_reason);
 	}
@@ -233,25 +252,38 @@ void main() {
 			return; // World-aligned page AABBs are additionally clipped to the source OBB.
 		}
 	}
-	// Resolved MSAA depth can refer to a sample away from the pixel center. Locate
-	// the first actual surface in a one-pixel neighborhood along this view ray,
-	// once per pixel, instead of pushing every probe endpoint through thin walls.
-	vec4 adjacent_x = params.inverse_projection * vec4(clip.xy + vec2(2.0 / float(extent.x), 0.0), depth, 1.0);
-	vec4 adjacent_y = params.inverse_projection * vec4(clip.xy + vec2(0.0, 2.0 / float(extent.y)), depth, 1.0);
-	float receiver_radius = max(length(adjacent_x.xyz / adjacent_x.w - view_position),
-			length(adjacent_y.xyz / adjacent_y.w - view_position)) + 0.00001;
-	vec3 view_direction = abs(params.inverse_projection[2][3]) > 1e-6
-			? normalize(world - params.view_to_world[3].xyz)
-			: -normalize(params.view_to_world[2].xyz);
 	int receiver_triangle = -1;
-	if (params.control.w > 0.5) {
-		world = nearest_surface(world, view_direction, receiver_radius, -1, receiver_triangle);
-	}
 	vec3 normal_view = normalize(texelFetch(normal_roughness, pixel, 0).xyz * 2.0 - 1.0);
 	vec3 normal_world = normalize(mat3(params.view_to_world) * normal_view);
+	vec3 secondary_emission;
+	vec3 primary_sky;
+	int selected_level = -1;
+	vec3 cell_fraction = vec3(0.0);
+	bool cached_light = sample_clv_certified(world, normal_world,
+			secondary_emission, primary_sky, selected_level, cell_fraction);
+	if (!cached_light && params.control.w > 0.5) {
+		// Resolve off-center MSAA depth only when the certified plane did not match.
+		vec4 adjacent_x = params.inverse_projection * vec4(clip.xy + vec2(2.0 / float(extent.x), 0.0), depth, 1.0);
+		vec4 adjacent_y = params.inverse_projection * vec4(clip.xy + vec2(0.0, 2.0 / float(extent.y)), depth, 1.0);
+		float receiver_radius = max(length(adjacent_x.xyz / adjacent_x.w - view_position),
+				length(adjacent_y.xyz / adjacent_y.w - view_position)) + 0.00001;
+		vec3 view_direction = abs(params.inverse_projection[2][3]) > 1e-6
+				? normalize(world - params.view_to_world[3].xyz)
+				: -normalize(params.view_to_world[2].xyz);
+		vec3 cached_receiver;
+		if (clv_cached_receiver(world, view_direction, receiver_radius, normal_world,
+				cached_receiver, receiver_triangle)) {
+			world = cached_receiver;
+		} else {
+			receiver_triangle = clv_receiver_hint(world, normal_world);
+		}
+	}
 	vec3 albedo = texelFetch(gbuffer_albedo, pixel, 0).rgb;
 	float ao = clamp(orm.r, 0.0, 1.0);
 	float metallic = clamp(orm.b, 0.0, 1.0);
+	// Skip only radiance work for exact-zero diffuse; ownership and Sky subtraction still run below.
+	bool candidate_only = !debug_enabled && (metallic == 1.0 || ao == 0.0
+			|| all(equal(albedo, vec3(0.0))));
 	float spacing = max(params.control.y, 0.001);
 	vec3 dimensions = params.grid.xyz;
 	vec3 grid_position = (params.world_to_grid * vec4(world, 1.0)).xyz;
@@ -270,32 +302,30 @@ void main() {
 	}
 	grid_position = clamp(grid_position, vec3(0.0), dimensions);
 
-	vec3 secondary_emission;
-	vec3 primary_sky;
 	float candidate_weight = 1.0;
-	float cache_weight = 0.0;
-	bool complete_support = false;
-	int selected_level = -1;
-	int sample_status = CLV_SAMPLE_EXACT;
+	float cache_weight = cached_light ? 1.0 : 0.0;
+	bool complete_support = cached_light;
+	int sample_status = cached_light ? CLV_SAMPLE_FULL : CLV_SAMPLE_EXACT;
 	int reject_reason = CLV_REJECT_NONE;
-	vec3 cell_fraction = vec3(0.0);
 	int receiver_patch = receiver_triangle >= 0 ? int(visibility_geometry.triangles[receiver_triangle * 3 + 2].w) : 0;
-	// Cache radiance is used only when every positive-weight corner has valid metadata and clear LOS.
-	// Incomplete support falls through to one exact gather so both paths reconstruct the same field.
-	bool cached_light;
-	if (debug_enabled) {
-		cached_light = sample_clv_diagnostic(world, normal_world, receiver_triangle, receiver_patch,
-				secondary_emission, primary_sky, cache_weight, complete_support,
-				selected_level, sample_status, reject_reason, cell_fraction);
-	} else {
-		cached_light = sample_clv(world, normal_world, receiver_triangle, receiver_patch,
-				secondary_emission, primary_sky, cache_weight, complete_support);
+	if (!cached_light && clv.control.w == CLV_LAYOUT_VERSION) {
+		if (debug_enabled) {
+			cached_light = sample_clv_diagnostic(world, normal_world, receiver_triangle, receiver_patch,
+					secondary_emission, primary_sky, cache_weight, complete_support,
+					selected_level, sample_status, reject_reason, cell_fraction);
+		} else {
+			cached_light = sample_clv(world, normal_world, receiver_triangle, receiver_patch,
+					secondary_emission, primary_sky, cache_weight, complete_support);
+		}
+	} else if (!cached_light && debug_enabled) {
+		reject_reason = CLV_REJECT_DISABLED;
 	}
 	if (!cached_light) {
+
 		vec4 coefficients[18];
 		float visible_support_weight = 0.0;
 		gather_probe_field(world, normal_world, receiver_triangle, false, clv.control.w > 0,
-				coefficients, candidate_weight, visible_support_weight);
+				coefficients, candidate_weight, visible_support_weight, candidate_only);
 		secondary_emission = max(coefficients[0].rgb, vec3(0.0));
 		primary_sky = max(coefficients[9].rgb, vec3(0.0));
 		if (debug_enabled && reject_reason == CLV_REJECT_INCOMPLETE_SUPPORT

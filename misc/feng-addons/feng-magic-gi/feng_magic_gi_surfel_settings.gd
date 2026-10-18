@@ -56,6 +56,50 @@ const MAX_UPDATES_PER_FRAME := 16384
 		history_weight = next_value
 		emit_changed()
 
+@export_enum("NRD RELAX", "World Cache") var denoiser := 0:
+	set(value):
+		var next_value := clampi(value, 0, 1)
+		if denoiser == next_value:
+			return
+		denoiser = next_value
+		emit_changed()
+
+@export var half_resolution := true:
+	set(value):
+		if half_resolution == value:
+			return
+		half_resolution = value
+		emit_changed()
+
+@export var probe_fallback_enabled := true:
+	set(value):
+		if probe_fallback_enabled == value:
+			return
+		probe_fallback_enabled = value
+		emit_changed()
+
+@export var adaptive_distribution_enabled := true:
+	set(value):
+		if adaptive_distribution_enabled == value:
+			return
+		adaptive_distribution_enabled = value
+		emit_changed()
+
+@export var ray_guiding_enabled := true:
+	set(value):
+		if ray_guiding_enabled == value:
+			return
+		ray_guiding_enabled = value
+		emit_changed()
+
+@export_range(0.25, 1.0, 0.05) var guide_cosine_floor := 0.5:
+	set(value):
+		var next_value := clampf(value if is_finite(value) else 0.5, 0.25, 1.0)
+		if guide_cosine_floor == next_value:
+			return
+		guide_cosine_floor = next_value
+		emit_changed()
+
 @export_enum("Off", "Irradiance", "Coverage", "Age") var debug_view := 0:
 	set(value):
 		var next_value := clampi(value, 0, 3)
@@ -73,5 +117,11 @@ func to_runtime_settings() -> Dictionary:
 		"rays_per_surfel": rays_per_surfel,
 		"max_ray_distance": max_ray_distance,
 		"history_weight": history_weight,
+		"denoiser": denoiser,
+		"half_resolution": half_resolution,
+		"probe_fallback_enabled": probe_fallback_enabled,
+		"adaptive_distribution_enabled": adaptive_distribution_enabled,
+		"ray_guiding_enabled": ray_guiding_enabled,
+		"guide_cosine_floor": guide_cosine_floor,
 		"debug_view": debug_view,
 	}

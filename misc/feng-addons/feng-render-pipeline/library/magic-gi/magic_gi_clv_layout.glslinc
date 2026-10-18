@@ -1,0 +1,28 @@
+#ifndef FENG_MAGIC_GI_CLV_LAYOUT_GLSLINC
+#define FENG_MAGIC_GI_CLV_LAYOUT_GLSLINC
+
+// One CLV world cell stores independent X/Y/Z dominant-absolute-normal slots.
+// Radiance remains directional for curved and normal-mapped receivers. Aligned
+// receivers use the diffuse projection computed once during cache updates.
+const int CLV_LAYOUT_VERSION = 8;
+const int CLV_FACE_SLOT_COUNT = 3;
+const int CLV_FACE_SLOT_COLUMNS = 22;
+const int CLV_FACE_RADIANCE_COLUMNS = 18;
+const int CLV_FACE_METADATA_COLUMN = 18;
+const int CLV_FACE_ANCHOR_COLUMN = 19;
+const int CLV_FACE_DIFFUSE_COLUMN = 20;
+const float CLV_DIFFUSE_NORMAL_ERROR = 0.01;
+const float CLV_DIFFUSE_NORMAL_ERROR_SQUARED = CLV_DIFFUSE_NORMAL_ERROR * CLV_DIFFUSE_NORMAL_ERROR;
+
+int clv_dominant_absolute_normal_axis(vec3 normal) {
+	vec3 magnitude = abs(normal);
+	if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z) { return 0; }
+	if (magnitude.y >= magnitude.z) { return 1; }
+	return 2;
+}
+
+int clv_face_column(int axis, int column) {
+	return axis * CLV_FACE_SLOT_COLUMNS + column;
+}
+
+#endif

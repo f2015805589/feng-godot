@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c7ywrfhiswvk6"
+path="res://.godot/imported/magic_gi_surfel_lod_summary.glsl-f0e3a4dd0a78a713e64f99f57c95645e.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/surfel/magic_gi_surfel_lod_summary.glsl"
+dest_files=["res://.godot/imported/magic_gi_surfel_lod_summary.glsl-f0e3a4dd0a78a713e64f99f57c95645e.res"]
+
+[params]
+

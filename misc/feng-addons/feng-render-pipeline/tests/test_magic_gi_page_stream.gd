@@ -6,6 +6,7 @@ const PageUpload = preload("../passes/magic_gi_page_upload.gd")
 const DirectionalCache = preload("../passes/magic_gi_directional_cache.gd")
 const Clipmap = preload("../passes/magic_gi_clv_cache.gd")
 const MagicGIPass = preload("../passes/magic_gi_pass.gd")
+const MagicGIData = preload("../../feng-magic-gi/feng_magic_gi_data.gd")
 const ApplyShader: RDShaderFile = preload("../library/magic-gi/magic_gi_apply.glsl")
 const PendingShader: RDShaderFile = preload("../library/magic-gi/magic_gi_pending_page.glsl")
 
@@ -41,6 +42,27 @@ func _initialize() -> void:
 func run() -> void:
 	check(RenderingServer.get_rendering_device() == null,
 		"page scheduler and rollback tests run without a RenderingDevice/GPU")
+	var surface_samples := PackedVector3Array([
+		Vector3(-4.12, -0.166, -4.12), Vector3(4.12, 5.119, 4.007),
+		Vector3(0.0, 1.0, 0.0),
+	])
+	var exact_surface_bounds := MagicGIData.surface_sample_bounds(surface_samples)
+	check(exact_surface_bounds.position.distance_to(Vector3(-4.12, -0.166, -4.12)) < 0.00001
+			and absf(exact_surface_bounds.size.x - 8.24) < 0.00001
+			and absf(exact_surface_bounds.size.y - 5.285) < 0.00001
+			and absf(exact_surface_bounds.size.z - 8.127) < 0.00001,
+		"upload bounds are computed from exact surface anchors, not offset probe centers or page halos")
+	var planar_bounds := MagicGIData.surface_sample_bounds(PackedVector3Array([
+		Vector3(-1.0, 2.0, -3.0), Vector3(1.0, 2.0, 3.0),
+	]))
+	check(planar_bounds.size.y == 0.0 and planar_bounds.size.x == 2.0
+			and planar_bounds.size.z == 6.0,
+		"zero-thickness planar surface bounds remain valid")
+	check(MagicGIData.surface_sample_bounds(PackedVector3Array()).size.x < 0.0
+			and MagicGIData.surface_sample_bounds(PackedVector3Array([
+				Vector3(INF, 0.0, 0.0),
+			])).size.x < 0.0,
+		"empty and non-finite sample bounds are rejected")
 	for shader_file in [ApplyShader, PendingShader]:
 		var spirv: RDShaderSPIRV = shader_file.get_spirv()
 		check(spirv != null and not spirv.bytecode_compute.is_empty()
@@ -60,20 +82,46 @@ func run() -> void:
 	check(Stream.owner_index(pages, Vector3(32, 32, 32)) == -1,
 		"the upper corner of a half-open page is outside its core")
 	var owner_pass := MagicGIPass.new()
-	var shared_page := {"page_key": "0_0_0", "version": 4, "identity": "same"}
+	var shared_page := {"page_key": "0_0_0", "version": 4, "identity": "same",
+		"content_hash": "bake-a", "emission_identity": "emit-a", "emission_revision": 2}
 	var first_world := {"world_id": 3, "volume_id": 9, "manifest_key": "shared",
 		"generation": "generation-a"}
 	var second_world := first_world.duplicate()
 	second_world["world_id"] = 4
+	var geometry_token := owner_pass._stream_page_geometry_epoch(first_world, shared_page, 0.5)
+	var content_revision := owner_pass._stream_page_content_revision(shared_page, 5)
+	var relit_page: Dictionary = shared_page.duplicate()
+	relit_page["emission_revision"] = 3
+	var relit_content_revision := owner_pass._stream_page_content_revision(relit_page, 6)
+	var changed_geometry_page: Dictionary = shared_page.duplicate()
+	changed_geometry_page["version"] = 5
 	check(owner_pass._stream_cache_namespace(first_world)
 			!= owner_pass._stream_cache_namespace(second_world)
 			and Stream.stable_version_key(owner_pass._stream_cache_namespace(first_world), shared_page)
 			!= Stream.stable_version_key(owner_pass._stream_cache_namespace(second_world), shared_page)
 			and owner_pass._stream_owner_page_key(first_world, shared_page)
 			!= owner_pass._stream_owner_page_key(second_world, shared_page)
-			and owner_pass._stream_page_epoch(first_world, shared_page, 5)
-			!= owner_pass._stream_page_epoch(second_world, shared_page, 5),
-		"same-manifest pages, mutable lighting and CLV epochs are namespaced per World and Volume")
+			and geometry_token != 0
+			and geometry_token == owner_pass._stream_page_geometry_epoch(first_world, relit_page, 0.5)
+			and geometry_token != owner_pass._stream_page_geometry_epoch(first_world,
+				changed_geometry_page, 0.5)
+			and content_revision != relit_content_revision
+			and geometry_token != owner_pass._stream_page_geometry_epoch(second_world,
+				shared_page, 0.5),
+		"stream geometry tokens are stable across lighting updates and separate across immutable bake identities")
+	var nonstream_snapshot := {"world_id": 3, "volume_id": 9,
+		"emission_identity": "emit-a", "emission_revision": 2}
+	var nonstream_geometry := owner_pass._nonstream_clv_geometry_epoch(
+		nonstream_snapshot, "bake-identity", 41, 12)
+	var nonstream_relit_snapshot: Dictionary = nonstream_snapshot.duplicate()
+	nonstream_relit_snapshot["emission_revision"] = 99
+	check(nonstream_geometry != 0 and nonstream_geometry == owner_pass._nonstream_clv_geometry_epoch(
+		nonstream_relit_snapshot, "bake-identity", 41, 12)
+		and owner_pass._nonstream_clv_content_revision(nonstream_snapshot,
+			{"emission_identity": "emit-a", "emission_revision": 2}, 5)
+		!= owner_pass._nonstream_clv_content_revision(nonstream_relit_snapshot,
+			{"emission_identity": "emit-a", "emission_revision": 99}, 6),
+		"non-stream CLV tags follow bake identity while light and emission revisions only schedule refresh")
 	check(floor(-0.01 / Stream.MANAGER_BLOCK_XZ) == -1
 			and floor(0.0 / Stream.MANAGER_BLOCK_XZ) == 0
 			and floor(512.0 / Stream.MANAGER_BLOCK_XZ) == 1,
@@ -251,6 +299,7 @@ func run() -> void:
 		"geometry_image": Image.create(1, 1, false, Image.FORMAT_RGBAF),
 		"visibility_moment_image": Image.create(1, 1, false, Image.FORMAT_RGF),
 		"emission_image": Image.create(1, 1, false, Image.FORMAT_RGBAF),
+		"surface_bounds": AABB(Vector3(-4.12, -0.166, -4.12), Vector3(8.24, 5.285, 8.127)),
 		"visibility_node_bytes": PackedByteArray().duplicate(),
 		"visibility_triangle_bytes": PackedByteArray().duplicate(),
 		"index_bytes": PackedByteArray(),
@@ -264,11 +313,41 @@ func run() -> void:
 	var published_nodes: PackedByteArray = published_bundle.visibility_node_bytes
 	var published_triangles: PackedByteArray = published_bundle.visibility_triangle_bytes
 	var published_indices: PackedByteArray = published_bundle.index_bytes
+	var page_support_bounds := AABB(Vector3(-10, -10, -10), Vector3(20, 20, 20))
 	var page_descriptor := {"data": MinimalPageData.new(), "render_upload": published_bundle,
-		"support_bounds": AABB(Vector3.ZERO, Vector3.ONE)}
+		"support_bounds": page_support_bounds}
 	var descriptor_uploader := PageUpload.new()
-	check(descriptor_uploader.begin(null, page_descriptor, "descriptor"),
-		"a minimally valid prepacked page can enter staged upload without a RenderingDevice")
+	check(descriptor_uploader.begin(null, page_descriptor, "descriptor")
+			and descriptor_uploader.cache.get("source_bounds") == published_bundle.surface_bounds,
+		"upload takes worker-prepacked surface bounds without reading Data arrays or using support bounds")
+	var legacy_bundle: Dictionary = published_bundle.duplicate(false)
+	legacy_bundle.erase("surface_bounds")
+	var legacy_descriptor: Dictionary = page_descriptor.duplicate(false)
+	legacy_descriptor["render_upload"] = legacy_bundle
+	var legacy_uploader := PageUpload.new()
+	check(legacy_uploader.begin(null, legacy_descriptor, "legacy-descriptor")
+			and legacy_uploader.cache.get("source_bounds") == page_support_bounds,
+		"older prepacked upload bundles conservatively fall back to page support bounds")
+	var planar_bundle: Dictionary = published_bundle.duplicate(false)
+	planar_bundle["surface_bounds"] = planar_bounds
+	var planar_descriptor: Dictionary = page_descriptor.duplicate(false)
+	planar_descriptor["render_upload"] = planar_bundle
+	var planar_uploader := PageUpload.new()
+	check(planar_uploader.begin(null, planar_descriptor, "planar-descriptor")
+			and planar_uploader.cache.get("source_bounds") == planar_bounds,
+		"page upload accepts zero-thickness surface bounds instead of rejecting planar geometry")
+	var invalid_bundle: Dictionary = published_bundle.duplicate(false)
+	invalid_bundle["surface_bounds"] = AABB(Vector3(INF, 0.0, 0.0), Vector3.ONE)
+	var invalid_descriptor: Dictionary = page_descriptor.duplicate(false)
+	invalid_descriptor["render_upload"] = invalid_bundle
+	var invalid_uploader := PageUpload.new()
+	check(not invalid_uploader.begin(null, invalid_descriptor, "invalid-descriptor"),
+		"page upload rejects non-finite prepacked surface bounds")
+	var no_bounds_descriptor: Dictionary = legacy_descriptor.duplicate(false)
+	no_bounds_descriptor.erase("support_bounds")
+	var no_bounds_uploader := PageUpload.new()
+	check(not no_bounds_uploader.begin(null, no_bounds_descriptor, "no-bounds-descriptor"),
+		"legacy bundle without any bounds is rejected instead of accepting the default zero AABB")
 	descriptor_uploader._upload_index = descriptor_uploader._upload_tasks.size()
 	check(descriptor_uploader.upload_step(null, 0) == 0
 			and not descriptor_uploader._upload.has("marker")
@@ -382,9 +461,15 @@ func run() -> void:
 	clv._pending_set.clear()
 	clv._cursor = 0
 	var boundary_core := AABB(Vector3.ZERO, Vector3.ONE)
-	check(clv.queue_page_revision("boundary", boundary_core, 1.0, 7) == 1
+	check(clv.queue_page_revision("boundary", boundary_core, 1.0, 7, 10) == 1
 			and clv._pending == [Vector4i(0, 0, 0, 0)],
 		"page enqueue uses half-open cell-center bounds at the exact core boundary")
+	clv._pending.clear()
+	clv._pending_set.clear()
+	check(clv.queue_page_revision("boundary", boundary_core, 1.0, 7, 11) == 1
+			and int(clv._page_epochs["boundary"].get("geometry_token", -1)) == 7
+			and int(clv._page_epochs["boundary"].get("content_revision", -1)) == 11,
+		"a content-only page revision requeues its cells without changing geometry validity")
 	clv._pending.clear()
 	clv._pending_set.clear()
 	clv._page_epochs.clear()
@@ -419,6 +504,29 @@ func run() -> void:
 	clv.retain_page_epochs(PackedStringArray(["page-256"]))
 	check(clv._page_epochs.size() == 1 and clv._page_epochs.has("page-256"),
 		"resident page epoch retention prunes inactive page metadata")
+
+	var fair_clv := Clipmap.new()
+	fair_clv.queue_updates(Vector3.ZERO, 1.0, 5)
+	var first_content_batch := fair_clv.take_jobs(64)
+	var cursor_before_content := fair_clv._cursor
+	var content_jobs := fair_clv.queue_content_refresh(10)
+	var second_content_batch := fair_clv.take_jobs(64)
+	check(first_content_batch.size() == 64 and content_jobs == 64
+			and fair_clv._cursor >= cursor_before_content
+			and second_content_batch.size() == 64
+			and second_content_batch[0] != first_content_batch[0]
+			and fair_clv._geometry_epoch == 5,
+		"lighting revisions append deduplicated refresh work instead of restarting the geometry sweep")
+	for revision in range(11, 24):
+		fair_clv.queue_content_refresh(revision)
+		fair_clv.take_jobs(64)
+	check(fair_clv._geometry_epoch == 5
+			and fair_clv._pending_set.size() <= Clipmap.RESOLUTION * Clipmap.RESOLUTION \
+				* Clipmap.RESOLUTION * Clipmap.LEVELS,
+		"continuous content revisions keep the bounded work set progressing without geometry invalidation")
+	fair_clv.queue_updates(Vector3.ZERO, 1.0, 6)
+	check(fair_clv._geometry_epoch == 6 and fair_clv._cursor == 0,
+		"a bake geometry-token change starts a new bounded validity sweep")
 
 	var legacy_pages := Stream.normalize_streamed_snapshot({"streamed": false,
 		"data": Resource.new(), "pages": []})

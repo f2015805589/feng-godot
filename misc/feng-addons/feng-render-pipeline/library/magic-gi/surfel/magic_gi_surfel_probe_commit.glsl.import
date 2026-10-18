@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://ct6iiirqrt5vu"
+path="res://.godot/imported/magic_gi_surfel_probe_commit.glsl-47d4b4edb108a1c1968cb7eb1e862416.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/surfel/magic_gi_surfel_probe_commit.glsl"
+dest_files=["res://.godot/imported/magic_gi_surfel_probe_commit.glsl-47d4b4edb108a1c1968cb7eb1e862416.res"]
+
+[params]
+

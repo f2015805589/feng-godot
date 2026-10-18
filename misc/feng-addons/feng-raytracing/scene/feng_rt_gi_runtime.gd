@@ -134,11 +134,11 @@ static var _started := false
 static func start() -> void:
 	if _started:
 		return
-	var tree := Engine.get_main_loop() as SceneTree
-	if tree == null:
+	if Engine.get_main_loop() == null:
 		return
+	if not RenderingServer.frame_pre_draw.is_connected(tick):
+		RenderingServer.frame_pre_draw.connect(tick)
 	_started = true
-	tree.process_frame.connect(tick)
 
 static func request_target(target: RID) -> void:
 	_published_mutex.lock()

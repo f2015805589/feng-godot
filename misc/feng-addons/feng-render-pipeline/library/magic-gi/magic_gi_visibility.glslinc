@@ -17,6 +17,211 @@ bool segment_hits_bounds(vec3 origin, vec3 direction, vec3 inverse_direction, fl
 	return near_distance <= far_distance;
 }
 
+bool visibility_finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool visibility_aabb_overlaps(vec3 first_lower, vec3 first_upper,
+		vec3 second_lower, vec3 second_upper) {
+	return all(greaterThanEqual(first_upper, second_lower))
+			&& all(lessThanEqual(first_lower, second_upper));
+}
+
+// Conservative CLV fast-path certificate. Every triangle whose AABB touches the
+// complete query box must belong to the anchor patch and be coplanar with it,
+// unless the complete triangle lies strictly behind the anchor plane. A segment
+// whose endpoints stay in the anchor plane's front half-space cannot hit such a
+// triangle. Malformed ranges, non-finite geometry, or traversal exhaustion reject
+// the certificate so the consumer retains its per-corner exact LOS test.
+bool clv_surface_bounds_certificate_clear(vec3 box_center, vec3 half_extent,
+		vec3 anchor, vec3 anchor_normal, int anchor_patch,
+		float plane_tolerance, float box_margin) {
+	if (anchor_patch <= 0 || any(lessThanEqual(half_extent, vec3(0.0)))
+			|| !visibility_finite_vec3(box_center) || !visibility_finite_vec3(anchor)
+			|| !visibility_finite_vec3(anchor_normal)
+			|| !(plane_tolerance > 0.0) || !(box_margin >= 0.0)
+			|| !visibility_finite_vec3(half_extent)
+			|| isnan(plane_tolerance) || isinf(plane_tolerance)
+			|| isnan(box_margin) || isinf(box_margin)) {
+		return false;
+	}
+	float normal_length_squared = dot(anchor_normal, anchor_normal);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared)) {
+		return false;
+	}
+	vec3 normal = anchor_normal * inversesqrt(normal_length_squared);
+	vec3 box_lower = box_center - vec3(half_extent + box_margin);
+	vec3 box_upper = box_center + vec3(half_extent + box_margin);
+	if (!visibility_finite_vec3(box_lower) || !visibility_finite_vec3(box_upper)) {
+		return false;
+	}
+	int node_value_count = visibility_bvh.nodes.length();
+	int triangle_value_count = visibility_geometry.triangles.length();
+	if (node_value_count <= 0 || (node_value_count % 2) != 0
+			|| triangle_value_count <= 0 || (triangle_value_count % 3) != 0) {
+		return false;
+	}
+	int node_count = node_value_count / 2;
+	int node = 0;
+	for (int visit = 0; visit < 256 && node < node_count; visit++) {
+		vec4 lower = visibility_bvh.nodes[node * 2];
+		vec4 upper = visibility_bvh.nodes[node * 2 + 1];
+		if (!visibility_finite_vec3(lower.xyz) || !visibility_finite_vec3(upper.xyz)) {
+			return false;
+		}
+		if (isnan(lower.w) || isinf(lower.w) || isnan(upper.w) || isinf(upper.w)
+				|| lower.w <= float(node) || lower.w > float(node_count)
+				|| floor(lower.w) != lower.w || any(greaterThan(lower.xyz, upper.xyz))) {
+			return false;
+		}
+		if (!visibility_aabb_overlaps(lower.xyz, upper.xyz, box_lower, box_upper)) {
+			int next_node = int(lower.w);
+			node = next_node;
+			continue;
+		}
+		if (upper.w < 0.0 || upper.w > 2147480000.0 || floor(upper.w) != upper.w) {
+			return false;
+		}
+		int leaf_range = int(upper.w);
+		if (leaf_range > 0) {
+			int first = leaf_range / 8 - 1;
+			int count = leaf_range % 8;
+			int triangle_count = visibility_geometry.triangles.length() / 3;
+			if (first < 0 || count <= 0 || first + count > triangle_count) {
+				return false;
+			}
+			for (int leaf = 0; leaf < count; leaf++) {
+				int triangle = (first + leaf) * 3;
+				vec3 a = visibility_geometry.triangles[triangle].xyz;
+				vec3 edge1 = visibility_geometry.triangles[triangle + 1].xyz;
+				vec3 edge2 = visibility_geometry.triangles[triangle + 2].xyz;
+				vec3 b = a + edge1;
+				vec3 c = a + edge2;
+				if (!visibility_finite_vec3(a) || !visibility_finite_vec3(b)
+						|| !visibility_finite_vec3(c)) {
+					return false;
+				}
+				vec3 triangle_lower = min(a, min(b, c));
+				vec3 triangle_upper = max(a, max(b, c));
+				if (!visibility_aabb_overlaps(triangle_lower, triangle_upper,
+						box_lower, box_upper)) {
+					continue;
+				}
+				float signed_a = dot(a - anchor, normal);
+				float signed_b = dot(b - anchor, normal);
+				float signed_c = dot(c - anchor, normal);
+				float behind_threshold = -(plane_tolerance + box_margin);
+				if (isnan(signed_a) || isinf(signed_a) || isnan(signed_b) || isinf(signed_b)
+						|| isnan(signed_c) || isinf(signed_c) || isnan(behind_threshold)
+						|| isinf(behind_threshold)) {
+					return false;
+				}
+				if (max(signed_a, max(signed_b, signed_c)) < behind_threshold) {
+					continue;
+				}
+				float triangle_patch_value = visibility_geometry.triangles[triangle + 2].w;
+				if (isnan(triangle_patch_value) || isinf(triangle_patch_value)
+						|| abs(triangle_patch_value) > 2147480000.0) { return false; }
+				int triangle_patch = int(triangle_patch_value);
+				if (float(triangle_patch) != triangle_patch_value
+						|| triangle_patch != anchor_patch) { return false; }
+				float determinant_epsilon = visibility_geometry.triangles[triangle + 1].w;
+				if (isnan(determinant_epsilon) || isinf(determinant_epsilon)
+						|| determinant_epsilon < 0.0) { return false; }
+				vec3 triangle_normal = cross(edge2, edge1);
+				float triangle_length_squared = dot(triangle_normal, triangle_normal);
+				if (!visibility_finite_vec3(triangle_normal)
+						|| !(triangle_length_squared > 1e-12)
+						|| isnan(triangle_length_squared) || isinf(triangle_length_squared)) {
+					return false;
+				}
+				triangle_normal *= inversesqrt(triangle_length_squared);
+				if (dot(triangle_normal, normal) < 0.9999
+						|| abs(dot(a - anchor, normal)) > plane_tolerance
+						|| abs(dot(b - anchor, normal)) > plane_tolerance
+						|| abs(dot(c - anchor, normal)) > plane_tolerance) {
+					return false;
+				}
+			}
+		}
+		node++;
+	}
+	return node >= node_count;
+}
+
+bool clv_surface_box_certificate_clear(vec3 box_center, float half_extent,
+		vec3 anchor, vec3 anchor_normal, int anchor_patch,
+		float plane_tolerance, float box_margin) {
+	return clv_surface_bounds_certificate_clear(box_center, vec3(half_extent),
+			anchor, anchor_normal, anchor_patch, plane_tolerance, box_margin);
+}
+
+// Validate a particular receiver-to-corner segment against the certificate's
+// finite box and anchor plane. The receiver triangle's geometric normal is used
+// instead of its potentially normal-mapped GBuffer normal.
+bool clv_surface_box_certificate_contains(vec3 receiver, vec3 corner,
+		ivec3 logical_cell, float step_size, vec4 stored_anchor,
+		vec3 stored_normal, int receiver_triangle, int receiver_patch,
+		int corner_patch) {
+	if (!(stored_anchor.w > 0.5) || receiver_patch <= 0
+			|| corner_patch != receiver_patch || receiver_triangle < 0
+			|| !visibility_finite_vec3(receiver) || !visibility_finite_vec3(corner)
+			|| !visibility_finite_vec3(stored_anchor.xyz)
+			|| !visibility_finite_vec3(stored_normal)
+			|| !(step_size > 0.0) || isnan(step_size) || isinf(step_size)) {
+		return false;
+	}
+	int triangle_count = visibility_geometry.triangles.length() / 3;
+	if (receiver_triangle >= triangle_count) { return false; }
+	int triangle = receiver_triangle * 3;
+	if (triangle + 2 >= visibility_geometry.triangles.length()) {
+		return false;
+	}
+	float receiver_patch_value = visibility_geometry.triangles[triangle + 2].w;
+	if (isnan(receiver_patch_value) || isinf(receiver_patch_value)
+			|| abs(receiver_patch_value) > 2147480000.0
+			|| float(int(receiver_patch_value)) != receiver_patch_value
+			|| int(receiver_patch_value) != receiver_patch) { return false; }
+	float anchor_normal_length_squared = dot(stored_normal, stored_normal);
+	if (!(anchor_normal_length_squared > 1e-12) || isnan(anchor_normal_length_squared)
+			|| isinf(anchor_normal_length_squared)) { return false; }
+	vec3 anchor_normal = stored_normal * inversesqrt(anchor_normal_length_squared);
+	vec3 edge1 = visibility_geometry.triangles[triangle + 1].xyz;
+	vec3 edge2 = visibility_geometry.triangles[triangle + 2].xyz;
+	vec3 receiver_normal = cross(edge2, edge1);
+	float receiver_length_squared = dot(receiver_normal, receiver_normal);
+	if (!visibility_finite_vec3(anchor_normal) || !visibility_finite_vec3(receiver_normal)
+			|| !(receiver_length_squared > 1e-12) || isnan(receiver_length_squared)
+			|| isinf(receiver_length_squared)) {
+		return false;
+	}
+	receiver_normal *= inversesqrt(receiver_length_squared);
+	if (dot(receiver_normal, anchor_normal) < 0.9999) { return false; }
+	vec3 box_center = (vec3(logical_cell) + 0.5) * step_size;
+	if (!visibility_finite_vec3(box_center)) { return false; }
+	float magnitude = max(step_size,
+		max(max(abs(box_center.x), abs(box_center.y)), abs(box_center.z)));
+	float margin = max(1e-5, magnitude * 1.9073486328125e-6);
+	float half_extent = 1.75 * step_size + margin;
+	float plane_tolerance = max(1e-5, step_size * 1e-4) + margin;
+	vec3 box_lower = box_center - vec3(half_extent);
+	vec3 box_upper = box_center + vec3(half_extent);
+	if (any(lessThan(receiver, box_lower)) || any(greaterThan(receiver, box_upper))
+			|| any(lessThan(corner, box_lower)) || any(greaterThan(corner, box_upper))) {
+		return false;
+	}
+	float receiver_plane_distance = dot(receiver - stored_anchor.xyz, anchor_normal);
+	float corner_plane_distance = dot(corner - stored_anchor.xyz, anchor_normal);
+	if (isnan(receiver_plane_distance) || isinf(receiver_plane_distance)
+			|| isnan(corner_plane_distance) || isinf(corner_plane_distance)) {
+		return false;
+	}
+	return abs(receiver_plane_distance) <= plane_tolerance
+			&& receiver_plane_distance >= -plane_tolerance
+			&& corner_plane_distance >= -plane_tolerance;
+}
+
 vec3 nearest_surface(vec3 world, vec3 view_direction, float radius, int ignored_triangle, out int receiver_triangle) {
 	vec3 origin = world - view_direction * radius;
 	vec3 inverse_direction = 1.0 / mix(view_direction, vec3(1.0), lessThan(abs(view_direction), vec3(1e-8)));
