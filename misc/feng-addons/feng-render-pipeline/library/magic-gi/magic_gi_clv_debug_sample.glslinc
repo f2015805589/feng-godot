@@ -1,0 +1,897 @@
+#ifndef FENG_MAGIC_GI_CLV_DEBUG_SAMPLE_GLSLINC
+#define FENG_MAGIC_GI_CLV_DEBUG_SAMPLE_GLSLINC
+
+// Portable addon-side mirror of the native FRP layout-9 sampler in
+// servers/rendering/renderer_rd/shaders/frp_clustered/frp_magic_gi_clv.glslinc.
+// Keep these predicates, column numbers, and lookup order synchronized with
+// frp_magic_gi_sample_certified_view0 / frp_magic_gi_sample_approx_view0.
+// This diagnostic helper is intentionally self-contained so an installed addon
+// does not require the engine source tree to import its shader resources.
+const int FRP_MAGIC_GI_CLV_LAYOUT_VERSION = 9;
+const int FRP_MAGIC_GI_CLV_FACE_SLOT_COLUMNS = 24;
+const int FRP_MAGIC_GI_CLV_FACE_METADATA_COLUMN = 18;
+const int FRP_MAGIC_GI_CLV_FACE_ANCHOR_COLUMN = 19;
+const int FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN = 20;
+const int FRP_MAGIC_GI_CLV_FACE_APPROX_GEOMETRY_COLUMN = 22;
+const int FRP_MAGIC_GI_CLV_FACE_APPROX_PATCH_PLANE_MOMENTS_COLUMN = 23;
+const float FRP_MAGIC_GI_CLV_DIFFUSE_NORMAL_ERROR_SQUARED = 0.0001;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_NEIGHBOR_TAGS_READY = 128u;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_X = 1u << 11u;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Y = 1u << 12u;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Z = 1u << 13u;
+const float FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON = 1e-6;
+const float FRP_MAGIC_GI_CLV_CURVED_SH_SAME_FACING_DOT_MIN = 0.0; // Must match the producer's same-facing BVH certificate.
+const float FRP_MAGIC_GI_CLV_DIFFUSE_DOMAIN_NORMAL_DOT_MIN = 0.99995; // synchronized with producer and native FRP.
+
+// Same thresholds as magic_gi_clv_approx_contract.glslinc, kept local to avoid
+// pulling unrelated gather shader resources into this standalone debug shader.
+const float FRP_MAGIC_GI_CLV_APPROX_MIN_VALID_WEIGHT = 0.55;
+const float FRP_MAGIC_GI_CLV_APPROX_MIN_NORMAL_LENGTH_SQUARED = 0.90;
+const float FRP_MAGIC_GI_CLV_APPROX_MIN_NORMAL_ALIGNMENT = 0.95;
+const float FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_VARIANCE_STEP = 0.06;
+const float FRP_MAGIC_GI_CLV_APPROX_MAX_RECEIVER_PLANE_ERROR_STEP = 0.15;
+const float FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_PRECISION_ERROR_FRACTION = 0.25;
+const float FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON = 1e-4;
+
+int frp_magic_gi_clv_face_column(int axis, int column) {
+	return axis * FRP_MAGIC_GI_CLV_FACE_SLOT_COLUMNS + column;
+}
+
+int frp_magic_gi_clv_dominant_axis(vec3 normal) {
+	vec3 magnitude = abs(normal);
+	if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z) { return 0; }
+	if (magnitude.y >= magnitude.z) { return 1; }
+	return 2;
+}
+
+bool frp_magic_gi_clv_finite(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+void frp_magic_gi_clv_diffuse_basis(vec3 n, out float y[9]) {
+	y[0] = 0.2820947918;
+	y[1] = 0.4886025119 * n.y * (2.0 / 3.0);
+	y[2] = 0.4886025119 * n.z * (2.0 / 3.0);
+	y[3] = 0.4886025119 * n.x * (2.0 / 3.0);
+	y[4] = 1.0925484306 * n.x * n.y * 0.25;
+	y[5] = 1.0925484306 * n.y * n.z * 0.25;
+	y[6] = 0.3153915653 * (3.0 * n.z * n.z - 1.0) * 0.25;
+	y[7] = 1.0925484306 * n.x * n.z * 0.25;
+	y[8] = 0.5462742153 * (n.x * n.x - n.y * n.y) * 0.25;
+}
+
+vec3 frp_magic_gi_clv_receiver_domain_half_extent(vec3 cone_axis, float step_size,
+		float min_normal_dot) {
+	vec3 absolute_axis = abs(cone_axis);
+	float cone_sine = sqrt(max(1.0 - min_normal_dot * min_normal_dot, 0.0));
+	vec3 radial = sqrt(max(vec3(1.0) - absolute_axis * absolute_axis, vec3(0.0)));
+	vec3 max_normal_component = mix(absolute_axis * min_normal_dot
+			+ radial * cone_sine, vec3(1.0), greaterThanEqual(absolute_axis,
+			vec3(min_normal_dot)));
+	return step_size * (vec3(0.5) + 0.75 * max_normal_component);
+}
+
+bool frp_magic_gi_sample_domain(vec3 world, vec3 geometric_normal, vec3 shading_normal,
+		out vec3 secondary, out vec3 primary, out int selected_level,
+		out int sample_method) {
+	secondary = vec3(0.0); primary = vec3(0.0);
+	selected_level = -1; sample_method = 0;
+	if (frp_magic_gi_clv_parameters0.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION
+			|| !frp_magic_gi_clv_finite(world) || !frp_magic_gi_clv_finite(geometric_normal)
+			|| !frp_magic_gi_clv_finite(shading_normal)) { return false; }
+	float geometry_length_squared = dot(geometric_normal, geometric_normal);
+	float shading_length_squared = dot(shading_normal, shading_normal);
+	int resolution = frp_magic_gi_clv_parameters0.control.x;
+	if (resolution < 2 || !(geometry_length_squared > 1e-12)
+			|| isnan(geometry_length_squared) || isinf(geometry_length_squared)
+			|| !(shading_length_squared > 1e-12) || isnan(shading_length_squared)
+			|| isinf(shading_length_squared)) { return false; }
+	geometric_normal *= inversesqrt(geometry_length_squared);
+	shading_normal *= inversesqrt(shading_length_squared);
+	int axis = frp_magic_gi_clv_dominant_axis(geometric_normal);
+	for (int level = 0; level < min(frp_magic_gi_clv_parameters0.control.y, 3); level++) {
+		float step_size = frp_magic_gi_clv_parameters0.spacing.x * float(1 << level);
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) { continue; }
+		vec3 position = (world + geometric_normal * step_size * 0.75) / step_size - 0.5;
+		if (!frp_magic_gi_clv_finite(position)) { continue; }
+		ivec3 base = ivec3(floor(position));
+		ivec3 origin = frp_magic_gi_clv_parameters0.origins[level].xyz;
+		ivec3 relative = base - origin;
+		if (any(lessThan(relative, ivec3(0)))
+				|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		if (any(equal(physical, ivec3(resolution - 1)))) { continue; }
+		ivec3 slot = physical + ivec3(0, 0, level * resolution);
+		ivec4 tag = texelFetch(isampler3D(frp_magic_gi_clv_tags0,
+				SAMPLER_NEAREST_CLAMP), slot, 0);
+		if (any(notEqual(tag.xyz, base))
+				|| tag.w != frp_magic_gi_clv_parameters0.control.z) { continue; }
+		uint support = texelFetch(usampler3D(frp_magic_gi_clv_support0,
+				SAMPLER_NEAREST_CLAMP), slot, 0).r;
+		if ((support & FRP_MAGIC_GI_CLV_SUPPORT_NEIGHBOR_TAGS_READY) == 0u) { continue; }
+		uint domain_mask = (1u << uint(axis + 3)) | (1u << uint(axis + 8));
+		if ((support & domain_mask) == 0u) { continue; }
+		vec4 metadata = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_NEAREST_CLAMP), slot + ivec3(frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0);
+		vec4 anchor = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_NEAREST_CLAMP), slot + ivec3(frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0);
+		float metadata_length_squared = dot(metadata.xyz, metadata.xyz);
+		if (!(metadata.w > 0.0) || !frp_magic_gi_clv_finite(metadata.xyz)
+				|| !frp_magic_gi_clv_finite(anchor.xyz)
+				|| !(metadata_length_squared > 1e-12)
+				|| isnan(metadata_length_squared) || isinf(metadata_length_squared)) { continue; }
+		vec3 cone_axis = metadata.xyz * inversesqrt(metadata_length_squared);
+		float coordinate_scale = max(max(abs(world.x), abs(world.y)), abs(world.z)) + 2.0 * step_size;
+		float margin = max(1e-5, coordinate_scale * 1.9073486328125e-6);
+		vec3 domain_center = (vec3(base) + vec3(1.0)) * step_size;
+		vec3 curved_half_extent = vec3(1.25 * step_size);
+		bool in_curved_domain = all(lessThanEqual(abs(world - domain_center), curved_half_extent + vec3(margin)));
+		vec3 flat_half_extent = frp_magic_gi_clv_receiver_domain_half_extent(cone_axis,
+				step_size, FRP_MAGIC_GI_CLV_DIFFUSE_DOMAIN_NORMAL_DOT_MIN);
+		bool in_flat_domain = all(lessThanEqual(abs(world - domain_center), flat_half_extent + vec3(margin)));
+		float flat_plane_distance = dot(world - anchor.xyz, cone_axis);
+		float flat_front_tolerance = max(1e-5, step_size * 1e-4) + margin;
+		uint diffuse_domain_bit = 1u << uint(axis + 3);
+		uint curved_domain_bit = 1u << uint(axis + 8);
+		if ((support & diffuse_domain_bit) != 0u
+				&& dot(geometric_normal, cone_axis) >= FRP_MAGIC_GI_CLV_DIFFUSE_DOMAIN_NORMAL_DOT_MIN
+				&& dot(shading_normal - cone_axis, shading_normal - cone_axis)
+						<= FRP_MAGIC_GI_CLV_DIFFUSE_NORMAL_ERROR_SQUARED
+				&& in_flat_domain
+				&& flat_plane_distance >= -flat_front_tolerance
+				&& flat_plane_distance <= max(step_size * 0.15, 1e-4)) {
+			vec3 coordinate = vec3(slot) + fract(position) + 0.5;
+			vec3 extent = vec3(textureSize(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_LINEAR_CLAMP), 0));
+			vec4 secondary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_LINEAR_CLAMP), (coordinate + vec3(frp_magic_gi_clv_face_column(axis,
+					FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent, 0.0);
+			vec4 primary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_LINEAR_CLAMP), (coordinate + vec3(frp_magic_gi_clv_face_column(axis,
+					FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent, 0.0);
+			float valid_weight = min(secondary_sample.a, primary_sample.a);
+			if (valid_weight >= FRP_MAGIC_GI_CLV_APPROX_MIN_VALID_WEIGHT
+					&& !isnan(valid_weight) && !isinf(valid_weight)
+					&& frp_magic_gi_clv_finite(secondary_sample.rgb)
+					&& frp_magic_gi_clv_finite(primary_sample.rgb)) {
+				secondary = secondary_sample.rgb / valid_weight;
+				primary = primary_sample.rgb / valid_weight;
+				selected_level = level; sample_method = 1; return true;
+			}
+		}
+		if ((support & curved_domain_bit) != 0u
+				&& dot(geometric_normal, cone_axis) > FRP_MAGIC_GI_CLV_CURVED_SH_SAME_FACING_DOT_MIN
+				&& in_curved_domain) {
+			vec3 coordinate = vec3(slot) + fract(position) + 0.5;
+			vec3 extent = vec3(textureSize(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_LINEAR_CLAMP), 0));
+			float sh_basis[9];
+			frp_magic_gi_clv_diffuse_basis(shading_normal, sh_basis);
+			secondary = vec3(0.0); primary = vec3(0.0);
+			for (int coefficient = 0; coefficient < 9; coefficient++) {
+				int secondary_column = frp_magic_gi_clv_face_column(axis, coefficient);
+				int primary_column = frp_magic_gi_clv_face_column(axis, coefficient + 9);
+				vec3 secondary_coefficient = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_LINEAR_CLAMP), (coordinate + vec3(secondary_column * resolution, 0, 0)) / extent, 0.0).rgb;
+				vec3 primary_coefficient = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_LINEAR_CLAMP), (coordinate + vec3(primary_column * resolution, 0, 0)) / extent, 0.0).rgb;
+				secondary += secondary_coefficient * sh_basis[coefficient];
+				primary += primary_coefficient * sh_basis[coefficient];
+			}
+			if (frp_magic_gi_clv_finite(secondary) && frp_magic_gi_clv_finite(primary)) {
+				selected_level = level; sample_method = 2; return true;
+			}
+			secondary = vec3(0.0); primary = vec3(0.0);
+		}
+	}
+	return false;
+}
+
+bool frp_magic_gi_owner_contains(vec3 world, vec4 owner_size_enabled,
+		mat4 world_to_local) {
+	if (owner_size_enabled.w <= 0.5) { return true; }
+	vec3 local_position = (world_to_local * vec4(world, 1.0)).xyz;
+	return all(lessThanEqual(abs(local_position), owner_size_enabled.xyz * 0.5));
+}
+
+bool frp_magic_gi_in_bake_bounds(vec3 world) {
+	float spacing = max(frp_magic_gi_bake_parameters.control.y, 0.001);
+	vec3 dimensions = frp_magic_gi_bake_parameters.grid.xyz;
+	vec3 grid_position = (frp_magic_gi_bake_parameters.world_to_grid
+			* vec4(world, 1.0)).xyz;
+	mat3 world_to_grid_basis = mat3(frp_magic_gi_bake_parameters.world_to_grid);
+	float grid_epsilon = max(1e-5, spacing * 0.001 * max(
+			length(world_to_grid_basis[0]),
+			max(length(world_to_grid_basis[1]), length(world_to_grid_basis[2]))));
+	return frp_magic_gi_bake_parameters.grid.w > 0.0
+			&& !any(lessThan(grid_position, vec3(-grid_epsilon)))
+			&& !any(greaterThan(grid_position, dimensions + vec3(grid_epsilon)));
+}
+
+bool frp_magic_gi_sample_certified(vec3 world, vec3 geometric_normal,
+		vec3 shading_normal, out vec3 secondary, out vec3 primary,
+		out int selected_level, out int sample_method) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	selected_level = -1;
+	sample_method = 0;
+	if (frp_magic_gi_sample_domain(world, geometric_normal, shading_normal,
+			secondary, primary, selected_level, sample_method)) { return true; }
+	if (frp_magic_gi_clv_parameters0.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION
+			|| !frp_magic_gi_clv_finite(world) || !frp_magic_gi_clv_finite(shading_normal)) {
+		return false;
+	}
+	vec3 normal = shading_normal;
+	int axis = frp_magic_gi_clv_dominant_axis(normal);
+	int resolution = frp_magic_gi_clv_parameters0.control.x;
+	for (int level = 0; level < min(frp_magic_gi_clv_parameters0.control.y, 3); level++) {
+		float step_size = frp_magic_gi_clv_parameters0.spacing.x * float(1 << level);
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
+		ivec3 base = ivec3(floor(position));
+		ivec3 origin = frp_magic_gi_clv_parameters0.origins[level].xyz;
+		ivec3 relative = base - origin;
+		if (any(lessThan(relative, ivec3(0)))
+				|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		if (any(equal(physical, ivec3(resolution - 1)))) { continue; }
+		ivec3 slot = physical + ivec3(0, 0, level * resolution);
+		ivec4 tag = texelFetch(isampler3D(frp_magic_gi_clv_tags0,
+				SAMPLER_NEAREST_CLAMP), slot, 0);
+		uint support = texelFetch(usampler3D(frp_magic_gi_clv_support0,
+				SAMPLER_NEAREST_CLAMP), slot, 0).r;
+		if (any(notEqual(tag.xyz, base))
+				|| tag.w != frp_magic_gi_clv_parameters0.control.z
+				|| (support & (1u << uint(axis))) == 0u) { continue; }
+		vec4 metadata = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_LINEAR_CLAMP), slot + ivec3(
+				frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0);
+		vec4 anchor = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_LINEAR_CLAMP), slot + ivec3(
+				frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0);
+		vec3 normal_delta = normal - metadata.xyz;
+		if (dot(normal_delta, normal_delta)
+				> FRP_MAGIC_GI_CLV_DIFFUSE_NORMAL_ERROR_SQUARED) { continue; }
+		vec3 center = (vec3(base) + 0.5) * step_size;
+		float magnitude = max(step_size, max(max(abs(center.x), abs(center.y)), abs(center.z)));
+		float margin = max(1e-5, magnitude * 1.9073486328125e-6);
+		float tolerance = max(1e-5, step_size * 1e-4) + margin;
+		if (abs(dot(world - anchor.xyz, metadata.xyz)) > tolerance
+				|| any(lessThan(world, center - vec3(0.75 * step_size + margin)))
+				|| any(greaterThan(world, center + vec3(1.75 * step_size + margin)))) {
+			continue;
+		}
+		vec3 coordinate = vec3(slot) + fract(position) + 0.5;
+		vec3 extent = vec3(textureSize(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_LINEAR_CLAMP), 0));
+		vec4 secondary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_LINEAR_CLAMP), (coordinate + vec3(
+				frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent,
+				0.0);
+		vec4 primary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_LINEAR_CLAMP), (coordinate + vec3(
+				frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent,
+				0.0);
+		float valid_weight = min(secondary_sample.a, primary_sample.a);
+		if (!(valid_weight >= 0.55) || isnan(valid_weight) || isinf(valid_weight)
+				|| !frp_magic_gi_clv_finite(secondary_sample.rgb)
+				|| !frp_magic_gi_clv_finite(primary_sample.rgb)) { continue; }
+		secondary = secondary_sample.rgb / valid_weight;
+		primary = primary_sample.rgb / valid_weight;
+		selected_level = level;
+		sample_method = 3;
+		return true;
+	}
+	return false;
+}
+
+bool frp_magic_gi_clv_approx_geometry_valid(vec3 receiver_normal,
+		vec4 geometry_sample, vec4 moment_sample, vec4 plane_moments,
+		float valid_weight, float step_size, float base_spacing) {
+	if (!(valid_weight >= FRP_MAGIC_GI_CLV_APPROX_MIN_VALID_WEIGHT)
+			|| isnan(valid_weight) || isinf(valid_weight)
+			|| any(isnan(geometry_sample)) || any(isinf(geometry_sample))
+			|| any(isnan(moment_sample)) || any(isinf(moment_sample))
+			|| any(isnan(plane_moments)) || any(isinf(plane_moments))) { return false; }
+	vec3 mean_normal = geometry_sample.xyz / valid_weight;
+	float normal_length_squared = dot(mean_normal, mean_normal);
+	if (!(normal_length_squared >= FRP_MAGIC_GI_CLV_APPROX_MIN_NORMAL_LENGTH_SQUARED)
+			|| isnan(normal_length_squared) || isinf(normal_length_squared)) { return false; }
+	mean_normal *= inversesqrt(normal_length_squared);
+	float normal_alignment = dot(mean_normal, normalize(receiver_normal));
+	if (isnan(normal_alignment) || isinf(normal_alignment)
+			|| normal_alignment < FRP_MAGIC_GI_CLV_APPROX_MIN_NORMAL_ALIGNMENT) { return false; }
+	float mean_plane_delta = plane_moments.x / valid_weight;
+	float plane_variance = max(plane_moments.y / valid_weight
+			- mean_plane_delta * mean_plane_delta, 0.0);
+	float precision_limit = max(base_spacing
+			* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_VARIANCE_STEP
+			* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_PRECISION_ERROR_FRACTION,
+			FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON);
+	float receiver_plane_error = mean_plane_delta;
+	return sqrt(plane_variance) <= max(step_size
+			* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_VARIANCE_STEP,
+			FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON)
+			&& plane_moments.z <= max(base_spacing
+				* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_VARIANCE_STEP,
+				FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON)
+			&& plane_moments.w <= precision_limit
+			&& moment_sample.z > 0.5
+			&& abs(receiver_plane_error) <= max(step_size
+				* FRP_MAGIC_GI_CLV_APPROX_MAX_RECEIVER_PLANE_ERROR_STEP,
+				FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON);
+}
+
+bool frp_magic_gi_sample_approx(vec3 world, vec3 normal,
+		out vec3 secondary, out vec3 primary, out int selected_level,
+		out float confidence) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	selected_level = -1;
+	confidence = 0.0;
+	if (frp_magic_gi_clv_parameters0.spacing.y < 0.5
+			|| frp_magic_gi_clv_parameters0.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION
+			|| !frp_magic_gi_clv_finite(world) || !frp_magic_gi_clv_finite(normal)) {
+		return false;
+	}
+	float input_normal_length_squared = dot(normal, normal);
+	if (!(input_normal_length_squared > 1e-12) || isnan(input_normal_length_squared)
+			|| isinf(input_normal_length_squared)) { return false; }
+	normal *= inversesqrt(input_normal_length_squared);
+	int resolution = frp_magic_gi_clv_parameters0.control.x;
+	int axis = frp_magic_gi_clv_dominant_axis(normal);
+	for (int level = 0; level < min(frp_magic_gi_clv_parameters0.control.y, 3); level++) {
+		float step_size = frp_magic_gi_clv_parameters0.spacing.x * float(1 << level);
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) { continue; }
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
+		if (!frp_magic_gi_clv_finite(position)) { continue; }
+		ivec3 base = ivec3(floor(position));
+		ivec3 relative = base - frp_magic_gi_clv_parameters0.origins[level].xyz;
+		if (any(lessThan(relative, ivec3(0)))
+				|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		ivec3 slot = physical + ivec3(0, 0, level * resolution);
+		ivec4 base_tag = texelFetch(isampler3D(frp_magic_gi_clv_tags0,
+				SAMPLER_NEAREST_CLAMP), slot, 0);
+		if (any(notEqual(base_tag.xyz, base))
+				|| base_tag.w != frp_magic_gi_clv_parameters0.control.z) { continue; }
+		uint readiness = texelFetch(usampler3D(frp_magic_gi_clv_support0,
+				SAMPLER_NEAREST_CLAMP), slot, 0).r;
+		bool ready_tags = (readiness & FRP_MAGIC_GI_CLV_SUPPORT_NEIGHBOR_TAGS_READY) != 0u;
+		if (!ready_tags) {
+			bool tags_valid = true;
+			for (int corner = 1; corner < 8; corner++) {
+				ivec3 logical_corner = base + ivec3(corner & 1,
+						(corner >> 1) & 1, (corner >> 2) & 1);
+				ivec3 corner_slot = ((logical_corner % resolution) + resolution) % resolution;
+				corner_slot.z += level * resolution;
+				ivec4 corner_tag = texelFetch(isampler3D(frp_magic_gi_clv_tags0,
+						SAMPLER_NEAREST_CLAMP), corner_slot, 0);
+				if (any(notEqual(corner_tag.xyz, logical_corner))
+						|| corner_tag.w != frp_magic_gi_clv_parameters0.control.z) {
+					tags_valid = false;
+					break;
+				}
+			}
+			if (!tags_valid) { continue; }
+		}
+		vec3 fraction = fract(position);
+		bool boundary_fraction = any(lessThanEqual(fraction,
+				vec3(FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)))
+				|| any(greaterThanEqual(fraction,
+					vec3(1.0 - FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)));
+		uint approx_possible_bit = axis == 0 ? FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_X
+				: (axis == 1 ? FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Y
+					: FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Z);
+		if (ready_tags && (readiness & approx_possible_bit) == 0u && !boundary_fraction) { continue; }
+		vec4 secondary_sample = vec4(0.0);
+		vec4 primary_sample = vec4(0.0);
+		vec4 geometry_sample = vec4(0.0);
+		vec4 moment_sample = vec4(0.0);
+		vec4 plane_moments = vec4(0.0);
+		float coordinate_scale = max(max(abs(world.x), abs(world.y)), abs(world.z))
+				+ 2.0 * step_size;
+		plane_moments.w = coordinate_scale * 1.1920928955078125e-7;
+		int secondary_column = frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN);
+		int geometry_column = frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_APPROX_GEOMETRY_COLUMN);
+		int moments_column = frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_APPROX_PATCH_PLANE_MOMENTS_COLUMN);
+		ivec3 physical_base = ((base % resolution) + resolution) % resolution;
+		ivec3 slot_base = physical_base + ivec3(0, 0, level * resolution);
+		bool use_hardware_filter = all(lessThan(physical_base, ivec3(resolution - 1)));
+		bool valid_geometry = true;
+		bool have_patch_reference = false;
+		bool patch_ids_match = true;
+		float patch_reference = 0.0;
+		for (int corner = 0; corner < 8; corner++) {
+			ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+			float corner_weight = (offset.x == 0 ? 1.0 - fraction.x : fraction.x)
+					* (offset.y == 0 ? 1.0 - fraction.y : fraction.y)
+					* (offset.z == 0 ? 1.0 - fraction.z : fraction.z);
+			if (!(corner_weight > 0.0)) { continue; }
+			ivec3 logical_corner = base + offset;
+			ivec3 corner_slot = ((logical_corner % resolution) + resolution) % resolution;
+			corner_slot.z += level * resolution;
+			vec4 corner_geometry = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+					geometry_column * resolution, 0, 0), 0);
+			vec4 corner_moments = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+					moments_column * resolution, 0, 0), 0);
+			float corner_valid = corner_moments.a;
+			if (!use_hardware_filter) {
+				vec4 corner_secondary = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+						secondary_column * resolution, 0, 0), 0);
+				vec4 corner_primary = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+						(secondary_column + 1) * resolution, 0, 0), 0);
+				secondary_sample += corner_secondary * corner_weight;
+				primary_sample += corner_primary * corner_weight;
+				corner_valid = min(min(corner_secondary.a, corner_primary.a), corner_moments.a);
+			}
+			geometry_sample.xyz += corner_geometry.xyz * corner_weight;
+			moment_sample.xy += corner_moments.xy * corner_weight;
+			moment_sample.a += corner_moments.a * corner_weight;
+			if (corner_valid > 0.0) {
+				float corner_patch = corner_moments.x;
+				if (!(corner_patch > 0.0) || isnan(corner_patch) || isinf(corner_patch)
+						|| floor(corner_patch) != corner_patch) {
+					patch_ids_match = false;
+				} else if (!have_patch_reference) {
+					patch_reference = corner_patch;
+					have_patch_reference = true;
+				} else if (corner_patch != patch_reference) {
+					patch_ids_match = false;
+				}
+				vec3 corner_normal = corner_geometry.xyz / corner_valid;
+				float normal_length_squared = dot(corner_normal, corner_normal);
+				float corner_offset = corner_geometry.w / corner_valid;
+				if (!frp_magic_gi_clv_finite(corner_normal)
+						|| !(normal_length_squared > 1e-12)
+						|| isnan(normal_length_squared) || isinf(normal_length_squared)
+						|| isnan(corner_offset) || isinf(corner_offset)) {
+					valid_geometry = false;
+				} else {
+					vec3 cell_center = (vec3(logical_corner) + 0.5) * step_size;
+					float receiver_plane_delta = dot(world - cell_center, corner_normal)
+							- corner_offset;
+					if (isnan(receiver_plane_delta) || isinf(receiver_plane_delta)) {
+						valid_geometry = false;
+					} else {
+						float weighted_validity = corner_weight * corner_valid;
+						plane_moments.x += receiver_plane_delta * weighted_validity;
+						plane_moments.y += receiver_plane_delta * receiver_plane_delta
+								* weighted_validity;
+						plane_moments.z = max(plane_moments.z, abs(receiver_plane_delta));
+					}
+				}
+			}
+		}
+		if (use_hardware_filter) {
+			vec3 coordinate = vec3(slot_base) + fraction + 0.5;
+			vec3 extent = vec3(textureSize(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_LINEAR_CLAMP), 0));
+			secondary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_LINEAR_CLAMP), (coordinate + vec3(
+					secondary_column * resolution, 0, 0)) / extent, 0.0);
+			primary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+					SAMPLER_LINEAR_CLAMP), (coordinate + vec3(
+					(secondary_column + 1) * resolution, 0, 0)) / extent, 0.0);
+			secondary_sample.a = moment_sample.a;
+			primary_sample.a = moment_sample.a;
+		}
+		geometry_sample.w = 0.0;
+		moment_sample.z = have_patch_reference && patch_ids_match ? 1.0 : 0.0;
+		if (!valid_geometry) { continue; }
+		float valid_weight = min(min(secondary_sample.a, primary_sample.a), moment_sample.a);
+		if (!(valid_weight >= FRP_MAGIC_GI_CLV_APPROX_MIN_VALID_WEIGHT)
+				|| isnan(valid_weight) || isinf(valid_weight)) { continue; }
+		vec3 mean_normal = geometry_sample.xyz / valid_weight;
+		float normal_length_squared = dot(mean_normal, mean_normal);
+		if (!(normal_length_squared >= FRP_MAGIC_GI_CLV_APPROX_MIN_NORMAL_LENGTH_SQUARED)
+				|| isnan(normal_length_squared) || isinf(normal_length_squared)) { continue; }
+		mean_normal *= inversesqrt(normal_length_squared);
+		float normal_alignment = dot(mean_normal, normalize(normal));
+		if (isnan(normal_alignment) || isinf(normal_alignment)
+				|| normal_alignment < FRP_MAGIC_GI_CLV_APPROX_MIN_NORMAL_ALIGNMENT) { continue; }
+		float mean_plane_delta = plane_moments.x / valid_weight;
+		float plane_variance = max(plane_moments.y / valid_weight
+				- mean_plane_delta * mean_plane_delta, 0.0);
+		float precision_limit = max(frp_magic_gi_clv_parameters0.spacing.x
+				* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_VARIANCE_STEP
+				* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_PRECISION_ERROR_FRACTION,
+				FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON);
+		if (!(sqrt(plane_variance) <= max(step_size
+				* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_VARIANCE_STEP,
+				FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON))
+				|| !(plane_moments.z <= max(frp_magic_gi_clv_parameters0.spacing.x
+					* FRP_MAGIC_GI_CLV_APPROX_MAX_PLANE_VARIANCE_STEP,
+					FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON))
+				|| !(plane_moments.w <= precision_limit)
+				|| !(moment_sample.z > 0.5)
+				|| !(abs(mean_plane_delta) <= max(step_size
+					* FRP_MAGIC_GI_CLV_APPROX_MAX_RECEIVER_PLANE_ERROR_STEP,
+					FRP_MAGIC_GI_CLV_APPROX_MIN_EPSILON))) { continue; }
+		selected_level = level;
+		confidence = clamp(valid_weight, 0.0, 1.0);
+		secondary = secondary_sample.rgb / valid_weight;
+		primary = primary_sample.rgb / valid_weight;
+		if (!frp_magic_gi_clv_finite(secondary) || !frp_magic_gi_clv_finite(primary)) {
+			secondary = vec3(0.0);
+			primary = vec3(0.0);
+			selected_level = -1;
+			confidence = 0.0;
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
+// View-5 diagnostic twin of frp_magic_gi_sample_approx. It records the first
+// failed predicate on the finest attempted level, using the same read order,
+// thresholds, alpha validity, and plane/patch checks as the sampler above.
+// `details` is (valid_weight, normal_alignment, mean_plane_delta, patch_variance).
+int frp_magic_gi_clv_debug_approx_first_reject(vec3 world, vec3 input_normal,
+		out int rejected_level, out ivec3 rejected_base, out vec3 rejected_fraction,
+		out vec4 details) {
+	rejected_level = -1;
+	rejected_base = ivec3(0);
+	rejected_fraction = vec3(0.0);
+	details = vec4(0.0);
+	if (frp_magic_gi_clv_parameters0.spacing.y < 0.5) {
+		return CLV_DEBUG_APPROX_REJECT_DISABLED;
+	}
+	if (frp_magic_gi_clv_parameters0.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION) {
+		return CLV_DEBUG_APPROX_REJECT_LAYOUT;
+	}
+	if (!frp_magic_gi_clv_finite(world) || !frp_magic_gi_clv_finite(input_normal)) {
+		return CLV_DEBUG_APPROX_REJECT_INPUT;
+	}
+	float input_normal_length_squared = dot(input_normal, input_normal);
+	if (!(input_normal_length_squared > 1e-12)
+			|| isnan(input_normal_length_squared) || isinf(input_normal_length_squared)) {
+		return CLV_DEBUG_APPROX_REJECT_INPUT;
+	}
+	vec3 normal = input_normal * inversesqrt(input_normal_length_squared);
+	int resolution = frp_magic_gi_clv_parameters0.control.x;
+	int level_count = min(frp_magic_gi_clv_parameters0.control.y, 3);
+	if (resolution < 2 || level_count <= 0) {
+		return CLV_DEBUG_APPROX_REJECT_LAYOUT;
+	}
+	int axis = frp_magic_gi_clv_dominant_axis(normal);
+	int first_reason = CLV_DEBUG_APPROX_REJECT_SAMPLER_DIVERGENCE;
+	bool has_first_reason = false;
+	for (int level = 0; level < level_count; level++) {
+		int reason = CLV_DEBUG_APPROX_REJECT_NONE;
+		float step_size = frp_magic_gi_clv_parameters0.spacing.x * float(1 << level);
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) {
+			reason = CLV_DEBUG_APPROX_REJECT_STEP;
+		}
+		vec3 position = vec3(0.0);
+		ivec3 base = ivec3(0);
+		vec3 fraction = vec3(0.0);
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE) {
+			position = (world + normal * step_size * 0.75) / step_size - 0.5;
+			if (!frp_magic_gi_clv_finite(position)) {
+				reason = CLV_DEBUG_APPROX_REJECT_POSITION;
+			} else {
+				base = ivec3(floor(position));
+				fraction = fract(position);
+			}
+		}
+		ivec3 relative = base - frp_magic_gi_clv_parameters0.origins[level].xyz;
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE
+				&& (any(lessThan(relative, ivec3(0)))
+					|| any(greaterThanEqual(relative, ivec3(resolution - 1))))) {
+			reason = CLV_DEBUG_APPROX_REJECT_WINDOW;
+		}
+		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		ivec3 slot = physical + ivec3(0, 0, level * resolution);
+		uint readiness = 0u;
+		bool neighbors_ready = false;
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE) {
+			ivec4 base_tag = texelFetch(isampler3D(frp_magic_gi_clv_tags0,
+					SAMPLER_NEAREST_CLAMP), slot, 0);
+			if (any(notEqual(base_tag.xyz, base))
+					|| base_tag.w != frp_magic_gi_clv_parameters0.control.z) {
+				reason = CLV_DEBUG_APPROX_REJECT_BASE_TAG;
+			} else {
+				readiness = texelFetch(usampler3D(frp_magic_gi_clv_support0,
+						SAMPLER_NEAREST_CLAMP), slot, 0).r;
+				neighbors_ready = (readiness & FRP_MAGIC_GI_CLV_SUPPORT_NEIGHBOR_TAGS_READY) != 0u;
+			}
+		}
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE && !neighbors_ready) {
+			for (int corner = 1; corner < 8; corner++) {
+				ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+				ivec3 logical_corner = base + offset;
+				ivec3 corner_slot = ((logical_corner % resolution) + resolution) % resolution;
+				corner_slot.z += level * resolution;
+				ivec4 corner_tag = texelFetch(isampler3D(frp_magic_gi_clv_tags0,
+						SAMPLER_NEAREST_CLAMP), corner_slot, 0);
+				if (any(notEqual(corner_tag.xyz, logical_corner))
+						|| corner_tag.w != frp_magic_gi_clv_parameters0.control.z) {
+					reason = CLV_DEBUG_APPROX_REJECT_CORNER_TAG;
+					break;
+				}
+			}
+		}
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE && neighbors_ready) {
+			bool boundary_fraction = any(lessThanEqual(fraction,
+					vec3(FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)))
+					|| any(greaterThanEqual(fraction,
+						vec3(1.0 - FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)));
+			uint approx_possible_bit = axis == 0 ? FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_X
+					: (axis == 1 ? FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Y
+						: FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Z);
+			if ((readiness & approx_possible_bit) == 0u && !boundary_fraction) {
+				reason = CLV_DEBUG_APPROX_REJECT_PATCH_MISMATCH;
+			}
+		}
+		vec4 secondary_sample = vec4(0.0);
+		vec4 primary_sample = vec4(0.0);
+		vec4 geometry_sample = vec4(0.0);
+		vec4 moment_sample = vec4(0.0);
+		vec4 plane_moments = vec4(0.0);
+		bool valid_geometry = true;
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE) {
+			int secondary_column = frp_magic_gi_clv_face_column(axis,
+					FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN);
+			int geometry_column = frp_magic_gi_clv_face_column(axis,
+					FRP_MAGIC_GI_CLV_FACE_APPROX_GEOMETRY_COLUMN);
+			int moments_column = frp_magic_gi_clv_face_column(axis,
+					FRP_MAGIC_GI_CLV_FACE_APPROX_PATCH_PLANE_MOMENTS_COLUMN);
+			ivec3 physical_base = ((base % resolution) + resolution) % resolution;
+			ivec3 slot_base = physical_base + ivec3(0, 0, level * resolution);
+			bool use_hardware_filter = all(lessThan(physical_base, ivec3(resolution - 1)));
+			float coordinate_scale = max(max(abs(world.x), abs(world.y)), abs(world.z))
+					+ 2.0 * step_size;
+			plane_moments.w = coordinate_scale * 1.1920928955078125e-7;
+			bool have_patch_reference = false;
+			bool patch_ids_match = true;
+			float patch_reference = 0.0;
+			for (int corner = 0; corner < 8; corner++) {
+				ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+				float corner_weight = (offset.x == 0 ? 1.0 - fraction.x : fraction.x)
+						* (offset.y == 0 ? 1.0 - fraction.y : fraction.y)
+						* (offset.z == 0 ? 1.0 - fraction.z : fraction.z);
+				if (!(corner_weight > 0.0)) { continue; }
+				ivec3 logical_corner = base + offset;
+				ivec3 corner_slot = ((logical_corner % resolution) + resolution) % resolution;
+				corner_slot.z += level * resolution;
+				vec4 corner_geometry = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+						geometry_column * resolution, 0, 0), 0);
+				vec4 corner_moments = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+						moments_column * resolution, 0, 0), 0);
+				float corner_valid = corner_moments.a;
+				if (!use_hardware_filter) {
+					vec4 corner_secondary = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+							SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+							secondary_column * resolution, 0, 0), 0);
+					vec4 corner_primary = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+							SAMPLER_NEAREST_CLAMP), corner_slot + ivec3(
+							(secondary_column + 1) * resolution, 0, 0), 0);
+					secondary_sample += corner_secondary * corner_weight;
+					primary_sample += corner_primary * corner_weight;
+					corner_valid = min(min(corner_secondary.a, corner_primary.a), corner_moments.a);
+				}
+				geometry_sample.xyz += corner_geometry.xyz * corner_weight;
+				moment_sample.xy += corner_moments.xy * corner_weight;
+				moment_sample.a += corner_moments.a * corner_weight;
+				if (corner_valid > 0.0) {
+					float corner_patch = corner_moments.x;
+					if (!(corner_patch > 0.0) || isnan(corner_patch) || isinf(corner_patch)
+							|| floor(corner_patch) != corner_patch) {
+						patch_ids_match = false;
+					} else if (!have_patch_reference) {
+						patch_reference = corner_patch;
+						have_patch_reference = true;
+					} else if (corner_patch != patch_reference) {
+						patch_ids_match = false;
+					}
+					vec3 corner_normal = corner_geometry.xyz / corner_valid;
+					float corner_normal_length_squared = dot(corner_normal, corner_normal);
+					float corner_offset = corner_geometry.w / corner_valid;
+					if (!frp_magic_gi_clv_finite(corner_normal)
+							|| !(corner_normal_length_squared > 1e-12)
+							|| isnan(corner_normal_length_squared)
+							|| isinf(corner_normal_length_squared)
+							|| isnan(corner_offset) || isinf(corner_offset)) {
+						valid_geometry = false;
+					} else {
+						vec3 cell_center = (vec3(logical_corner) + 0.5) * step_size;
+						float receiver_plane_delta = dot(world - cell_center, corner_normal)
+								- corner_offset;
+						if (isnan(receiver_plane_delta) || isinf(receiver_plane_delta)) {
+							valid_geometry = false;
+						} else {
+							float weighted_validity = corner_weight * corner_valid;
+							plane_moments.x += receiver_plane_delta * weighted_validity;
+							plane_moments.y += receiver_plane_delta * receiver_plane_delta
+									* weighted_validity;
+							plane_moments.z = max(plane_moments.z, abs(receiver_plane_delta));
+						}
+					}
+				}
+			}
+			if (use_hardware_filter) {
+				vec3 coordinate = vec3(slot_base) + fraction + 0.5;
+				vec3 extent = vec3(textureSize(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_LINEAR_CLAMP), 0));
+				secondary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_LINEAR_CLAMP), (coordinate + vec3(
+						secondary_column * resolution, 0, 0)) / extent, 0.0);
+				primary_sample = textureLod(sampler3D(frp_magic_gi_clv_texture0,
+						SAMPLER_LINEAR_CLAMP), (coordinate + vec3(
+						(secondary_column + 1) * resolution, 0, 0)) / extent, 0.0);
+				secondary_sample.a = moment_sample.a;
+				primary_sample.a = moment_sample.a;
+			}
+			moment_sample.z = have_patch_reference && patch_ids_match ? 1.0 : 0.0;
+			if (reason == CLV_DEBUG_APPROX_REJECT_NONE && !valid_geometry) {
+				reason = CLV_DEBUG_APPROX_REJECT_CORNER_GEOMETRY;
+			}
+		}
+		float valid_weight = min(min(secondary_sample.a, primary_sample.a), moment_sample.a);
+		float normal_alignment = 0.0;
+		float mean_plane_delta = 0.0;
+		float patch_variance = 0.0;
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE
+				&& (!(valid_weight >= FRP_MAGIC_GI_CLV_APPROX_MIN_VALID_WEIGHT)
+					|| isnan(valid_weight) || isinf(valid_weight))) {
+			reason = CLV_DEBUG_APPROX_REJECT_LOW_COVERAGE;
+		}
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE) {
+			uint geometry_reason = clv_approx_geometry_reject_reason(normal,
+					geometry_sample, moment_sample, plane_moments, valid_weight,
+					step_size, frp_magic_gi_clv_parameters0.spacing.x);
+			vec3 mean_normal = geometry_sample.xyz / valid_weight;
+			float normal_length_squared = dot(mean_normal, mean_normal);
+			if (normal_length_squared > 1e-12 && !isnan(normal_length_squared)
+					&& !isinf(normal_length_squared)) {
+				mean_normal *= inversesqrt(normal_length_squared);
+				normal_alignment = dot(mean_normal, normal);
+			}
+			mean_plane_delta = plane_moments.x / valid_weight;
+			patch_variance = max(moment_sample.y / valid_weight
+					- (moment_sample.x / valid_weight) * (moment_sample.x / valid_weight), 0.0);
+			if (geometry_reason == CLV_APPROX_REJECT_NONFINITE_SAMPLES) {
+				reason = CLV_DEBUG_APPROX_REJECT_NONFINITE_SAMPLES;
+			} else if (geometry_reason == CLV_APPROX_REJECT_NORMAL_MAGNITUDE) {
+				reason = CLV_DEBUG_APPROX_REJECT_NORMAL_MAGNITUDE;
+			} else if (geometry_reason == CLV_APPROX_REJECT_NORMAL_ALIGNMENT) {
+				reason = CLV_DEBUG_APPROX_REJECT_NORMAL_ALIGNMENT;
+			} else if (geometry_reason == CLV_APPROX_REJECT_PLANE_VARIANCE) {
+				reason = CLV_DEBUG_APPROX_REJECT_PLANE_VARIANCE;
+			} else if (geometry_reason == CLV_APPROX_REJECT_PLANE_RESIDUAL) {
+				reason = CLV_DEBUG_APPROX_REJECT_PLANE_RESIDUAL;
+			} else if (geometry_reason == CLV_APPROX_REJECT_PLANE_PRECISION) {
+				reason = CLV_DEBUG_APPROX_REJECT_PLANE_PRECISION;
+			} else if (geometry_reason == CLV_APPROX_REJECT_PATCH_MISMATCH) {
+				reason = CLV_DEBUG_APPROX_REJECT_PATCH_MISMATCH;
+			} else if (geometry_reason == CLV_APPROX_REJECT_RECEIVER_PLANE) {
+				reason = CLV_DEBUG_APPROX_REJECT_RECEIVER_PLANE;
+			} else if (geometry_reason != CLV_APPROX_REJECT_NONE) {
+				reason = CLV_DEBUG_APPROX_REJECT_SAMPLER_DIVERGENCE;
+			}
+		}
+		if (reason == CLV_DEBUG_APPROX_REJECT_NONE) {
+			vec3 secondary = secondary_sample.rgb / valid_weight;
+			vec3 primary = primary_sample.rgb / valid_weight;
+			if (!frp_magic_gi_clv_finite(secondary) || !frp_magic_gi_clv_finite(primary)) {
+				reason = CLV_DEBUG_APPROX_REJECT_RADIANCE;
+			} else {
+				// The production sampler would have returned true. This means the
+				// debug copy diverged from the selected runtime path.
+				reason = CLV_DEBUG_APPROX_REJECT_SAMPLER_DIVERGENCE;
+			}
+		}
+		if (!has_first_reason) {
+			first_reason = reason;
+			has_first_reason = true;
+			rejected_level = level;
+			rejected_base = base;
+			rejected_fraction = fraction;
+			details = vec4(valid_weight, normal_alignment, mean_plane_delta, patch_variance);
+		}
+	}
+	return has_first_reason ? first_reason : CLV_DEBUG_APPROX_REJECT_SAMPLER_DIVERGENCE;
+}
+
+// Debug-only rejection classifier. It mirrors only the early certified lookup
+// gates so Cache Validity can distinguish spatial admission from stale or
+// incomplete cache data without changing the production sampler.
+int frp_magic_gi_clv_debug_rejection(vec3 world, vec3 normal) {
+	const int REJECT_INVALID_LAYOUT = 7;
+	const int REJECT_OUTSIDE_WINDOW = 3;
+	const int REJECT_TAG_OR_EPOCH = 4;
+	const int REJECT_AXIS_SUPPORT = 5;
+	const int REJECT_CERTIFICATE = 6;
+	if (frp_magic_gi_clv_parameters0.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION
+			|| !frp_magic_gi_clv_finite(world) || !frp_magic_gi_clv_finite(normal)) {
+		return REJECT_INVALID_LAYOUT;
+	}
+	int resolution = frp_magic_gi_clv_parameters0.control.x;
+	int level_count = min(frp_magic_gi_clv_parameters0.control.y, 3);
+	float base_spacing = frp_magic_gi_clv_parameters0.spacing.x;
+	float normal_length_squared = dot(normal, normal);
+	if (resolution < 2 || level_count <= 0 || !(base_spacing > 0.0)
+			|| !(normal_length_squared > 1e-12)
+			|| isnan(normal_length_squared) || isinf(normal_length_squared)) {
+		return REJECT_INVALID_LAYOUT;
+	}
+	normal *= inversesqrt(normal_length_squared);
+	int axis = frp_magic_gi_clv_dominant_axis(normal);
+	bool found_window = false;
+	bool found_matching_tag = false;
+	bool found_axis_support = false;
+	bool found_certificate_reject = false;
+	for (int level = 0; level < level_count; level++) {
+		float step_size = base_spacing * float(1 << level);
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
+		if (!(step_size > 0.0) || !frp_magic_gi_clv_finite(position)) { continue; }
+		ivec3 base = ivec3(floor(position));
+		ivec3 origin = frp_magic_gi_clv_parameters0.origins[level].xyz;
+		ivec3 relative = base - origin;
+		if (any(lessThan(relative, ivec3(0)))
+				|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		if (any(equal(physical, ivec3(resolution - 1)))) { continue; }
+		found_window = true;
+		ivec3 slot = physical + ivec3(0, 0, level * resolution);
+		ivec4 tag = texelFetch(isampler3D(frp_magic_gi_clv_tags0,
+				SAMPLER_NEAREST_CLAMP), slot, 0);
+		if (any(notEqual(tag.xyz, base))
+				|| tag.w != frp_magic_gi_clv_parameters0.control.z) { continue; }
+		found_matching_tag = true;
+		uint support = texelFetch(usampler3D(frp_magic_gi_clv_support0,
+				SAMPLER_NEAREST_CLAMP), slot, 0).r;
+		if ((support & (1u << uint(axis))) == 0u) { continue; }
+		found_axis_support = true;
+		vec4 metadata = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_LINEAR_CLAMP), slot + ivec3(
+				frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0);
+		vec4 anchor = texelFetch(sampler3D(frp_magic_gi_clv_texture0,
+				SAMPLER_LINEAR_CLAMP), slot + ivec3(
+				frp_magic_gi_clv_face_column(axis,
+				FRP_MAGIC_GI_CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0);
+		vec3 normal_delta = normal - metadata.xyz;
+		if (dot(normal_delta, normal_delta)
+				> FRP_MAGIC_GI_CLV_DIFFUSE_NORMAL_ERROR_SQUARED) {
+			found_certificate_reject = true;
+			continue;
+		}
+		vec3 center = (vec3(base) + 0.5) * step_size;
+		float magnitude = max(step_size, max(max(abs(center.x), abs(center.y)), abs(center.z)));
+		float margin = max(1e-5, magnitude * 1.9073486328125e-6);
+		float tolerance = max(1e-5, step_size * 1e-4) + margin;
+		if (abs(dot(world - anchor.xyz, metadata.xyz)) > tolerance
+				|| any(lessThan(world, center - vec3(0.75 * step_size + margin)))
+				|| any(greaterThan(world, center + vec3(1.75 * step_size + margin)))) {
+			found_certificate_reject = true;
+			continue;
+		}
+		// A fully passing candidate should have been returned by the normal
+		// sampler. Keep this distinct from a bounds/tag/support rejection.
+		return REJECT_CERTIFICATE;
+	}
+	if (!found_window) { return REJECT_OUTSIDE_WINDOW; }
+	if (!found_matching_tag) { return REJECT_TAG_OR_EPOCH; }
+	if (!found_axis_support) { return REJECT_AXIS_SUPPORT; }
+	if (found_certificate_reject) { return REJECT_CERTIFICATE; }
+	return REJECT_INVALID_LAYOUT;
+}
+
+#endif

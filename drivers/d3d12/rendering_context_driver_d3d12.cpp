@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/os/os.h"
 #include "core/string/ustring.h"
 #include "core/templates/local_vector.h"
 
@@ -217,6 +218,25 @@ bool RenderingContextDriverD3D12::use_validation_layers() const {
 Error RenderingContextDriverD3D12::initialize() {
 	Error err = _init_device_factory();
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
+
+	// Opt-in DRED for diagnosing device removal without changing normal runtime behavior.
+	if (OS::get_singleton()->get_environment("FENG_D3D12_DRED") == "1") {
+		PFN_D3D12_GET_DEBUG_INTERFACE d3d_D3D12GetDebugInterface = (PFN_D3D12_GET_DEBUG_INTERFACE)(void *)GetProcAddress(lib_d3d12, "D3D12GetDebugInterface");
+		if (d3d_D3D12GetDebugInterface != nullptr) {
+			ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dred_settings;
+			HRESULT dred_hr = d3d_D3D12GetDebugInterface(IID_PPV_ARGS(dred_settings.GetAddressOf()));
+			if (SUCCEEDED(dred_hr)) {
+				dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				dred_settings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				print_verbose("D3D12: DRED breadcrumbs and page-fault tracking enabled by FENG_D3D12_DRED.");
+			} else {
+				print_verbose(vformat("D3D12: DRED settings interface unavailable (0x%08x).", (uint32_t)dred_hr));
+			}
+		} else {
+			print_verbose("D3D12: DRED debug interface unavailable.");
+		}
+	}
 
 	if (use_validation_layers()) {
 		err = _initialize_debug_layers();

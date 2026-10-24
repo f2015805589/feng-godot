@@ -8,6 +8,7 @@ enum Usage {
 	COLOR_ATTACHMENT = RenderingDevice.TEXTURE_USAGE_COLOR_ATTACHMENT_BIT,
 	STORAGE = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT,
 	COPY_TO = RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT,
+	COPY_FROM = RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT,
 }
 
 @export var name: StringName = &"":

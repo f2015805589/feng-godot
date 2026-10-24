@@ -1781,24 +1781,27 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 
 					RSE::LightDirectionalShadowMode shadow_mode = light_storage->light_directional_get_shadow_mode(base);
 
-					int limit = shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL ? 0 : (shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_2_SPLITS ? 1 : 3);
+					int limit = shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL ? 0 :
+							(shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_2_SPLITS ? 1 :
+								(shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS ? 2 : 3));
 
 					shadow_data.shadow_atlas_pixel_size = 1.0 / light_storage->directional_shadow_get_size();
 
 					shadow_data.blend_splits = uint32_t((shadow_mode != RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL) && light_storage->light_directional_get_blend_splits(base));
 					for (int j = 0; j < 4; j++) {
-						Rect2 atlas_rect = li->shadow_transform[j].atlas_rect;
+						const int transform_index = MIN(limit, j);
+						Rect2 atlas_rect = li->shadow_transform[transform_index].atlas_rect;
 						Projection correction;
 						correction.set_depth_correction(false, true, false);
-						Projection matrix = correction * li->shadow_transform[j].camera;
-						float split = li->shadow_transform[MIN(limit, j)].split;
+						Projection matrix = correction * li->shadow_transform[transform_index].camera;
+						float split = li->shadow_transform[transform_index].split;
 
 						Projection bias;
 						bias.set_light_bias();
 						Projection rectm;
 						rectm.set_light_atlas_rect(atlas_rect);
 
-						Transform3D modelview = (inverse_transform * li->shadow_transform[j].transform).inverse();
+						Transform3D modelview = (inverse_transform * li->shadow_transform[transform_index].transform).inverse();
 
 						shadow_data.direction[0] = light_data.direction[0];
 						shadow_data.direction[1] = light_data.direction[1];
@@ -1806,7 +1809,7 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 
 						Projection shadow_mtx = rectm * bias * matrix * modelview;
 						shadow_data.shadow_split_offsets[j] = split;
-						shadow_data.shadow_normal_bias[j] = light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS) * li->shadow_transform[j].shadow_texel_size;
+						shadow_data.shadow_normal_bias[j] = light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS) * li->shadow_transform[transform_index].shadow_texel_size;
 						GLES3::MaterialStorage::store_camera(shadow_mtx, shadow_data.shadow_matrices[j]);
 					}
 					float fade_start = light_storage->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_FADE_START);
@@ -2218,7 +2221,7 @@ void RasterizerSceneGLES3::_render_shadow_pass(RID p_light, RID p_shadow_atlas, 
 
 		atlas_rect = light_storage->light_instance_get_directional_rect(p_light);
 
-		if (light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS) {
+		if (light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS || light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS) {
 			atlas_rect.size.width /= 2;
 			atlas_rect.size.height /= 2;
 

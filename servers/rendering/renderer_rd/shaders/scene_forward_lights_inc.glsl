@@ -348,6 +348,98 @@ half sample_directional_pcf_shadow(texture2D shadow, vec2 shadow_pixel_size, vec
 	return half(avg * (1.0 / float(sc_directional_soft_shadow_samples())));
 }
 
+bool directional_shadow_is_frp(DirectionalLightData light_data) {
+	// FRP stores only log2(slot size) in pad.y. Legacy directional data always
+	// stores a nonzero atlas-rect height in bits 16..30, so this range test is
+	// disjoint even when a legacy rect's y coordinate sets any pad.x high bit.
+	return light_data.pad.y >= 8u && light_data.pad.y <= 13u;
+}
+
+uint directional_shadow_cascade_count(DirectionalLightData light_data) {
+	if (directional_shadow_is_frp(light_data)) {
+		return ((light_data.pad.x >> 18u) & 0x3u) + 1u;
+	}
+	uint encoded_count = ((light_data.pad.x >> 15u) & 1u) | (((light_data.pad.x >> 31u) & 1u) << 1u);
+	return encoded_count + 1u;
+}
+
+bool directional_shadow_has_object_map(DirectionalLightData light_data) {
+	if (directional_shadow_is_frp(light_data)) {
+		return ((light_data.pad.x >> 20u) & 1u) != 0u;
+	}
+	return ((light_data.pad.y >> 15u) & 1u) != 0u;
+}
+
+bool directional_shadow_has_reserved_object_slot(DirectionalLightData light_data) {
+	if (directional_shadow_is_frp(light_data)) {
+		return ((light_data.pad.x >> 21u) & 1u) != 0u;
+	}
+	return ((light_data.pad.y >> 31u) & 1u) != 0u;
+}
+
+vec4 directional_shadow_map_rect(DirectionalLightData light_data, uint p_map_index, vec2 shadow_pixel_size) {
+	if (directional_shadow_is_frp(light_data)) {
+		uint base_slot = light_data.pad.x & 0xFFFu;
+		uint columns = ((light_data.pad.x >> 12u) & 0x3Fu) + 1u;
+		uint total_slots = directional_shadow_cascade_count(light_data) + (directional_shadow_has_reserved_object_slot(light_data) ? 1u : 0u);
+		uint map_index = min(p_map_index, total_slots - 1u);
+		uint slot = base_slot + map_index;
+		float layer_size = exp2(float(light_data.pad.y));
+		vec2 atlas_size = 1.0 / max(shadow_pixel_size, vec2(1e-8));
+		vec2 cell_position = vec2(float(slot % columns), float(slot / columns)) * layer_size;
+		return vec4(cell_position / atlas_size, vec2(layer_size) / atlas_size);
+	}
+	vec2 base_position = vec2(float(light_data.pad.x & 0x7FFFu), float((light_data.pad.x >> 16u) & 0x7FFFu));
+	vec2 base_size = vec2(float(light_data.pad.y & 0x7FFFu), float((light_data.pad.y >> 16u) & 0x7FFFu));
+	uint total_slots = directional_shadow_cascade_count(light_data) + (directional_shadow_has_reserved_object_slot(light_data) ? 1u : 0u);
+	uint columns = total_slots >= 3u ? 2u : 1u;
+	uint rows = total_slots >= 3u ? 2u : max(total_slots, 1u);
+	uint map_index = min(p_map_index, total_slots - 1u);
+	vec2 cell_size = base_size / vec2(float(columns), float(rows));
+	vec2 cell_position = base_position + vec2(float(map_index % columns), float(map_index / columns)) * cell_size;
+	return vec4(cell_position * shadow_pixel_size, cell_size * shadow_pixel_size);
+}
+
+bool directional_shadow_coord_inside_rect(vec3 p_coord, vec4 p_rect, vec2 shadow_pixel_size) {
+	vec2 half_texel = shadow_pixel_size * 0.5;
+	return p_coord.z >= 0.0 && p_coord.z <= 1.0 &&
+		all(greaterThanEqual(p_coord.xy, p_rect.xy + half_texel)) &&
+		all(lessThanEqual(p_coord.xy, p_rect.xy + p_rect.zw - half_texel));
+}
+
+vec2 directional_shadow_clamp_uv(vec2 p_uv, vec4 p_rect, vec2 shadow_pixel_size) {
+	vec2 half_texel = shadow_pixel_size * 0.5;
+	vec2 minimum_uv = p_rect.xy + half_texel;
+	vec2 maximum_uv = max(minimum_uv, p_rect.xy + p_rect.zw - half_texel);
+	return clamp(p_uv, minimum_uv, maximum_uv);
+}
+
+half sample_directional_pcf_shadow_rect(texture2D shadow, vec2 shadow_pixel_size, vec4 coord, vec4 atlas_rect, vec2 atlas_pixel_size, float taa_frame_count) {
+	if (!directional_shadow_coord_inside_rect(coord.xyz, atlas_rect, atlas_pixel_size)) {
+		return half(1.0);
+	}
+	vec2 pos = directional_shadow_clamp_uv(coord.xy, atlas_rect, atlas_pixel_size);
+	if (sc_directional_soft_shadow_samples() == 0) {
+		return half(textureProj(sampler2DShadow(shadow, shadow_sampler), vec4(pos, coord.z, 1.0)));
+	}
+	mat2 disk_rotation;
+	{
+		float r = quick_hash(gl_FragCoord.xy + vec2(taa_frame_count * 5.588238)) * 2.0 * M_PI;
+		float sr = sin(r);
+		float cr = cos(r);
+		disk_rotation = mat2(vec2(cr, -sr), vec2(sr, cr));
+	}
+	vec2 max_radius = max(atlas_rect.zw * 0.5 - atlas_pixel_size, vec2(0.0));
+	vec2 radius = min(abs(shadow_pixel_size), max_radius);
+	float avg = 0.0;
+	SPEC_CONSTANT_LOOP_ANNOTATION
+	for (uint i = 0; i < sc_directional_soft_shadow_samples(); i++) {
+		vec2 sample_uv = directional_shadow_clamp_uv(pos + radius * (disk_rotation * scene_data_block.data.directional_soft_shadow_kernel[i].xy), atlas_rect, atlas_pixel_size);
+		avg += textureProj(sampler2DShadow(shadow, shadow_sampler), vec4(sample_uv, coord.z, 1.0));
+	}
+	return half(avg * (1.0 / float(sc_directional_soft_shadow_samples())));
+}
+
 half sample_pcf_shadow(texture2D shadow, vec2 shadow_pixel_size, vec3 coord, float taa_frame_count) {
 	vec2 pos = coord.xy;
 	float depth = coord.z;
@@ -419,7 +511,12 @@ half sample_omni_pcf_shadow(texture2D shadow, float blur_scale, vec2 coord, vec4
 	return half(avg * (1.0 / float(sc_soft_shadow_samples())));
 }
 
-half sample_directional_soft_shadow(texture2D shadow, vec3 pssm_coord, vec2 tex_scale, float taa_frame_count) {
+half sample_directional_soft_shadow(texture2D shadow, vec3 pssm_coord, vec2 tex_scale, vec4 atlas_rect, vec2 atlas_pixel_size, float taa_frame_count) {
+	if (!directional_shadow_coord_inside_rect(pssm_coord, atlas_rect, atlas_pixel_size)) {
+		return half(1.0);
+	}
+	vec2 max_radius = max(atlas_rect.zw * 0.5 - atlas_pixel_size, vec2(0.0));
+	tex_scale = min(abs(tex_scale), max_radius);
 	//find blocker
 	float blocker_count = 0.0;
 	float blocker_average = 0.0;
@@ -434,7 +531,7 @@ half sample_directional_soft_shadow(texture2D shadow, vec3 pssm_coord, vec2 tex_
 
 	SPEC_CONSTANT_LOOP_ANNOTATION
 	for (uint i = 0; i < sc_directional_penumbra_shadow_samples(); i++) {
-		vec2 suv = pssm_coord.xy + (disk_rotation * scene_data_block.data.directional_penumbra_shadow_kernel[i].xy) * tex_scale;
+		vec2 suv = directional_shadow_clamp_uv(pssm_coord.xy + (disk_rotation * scene_data_block.data.directional_penumbra_shadow_kernel[i].xy) * tex_scale, atlas_rect, atlas_pixel_size);
 		float d = textureLod(sampler2D(shadow, SAMPLER_LINEAR_CLAMP), suv, 0.0).r;
 		if (d > pssm_coord.z) {
 			blocker_average += d;
@@ -445,14 +542,14 @@ half sample_directional_soft_shadow(texture2D shadow, vec3 pssm_coord, vec2 tex_
 	if (blocker_count > 0.0) {
 		//blockers found, do soft shadow
 		blocker_average /= blocker_count;
-		float penumbra = (-pssm_coord.z + blocker_average) / (1.0 - blocker_average);
-		tex_scale *= penumbra;
+		float penumbra = clamp((-pssm_coord.z + blocker_average) / max(1.0 - blocker_average, 1e-4), 0.0, 1.0);
+		tex_scale = min(tex_scale * penumbra, max_radius);
 
 		float s = 0.0;
 
 		SPEC_CONSTANT_LOOP_ANNOTATION
 		for (uint i = 0; i < sc_directional_penumbra_shadow_samples(); i++) {
-			vec2 suv = pssm_coord.xy + (disk_rotation * scene_data_block.data.directional_penumbra_shadow_kernel[i].xy) * tex_scale;
+			vec2 suv = directional_shadow_clamp_uv(pssm_coord.xy + (disk_rotation * scene_data_block.data.directional_penumbra_shadow_kernel[i].xy) * tex_scale, atlas_rect, atlas_pixel_size);
 			s += textureProj(sampler2DShadow(shadow, shadow_sampler), vec4(suv, pssm_coord.z, 1.0));
 		}
 
@@ -462,6 +559,135 @@ half sample_directional_soft_shadow(texture2D shadow, vec3 pssm_coord, vec2 tex_
 		//no blockers found, so no shadow
 		return half(1.0);
 	}
+}
+
+half sample_directional_object_shadow(texture2D shadow, DirectionalLightData light_data, vec3 vertex, vec3 normal, vec2 atlas_pixel_size, float taa_frame_count) {
+	if (!directional_shadow_has_object_map(light_data)) {
+		return half(1.0);
+	}
+
+	vec3 light_dir = light_data.direction;
+	vec3 base_normal_bias = normal * (1.0 - max(0.0, dot(light_dir, -normal)));
+	vec4 v = vec4(vertex, 1.0);
+	v.xyz += light_dir * light_data.shadow_bias.w;
+	vec3 normal_bias = base_normal_bias * light_data.shadow_normal_bias.w;
+	normal_bias -= light_dir * dot(light_dir, normal_bias);
+	v.xyz += normal_bias;
+
+	vec4 shadow_coord = light_data.shadow_matrix4 * v;
+	shadow_coord /= shadow_coord.w;
+	uint map_index = directional_shadow_cascade_count(light_data);
+	vec4 atlas_rect = directional_shadow_map_rect(light_data, map_index, atlas_pixel_size);
+	if (!directional_shadow_coord_inside_rect(shadow_coord.xyz, atlas_rect, atlas_pixel_size)) {
+		return half(1.0);
+	}
+
+	if (sc_use_directional_soft_shadows() && light_data.softshadow_angle > 0.0 && light_data.soft_shadow_scale > 0.0) {
+		float range_pos = dot(light_dir, v.xyz);
+		// range_begin is the shadow near-plane depth relative to the view origin,
+		// while range_pos is the receiver depth relative to that same origin.
+		// With reversed-Z directional projections, near-plane minus receiver is
+		// the positive world-space distance used to size the PCSS search radius.
+		float test_radius = max(light_data.shadow_range_begin.w - range_pos, 0.0) * light_data.softshadow_angle;
+		vec2 tex_scale = light_data.uv_scale4 * test_radius * light_data.soft_shadow_scale;
+		return sample_directional_soft_shadow(shadow, shadow_coord.xyz, tex_scale, atlas_rect, atlas_pixel_size, taa_frame_count);
+	}
+
+	vec2 pcf_radius = atlas_pixel_size * light_data.soft_shadow_scale;
+	return sample_directional_pcf_shadow_rect(shadow, pcf_radius, shadow_coord, atlas_rect, atlas_pixel_size, taa_frame_count);
+}
+
+half sample_directional_cascade_shadow(texture2D shadow, DirectionalLightData light_data, uint cascade_index, vec3 vertex, vec3 normal, vec2 atlas_pixel_size, float taa_frame_count) {
+	mat4 shadow_matrix = light_data.shadow_matrix1;
+	float shadow_bias = light_data.shadow_bias.x;
+	float shadow_normal_bias = light_data.shadow_normal_bias.x;
+	float range_begin = light_data.shadow_range_begin.x;
+	vec2 uv_scale = light_data.uv_scale1;
+	if (cascade_index == 1u) {
+		shadow_matrix = light_data.shadow_matrix2;
+		shadow_bias = light_data.shadow_bias.y;
+		shadow_normal_bias = light_data.shadow_normal_bias.y;
+		range_begin = light_data.shadow_range_begin.y;
+		uv_scale = light_data.uv_scale2;
+	} else if (cascade_index == 2u) {
+		shadow_matrix = light_data.shadow_matrix3;
+		shadow_bias = light_data.shadow_bias.z;
+		shadow_normal_bias = light_data.shadow_normal_bias.z;
+		range_begin = light_data.shadow_range_begin.z;
+		uv_scale = light_data.uv_scale3;
+	} else if (cascade_index >= 3u) {
+		shadow_matrix = light_data.shadow_matrix4;
+		shadow_bias = light_data.shadow_bias.w;
+		shadow_normal_bias = light_data.shadow_normal_bias.w;
+		range_begin = light_data.shadow_range_begin.w;
+		uv_scale = light_data.uv_scale4;
+	}
+
+	vec3 light_dir = light_data.direction;
+	vec3 base_normal_bias = normal * (1.0 - max(0.0, dot(light_dir, -normal)));
+	vec4 v = vec4(vertex, 1.0);
+	v.xyz += light_dir * shadow_bias;
+	vec3 normal_bias = base_normal_bias * shadow_normal_bias;
+	normal_bias -= light_dir * dot(light_dir, normal_bias);
+	v.xyz += normal_bias;
+
+	vec4 shadow_coord = shadow_matrix * v;
+	shadow_coord /= shadow_coord.w;
+	vec4 atlas_rect = directional_shadow_map_rect(light_data, cascade_index, atlas_pixel_size);
+	if (!directional_shadow_coord_inside_rect(shadow_coord.xyz, atlas_rect, atlas_pixel_size)) {
+		return half(1.0);
+	}
+
+	if (sc_use_directional_soft_shadows() && light_data.softshadow_angle > 0.0 && light_data.soft_shadow_scale > 0.0) {
+		float range_pos = dot(light_dir, v.xyz);
+		// range_begin and range_pos share the view-origin depth reference; for a
+		// receiver inside the cascade, their difference is its positive distance
+		// from the shadow near plane.
+		float test_radius = max(range_begin - range_pos, 0.0) * light_data.softshadow_angle;
+		vec2 tex_scale = uv_scale * test_radius * light_data.soft_shadow_scale;
+		return sample_directional_soft_shadow(shadow, shadow_coord.xyz, tex_scale, atlas_rect, atlas_pixel_size, taa_frame_count);
+	}
+
+	float first_split = max(light_data.shadow_split_offsets.x, 1e-4);
+	float current_split = max(light_data.shadow_split_offsets[cascade_index], first_split);
+	float blur_factor = first_split / current_split;
+	vec2 pcf_radius = atlas_pixel_size * light_data.soft_shadow_scale * mix(blur_factor, 1.0, float(light_data.blend_splits));
+	return sample_directional_pcf_shadow_rect(shadow, pcf_radius, shadow_coord, atlas_rect, atlas_pixel_size, taa_frame_count);
+}
+
+half sample_directional_csm_and_object_shadow(texture2D shadow, DirectionalLightData light_data, vec3 vertex, vec3 normal, vec2 atlas_pixel_size, float taa_frame_count) {
+	uint cascade_count = min(max(directional_shadow_cascade_count(light_data), 1u), 4u);
+	float depth_z = -vertex.z;
+	float last_cascade_distance = light_data.shadow_split_offsets[cascade_count - 1u];
+	float shadow_value = 1.0;
+	if (depth_z <= last_cascade_distance) {
+		uint cascade_index = 0u;
+		for (uint index = 0u; index < 4u; index++) {
+			if (index + 1u >= cascade_count || depth_z < light_data.shadow_split_offsets[index]) {
+				cascade_index = index;
+				break;
+			}
+		}
+		cascade_index = min(cascade_index, cascade_count - 1u);
+		shadow_value = float(sample_directional_cascade_shadow(shadow, light_data, cascade_index, vertex, normal, atlas_pixel_size, taa_frame_count));
+
+		// Blend across a narrow band before each active split. Selecting by the
+		// actual CSM count prevents a reserved object map from becoming a far CSM.
+		if (light_data.blend_splits && cascade_index + 1u < cascade_count) {
+			float split_distance = light_data.shadow_split_offsets[cascade_index];
+			float previous_split = cascade_index == 0u ? 0.0 : light_data.shadow_split_offsets[cascade_index - 1u];
+			float blend_start = split_distance - max(split_distance - previous_split, 0.0) * 0.1;
+			if (depth_z > blend_start) {
+				float next_shadow = float(sample_directional_cascade_shadow(shadow, light_data, cascade_index + 1u, vertex, normal, atlas_pixel_size, taa_frame_count));
+				shadow_value = mix(shadow_value, next_shadow, smoothstep(blend_start, split_distance, depth_z));
+			}
+		}
+	}
+
+	if (directional_shadow_has_object_map(light_data)) {
+		shadow_value = min(shadow_value, float(sample_directional_object_shadow(shadow, light_data, vertex, normal, atlas_pixel_size, taa_frame_count)));
+	}
+	return half(shadow_value);
 }
 
 #endif // SHADOWS_DISABLED

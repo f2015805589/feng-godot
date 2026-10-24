@@ -2437,7 +2437,11 @@ void fragment() {
 		dot(blendedNormal, w_binormal),
 		dot(blendedNormal, w_normal));
 	vec3 normal_map = fma(normalize(normalTS), vec3(0.5), vec3(0.5));
-	float distant_normal_amplifier = clamp(max(length(base_ddx.xz), length(base_ddy.xz)), 1., distant_normal_scale);
+	float normal_footprint = 2.0 / max(PROJECTION_MATRIX[1][1] * VIEWPORT_SIZE.y, 1e-6);
+	if (PROJECTION_MATRIX[3][3] != 1.0) {
+		normal_footprint *= distance(v_vertex, v_camera_pos);
+	}
+	float distant_normal_amplifier = clamp(normal_footprint * bias, 1., distant_normal_scale);
 	// Each layer's depth was already applied before projection and blending by
 	// idweight_decode_normal(), in both source evaluation and the VT baker.
 	// Applying their weighted depth again here scales the finished direction twice.

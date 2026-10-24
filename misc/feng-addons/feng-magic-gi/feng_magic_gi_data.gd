@@ -26,6 +26,20 @@ const VISIBILITY_TEXELS_PER_PROBE := VISIBILITY_TILE_SIZE * VISIBILITY_TILE_SIZE
 const CELL_CAPACITY := 8
 const CELL_BOUNDARY_EPSILON := 0.00001
 const SH_Y00 := 0.2820947918
+## Revision 2 stores the complete diffuse incident field: secondary transfer
+## plus visibility-filtered primary Sky. Direct DirectionalLight remains live.
+const BAKED_INDIRECT_SH_REVISION := 2
+## Algorithm metadata distinguishes old rev-2 SH9 directional projection from the
+## bake-only exact directional-secondary estimator without changing the payload.
+const BAKED_INDIRECT_SH_ALGORITHM_LEGACY := "legacy_sh9_directional_v2"
+const BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE := "exact_directional_secondary_nee_v1"
+const BAKED_DIRECTIONAL_SOURCE_SCHEMA_VERSION := 1
+const BAKED_BOUNDARY_TENSOR_SCHEMA_VERSION := 1
+const BAKED_BOUNDARY_TENSOR_ALGORITHM := "closed_mesh_boundary_tensor_v1"
+const BAKED_BOUNDARY_TENSOR_LAYOUT_VERSION := 17
+const BAKED_BOUNDARY_TENSOR_LEVEL_COUNT := 3
+const BAKED_BOUNDARY_TENSOR_TERMS := 9
+const BAKED_BOUNDARY_TENSOR_VALUES_PER_RECORD := BAKED_BOUNDARY_TENSOR_TERMS * 3
 
 @export_storage var format_version := 0
 @export_storage var grid_dims := Vector3i.ZERO
@@ -78,6 +92,46 @@ const SH_Y00 := 0.2820947918
 ## Emitter-major: (emitter * probe_count + probe) * 6 + term * 3 + channel.
 ## term 0 is uniform source radiance; term 1 is static emission-texture modulation.
 @export_storage var emitter_transport := PackedFloat32Array()
+## Persistent total baked indirect incident-radiance SH9 RGB field. Probe-major,
+## world-axis, linear HDR radiance, 27 floats per probe. Revision 2 combines
+## secondary transport with geometry-visibility-filtered primary Sky. Direct
+## DirectionalLight and the Sky background remain live in the renderer.
+@export_storage var baked_indirect_sh_revision := 0
+@export_storage var baked_indirect_sh := PackedFloat32Array()
+## Empty means a legacy revision-2 SH9-directional bake. Runtime consumes the
+## same 27-float payload for either recognized algorithm.
+@export_storage var baked_indirect_sh_algorithm := ""
+@export_storage var baked_indirect_directional_source_signature := ""
+@export_storage var baked_indirect_directional_source_provenance: Dictionary = {}
+## Optional sparse layout-17 boundary tensor overrides. Keys are packed as
+## [level, logical_x, logical_y, logical_z]; values are 9 RGB terms per key
+## in [Ex,Ey,Ez,Lx,Ly,Lz,Qxy,Qyz,Qxz] order. Missing legacy fields mean no overrides.
+@export_storage var baked_boundary_tensor_schema_version := 0
+@export_storage var baked_boundary_tensor_keys := PackedInt32Array()
+@export_storage var baked_boundary_tensor_coefficients := PackedFloat32Array()
+@export_storage var baked_boundary_tensor_provenance: Dictionary = {}
+@export_storage var baked_boundary_tensor_signature := ""
+var _baked_boundary_tensor_validation_cached := false
+var _baked_boundary_tensor_validation_result := false
+## Bake-time primary Sky provenance. Kept separate from geometry validation so
+## legacy resources remain readable, but backend-1 upload requires valid data.
+@export_storage var baked_indirect_sky_provenance: Dictionary = {}
+var _sky_provenance_validation_cached := false
+var _sky_provenance_validation_result := false
+var _baked_indirect_sh_validation_cached := false
+var _baked_indirect_sh_validation_result := false
+var _baked_indirect_payload_validation_cached := false
+var _baked_indirect_payload_validation_result := false
+var _baked_directional_provenance_validation_cached := false
+var _baked_directional_provenance_validation_result := false
+## Worker-only scratch; intentionally not exported or serialized.
+var bake_exact_directional_secondary := PackedFloat32Array()
+var bake_exact_directional_secondary_valid := false
+var _bake_exact_directional_probe_complete := PackedByteArray()
+## Bake-time radiance snapshots are diagnostic only; changes request rebake,
+## but never invalidate the field or trigger runtime relighting.
+@export_storage var baked_indirect_lighting_signature := 0
+@export_storage var baked_indirect_emission_signature := 0
 @export_storage var cell_indices := PackedInt32Array()
 @export_storage var bake_version := 0
 ## Optional independently versioned spherical transfer. Absent in saved surface
@@ -119,6 +173,535 @@ static func sampler_revision_for_signature(saved_signature: int) -> int:
 func probe_count() -> int:
 	return positions.size()
 
+func _invalidate_baked_indirect_sh_validation_cache() -> void:
+	_sky_provenance_validation_cached = false
+	_sky_provenance_validation_result = false
+	_baked_indirect_sh_validation_cached = false
+	_baked_indirect_sh_validation_result = false
+	_baked_indirect_payload_validation_cached = false
+	_baked_indirect_payload_validation_result = false
+	_baked_directional_provenance_validation_cached = false
+	_baked_directional_provenance_validation_result = false
+	# Resource assignment and changed() also use this invalidator. Preserve serialized
+	# sidecars and revalidate their SH/trace hashes lazily at the next bake/cache boundary.
+	_invalidate_baked_boundary_tensor_validation_cache()
+
+func has_baked_indirect_sh() -> bool:
+	if not _baked_indirect_sh_validation_cached:
+		_baked_indirect_sh_validation_result = probe_count() > 0 \
+				and baked_indirect_sh_revision == BAKED_INDIRECT_SH_REVISION \
+				and baked_indirect_sh.size() == probe_count() * 27 \
+				and baked_indirect_sh_is_valid() \
+				and baked_indirect_sky_provenance_is_valid() \
+				and baked_indirect_directional_provenance_is_valid()
+		_baked_indirect_sh_validation_cached = true
+	return _baked_indirect_sh_validation_result \
+			and baked_indirect_sh_revision == BAKED_INDIRECT_SH_REVISION \
+			and baked_indirect_sh.size() == probe_count() * 27
+
+func set_baked_boundary_tensor_records(payload: Dictionary) -> bool:
+	var input := payload.duplicate(true)
+	var provenance_value: Variant = input.get("provenance", null)
+	if not provenance_value is Dictionary:
+		_clear_baked_boundary_tensor_records()
+		return false
+	var provenance: Dictionary = provenance_value.duplicate(true)
+	var expected_placement_signature := int(scene_signature) & 0xffffffff
+	if int(provenance.get("placement_scene_signature_u32", -1)) != expected_placement_signature:
+		_clear_baked_boundary_tensor_records()
+		return false
+	var expected_trace_geometry_sha256 := _sha256_packed_float32(visibility_triangles)
+	if expected_trace_geometry_sha256.is_empty() \
+			or String(provenance.get("trace_geometry_sha256", "")) != expected_trace_geometry_sha256:
+		_clear_baked_boundary_tensor_records()
+		return false
+	input["provenance"] = provenance
+	input["schema_version"] = int(provenance.get("schema_version", 0))
+	var parsed := _parse_baked_boundary_tensor_payload(input)
+	if not bool(parsed.get("valid", false)):
+		_clear_baked_boundary_tensor_records()
+		return false
+	baked_boundary_tensor_schema_version = BAKED_BOUNDARY_TENSOR_SCHEMA_VERSION
+	baked_boundary_tensor_keys = parsed["keys"]
+	baked_boundary_tensor_coefficients = parsed["coefficients"]
+	baked_boundary_tensor_provenance = parsed["provenance"]
+	baked_boundary_tensor_signature = _baked_boundary_tensor_payload_signature(
+		baked_boundary_tensor_keys, baked_boundary_tensor_coefficients,
+		baked_boundary_tensor_provenance)
+	_invalidate_baked_boundary_tensor_validation_cache()
+	return has_baked_boundary_tensor_records()
+
+func has_baked_boundary_tensor_records() -> bool:
+	if not _baked_boundary_tensor_validation_cached:
+		_baked_boundary_tensor_validation_result = _validate_baked_boundary_tensor_records()
+		_baked_boundary_tensor_validation_cached = true
+	return _baked_boundary_tensor_validation_result
+
+func get_baked_boundary_tensor_records_for_runtime() -> Dictionary:
+	if not has_baked_boundary_tensor_records():
+		return {"valid": false, "reason": "boundary_tensor_sidecar_unavailable"}
+	return {"valid": true, "schema_version": baked_boundary_tensor_schema_version,
+		"keys": baked_boundary_tensor_keys, "coefficients": baked_boundary_tensor_coefficients,
+		"provenance": baked_boundary_tensor_provenance,
+		"signature": baked_boundary_tensor_signature}
+
+func _invalidate_baked_boundary_tensor_validation_cache() -> void:
+	_baked_boundary_tensor_validation_cached = false
+	_baked_boundary_tensor_validation_result = false
+
+## Call before replacing baked SH or trace geometry on an existing Resource.
+## Published runtime Data is otherwise immutable; clearing the record set makes
+## the next cache update restore ordinary gather values across the current window.
+func invalidate_baked_boundary_tensor_records() -> void:
+	_clear_baked_boundary_tensor_records()
+
+func _clear_baked_boundary_tensor_records() -> void:
+	baked_boundary_tensor_schema_version = 0
+	baked_boundary_tensor_keys.clear()
+	baked_boundary_tensor_coefficients.clear()
+	baked_boundary_tensor_provenance.clear()
+	baked_boundary_tensor_signature = ""
+	_invalidate_baked_boundary_tensor_validation_cache()
+
+func _validate_baked_boundary_tensor_records() -> bool:
+	var parsed := _parse_baked_boundary_tensor_payload({
+		"schema_version": baked_boundary_tensor_schema_version,
+		"keys": baked_boundary_tensor_keys,
+		"coefficients": baked_boundary_tensor_coefficients,
+		"provenance": baked_boundary_tensor_provenance})
+	if not bool(parsed.get("valid", false)):
+		return false
+	return baked_boundary_tensor_signature == _baked_boundary_tensor_payload_signature(
+		baked_boundary_tensor_keys, baked_boundary_tensor_coefficients,
+		baked_boundary_tensor_provenance)
+
+func _parse_baked_boundary_tensor_payload(payload: Dictionary) -> Dictionary:
+	if int(payload.get("schema_version", 0)) != BAKED_BOUNDARY_TENSOR_SCHEMA_VERSION:
+		return {"valid": false, "reason": "unsupported_schema"}
+	var keys_value: Variant = payload.get("keys", null)
+	var coefficients_value: Variant = payload.get("coefficients", null)
+	var provenance_value: Variant = payload.get("provenance", null)
+	if not keys_value is PackedInt32Array or not coefficients_value is PackedFloat32Array \
+			 or not provenance_value is Dictionary:
+		return {"valid": false, "reason": "invalid_payload_types"}
+	var keys: PackedInt32Array = keys_value
+	var coefficients: PackedFloat32Array = coefficients_value
+	var provenance: Dictionary = provenance_value
+	var record_count := keys.size() / 4
+	if keys.size() % 4 != 0 or coefficients.size() != record_count * BAKED_BOUNDARY_TENSOR_VALUES_PER_RECORD:
+		return {"valid": false, "reason": "record_shape_mismatch"}
+	if not _baked_boundary_tensor_provenance_matches(provenance):
+		return {"valid": false, "reason": "provenance_mismatch"}
+	var dedup_keys := PackedInt32Array()
+	var dedup_coefficients := PackedFloat32Array()
+	var seen: Dictionary = {}
+	for record_index in record_count:
+		var offset := record_index * 4
+		var level := keys[offset]
+		var x := keys[offset + 1]
+		var y := keys[offset + 2]
+		var z := keys[offset + 3]
+		if level < 0 or level >= BAKED_BOUNDARY_TENSOR_LEVEL_COUNT:
+			return {"valid": false, "reason": "record_level_out_of_range"}
+		var key := Vector4i(x, y, z, level)
+		var value_offset := record_index * BAKED_BOUNDARY_TENSOR_VALUES_PER_RECORD
+		for lane in BAKED_BOUNDARY_TENSOR_VALUES_PER_RECORD:
+			if not is_finite(coefficients[value_offset + lane]):
+				return {"valid": false, "reason": "record_nonfinite"}
+		if seen.has(key):
+			var previous_offset: int = int(seen[key])
+			for lane in BAKED_BOUNDARY_TENSOR_VALUES_PER_RECORD:
+				var previous := dedup_coefficients[previous_offset + lane]
+				var current := coefficients[value_offset + lane]
+				var tolerance := 1e-5 * maxf(1.0, maxf(absf(previous), absf(current)))
+				if absf(previous - current) > tolerance:
+					return {"valid": false, "reason": "conflicting_duplicate_record"}
+			continue
+		seen[key] = dedup_coefficients.size()
+		dedup_keys.append_array(PackedInt32Array([level, x, y, z]))
+		for lane in BAKED_BOUNDARY_TENSOR_VALUES_PER_RECORD:
+			dedup_coefficients.append(coefficients[value_offset + lane])
+	return {"valid": true, "keys": dedup_keys, "coefficients": dedup_coefficients,
+		"provenance": provenance.duplicate(true)}
+
+func _baked_boundary_tensor_provenance_matches(provenance: Dictionary) -> bool:
+	var source_data_path_value: Variant = provenance.get("source_data_path", null)
+	var scene_sha256_value: Variant = provenance.get("scene_sha256", null)
+	if not source_data_path_value is String or not scene_sha256_value is String:
+		return false
+	var scene_sha256 := String(scene_sha256_value)
+	if not scene_sha256.is_empty() and not _is_sha256_hex(scene_sha256):
+		return false
+	if int(provenance.get("schema_version", 0)) != BAKED_BOUNDARY_TENSOR_SCHEMA_VERSION \
+			 or String(provenance.get("algorithm", "")) != BAKED_BOUNDARY_TENSOR_ALGORITHM \
+			 or int(provenance.get("layout_version", 0)) != BAKED_BOUNDARY_TENSOR_LAYOUT_VERSION \
+			 or int(provenance.get("source_sh_revision", 0)) != BAKED_INDIRECT_SH_REVISION \
+			 or int(provenance.get("placement_scene_signature_u32", -1)) < 0 \
+			 or int(provenance.get("placement_scene_signature_u32", -1)) \
+				!= (int(scene_signature) & 0xffffffff) \
+			 or int(provenance.get("level_count", 0)) != BAKED_BOUNDARY_TENSOR_LEVEL_COUNT \
+			 or String(provenance.get("input_signature", "")).is_empty() \
+			 or not _is_sha256_hex(String(provenance.get("input_signature", ""))) \
+			 or not _is_sha256_hex(String(provenance.get("source_sh_sha256", ""))) \
+			 or not _is_sha256_hex(String(provenance.get("geometry_signature", ""))) \
+			 or not _is_sha256_hex(String(provenance.get("geometry_triangles_sha256", ""))) \
+			 or not _is_sha256_hex(String(provenance.get("trace_geometry_sha256", ""))):
+		return false
+	var spacing_value := float(provenance.get("base_spacing_m", NAN))
+	if not is_finite(spacing_value) or not is_equal_approx(spacing_value, spacing):
+		return false
+	var levels_value: Variant = provenance.get("level_steps_m", null)
+	var phase_value: Variant = provenance.get("phase_cells", null)
+	if not levels_value is PackedFloat32Array or levels_value.size() != BAKED_BOUNDARY_TENSOR_LEVEL_COUNT \
+			 or not phase_value is PackedInt32Array or phase_value != PackedInt32Array([0, 0, 0]):
+		return false
+	for level in BAKED_BOUNDARY_TENSOR_LEVEL_COUNT:
+		if not is_equal_approx(float(levels_value[level]), spacing * float(1 << level)):
+			return false
+	return String(provenance.get("input_signature", "")) \
+			== _baked_boundary_tensor_input_signature(provenance) \
+			and String(provenance.get("source_sh_sha256", "")) == _sha256_packed_float32(baked_indirect_sh) \
+			 and String(provenance.get("trace_geometry_sha256", "")) \
+				== _sha256_packed_float32(visibility_triangles)
+
+static func _is_sha256_hex(value: String) -> bool:
+	if value.length() != 64:
+		return false
+	for index in value.length():
+		if "0123456789abcdef".find(value.substr(index, 1)) < 0:
+			return false
+	return true
+
+static func _baked_boundary_tensor_input_signature(provenance: Dictionary) -> String:
+	var context := HashingContext.new()
+	if context.start(HashingContext.HASH_SHA256) != OK:
+		return ""
+	context.update("MagicGI boundary tensor build input v1".to_utf8_buffer())
+	var text_keys := ["algorithm", "scene_sha256", "source_sh_sha256", "source_data_path",
+		"geometry_signature", "geometry_triangles_sha256", "trace_geometry_sha256"]
+	for key in text_keys:
+		var value := String(provenance.get(key, ""))
+		var encoded := value.to_utf8_buffer()
+		context.update(PackedInt32Array([encoded.size()]).to_byte_array())
+		if not encoded.is_empty():
+			context.update(encoded)
+	var floats := PackedFloat32Array([float(provenance.get("base_spacing_m", NAN))])
+	var steps_value: Variant = provenance.get("level_steps_m", null)
+	if not steps_value is PackedFloat32Array:
+		return ""
+	floats.append_array(steps_value)
+	var phase_value: Variant = provenance.get("phase_cells", null)
+	if not phase_value is PackedInt32Array:
+		return ""
+	context.update(PackedInt32Array([int(provenance.get("schema_version", 0)),
+		int(provenance.get("layout_version", 0)),
+		int(provenance.get("source_sh_revision", 0)),
+		int(provenance.get("placement_scene_signature_u32", -1)),
+		int(provenance.get("level_count", 0))]).to_byte_array())
+	context.update(floats.to_byte_array())
+	context.update(phase_value.to_byte_array())
+	return context.finish().hex_encode()
+
+static func _sha256_packed_float32(values: PackedFloat32Array) -> String:
+	var context := HashingContext.new()
+	if context.start(HashingContext.HASH_SHA256) != OK:
+		return ""
+	var bytes := values.to_byte_array()
+	if not bytes.is_empty():
+		context.update(bytes)
+	return context.finish().hex_encode()
+
+static func _baked_boundary_tensor_payload_signature(keys: PackedInt32Array,
+		coefficients: PackedFloat32Array, provenance: Dictionary) -> String:
+	var context := HashingContext.new()
+	if context.start(HashingContext.HASH_SHA256) != OK:
+		return ""
+	context.update("MagicGI boundary tensor records v1".to_utf8_buffer())
+	context.update(PackedInt32Array([BAKED_BOUNDARY_TENSOR_SCHEMA_VERSION,
+		BAKED_BOUNDARY_TENSOR_LAYOUT_VERSION, keys.size(), coefficients.size()]).to_byte_array())
+	var key_bytes := keys.to_byte_array()
+	if not key_bytes.is_empty():
+		context.update(key_bytes)
+	var coefficient_bytes := coefficients.to_byte_array()
+	if not coefficient_bytes.is_empty():
+		context.update(coefficient_bytes)
+	var provenance_keys := ["algorithm", "input_signature", "scene_sha256", "source_data_path",
+		"source_sh_sha256", "geometry_signature", "geometry_triangles_sha256",
+		"trace_geometry_sha256"]
+	for key in provenance_keys:
+		var value := String(provenance.get(key, "")).to_utf8_buffer()
+		context.update(PackedInt32Array([value.size()]).to_byte_array())
+		if not value.is_empty():
+			context.update(value)
+	var numeric := PackedFloat32Array([float(provenance.get("base_spacing_m", NAN))])
+	context.update(numeric.to_byte_array())
+	context.update(PackedInt32Array([int(provenance.get("schema_version", 0)),
+		int(provenance.get("layout_version", 0)), int(provenance.get("source_sh_revision", 0)),
+		int(provenance.get("placement_scene_signature_u32", -1)),
+		int(provenance.get("level_count", 0))]).to_byte_array())
+	context.update(PackedFloat32Array(provenance.get("level_steps_m", PackedFloat32Array())).to_byte_array())
+	context.update(PackedInt32Array(provenance.get("phase_cells", PackedInt32Array())).to_byte_array())
+	return context.finish().hex_encode()
+
+func has_legacy_baked_indirect_sh_payload() -> bool:
+	return _resolved_baked_indirect_sh_algorithm() == BAKED_INDIRECT_SH_ALGORITHM_LEGACY \
+			and baked_indirect_sh_revision == BAKED_INDIRECT_SH_REVISION \
+			and baked_indirect_sh.size() == probe_count() * 27 and baked_indirect_sh_is_valid()
+
+func _resolved_baked_indirect_sh_algorithm() -> String:
+	return BAKED_INDIRECT_SH_ALGORITHM_LEGACY if baked_indirect_sh_algorithm.is_empty() \
+			else baked_indirect_sh_algorithm
+
+func baked_indirect_directional_provenance_is_valid() -> bool:
+	if not _baked_directional_provenance_validation_cached:
+		_baked_directional_provenance_validation_result = is_valid_baked_indirect_directional_provenance(
+				_resolved_baked_indirect_sh_algorithm(), baked_indirect_directional_source_signature,
+				baked_indirect_directional_source_provenance)
+		_baked_directional_provenance_validation_cached = true
+	return _baked_directional_provenance_validation_result
+
+static func is_valid_baked_indirect_directional_provenance(algorithm: String,
+		signature: String, provenance: Dictionary) -> bool:
+	if algorithm == BAKED_INDIRECT_SH_ALGORITHM_LEGACY:
+		return signature.is_empty() and provenance.is_empty()
+	if algorithm != BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE \
+			or int(provenance.get("schema_version", 0)) != BAKED_DIRECTIONAL_SOURCE_SCHEMA_VERSION:
+		return false
+	var physical_units: Variant = provenance.get("physical_units", null)
+	var sources_value: Variant = provenance.get("sources", null)
+	if typeof(physical_units) != TYPE_BOOL or typeof(sources_value) != TYPE_ARRAY \
+			or String(provenance.get("source_scale_convention", "")) \
+			!= "godot_directional_nee_q_v1" \
+			or String(provenance.get("visibility_contract", "")) \
+			!= "all_collected_static_triangles_v1" \
+			or String(provenance.get("angular_source_contract", "")) \
+			!= "collimated_directional_v1" \
+			or String(provenance.get("light_masks_contract", "")) \
+			!= "recorded_not_applied_to_bvh_v1":
+		return false
+	var sources: Array = sources_value
+	if signature.is_empty() or signature != baked_directional_source_signature(sources, physical_units):
+		return false
+	var previous_path := ""
+	for source_value in sources:
+		if not source_value is Dictionary:
+			return false
+		var source: Dictionary = source_value
+		var path := String(source.get("path", ""))
+		var direction_value: Variant = source.get("direction_world", null)
+		var radiance_value: Variant = source.get("radiance_rgb", null)
+		var sky_mode := int(source.get("sky_mode", -1))
+		if typeof(direction_value) != TYPE_VECTOR3 or typeof(radiance_value) != TYPE_VECTOR3:
+			return false
+		var direction: Vector3 = direction_value
+		var radiance: Vector3 = radiance_value
+		if path.is_empty() or (not previous_path.is_empty() and path <= previous_path) \
+				or not direction.is_finite() or direction.length_squared() < 0.999 \
+				or direction.length_squared() > 1.001 or not radiance.is_finite() \
+				or sky_mode < DirectionalLight3D.SKY_MODE_LIGHT_AND_SKY \
+				or sky_mode > DirectionalLight3D.SKY_MODE_SKY_ONLY:
+			return false
+		if typeof(source.get("light_negative", null)) != TYPE_BOOL \
+				or typeof(source.get("shadow_enabled", null)) != TYPE_BOOL \
+				or typeof(source.get("light_cull_mask", null)) != TYPE_INT \
+				or typeof(source.get("shadow_caster_mask", null)) != TYPE_INT \
+				or typeof(source.get("bake_mode", null)) != TYPE_INT \
+				or typeof(source.get("physical_units", null)) != TYPE_BOOL \
+				or bool(source.get("physical_units", false)) != physical_units:
+			return false
+		previous_path = path
+	return true
+
+static func baked_directional_source_signature(sources: Array, physical_units: bool) -> String:
+	var context := HashingContext.new()
+	if context.start(HashingContext.HASH_SHA256) != OK:
+		return ""
+	context.update("MagicGI directional source snapshot v1".to_utf8_buffer())
+	context.update(PackedInt32Array([BAKED_DIRECTIONAL_SOURCE_SCHEMA_VERSION,
+			1 if physical_units else 0, sources.size()]).to_byte_array())
+	var previous_path := ""
+	for source_value in sources:
+		if not source_value is Dictionary:
+			return ""
+		var source: Dictionary = source_value
+		var path := String(source.get("path", ""))
+		var direction_value: Variant = source.get("direction_world", null)
+		var radiance_value: Variant = source.get("radiance_rgb", null)
+		if typeof(direction_value) != TYPE_VECTOR3 or typeof(radiance_value) != TYPE_VECTOR3:
+			return ""
+		var direction: Vector3 = direction_value
+		var radiance: Vector3 = radiance_value
+		if path.is_empty() or (not previous_path.is_empty() and path <= previous_path) \
+				or not direction.is_finite() or not radiance.is_finite():
+			return ""
+		previous_path = path
+		var path_bytes := path.to_utf8_buffer()
+		context.update(PackedInt32Array([path_bytes.size()]).to_byte_array())
+		context.update(path_bytes)
+		var color_value: Variant = source.get("color_linear", null)
+		var temperature_value: Variant = source.get("temperature_linear", null)
+		var energy := float(source.get("light_energy", NAN))
+		var indirect_energy := float(source.get("light_indirect_energy", NAN))
+		var intensity_lux := float(source.get("intensity_lux", NAN))
+		var angular_distance := float(source.get("angular_distance", NAN))
+		if typeof(color_value) != TYPE_VECTOR3 or typeof(temperature_value) != TYPE_VECTOR3:
+			return ""
+		var color_linear: Vector3 = color_value
+		var temperature_linear: Vector3 = temperature_value
+		if not color_linear.is_finite() or not temperature_linear.is_finite() \
+				or not is_finite(energy) or not is_finite(indirect_energy) \
+				or not is_finite(intensity_lux) or not is_finite(angular_distance):
+			return ""
+		for key in ["light_negative", "sky_mode", "light_cull_mask", "shadow_caster_mask", "shadow_enabled", "bake_mode"]:
+			if not source.has(key):
+				return ""
+		var values := PackedFloat32Array([
+			direction.x, direction.y, direction.z,
+			radiance.x, radiance.y, radiance.z,
+			color_linear.x, color_linear.y, color_linear.z,
+			temperature_linear.x, temperature_linear.y, temperature_linear.z,
+			energy, indirect_energy, intensity_lux, angular_distance])
+		for value in values:
+			if not is_finite(value):
+				return ""
+		context.update(values.to_byte_array())
+		var flags := PackedInt32Array([
+			int(source.get("light_negative", false)),
+			int(source.get("sky_mode", -1)),
+			int(source.get("light_cull_mask", -1)),
+			int(source.get("shadow_caster_mask", -1)),
+			int(source.get("shadow_enabled", false)),
+			int(source.get("bake_mode", -1)),
+			int(source.get("physical_units", false))])
+		context.update(flags.to_byte_array())
+	return context.finish().hex_encode()
+
+func prepare_bake_exact_directional_secondary() -> void:
+	bake_exact_directional_secondary.resize(probe_count() * 27)
+	bake_exact_directional_secondary.fill(0.0)
+	bake_exact_directional_secondary_valid = false
+	_bake_exact_directional_probe_complete.resize(probe_count())
+	_bake_exact_directional_probe_complete.fill(0)
+
+func validate_bake_exact_directional_secondary() -> bool:
+	if bake_exact_directional_secondary.size() != probe_count() * 27 \
+			or _bake_exact_directional_probe_complete.size() != probe_count():
+		bake_exact_directional_secondary_valid = false
+		return false
+	for probe in probe_count():
+		if _bake_exact_directional_probe_complete[probe] != 1:
+			bake_exact_directional_secondary_valid = false
+			return false
+	for value in bake_exact_directional_secondary:
+		if not is_finite(value):
+			bake_exact_directional_secondary_valid = false
+			return false
+	bake_exact_directional_secondary_valid = true
+	return true
+
+func clear_bake_exact_directional_secondary() -> void:
+	bake_exact_directional_secondary.clear()
+	bake_exact_directional_secondary_valid = false
+	_bake_exact_directional_probe_complete.clear()
+
+func baked_indirect_sky_provenance_is_valid(provenance: Dictionary = {}) -> bool:
+	if not provenance.is_empty():
+		return is_valid_baked_indirect_sky_provenance(provenance)
+	if not _sky_provenance_validation_cached:
+		_sky_provenance_validation_result = is_valid_baked_indirect_sky_provenance(
+				baked_indirect_sky_provenance)
+		_sky_provenance_validation_cached = true
+	return _sky_provenance_validation_result
+
+static func is_valid_baked_indirect_sky_provenance(provenance: Dictionary) -> bool:
+	if int(provenance.get("schema_version", 0)) != 1:
+		return false
+	var status := String(provenance.get("status", ""))
+	if status != "explicit_no_sky" and status != "verified_ready_sky":
+		return false
+	if String(provenance.get("radiance_unit", "")) != "scene_linear_radiance":
+		return false
+	var radiance: Variant = provenance.get("radiance_sh")
+	if not radiance is PackedFloat32Array or radiance.size() != 27:
+		return false
+	for value in radiance:
+		if not is_finite(value):
+			return false
+	var energy := float(provenance.get("radiance_energy", NAN))
+	if not is_finite(energy) or energy < 0.0:
+		return false
+	var signature := String(provenance.get("input_signature", ""))
+	if signature.is_empty() or signature != baked_sky_input_signature(radiance, energy):
+		return false
+	if status == "explicit_no_sky":
+		if String(provenance.get("source", "")) != "none" \
+				or int(provenance.get("source_mode", -1)) != -1 \
+				or energy != 0.0:
+			return false
+		for value in radiance:
+			if value != 0.0:
+				return false
+	else:
+		if String(provenance.get("source", "")).is_empty() \
+				or int(provenance.get("source_mode", -1)) < 0 \
+				or int(provenance.get("source_revision", -1)) < 0:
+			return false
+	return true
+
+static func baked_sky_input_signature(radiance: PackedFloat32Array, energy: float) -> String:
+	if radiance.size() != 27 or not is_finite(energy) or energy < 0.0:
+		return ""
+	var values := PackedFloat32Array()
+	values.resize(28)
+	values[0] = energy
+	for i in 27:
+		if not is_finite(radiance[i]):
+			return ""
+		values[i + 1] = radiance[i]
+	var context := HashingContext.new()
+	if context.start(HashingContext.HASH_SHA256) != OK:
+		return ""
+	context.update(values.to_byte_array())
+	return context.finish().hex_encode()
+
+func baked_indirect_sh_is_valid() -> bool:
+	if not _baked_indirect_payload_validation_cached:
+		_baked_indirect_payload_validation_result = true
+		if baked_indirect_sh_revision == 0:
+			_baked_indirect_payload_validation_result = baked_indirect_sh.is_empty()
+		elif baked_indirect_sh_revision < 0 \
+				or baked_indirect_sh_revision > BAKED_INDIRECT_SH_REVISION \
+				or baked_indirect_sh.size() != probe_count() * 27:
+			_baked_indirect_payload_validation_result = false
+		else:
+			for value in baked_indirect_sh:
+				if not is_finite(value):
+					_baked_indirect_payload_validation_result = false
+					break
+		_baked_indirect_payload_validation_cached = true
+	# Published Data resources are immutable. Keep cheap shape/revision guards
+	# live while reusing the one-time finite scan for backend readiness/status.
+	if baked_indirect_sh_revision == 0:
+		return _baked_indirect_payload_validation_result and baked_indirect_sh.is_empty()
+	return _baked_indirect_payload_validation_result \
+			and baked_indirect_sh_revision > 0 \
+			and baked_indirect_sh_revision <= BAKED_INDIRECT_SH_REVISION \
+			and baked_indirect_sh.size() == probe_count() * 27
+
+## Packs revision-2 probe-major SH9 RGB into seven vec4s per probe for the
+## block producer. The final lane is zero padding; the persisted resource stays
+## compact at 27 floats per probe.
+func make_baked_indirect_sh_upload_bytes() -> PackedByteArray:
+	if not has_baked_indirect_sh() or not baked_indirect_sh_is_valid() \
+			or not is_valid_baked_indirect_sky_provenance(baked_indirect_sky_provenance):
+		return PackedByteArray()
+	var packed := PackedFloat32Array()
+	packed.resize(probe_count() * 28)
+	for probe in probe_count():
+		for scalar in 27:
+			packed[probe * 28 + scalar] = baked_indirect_sh[probe * 27 + scalar]
+	return packed.to_byte_array()
+
 ## Conservative CPU residency estimate for the packed arrays owned by this
 ## resource. Resource/file compression is deliberately not used as a proxy for
 ## resident memory.
@@ -129,6 +712,17 @@ func estimate_cpu_bytes() -> int:
 	bytes += transfer.size() * 4 + primary_sky_visibility.size() * 4
 	bytes += visibility_moments.size() * 4 + visibility_nodes.size() * 4
 	bytes += visibility_triangles.size() * 4 + cell_ranges.size() * 4 + cell_indices.size() * 4
+	bytes += baked_indirect_sh.size() * 4
+	if not baked_indirect_sky_provenance.is_empty():
+		bytes += 384 # Small dictionary metadata plus the 27-float captured Sky SH.
+	if not baked_indirect_directional_source_provenance.is_empty():
+		bytes += 256 + baked_indirect_directional_source_signature.to_utf8_buffer().size()
+		var source_values: Variant = baked_indirect_directional_source_provenance.get("sources", [])
+		if source_values is Array:
+			for source_value in source_values:
+				bytes += 1024 # Conservative Variant/Dictionary storage for one source record.
+				if source_value is Dictionary:
+					bytes += String(source_value.get("path", "")).to_utf8_buffer().size()
 	bytes += emitter_static_signatures.size() * 8 + emitter_transport.size() * 4
 	for key in emitter_keys:
 		bytes += key.to_utf8_buffer().size() + 32
@@ -160,6 +754,9 @@ func estimate_gpu_bytes() -> int:
 	if directional != null and directional is DirectionalData:
 		bytes += (directional.transfer.size() + directional.sky.size()
 				+ directional.emission.size()) * 4
+	if baked_indirect_sh_revision == BAKED_INDIRECT_SH_REVISION \
+			and baked_indirect_sh.size() == probe_count() * 27:
+		bytes += probe_count() * 7 * 16 # Runtime packed source SSBO.
 	bytes += count * 16 # Runtime normal buffer.
 	bytes += count * 32 # Surface relight result.
 	if directional != null:
@@ -169,7 +766,7 @@ func estimate_gpu_bytes() -> int:
 ## Reports whether any geometry transport coefficient contributes. Volumes
 ## cache this O(coefficients) scan alongside full resource validation.
 func has_nonzero_transfer() -> bool:
-	for coefficients in [transfer, primary_sky_visibility, emitter_transport]:
+	for coefficients in [transfer, primary_sky_visibility, emitter_transport, baked_indirect_sh]:
 		for value in coefficients:
 			if value != 0.0:
 				return true
@@ -557,6 +1154,7 @@ func make_render_upload() -> Dictionary:
 		"sparse_indices": adaptive_placement,
 		"index_entries": cell_indices.to_byte_array() if adaptive_placement else PackedInt32Array([0]).to_byte_array(),
 		"emission_image": emission_image,
+		"baked_indirect_sh_bytes": make_baked_indirect_sh_upload_bytes(),
 		"surface_bounds": surface_bounds
 	}
 

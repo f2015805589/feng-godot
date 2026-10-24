@@ -1,0 +1,584 @@
+#ifndef FRP_MAGIC_GI_CLV_GLSLINC
+#define FRP_MAGIC_GI_CLV_GLSLINC
+
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_approx_contract.glslinc"
+
+// Layout-9 CLV consumer. Producer-published parent-cube bits select either a
+// flat diffuse fast path or a same-patch curved raw-SH path; both retain current
+// base tag/epoch checks and the exact producer domain bounds. If neither applies,
+// the existing strict/approximate CLV sampling paths remain available.
+layout(set = 1, binding = 50) uniform texture3D frp_magic_gi_clv_texture0;
+layout(set = 1, binding = 51) uniform itexture3D frp_magic_gi_clv_tags0;
+layout(set = 1, binding = 52) uniform utexture3D frp_magic_gi_clv_support0;
+layout(set = 1, binding = 53, std140) uniform FRPMagicGIClipmapParameters0 {
+	ivec4 origins[3];
+	vec4 spacing; // x = cell size; y = approximate volume.
+	ivec4 control;
+} frp_magic_gi_clv_parameters0;
+
+#ifdef USE_MULTIVIEW
+layout(set = 1, binding = 54) uniform texture3D frp_magic_gi_clv_texture1;
+layout(set = 1, binding = 55) uniform itexture3D frp_magic_gi_clv_tags1;
+layout(set = 1, binding = 56) uniform utexture3D frp_magic_gi_clv_support1;
+layout(set = 1, binding = 57, std140) uniform FRPMagicGIClipmapParameters1 {
+	ivec4 origins[3];
+	vec4 spacing; // x = cell size; y = approximate volume.
+	ivec4 control;
+} frp_magic_gi_clv_parameters1;
+#endif
+
+layout(set = 1, binding = 58, std140) uniform FRPMagicGIOwnerParameters0 {
+	mat4 world_to_local;
+	vec4 owner_size_enabled;
+	vec4 control; // x = total strength, y = Sky replacement, z = scene exposure normalization.
+} frp_magic_gi_owner_parameters0;
+#ifdef USE_MULTIVIEW
+layout(set = 1, binding = 59, std140) uniform FRPMagicGIOwnerParameters1 {
+	mat4 world_to_local;
+	vec4 owner_size_enabled;
+	vec4 control;
+} frp_magic_gi_owner_parameters1;
+#endif
+layout(set = 1, binding = 60, std140) uniform FRPMagicGIBakeParameters {
+	mat4 world_to_grid;
+	vec4 grid;
+	vec4 control;
+} frp_magic_gi_bake_parameters;
+
+const int FRP_MAGIC_GI_CLV_LAYOUT_VERSION = 9;
+const int FRP_MAGIC_GI_CLV_FACE_SLOT_COLUMNS = 24;
+const int FRP_MAGIC_GI_CLV_FACE_METADATA_COLUMN = 18;
+const int FRP_MAGIC_GI_CLV_FACE_ANCHOR_COLUMN = 19;
+const int FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN = 20;
+const int FRP_MAGIC_GI_CLV_FACE_APPROX_GEOMETRY_COLUMN = 22;
+const int FRP_MAGIC_GI_CLV_FACE_APPROX_PATCH_PLANE_MOMENTS_COLUMN = 23;
+const float FRP_MAGIC_GI_CLV_DIFFUSE_NORMAL_ERROR_SQUARED = 0.0001;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_NEIGHBOR_TAGS_READY = 128u;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_X = 1u << 11u;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Y = 1u << 12u;
+const uint FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Z = 1u << 13u;
+const float FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON = 1e-6;
+const float FRP_MAGIC_GI_CLV_CURVED_SH_SAME_FACING_DOT_MIN = 0.0; // Must match the producer's same-facing BVH certificate.
+const float FRP_MAGIC_GI_CLV_DIFFUSE_DOMAIN_NORMAL_DOT_MIN = 0.99995; // synchronized with addon certify.
+
+int frp_magic_gi_clv_face_column(int axis, int column) {
+	return axis * FRP_MAGIC_GI_CLV_FACE_SLOT_COLUMNS + column;
+}
+
+int frp_magic_gi_clv_dominant_axis(vec3 normal) {
+	vec3 magnitude = abs(normal);
+	if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z) { return 0; }
+	if (magnitude.y >= magnitude.z) { return 1; }
+	return 2;
+}
+
+bool frp_magic_gi_clv_finite(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+void frp_magic_gi_clv_diffuse_basis(vec3 n, out float y[9]) {
+	y[0] = 0.2820947918;
+	y[1] = 0.4886025119 * n.y * (2.0 / 3.0);
+	y[2] = 0.4886025119 * n.z * (2.0 / 3.0);
+	y[3] = 0.4886025119 * n.x * (2.0 / 3.0);
+	y[4] = 1.0925484306 * n.x * n.y * 0.25;
+	y[5] = 1.0925484306 * n.y * n.z * 0.25;
+	y[6] = 0.3153915653 * (3.0 * n.z * n.z - 1.0) * 0.25;
+	y[7] = 1.0925484306 * n.x * n.z * 0.25;
+	y[8] = 0.5462742153 * (n.x * n.x - n.y * n.y) * 0.25;
+}
+
+vec3 frp_magic_gi_clv_receiver_domain_half_extent(vec3 cone_axis, float step_size,
+		float min_normal_dot) {
+	vec3 absolute_axis = abs(cone_axis);
+	float cone_sine = sqrt(max(1.0 - min_normal_dot * min_normal_dot, 0.0));
+	vec3 radial = sqrt(max(vec3(1.0) - absolute_axis * absolute_axis, vec3(0.0)));
+	vec3 max_normal_component = mix(absolute_axis * min_normal_dot
+			+ radial * cone_sine, vec3(1.0), greaterThanEqual(absolute_axis,
+			vec3(min_normal_dot)));
+	return step_size * (vec3(0.5) + 0.75 * max_normal_component);
+}
+
+// Evaluate the already-relit outgoing SH coefficients as diffuse irradiance
+// divided by pi. The basis contains the Lambert cosine convolution once, just
+// like the producer's diffuse_basis() when it writes columns 20/21.
+#define FRP_MAGIC_GI_CLV_EVALUATE_RAW_SH(clv_texture, axis_arg, resolution_arg, coordinate_arg, extent_arg, normal_arg, secondary_out, primary_out) \
+	{ \
+		float sh_basis[9]; \
+		frp_magic_gi_clv_diffuse_basis(normal_arg, sh_basis); \
+		secondary_out = vec3(0.0); primary_out = vec3(0.0); \
+		for (int coefficient = 0; coefficient < 9; coefficient++) { \
+			int secondary_column = frp_magic_gi_clv_face_column(axis_arg, coefficient); \
+			int primary_column = frp_magic_gi_clv_face_column(axis_arg, coefficient + 9); \
+			vec3 secondary_coefficient = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), \
+					(coordinate_arg + vec3(secondary_column * resolution_arg, 0, 0)) / extent_arg, 0.0).rgb; \
+			vec3 primary_coefficient = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), \
+					(coordinate_arg + vec3(primary_column * resolution_arg, 0, 0)) / extent_arg, 0.0).rgb; \
+			secondary_out += secondary_coefficient * sh_basis[coefficient]; \
+			primary_out += primary_coefficient * sh_basis[coefficient]; \
+		} \
+	}
+
+#define FRP_MAGIC_GI_DEFINE_SAMPLE_DOMAIN_VIEW(function_name, clv_texture, clv_tags, clv_support, clv_parameters) \
+bool function_name(vec3 world, vec3 geometric_normal, vec3 shading_normal, \
+		out vec3 secondary, out vec3 primary, out int sample_method) { \
+	secondary = vec3(0.0); primary = vec3(0.0); sample_method = 0; \
+	if (clv_parameters.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION \
+			|| !frp_magic_gi_clv_finite(world) || !frp_magic_gi_clv_finite(geometric_normal) \
+			|| !frp_magic_gi_clv_finite(shading_normal)) { return false; } \
+	float geometry_length_squared = dot(geometric_normal, geometric_normal); \
+	float shading_length_squared = dot(shading_normal, shading_normal); \
+	int resolution = clv_parameters.control.x; \
+	if (resolution < 2 || !(geometry_length_squared > 1e-12) \
+			|| isnan(geometry_length_squared) || isinf(geometry_length_squared) \
+			|| !(shading_length_squared > 1e-12) || isnan(shading_length_squared) \
+			|| isinf(shading_length_squared)) { return false; } \
+	geometric_normal *= inversesqrt(geometry_length_squared); \
+	shading_normal *= inversesqrt(shading_length_squared); \
+	int axis = frp_magic_gi_clv_dominant_axis(geometric_normal); \
+	for (int level = 0; level < min(clv_parameters.control.y, 3); level++) { \
+		float step_size = clv_parameters.spacing.x * float(1 << level); \
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) { continue; } \
+		vec3 position = (world + geometric_normal * step_size * 0.75) / step_size - 0.5; \
+		if (!frp_magic_gi_clv_finite(position)) { continue; } \
+		ivec3 base = ivec3(floor(position)); \
+		ivec3 origin = level == 0 ? clv_parameters.origins[0].xyz \
+				: (level == 1 ? clv_parameters.origins[1].xyz : clv_parameters.origins[2].xyz); \
+		ivec3 relative = base - origin; \
+		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; } \
+		ivec3 physical = ((base % resolution) + resolution) % resolution; \
+		if (any(equal(physical, ivec3(resolution - 1)))) { continue; } \
+		ivec3 slot = physical + ivec3(0, 0, level * resolution); \
+		ivec4 tag = texelFetch(isampler3D(clv_tags, SAMPLER_NEAREST_CLAMP), slot, 0); \
+		if (any(notEqual(tag.xyz, base)) || tag.w != clv_parameters.control.z) { continue; } \
+		uint support = texelFetch(usampler3D(clv_support, SAMPLER_NEAREST_CLAMP), slot, 0).r; \
+		if ((support & FRP_MAGIC_GI_CLV_SUPPORT_NEIGHBOR_TAGS_READY) == 0u) { continue; } \
+		uint domain_mask = (1u << uint(axis + 3)) | (1u << uint(axis + 8)); \
+		if ((support & domain_mask) == 0u) { continue; } \
+		vec4 metadata = texelFetch(sampler3D(clv_texture, SAMPLER_NEAREST_CLAMP), \
+				slot + ivec3(frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0); \
+		vec4 anchor = texelFetch(sampler3D(clv_texture, SAMPLER_NEAREST_CLAMP), \
+				slot + ivec3(frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0); \
+		float metadata_length_squared = dot(metadata.xyz, metadata.xyz); \
+		if (!(metadata.w > 0.0) || !frp_magic_gi_clv_finite(metadata.xyz) \
+				|| !frp_magic_gi_clv_finite(anchor.xyz) || !(metadata_length_squared > 1e-12) \
+				|| isnan(metadata_length_squared) || isinf(metadata_length_squared)) { continue; } \
+		vec3 cone_axis = metadata.xyz * inversesqrt(metadata_length_squared); \
+		float coordinate_scale = max(max(abs(world.x), abs(world.y)), abs(world.z)) + 2.0 * step_size; \
+		float margin = max(1e-5, coordinate_scale * 1.9073486328125e-6); \
+		vec3 domain_center = (vec3(base) + vec3(1.0)) * step_size; \
+		vec3 curved_half_extent = vec3(1.25 * step_size); \
+		bool in_curved_domain = all(lessThanEqual(abs(world - domain_center), curved_half_extent + vec3(margin))); \
+		vec3 flat_half_extent = frp_magic_gi_clv_receiver_domain_half_extent(cone_axis, step_size, FRP_MAGIC_GI_CLV_DIFFUSE_DOMAIN_NORMAL_DOT_MIN); \
+		bool in_flat_domain = all(lessThanEqual(abs(world - domain_center), flat_half_extent + vec3(margin))); \
+		float flat_plane_distance = dot(world - anchor.xyz, cone_axis); \
+		float flat_front_tolerance = max(1e-5, step_size * 1e-4) + margin; \
+		uint diffuse_domain_bit = 1u << uint(axis + 3); \
+		uint curved_domain_bit = 1u << uint(axis + 8); \
+		if ((support & diffuse_domain_bit) != 0u \
+				&& dot(geometric_normal, cone_axis) >= FRP_MAGIC_GI_CLV_DIFFUSE_DOMAIN_NORMAL_DOT_MIN \
+				&& dot(shading_normal - cone_axis, shading_normal - cone_axis) \
+						<= FRP_MAGIC_GI_CLV_DIFFUSE_NORMAL_ERROR_SQUARED \
+				&& in_flat_domain \
+				&& flat_plane_distance >= -flat_front_tolerance \
+				&& flat_plane_distance <= max(step_size * 0.15, 1e-4)) { \
+			vec3 coordinate = vec3(slot) + fract(position) + 0.5; \
+			vec3 extent = vec3(textureSize(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), 0)); \
+			vec4 secondary_sample = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), \
+					(coordinate + vec3(frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent, 0.0); \
+			vec4 primary_sample = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), \
+					(coordinate + vec3(frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent, 0.0); \
+			float valid_weight = min(secondary_sample.a, primary_sample.a); \
+			if (valid_weight >= 0.55 && !isnan(valid_weight) && !isinf(valid_weight) \
+					&& frp_magic_gi_clv_finite(secondary_sample.rgb) \
+					&& frp_magic_gi_clv_finite(primary_sample.rgb)) { \
+				secondary = max(secondary_sample.rgb / valid_weight, vec3(0.0)); \
+				primary = max(primary_sample.rgb / valid_weight, vec3(0.0)); sample_method = 1; return true; \
+			} \
+		} \
+		if ((support & curved_domain_bit) != 0u \
+				&& dot(geometric_normal, cone_axis) > FRP_MAGIC_GI_CLV_CURVED_SH_SAME_FACING_DOT_MIN \
+				&& in_curved_domain) { \
+			vec3 coordinate = vec3(slot) + fract(position) + 0.5; \
+			vec3 extent = vec3(textureSize(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), 0)); \
+			FRP_MAGIC_GI_CLV_EVALUATE_RAW_SH(clv_texture, axis, resolution, coordinate, extent, shading_normal, secondary, primary); \
+			if (frp_magic_gi_clv_finite(secondary) && frp_magic_gi_clv_finite(primary)) { sample_method = 2; return true; } \
+			secondary = vec3(0.0); primary = vec3(0.0); \
+		} \
+	} \
+	return false; \
+}
+
+FRP_MAGIC_GI_DEFINE_SAMPLE_DOMAIN_VIEW(frp_magic_gi_sample_domain_view0,
+		frp_magic_gi_clv_texture0, frp_magic_gi_clv_tags0, frp_magic_gi_clv_support0,
+		frp_magic_gi_clv_parameters0)
+#ifdef USE_MULTIVIEW
+FRP_MAGIC_GI_DEFINE_SAMPLE_DOMAIN_VIEW(frp_magic_gi_sample_domain_view1,
+		frp_magic_gi_clv_texture1, frp_magic_gi_clv_tags1, frp_magic_gi_clv_support1,
+		frp_magic_gi_clv_parameters1)
+#endif
+#undef FRP_MAGIC_GI_DEFINE_SAMPLE_DOMAIN_VIEW
+#undef FRP_MAGIC_GI_CLV_EVALUATE_RAW_SH
+
+// Inline this block into the view-specialized sampler so sampler constructors
+// remain directly at their texelFetch sites; the shader compiler rejects them
+// as ordinary function-call arguments.
+// Layout-9 fill/relight writes the same 0/1 approximate-validity bit to the
+// diffuse fields and column-23.w. Interior sampling therefore gets coverage
+// from the manually weighted guide values, avoiding hardware-filter precision
+// changes at the acceptance threshold while still filtering only radiance.
+#define FRP_MAGIC_GI_APPROX_FETCH_NEIGHBORHOOD(clv_texture, world_arg, base_arg, fraction_arg, level_arg, axis_arg, resolution_arg, step_arg, secondary_out, primary_out, geometry_out, moment_out, plane_out, valid_out) \
+	{ \
+		secondary_out = vec4(0.0); primary_out = vec4(0.0); geometry_out = vec4(0.0); \
+		moment_out = vec4(0.0); plane_out = vec4(0.0); \
+		float coordinate_scale = max(max(abs(world_arg.x), abs(world_arg.y)), abs(world_arg.z)) + 2.0 * step_arg; \
+		plane_out.w = coordinate_scale * 1.1920928955078125e-7; \
+		bool valid_geometry = true; \
+		bool have_patch_reference = false; \
+		bool patch_ids_match = true; \
+		float patch_reference = 0.0; \
+		int secondary_column = frp_magic_gi_clv_face_column(axis_arg, FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN); \
+		int geometry_column = frp_magic_gi_clv_face_column(axis_arg, FRP_MAGIC_GI_CLV_FACE_APPROX_GEOMETRY_COLUMN); \
+		int moments_column = frp_magic_gi_clv_face_column(axis_arg, FRP_MAGIC_GI_CLV_FACE_APPROX_PATCH_PLANE_MOMENTS_COLUMN); \
+		ivec3 physical_base = ((base_arg % resolution_arg) + resolution_arg) % resolution_arg; \
+		ivec3 slot_base = physical_base + ivec3(0, 0, level_arg * resolution_arg); \
+		bool use_hardware_filter = all(lessThan(physical_base, ivec3(resolution_arg - 1))); \
+		for (int corner = 0; corner < 8; corner++) { \
+			ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1); \
+			float corner_weight = (offset.x == 0 ? 1.0 - fraction_arg.x : fraction_arg.x) * (offset.y == 0 ? 1.0 - fraction_arg.y : fraction_arg.y) * (offset.z == 0 ? 1.0 - fraction_arg.z : fraction_arg.z); \
+			if (!(corner_weight > 0.0)) { continue; } \
+			ivec3 logical_corner = base_arg + offset; \
+			ivec3 slot = ((logical_corner % resolution_arg) + resolution_arg) % resolution_arg; \
+			slot.z += level_arg * resolution_arg; \
+			vec4 corner_geometry = texelFetch(sampler3D(clv_texture, SAMPLER_NEAREST_CLAMP), slot + ivec3(geometry_column * resolution_arg, 0, 0), 0); \
+			vec4 corner_moments = texelFetch(sampler3D(clv_texture, SAMPLER_NEAREST_CLAMP), slot + ivec3(moments_column * resolution_arg, 0, 0), 0); \
+			float corner_valid = corner_moments.a; \
+			if (!use_hardware_filter) { \
+				vec4 corner_secondary = texelFetch(sampler3D(clv_texture, SAMPLER_NEAREST_CLAMP), slot + ivec3(secondary_column * resolution_arg, 0, 0), 0); \
+				vec4 corner_primary = texelFetch(sampler3D(clv_texture, SAMPLER_NEAREST_CLAMP), slot + ivec3((secondary_column + 1) * resolution_arg, 0, 0), 0); \
+				secondary_out += corner_secondary * corner_weight; primary_out += corner_primary * corner_weight; \
+				corner_valid = min(min(corner_secondary.a, corner_primary.a), corner_moments.a); \
+			} \
+			geometry_out.xyz += corner_geometry.xyz * corner_weight; \
+			moment_out.xy += corner_moments.xy * corner_weight; moment_out.a += corner_moments.a * corner_weight; \
+			if (corner_valid > 0.0) { \
+				float corner_patch = corner_moments.x; \
+				if (!(corner_patch > 0.0) || isnan(corner_patch) || isinf(corner_patch) || floor(corner_patch) != corner_patch) { \
+					patch_ids_match = false; \
+				} else if (!have_patch_reference) { \
+					patch_reference = corner_patch; have_patch_reference = true; \
+				} else if (corner_patch != patch_reference) { \
+					patch_ids_match = false; \
+				} \
+				vec3 corner_normal = corner_geometry.xyz / corner_valid; \
+				float normal_length_squared = dot(corner_normal, corner_normal); \
+				float corner_offset = corner_geometry.w / corner_valid; \
+				if (!frp_magic_gi_clv_finite(corner_normal) || !(normal_length_squared > 1e-12) || isnan(normal_length_squared) || isinf(normal_length_squared) || isnan(corner_offset) || isinf(corner_offset)) { \
+					valid_geometry = false; \
+				} else { \
+					vec3 cell_center = (vec3(logical_corner) + 0.5) * step_arg; \
+					float receiver_plane_delta = dot(world_arg - cell_center, corner_normal) - corner_offset; \
+					if (isnan(receiver_plane_delta) || isinf(receiver_plane_delta)) { \
+						valid_geometry = false; \
+					} else { \
+						float weighted_validity = corner_weight * corner_valid; \
+						plane_out.x += receiver_plane_delta * weighted_validity; \
+						plane_out.y += receiver_plane_delta * receiver_plane_delta * weighted_validity; \
+						plane_out.z = max(plane_out.z, abs(receiver_plane_delta)); \
+					} \
+				} \
+			} \
+		} \
+		if (use_hardware_filter) { \
+			vec3 coordinate = vec3(slot_base) + fraction_arg + 0.5; \
+			vec3 extent = vec3(textureSize(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), 0)); \
+			secondary_out = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), (coordinate + vec3(secondary_column * resolution_arg, 0, 0)) / extent, 0.0); \
+			primary_out = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), (coordinate + vec3((secondary_column + 1) * resolution_arg, 0, 0)) / extent, 0.0); \
+			secondary_out.a = moment_out.a; primary_out.a = moment_out.a; \
+		} \
+		geometry_out.w = 0.0; moment_out.z = have_patch_reference && patch_ids_match ? 1.0 : 0.0; valid_out = valid_geometry; \
+	}
+
+#define FRP_MAGIC_GI_DEFINE_SAMPLE_CERTIFIED_VIEW(function_name, clv_texture, clv_tags, clv_support, clv_parameters) \
+bool function_name(vec3 world, vec3 normal, out vec3 secondary, out vec3 primary) { \
+	secondary = vec3(0.0); \
+	primary = vec3(0.0); \
+	if (clv_parameters.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION || !frp_magic_gi_clv_finite(world) \
+			|| !frp_magic_gi_clv_finite(normal)) { \
+		return false; \
+	} \
+	int axis = frp_magic_gi_clv_dominant_axis(normal); \
+	int resolution = clv_parameters.control.x; \
+	for (int level = 0; level < min(clv_parameters.control.y, 3); level++) { \
+		float step_size = clv_parameters.spacing.x * float(1 << level); \
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5; \
+		ivec3 base = ivec3(floor(position)); \
+		ivec3 origin = level == 0 ? clv_parameters.origins[0].xyz : (level == 1 ? clv_parameters.origins[1].xyz : clv_parameters.origins[2].xyz); \
+		ivec3 relative = base - origin; \
+		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { \
+			continue; \
+		} \
+		ivec3 physical = ((base % resolution) + resolution) % resolution; \
+		if (any(equal(physical, ivec3(resolution - 1)))) { \
+			continue; \
+		} \
+		ivec3 slot = physical + ivec3(0, 0, level * resolution); \
+		ivec4 tag = texelFetch(isampler3D(clv_tags, SAMPLER_NEAREST_CLAMP), slot, 0); \
+		uint support = texelFetch(usampler3D(clv_support, SAMPLER_NEAREST_CLAMP), slot, 0).r; \
+		if (any(notEqual(tag.xyz, base)) || tag.w != clv_parameters.control.z \
+				|| (support & (1u << uint(axis))) == 0u) { \
+			continue; \
+		} \
+		vec4 metadata = texelFetch(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), \
+				slot + ivec3(frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0); \
+		vec4 anchor = texelFetch(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), \
+				slot + ivec3(frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_ANCHOR_COLUMN) * resolution, 0, 0), 0); \
+		vec3 normal_delta = normal - metadata.xyz; \
+		if (dot(normal_delta, normal_delta) > FRP_MAGIC_GI_CLV_DIFFUSE_NORMAL_ERROR_SQUARED) { \
+			continue; \
+		} \
+		vec3 center = (vec3(base) + 0.5) * step_size; \
+		float magnitude = max(step_size, max(max(abs(center.x), abs(center.y)), abs(center.z))); \
+		float margin = max(1e-5, magnitude * 1.9073486328125e-6); \
+		float tolerance = max(1e-5, step_size * 1e-4) + margin; \
+		if (abs(dot(world - anchor.xyz, metadata.xyz)) > tolerance \
+				|| any(lessThan(world, center - vec3(0.75 * step_size + margin))) \
+				|| any(greaterThan(world, center + vec3(1.75 * step_size + margin)))) { \
+			continue; \
+		} \
+		vec3 coordinate = vec3(slot) + fract(position) + 0.5; \
+		vec3 extent = vec3(textureSize(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), 0)); \
+		vec4 secondary_sample = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), (coordinate + vec3( \
+				frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent, 0.0); \
+		vec4 primary_sample = textureLod(sampler3D(clv_texture, SAMPLER_LINEAR_CLAMP), (coordinate + vec3( \
+				frp_magic_gi_clv_face_column(axis, FRP_MAGIC_GI_CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent, 0.0); \
+		float valid_weight = min(secondary_sample.a, primary_sample.a); \
+		if (!(valid_weight >= 0.55) || isnan(valid_weight) || isinf(valid_weight) \
+				|| !frp_magic_gi_clv_finite(secondary_sample.rgb) \
+				|| !frp_magic_gi_clv_finite(primary_sample.rgb)) { continue; } \
+		secondary = max(secondary_sample.rgb / valid_weight, vec3(0.0)); \
+		primary = max(primary_sample.rgb / valid_weight, vec3(0.0)); \
+		return true; \
+	} \
+	return false; \
+}
+
+FRP_MAGIC_GI_DEFINE_SAMPLE_CERTIFIED_VIEW(frp_magic_gi_sample_certified_view0,
+		frp_magic_gi_clv_texture0, frp_magic_gi_clv_tags0, frp_magic_gi_clv_support0,
+		frp_magic_gi_clv_parameters0)
+#ifdef USE_MULTIVIEW
+FRP_MAGIC_GI_DEFINE_SAMPLE_CERTIFIED_VIEW(frp_magic_gi_sample_certified_view1,
+		frp_magic_gi_clv_texture1, frp_magic_gi_clv_tags1, frp_magic_gi_clv_support1,
+		frp_magic_gi_clv_parameters1)
+#endif
+#undef FRP_MAGIC_GI_DEFINE_SAMPLE_CERTIFIED_VIEW
+
+bool frp_magic_gi_sample_certified(vec3 world, vec3 geometric_normal,
+		vec3 shading_normal, int view, out vec3 secondary, out vec3 primary,
+		out int sample_method) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	sample_method = 0;
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		if (frp_magic_gi_sample_domain_view1(world, geometric_normal, shading_normal,
+				secondary, primary, sample_method)) { return true; }
+		return frp_magic_gi_sample_certified_view1(world, shading_normal, secondary, primary);
+	}
+#endif
+	if (frp_magic_gi_sample_domain_view0(world, geometric_normal, shading_normal,
+			secondary, primary, sample_method)) { return true; }
+	if (frp_magic_gi_sample_certified_view0(world, shading_normal, secondary, primary)) {
+		sample_method = 3;
+		return true;
+	}
+	return false;
+}
+
+#define FRP_MAGIC_GI_DEFINE_SAMPLE_APPROX_VIEW(function_name, clv_texture, clv_tags, clv_support, clv_parameters) \
+bool function_name(vec3 world, vec3 normal, out vec3 secondary, out vec3 primary, \
+		out int selected_level, out float confidence) { \
+	secondary = vec3(0.0); primary = vec3(0.0); selected_level = -1; confidence = 0.0; \
+	if (clv_parameters.spacing.y < 0.5 || clv_parameters.control.w != FRP_MAGIC_GI_CLV_LAYOUT_VERSION || !frp_magic_gi_clv_finite(world) || !frp_magic_gi_clv_finite(normal)) { return false; } \
+	float input_normal_length_squared = dot(normal, normal); \
+	if (!(input_normal_length_squared > 1e-12) || isnan(input_normal_length_squared) || isinf(input_normal_length_squared)) { return false; } \
+	normal *= inversesqrt(input_normal_length_squared); \
+	int axis = frp_magic_gi_clv_dominant_axis(normal); int resolution = clv_parameters.control.x; \
+	for (int level = 0; level < min(clv_parameters.control.y, 3); level++) { \
+		float step_size = clv_parameters.spacing.x * float(1 << level); \
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) { continue; } \
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5; \
+		if (!frp_magic_gi_clv_finite(position)) { continue; } \
+		ivec3 base = ivec3(floor(position)); \
+		ivec3 origin = level == 0 ? clv_parameters.origins[0].xyz : (level == 1 ? clv_parameters.origins[1].xyz : clv_parameters.origins[2].xyz); \
+		ivec3 relative = base - origin; \
+		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; } \
+		ivec3 physical = ((base % resolution) + resolution) % resolution; \
+		ivec3 slot = physical + ivec3(0, 0, level * resolution); \
+		ivec4 base_tag = texelFetch(isampler3D(clv_tags, SAMPLER_NEAREST_CLAMP), slot, 0); \
+		if (any(notEqual(base_tag.xyz, base)) || base_tag.w != clv_parameters.control.z) { continue; } \
+		uint support = texelFetch(usampler3D(clv_support, SAMPLER_NEAREST_CLAMP), slot, 0).r; \
+		bool ready_tags = (support & FRP_MAGIC_GI_CLV_SUPPORT_NEIGHBOR_TAGS_READY) != 0u; \
+		if (!ready_tags) { \
+			bool tags_valid = true; \
+			for (int corner = 1; corner < 8; corner++) { \
+			ivec3 logical_corner = base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1); \
+			ivec3 corner_slot = ((logical_corner % resolution) + resolution) % resolution; corner_slot.z += level * resolution; \
+			ivec4 corner_tag = texelFetch(isampler3D(clv_tags, SAMPLER_NEAREST_CLAMP), corner_slot, 0); \
+			if (any(notEqual(corner_tag.xyz, logical_corner)) || corner_tag.w != clv_parameters.control.z) { tags_valid = false; break; } \
+		} \
+			if (!tags_valid) { continue; } \
+		} \
+		vec3 fraction = fract(position); \
+		bool boundary_fraction = any(lessThanEqual(fraction, vec3(FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON))) \
+				|| any(greaterThanEqual(fraction, vec3(1.0 - FRP_MAGIC_GI_CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON))); \
+		uint approx_possible_bit = axis == 0 ? FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_X \
+				: (axis == 1 ? FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Y \
+					: FRP_MAGIC_GI_CLV_SUPPORT_APPROX_POSSIBLE_Z); \
+		if (ready_tags && (support & approx_possible_bit) == 0u && !boundary_fraction) { continue; } \
+		vec4 secondary_sample; vec4 primary_sample; vec4 geometry_sample; vec4 moment_sample; vec4 plane_moments; \
+		bool sample_valid; \
+		FRP_MAGIC_GI_APPROX_FETCH_NEIGHBORHOOD(clv_texture, world, base, fraction, level, axis, resolution, step_size, \
+				secondary_sample, primary_sample, geometry_sample, moment_sample, plane_moments, sample_valid); \
+		if (!sample_valid) { continue; } \
+		float valid_weight = min(min(secondary_sample.a, primary_sample.a), moment_sample.a); \
+		if (!clv_approx_geometry_valid(normal, geometry_sample, moment_sample, plane_moments, \
+				valid_weight, step_size, clv_parameters.spacing.x)) { continue; } \
+		selected_level = level; confidence = clamp(valid_weight, 0.0, 1.0); \
+		secondary = max(secondary_sample.rgb / valid_weight, vec3(0.0)); primary = max(primary_sample.rgb / valid_weight, vec3(0.0)); \
+		if (!frp_magic_gi_clv_finite(secondary) || !frp_magic_gi_clv_finite(primary)) { secondary = vec3(0.0); primary = vec3(0.0); selected_level = -1; confidence = 0.0; continue; } \
+		return true; \
+	} \
+	return false; \
+}
+
+FRP_MAGIC_GI_DEFINE_SAMPLE_APPROX_VIEW(frp_magic_gi_sample_approx_view0,
+		frp_magic_gi_clv_texture0, frp_magic_gi_clv_tags0, frp_magic_gi_clv_support0,
+		frp_magic_gi_clv_parameters0)
+#ifdef USE_MULTIVIEW
+FRP_MAGIC_GI_DEFINE_SAMPLE_APPROX_VIEW(frp_magic_gi_sample_approx_view1,
+		frp_magic_gi_clv_texture1, frp_magic_gi_clv_tags1, frp_magic_gi_clv_support1,
+		frp_magic_gi_clv_parameters1)
+#endif
+#undef FRP_MAGIC_GI_DEFINE_SAMPLE_APPROX_VIEW
+#undef FRP_MAGIC_GI_APPROX_FETCH_NEIGHBORHOOD
+
+bool frp_magic_gi_sample_approx(vec3 world, vec3 normal, int view,
+		out vec3 secondary, out vec3 primary, out int selected_level,
+		out float confidence) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_sample_approx_view1(world, normal, secondary,
+				primary, selected_level, confidence);
+	}
+#endif
+	return frp_magic_gi_sample_approx_view0(world, normal, secondary,
+			primary, selected_level, confidence);
+}
+
+bool frp_magic_gi_owner_contains(vec3 world, vec4 owner_size_enabled,
+		mat4 world_to_local) {
+	if (owner_size_enabled.w <= 0.5) {
+		return true;
+	}
+	vec3 local_position = (world_to_local * vec4(world, 1.0)).xyz;
+	return all(lessThanEqual(abs(local_position), owner_size_enabled.xyz * 0.5));
+}
+
+// Read the current per-view CLV owner controls without depending on the
+// separate baked-SH shader variant. The deferred lighting source is shared by
+// mutually exclusive CLV and baked-SH specializations.
+vec4 frp_magic_gi_clv_owner_control(int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_owner_parameters1.control;
+	}
+#endif
+	return frp_magic_gi_owner_parameters0.control;
+}
+
+bool frp_magic_gi_in_bake_bounds(vec3 world) {
+	float spacing = max(frp_magic_gi_bake_parameters.control.y, 0.001);
+	vec3 dimensions = frp_magic_gi_bake_parameters.grid.xyz;
+	vec3 grid_position = (frp_magic_gi_bake_parameters.world_to_grid * vec4(world, 1.0)).xyz;
+	mat3 world_to_grid_basis = mat3(frp_magic_gi_bake_parameters.world_to_grid);
+	float grid_epsilon = max(1e-5, spacing * 0.001 * max(
+			length(world_to_grid_basis[0]),
+			max(length(world_to_grid_basis[1]), length(world_to_grid_basis[2]))));
+	return frp_magic_gi_bake_parameters.grid.w > 0.0
+			&& !any(lessThan(grid_position, vec3(-grid_epsilon)))
+			&& !any(greaterThan(grid_position, dimensions + vec3(grid_epsilon)));
+}
+
+bool frp_magic_gi_apply_certified(vec3 world, vec3 geometric_normal,
+		vec3 normal, vec3 albedo,
+		float ao, float diffuse_ao, int view,
+		inout vec3 ambient_light, vec3 global_sky_light_diffuse) {
+	vec4 owner_size_enabled;
+	mat4 world_to_local;
+	vec4 control;
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		owner_size_enabled = frp_magic_gi_owner_parameters1.owner_size_enabled;
+		world_to_local = frp_magic_gi_owner_parameters1.world_to_local;
+		control = frp_magic_gi_owner_parameters1.control;
+	} else
+#endif
+	{
+		owner_size_enabled = frp_magic_gi_owner_parameters0.owner_size_enabled;
+		world_to_local = frp_magic_gi_owner_parameters0.world_to_local;
+		control = frp_magic_gi_owner_parameters0.control;
+	}
+	float total_strength = max(control.x, 0.0);
+	if (!(total_strength > 0.0) || ao <= 0.0
+			|| all(equal(albedo, vec3(0.0)))
+			|| !frp_magic_gi_owner_contains(world, owner_size_enabled, world_to_local)
+			|| !frp_magic_gi_in_bake_bounds(world)) {
+		return false;
+	}
+	// Runner-only matched baseline (QA mode 4): keep this owner active and keep
+	// its sky-replacement subtraction identical, but bypass all CLV texture reads
+	// and report the receiver as handled so no general/pixel PRT fallback runs.
+	// This lets profiling compare the real consumer against zero contribution
+	// without changing producer state, bindings, or sky ownership.
+	if (abs(control.w - 4.0) < 0.01) {
+		if (control.y > 0.5) {
+			ambient_light -= global_sky_light_diffuse * clamp(total_strength, 0.0, 1.0);
+		}
+		return true;
+	}
+	vec3 secondary;
+	vec3 primary;
+	int sample_method;
+	bool sample_found = frp_magic_gi_sample_certified(world, geometric_normal,
+			normal, view, secondary, primary, sample_method);
+	if (!sample_found) {
+		int approximate_level;
+		float approximate_confidence;
+		sample_found = frp_magic_gi_sample_approx(world, normal, view,
+				secondary, primary, approximate_level, approximate_confidence);
+	}
+	// Runner-only route probe. Magenta marks a valid native layout-9 sample;
+	// cyan marks an owner/bake-bounds receiver for which both native sampling
+	// paths missed. Returning handled prevents a fallback from disguising it.
+	if (abs(control.w - 5.0) < 0.01) {
+		ambient_light = sample_found ? vec3(65536.0, 0.0, 65536.0)
+				: vec3(0.0, 65536.0, 65536.0);
+		return true;
+	}
+	if (!sample_found) {
+		return false;
+	}
+	if (control.y <= 0.5) {
+		primary = vec3(0.0);
+	} else {
+		ambient_light -= global_sky_light_diffuse * clamp(total_strength, 0.0, 1.0);
+	}
+	vec3 incident = max(secondary + primary, vec3(0.0));
+	// Deferred lighting has already multiplied ambient by albedo and both AO
+	// terms, then applies metallic and pre-exposure once in its shared combine.
+	ambient_light += incident * albedo * ao * diffuse_ao * total_strength * max(control.z, 0.0);
+	return true;
+}
+
+#endif // FRP_MAGIC_GI_CLV_GLSLINC

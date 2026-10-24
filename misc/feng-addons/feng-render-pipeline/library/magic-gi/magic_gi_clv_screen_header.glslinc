@@ -1,0 +1,263 @@
+
+// Post-GBuffer CLV receiver cache producer. A coherent 8x8 full-resolution
+// footprint costs one normal cache lookup; discontinuities are evaluated at
+// full resolution and are marked so the PBR consumer cannot cross the edge.
+// This shader stores raw incident irradiance only. Albedo, AO, owner strength,
+// pre-exposure, and scene-color normalization remain in the native PBR consumer.
+// Portable layout-9 helper pairs separate image/sampler descriptors at each texture operation.
+// Screen-side owner and bake bounds mirror the native consumer before any cache lookup.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+const int CLV_SCREEN_TILE_SIZE = 8;
+
+layout(set = 0, binding = 0) uniform sampler2D depth_buffer;
+layout(set = 0, binding = 1) uniform sampler2D normal_roughness;
+layout(rgba32f, set = 0, binding = 2) uniform image2D half_incident_output;
+layout(rgba32f, set = 0, binding = 3) uniform image2D half_guide_output;
+layout(rgba32f, set = 0, binding = 4) uniform image2D full_edge_output;
+layout(set = 0, binding = 6, std430) buffer ScreenResolveDiagnostics {
+	uint words[];
+} screen_diagnostics;
+layout(set = 0, binding = 5, std140) uniform GIParams {
+	mat4 inverse_projection;
+	mat4 world_to_grid;
+	mat4 view_to_world;
+	vec4 grid;
+	vec4 control;
+	vec4 lighting_sh[7];
+	vec4 sky_lighting_sh[7];
+} params;
+
+#if !defined(CLV_SCREEN_STAGE_CLASSIFY)
+layout(set = 1, binding = 50) uniform texture3D frp_magic_gi_clv_texture0;
+layout(set = 1, binding = 51) uniform itexture3D frp_magic_gi_clv_tags0;
+layout(set = 1, binding = 52) uniform utexture3D frp_magic_gi_clv_support0;
+layout(set = 1, binding = 53, std140) uniform FRPMagicGIClipmapParameters0 {
+	ivec4 origins[3];
+	vec4 spacing;
+	ivec4 control;
+} frp_magic_gi_clv_parameters0;
+#endif
+layout(set = 1, binding = 58, std140) uniform FRPMagicGIOwnerParameters0 {
+	mat4 world_to_local;
+	vec4 owner_size_enabled;
+	vec4 control;
+} frp_magic_gi_owner_parameters0;
+layout(set = 1, binding = 60, std140) uniform FRPMagicGIBakeParameters {
+	mat4 world_to_grid;
+	vec4 grid;
+	vec4 control;
+} frp_magic_gi_bake_parameters;
+#if !defined(CLV_SCREEN_STAGE_CLASSIFY)
+layout(set = 1, binding = 61) uniform sampler SAMPLER_NEAREST_CLAMP;
+layout(set = 1, binding = 62) uniform sampler SAMPLER_LINEAR_CLAMP;
+#if defined(CLV_SCREEN_STAGE_PARTIAL)
+layout(set = 1, binding = 63, std430) readonly buffer FRPMagicGIVisibilityNodes {
+	vec4 nodes[];
+} visibility_bvh;
+layout(set = 1, binding = 64, std430) readonly buffer FRPMagicGIVisibilityTriangles {
+	vec4 triangles[];
+} visibility_geometry;
+#endif
+#endif
+
+layout(push_constant, std430) uniform ScreenResolveParameters {
+	ivec2 full_size;
+	ivec2 half_size;
+	ivec2 diagnostic_roi_min;
+	ivec2 diagnostic_roi_max;
+	int diagnostic_enabled;
+	int stage_mode;
+} pc;
+
+const int CLV_SCREEN_PARTIAL_COARSE = 0;
+const int CLV_SCREEN_PARTIAL_LOCAL_EDGES = 1;
+const int CLV_SCREEN_FAST_COARSE = 0;
+const int CLV_SCREEN_FAST_LOCAL_EDGES = 1;
+const float CLV_SCREEN_PENDING_PARTIAL = -1.0;
+const float CLV_SCREEN_PENDING_FAST = -2.0;
+const float CLV_SCREEN_PENDING_FAST_CENTER = -3.0;
+
+const uint SCREEN_DIAG_GLOBAL_OFFSET = 0u;
+const uint SCREEN_DIAG_ROI_OFFSET = 53u;
+const uint SCREEN_DIAG_TILE_COUNT = 0u;
+const uint SCREEN_DIAG_COHERENT_TILES = 1u;
+const uint SCREEN_DIAG_EDGE_TILES = 2u;
+const uint SCREEN_DIAG_VALID_RECEIVERS = 3u;
+const uint SCREEN_DIAG_INVALID_RECEIVERS = 4u;
+const uint SCREEN_DIAG_SAMPLE_CALLS = 5u;
+const uint SCREEN_DIAG_SAMPLE_MISSES = 6u;
+const uint SCREEN_DIAG_DOMAIN_FLAT = 7u;
+const uint SCREEN_DIAG_DOMAIN_CURVED = 8u;
+const uint SCREEN_DIAG_LEGACY_STRICT = 9u;
+const uint SCREEN_DIAG_APPROX = 10u;
+const uint SCREEN_DIAG_PARTIAL_DIFFUSE = 11u;
+const uint SCREEN_DIAG_PARTIAL_SH = 12u;
+const uint SCREEN_DIAG_PARTIAL_LOD0 = 13u;
+const uint SCREEN_DIAG_PARTIAL_LOD1 = 14u;
+const uint SCREEN_DIAG_PARTIAL_LOD2 = 15u;
+const uint SCREEN_DIAG_PARTIAL_CANDIDATES = 16u;
+const uint SCREEN_DIAG_PARTIAL_RAYS = 17u;
+const uint SCREEN_DIAG_PARTIAL_BLOCKED = 18u;
+const uint SCREEN_DIAG_BVH_NODE_VISITS = 19u;
+const uint SCREEN_DIAG_ROUTE_LOD0 = 20u;
+const uint SCREEN_DIAG_ROUTE_LOD1 = 21u;
+const uint SCREEN_DIAG_ROUTE_LOD2 = 22u;
+const uint SCREEN_DIAG_AXIS_X = 23u;
+const uint SCREEN_DIAG_AXIS_Y = 24u;
+const uint SCREEN_DIAG_AXIS_Z = 25u;
+const uint SCREEN_DIAG_CONFIDENCE_SUM_CENT = 26u;
+const uint SCREEN_DIAG_CONFIDENCE_COUNT = 27u;
+const uint SCREEN_DIAG_OWNER_BOUNDS_MISSES = 28u;
+const uint SCREEN_DIAG_PARTIAL_CALLS = 29u;
+const uint SCREEN_DIAG_PARTIAL_RAY_VISITS = 30u;
+const uint SCREEN_DIAG_RESERVED = 31u;
+const uint SCREEN_DIAG_PARTIAL_COARSE_INVOCATIONS = 32u;
+const uint SCREEN_DIAG_PARTIAL_COARSE_PENDING = 33u;
+const uint SCREEN_DIAG_PARTIAL_LOCAL_INVOCATIONS = 34u;
+const uint SCREEN_DIAG_PARTIAL_LOCAL_PENDING = 35u;
+const uint SCREEN_DIAG_SIZE_FAIL_EXTENTS = 36u;
+const uint SCREEN_DIAG_SIZE_FAIL_CACHE = 37u;
+const uint SCREEN_DIAG_SIZE_FAIL_DEPTH = 38u;
+const uint SCREEN_DIAG_SIZE_FAIL_NORMAL = 39u;
+const uint SCREEN_DIAG_SIZE_FAIL_EDGE = 40u;
+const uint SCREEN_DIAG_SIZE_FAIL_HALF_INCIDENT = 41u;
+const uint SCREEN_DIAG_SIZE_FAIL_HALF_GUIDE = 42u;
+const uint SCREEN_DIAG_FAST_COARSE_INVOCATIONS = 43u;
+const uint SCREEN_DIAG_FAST_LOCAL_PENDING_PIXELS = 44u;
+const uint SCREEN_DIAG_PARTIAL_COARSE_GUIDE_VALID = 45u;
+const uint SCREEN_DIAG_PARTIAL_COARSE_GUIDE_INVALID = 46u;
+const uint SCREEN_DIAG_PARTIAL_COARSE_ALPHA_NEGATIVE = 47u;
+const uint SCREEN_DIAG_PARTIAL_COARSE_ALPHA_NONNEGATIVE = 48u;
+const uint SCREEN_DIAG_PARTIAL_LOCAL_NEGATIVE_PIXELS = 49u;
+const uint SCREEN_DIAG_PARTIAL_LOCAL_NONNEGATIVE_PIXELS = 50u;
+const uint SCREEN_DIAG_PARTIAL_POST_SIZE_ENTRIES = 51u;
+const uint SCREEN_DIAG_PARTIAL_BEFORE_FIRST_IMAGE_LOAD = 52u;
+const uint SCREEN_DIAG_SPLIT_STAGE_MAGIC = 0x53000000u;
+const uint SCREEN_DIAG_SPLIT_ENTRY_COARSE = 1u << 0u;
+const uint SCREEN_DIAG_SPLIT_ENTRY_LOCAL = 1u << 1u;
+const uint SCREEN_DIAG_SPLIT_POST_SIZE_COARSE = 1u << 2u;
+const uint SCREEN_DIAG_SPLIT_POST_SIZE_LOCAL = 1u << 3u;
+const uint SCREEN_DIAG_SPLIT_FIRST_LOAD_COARSE = 1u << 4u;
+const uint SCREEN_DIAG_SPLIT_FIRST_LOAD_LOCAL = 1u << 5u;
+const uint SCREEN_DIAG_SPLIT_AFTER_SIZE_QUERIES_COARSE = 1u << 6u;
+const uint SCREEN_DIAG_SPLIT_AFTER_SIZE_QUERIES_LOCAL = 1u << 7u;
+const uint SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE = 1u << 8u;
+const uint SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL = 1u << 9u;
+const uint SCREEN_DIAG_SPLIT_EXTENTS_FAIL_COARSE = 1u << 10u;
+const uint SCREEN_DIAG_SPLIT_EXTENTS_FAIL_LOCAL = 1u << 11u;
+const uint SCREEN_DIAG_SPLIT_CACHE_FAIL_COARSE = 1u << 12u;
+const uint SCREEN_DIAG_SPLIT_CACHE_FAIL_LOCAL = 1u << 13u;
+const uint SCREEN_DIAG_SPLIT_DEPTH_FAIL_COARSE = 1u << 14u;
+const uint SCREEN_DIAG_SPLIT_DEPTH_FAIL_LOCAL = 1u << 15u;
+const uint SCREEN_DIAG_SPLIT_NORMAL_FAIL_COARSE = 1u << 16u;
+const uint SCREEN_DIAG_SPLIT_NORMAL_FAIL_LOCAL = 1u << 17u;
+const uint SCREEN_DIAG_SPLIT_EDGE_FAIL_COARSE = 1u << 18u;
+const uint SCREEN_DIAG_SPLIT_EDGE_FAIL_LOCAL = 1u << 19u;
+const uint SCREEN_DIAG_SPLIT_HALF_INCIDENT_FAIL_COARSE = 1u << 20u;
+const uint SCREEN_DIAG_SPLIT_HALF_INCIDENT_FAIL_LOCAL = 1u << 21u;
+const uint SCREEN_DIAG_SPLIT_HALF_GUIDE_FAIL_COARSE = 1u << 22u;
+const uint SCREEN_DIAG_SPLIT_HALF_GUIDE_FAIL_LOCAL = 1u << 23u;
+
+bool clv_screen_diagnostic_pixel(ivec2 pixel) {
+	return pc.diagnostic_enabled != 0
+			&& all(greaterThanEqual(pixel, pc.diagnostic_roi_min))
+			&& all(lessThan(pixel, pc.diagnostic_roi_max));
+}
+
+void clv_screen_diagnostic_add(uint counter, uint amount, bool in_roi) {
+	if (pc.diagnostic_enabled == 0) { return; }
+	atomicAdd(screen_diagnostics.words[SCREEN_DIAG_GLOBAL_OFFSET + counter], amount);
+	if (in_roi) {
+		atomicAdd(screen_diagnostics.words[SCREEN_DIAG_ROI_OFFSET + counter], amount);
+	}
+}
+
+void clv_screen_diagnostic_stage_marker(uint bits) {
+	if (pc.diagnostic_enabled != 0) {
+		atomicOr(screen_diagnostics.words[SCREEN_DIAG_GLOBAL_OFFSET + SCREEN_DIAG_RESERVED],
+				SCREEN_DIAG_SPLIT_STAGE_MAGIC | bits);
+	}
+}
+
+void clv_screen_diagnostic_resolved_route(int route, int level, int axis,
+		float confidence, bool in_roi) {
+	if (route == 0) {
+		return;
+	}
+	if (route == 1) { clv_screen_diagnostic_add(SCREEN_DIAG_DOMAIN_FLAT, 1u, in_roi); }
+	else if (route == 2) { clv_screen_diagnostic_add(SCREEN_DIAG_DOMAIN_CURVED, 1u, in_roi); }
+	else if (route == 3) { clv_screen_diagnostic_add(SCREEN_DIAG_LEGACY_STRICT, 1u, in_roi); }
+	else if (route == 4) { clv_screen_diagnostic_add(SCREEN_DIAG_APPROX, 1u, in_roi); }
+	else if (route == 5) { clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_DIFFUSE, 1u, in_roi); }
+	else if (route == 6) { clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_SH, 1u, in_roi); }
+	if (level == 0) { clv_screen_diagnostic_add(SCREEN_DIAG_ROUTE_LOD0, 1u, in_roi); }
+	else if (level == 1) { clv_screen_diagnostic_add(SCREEN_DIAG_ROUTE_LOD1, 1u, in_roi); }
+	else if (level == 2) { clv_screen_diagnostic_add(SCREEN_DIAG_ROUTE_LOD2, 1u, in_roi); }
+	if (axis == 0) { clv_screen_diagnostic_add(SCREEN_DIAG_AXIS_X, 1u, in_roi); }
+	else if (axis == 1) { clv_screen_diagnostic_add(SCREEN_DIAG_AXIS_Y, 1u, in_roi); }
+	else if (axis == 2) { clv_screen_diagnostic_add(SCREEN_DIAG_AXIS_Z, 1u, in_roi); }
+	uint confidence_cent = uint(clamp(confidence, 0.0, 1.0) * 100.0 + 0.5);
+	clv_screen_diagnostic_add(SCREEN_DIAG_CONFIDENCE_SUM_CENT, confidence_cent, in_roi);
+	clv_screen_diagnostic_add(SCREEN_DIAG_CONFIDENCE_COUNT, 1u, in_roi);
+}
+
+void clv_screen_diagnostic_resolved_partial(int route, int level, int axis,
+		float confidence, bool in_roi) {
+	if (pc.diagnostic_enabled != 0) {
+		atomicAdd(screen_diagnostics.words[SCREEN_DIAG_GLOBAL_OFFSET + SCREEN_DIAG_SAMPLE_MISSES],
+				0xffffffffu);
+		if (in_roi) {
+			atomicAdd(screen_diagnostics.words[SCREEN_DIAG_ROI_OFFSET + SCREEN_DIAG_SAMPLE_MISSES],
+					0xffffffffu);
+		}
+	}
+	clv_screen_diagnostic_resolved_route(route, level, axis, confidence, in_roi);
+}
+
+void clv_screen_diagnostic_route(int route, int level, int axis,
+		float confidence, bool in_roi) {
+#if defined(CLV_SCREEN_STAGE_FAST)
+	clv_screen_diagnostic_add(SCREEN_DIAG_SAMPLE_CALLS, 1u, in_roi);
+	if (route == 0) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SAMPLE_MISSES, 1u, in_roi);
+		return;
+	}
+	clv_screen_diagnostic_resolved_route(route, level, axis, confidence, in_roi);
+#else
+	if (route != 0) {
+		clv_screen_diagnostic_resolved_partial(route, level, axis, confidence, in_roi);
+	}
+#endif
+}
+
+
+// The shared certified and approximate receiver samplers return the same
+// rejection identifiers used by the debug mirror. The resolve pass does not
+// visualize these values; it only needs the sampler implementations.
+#if defined(CLV_SCREEN_STAGE_FAST)
+const int CLV_DEBUG_APPROX_REJECT_NONE = 0;
+const int CLV_DEBUG_APPROX_REJECT_DISABLED = 9;
+const int CLV_DEBUG_APPROX_REJECT_LAYOUT = 10;
+const int CLV_DEBUG_APPROX_REJECT_INPUT = 11;
+const int CLV_DEBUG_APPROX_REJECT_STEP = 12;
+const int CLV_DEBUG_APPROX_REJECT_POSITION = 13;
+const int CLV_DEBUG_APPROX_REJECT_WINDOW = 14;
+const int CLV_DEBUG_APPROX_REJECT_BASE_TAG = 15;
+const int CLV_DEBUG_APPROX_REJECT_READY_BIT = 16;
+const int CLV_DEBUG_APPROX_REJECT_CORNER_TAG = 17;
+const int CLV_DEBUG_APPROX_REJECT_NONFINITE_SAMPLES = 18;
+const int CLV_DEBUG_APPROX_REJECT_CORNER_GEOMETRY = 19;
+const int CLV_DEBUG_APPROX_REJECT_LOW_COVERAGE = 20;
+const int CLV_DEBUG_APPROX_REJECT_NORMAL_MAGNITUDE = 21;
+const int CLV_DEBUG_APPROX_REJECT_NORMAL_ALIGNMENT = 22;
+const int CLV_DEBUG_APPROX_REJECT_PLANE_VARIANCE = 23;
+const int CLV_DEBUG_APPROX_REJECT_PLANE_PRECISION = 24;
+const int CLV_DEBUG_APPROX_REJECT_PATCH_VARIANCE = 25;
+const int CLV_DEBUG_APPROX_REJECT_PATCH_INTEGER = 26;
+const int CLV_DEBUG_APPROX_REJECT_RECEIVER_PLANE = 27;
+const int CLV_DEBUG_APPROX_REJECT_RADIANCE = 28;
+const int CLV_DEBUG_APPROX_REJECT_SAMPLER_DIVERGENCE = 29;
+const int CLV_DEBUG_APPROX_REJECT_PLANE_RESIDUAL = 30;
+const int CLV_DEBUG_APPROX_REJECT_PATCH_MISMATCH = 31;
+
+#endif

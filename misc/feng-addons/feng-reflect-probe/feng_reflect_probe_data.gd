@@ -4,6 +4,8 @@ extends Resource
 ## Portable HDR source for a FengReflectProbe. Captured bakes store the linear
 ## base cubemap; the runtime rebuilds the GGX roughness pyramid on the GPU.
 
+const ALL_3D_RENDER_LAYERS := 0xFFFFF
+
 @export var radiance: Cubemap:
 	set(value):
 		if radiance == value:
@@ -30,6 +32,15 @@ extends Resource
 		if capture_resolution == next:
 			return
 		capture_resolution = next
+		emit_changed()
+## Effective capture mask used for the saved cubemap. -1 marks legacy or
+## externally-authored data whose original capture mask is unknown.
+@export var captured_cull_mask := -1:
+	set(value):
+		var next := -1 if value < 0 else value & ALL_3D_RENDER_LAYERS
+		if captured_cull_mask == next:
+			return
+		captured_cull_mask = next
 		emit_changed()
 @export var source_description := "Specified Cubemap":
 	set(value):

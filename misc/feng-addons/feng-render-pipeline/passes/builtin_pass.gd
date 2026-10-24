@@ -24,8 +24,16 @@ const NativeSpec = preload("../pipeline/native_spec.gd")
 ## observed pass all have to follow.
 @export var implementation: PassBase:
 	set(value):
+		if implementation == value:
+			return
+		if implementation != null:
+			implementation.property_list_changed.disconnect(_on_implementation_layout_changed)
+			implementation.changed.disconnect(_on_implementation_changed)
 		implementation = value
-		emit_changed()
+		if implementation != null:
+			implementation.property_list_changed.connect(_on_implementation_layout_changed)
+			implementation.changed.connect(_on_implementation_changed)
+		notify_property_list_changed()
 
 func _init(p_native_id: int = -1, p_resource_name: String = "") -> void:
 	native_id = p_native_id
@@ -75,6 +83,54 @@ func get_configuration_warnings() -> PackedStringArray:
 		warnings.append("Native FRP pass id %d is not part of this engine's FRP pass set." % native_id)
 	return warnings
 
+func _has_shadow_settings() -> bool:
+	return native_id == NativeSpec.PASS_SHADOW_PRECOMPUTE and implementation != null \
+			and implementation.has_method("get_shadow_settings_property_list")
+
+func _on_implementation_layout_changed() -> void:
+	notify_property_list_changed()
+
+func _on_implementation_changed() -> void:
+	emit_changed()
+
+func _get_property_list() -> Array[Dictionary]:
+	var properties: Array[Dictionary] = []
+	if not _has_shadow_settings():
+		return properties
+	for info in implementation.get_shadow_settings_property_list():
+		var property: Dictionary = info.duplicate()
+		# Values are stored once, on implementation. These are Inspector aliases.
+		property.usage = int(property.usage) & ~PROPERTY_USAGE_STORAGE
+		properties.append(property)
+	return properties
+
+func _get(property: StringName) -> Variant:
+	if _has_shadow_settings() and implementation.is_shadow_setting(property):
+		return implementation.get(property)
+	return null
+
+func _set(property: StringName, value: Variant) -> bool:
+	if _has_shadow_settings() and implementation.is_shadow_setting(property):
+		implementation.set(property, value)
+		return true
+	return false
+
+func _property_can_revert(property: StringName) -> bool:
+	return _has_shadow_settings() and implementation.is_shadow_setting(property)
+
+func _property_get_revert(property: StringName) -> Variant:
+	if _property_can_revert(property):
+		return implementation.get_shadow_setting_default(property)
+	return null
+
+func ensure_frp_contract() -> bool:
+	if _has_shadow_settings() and resource_name in ["", "Shadow Precompute"]:
+		resource_name = "Shadow Pass"
+		return true
+	return false
+
 func _validate_property(property: Dictionary) -> void:
+	if property.name == "implementation" and _has_shadow_settings():
+		property.usage = PROPERTY_USAGE_STORAGE
 	if property.name in ["stage", "inputs", "outputs", "effect_callback_type", "access_resolved_color", "access_resolved_depth", "needs_motion_vectors", "needs_normal_roughness", "needs_separate_specular"]:
 		property.usage = PROPERTY_USAGE_STORAGE

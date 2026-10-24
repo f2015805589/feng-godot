@@ -10,6 +10,15 @@ vec3 linear_to_srgb(vec3 c) {
 			greaterThan(c, vec3(0.0031308)));
 }
 
+vec3 aces_fitted(vec3 c) {
+	const float a = 2.51;
+	const float b = 0.03;
+	const float d = 0.59;
+	const float e = 0.14;
+	const float f = 2.43;
+	return clamp((c * (a * c + b)) / (c * (f * c + d) + e), 0.0, 1.0);
+}
+
 void main() {
 	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
 	if (any(greaterThanEqual(p, imageSize(output_image)))) return;
@@ -24,6 +33,11 @@ void main() {
 		result = all(lessThanEqual(velocity, vec2(-1.0))) ? vec3(0.0)
 				: vec3(clamp(0.5 + velocity * pc.options.y, 0.0, 1.0), 0.5);
 	}
-	if (mode == 6) result = linear_to_srgb(max(result, vec3(0.0)) * pc.options.z);
+	if (mode == 6) {
+		vec3 gi = max(result, vec3(0.0)) * pc.options.z;
+		if (any(isnan(gi)) || any(isinf(gi))) gi = vec3(0.0);
+		if (pc.options.w < 0.5) gi = aces_fitted(gi);
+		result = linear_to_srgb(gi);
+	}
 	imageStore(output_image, p, vec4(result, 1.0));
 }

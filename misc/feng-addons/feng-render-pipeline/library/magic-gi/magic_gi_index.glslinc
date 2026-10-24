@@ -1,16 +1,16 @@
 layout(set = 0, binding = MAGIC_INDEX_BINDING, std430) readonly buffer ProbeIndexEntries { int values[]; } probe_indices;
 
-int cell_probe_count(ivec3 cell, ivec3 dimensions) {
-	if (textureSize(index_map, 0).x == dimensions.x) {
-		return texelFetch(index_map, ivec2(cell.x, cell.y + cell.z * dimensions.y), 0).g;
+ivec2 cell_probe_map_range(ivec3 cell, ivec3 dimensions, bool compact_index_map) {
+	if (compact_index_map) {
+		return texelFetch(index_map, ivec2(cell.x, cell.y + cell.z * dimensions.y), 0).rg;
 	}
-	return 8;
+	return ivec2(0, 8);
 }
 
-int cell_probe(ivec3 cell, int slot, ivec3 dimensions) {
-	if (textureSize(index_map, 0).x == dimensions.x) {
-		int first = texelFetch(index_map, ivec2(cell.x, cell.y + cell.z * dimensions.y), 0).r;
-		return probe_indices.values[first + slot];
+int cell_probe(ivec3 cell, int slot, ivec3 dimensions, bool compact_index_map,
+		int first_probe) {
+	if (compact_index_map) {
+		return probe_indices.values[first_probe + slot];
 	}
 	return texelFetch(index_map, ivec2(cell.x * 8 + slot, cell.y + cell.z * dimensions.y), 0).r;
 }

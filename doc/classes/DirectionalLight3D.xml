@@ -15,6 +15,12 @@
 		<member name="directional_shadow_blend_splits" type="bool" setter="set_blend_splits" getter="is_blend_splits_enabled" default="false">
 			If [code]true[/code], shadow detail is sacrificed in exchange for smoother transitions between splits. Enabling shadow blend splitting also has a moderate performance cost. This is ignored when [member directional_shadow_mode] is [constant SHADOW_ORTHOGONAL].
 		</member>
+		<member name="directional_shadow_object_shadow_enabled" type="bool" setter="set_object_shadow_enabled" getter="is_object_shadow_enabled" default="false">
+			If [code]true[/code], reserves the final directional-shadow atlas slot for a focused shadow map of [member directional_shadow_object_shadow_target]. The target's [Node3D] subtree is used as the caster set, while regular directional-light receivers can receive the focused shadow. This replaces one PSSM cascade: PSSM 2 uses 1 cascade plus the object map, PSSM 3 uses 2 plus the object map, and PSSM 4 uses 3 plus the object map. If the target is missing or has no eligible shadow casters, the object slot is cleared but remains reserved; the reduced set of cascades still covers the full [member directional_shadow_max_distance]. This option is hidden for [constant SHADOW_ORTHOGONAL].
+		</member>
+		<member name="directional_shadow_object_shadow_target" type="NodePath" setter="set_object_shadow_target" getter="get_object_shadow_target" default="NodePath(&quot;&quot;)">
+			A node within the same scene tree whose complete subtree supplies casters for the reserved object shadow map. Assign the character or prop root so that child [MeshInstance3D] and skinned mesh instances are included. Receivers are not restricted to the target subtree.
+		</member>
 		<member name="directional_shadow_fade_start" type="float" setter="set_param" getter="get_param" default="0.8">
 			Proportion of [member directional_shadow_max_distance] at which point the shadow starts to fade. At [member directional_shadow_max_distance], the shadow will disappear. The default value is a balance between smooth fading and distant shadow visibility. If the camera moves fast and the [member directional_shadow_max_distance] is low, consider lowering [member directional_shadow_fade_start] below [code]0.8[/code] to make shadow transitions less noticeable. On the other hand, if you tuned [member directional_shadow_max_distance] to cover the entire scene, you can set [member directional_shadow_fade_start] to [code]1.0[/code] to prevent the shadow from fading in the distance (it will suddenly cut off instead).
 		</member>
@@ -22,16 +28,16 @@
 			The maximum distance for shadow splits. Increasing this value will make directional shadows visible from further away, at the cost of lower overall shadow detail and performance (since more objects need to be included in the directional shadow rendering).
 		</member>
 		<member name="directional_shadow_mode" type="int" setter="set_shadow_mode" getter="get_shadow_mode" enum="DirectionalLight3D.ShadowMode" default="2">
-			The light's shadow rendering algorithm.
+			The light's shadow rendering algorithm. Orthogonal uses one shadow map, while PSSM 2, PSSM 3, and PSSM 4 use two, three, and four cascades, respectively. The enum values of the existing Orthogonal, PSSM 2, and PSSM 4 modes are preserved for scene compatibility.
 		</member>
 		<member name="directional_shadow_pancake_size" type="float" setter="set_param" getter="get_param" default="20.0">
 			Sets the size of the directional shadow pancake. The pancake offsets the start of the shadow's camera frustum to provide a higher effective depth resolution for the shadow. However, a high pancake size can cause artifacts in the shadows of large objects that are close to the edge of the frustum. Reducing the pancake size can help. Setting the size to [code]0[/code] turns off the pancaking effect.
 		</member>
 		<member name="directional_shadow_split_1" type="float" setter="set_param" getter="get_param" default="0.1">
-			The distance from camera to shadow split 1. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_2_SPLITS] or [constant SHADOW_PARALLEL_4_SPLITS].
+			The distance from camera to shadow split 1. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_2_SPLITS], [constant SHADOW_PARALLEL_3_SPLITS], or [constant SHADOW_PARALLEL_4_SPLITS].
 		</member>
 		<member name="directional_shadow_split_2" type="float" setter="set_param" getter="get_param" default="0.2">
-			The distance from shadow split 1 to split 2. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_4_SPLITS].
+			The distance from shadow split 1 to split 2. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_3_SPLITS] or [constant SHADOW_PARALLEL_4_SPLITS].
 		</member>
 		<member name="directional_shadow_split_3" type="float" setter="set_param" getter="get_param" default="0.5">
 			The distance from shadow split 2 to split 3. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_4_SPLITS].
@@ -46,6 +52,9 @@
 		</constant>
 		<constant name="SHADOW_PARALLEL_2_SPLITS" value="1" enum="ShadowMode">
 			Splits the view frustum in 2 areas, each with its own shadow map. This shadow mode is a compromise between [constant SHADOW_ORTHOGONAL] and [constant SHADOW_PARALLEL_4_SPLITS] in terms of performance.
+		</constant>
+		<constant name="SHADOW_PARALLEL_3_SPLITS" value="3" enum="ShadowMode">
+			Splits the view frustum in 3 areas, each with its own shadow map. The PSSM 3 mode uses the first two split offsets to distribute shadow detail across its cascades.
 		</constant>
 		<constant name="SHADOW_PARALLEL_4_SPLITS" value="2" enum="ShadowMode">
 			Splits the view frustum in 4 areas, each with its own shadow map. This is the slowest directional shadow mode.

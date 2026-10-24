@@ -3,7 +3,7 @@ extends RefCounted
 
 const MARKER_RADIUS_CELL_RATIO := 0.12
 ## Version of persisted world-space candidate arbitration and coverage selection.
-const PLACEMENT_LAYOUT_REVISION := 2
+const PLACEMENT_LAYOUT_REVISION := 3
 const MAX_DOMAINS_PER_ARBITRATION_CELL := 8
 const CANDIDATES_PER_DOMAIN := 2
 

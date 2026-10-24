@@ -79,6 +79,10 @@ func run() -> void:
 		camera.rotation_degrees.y = yaw
 		var turn := await frame_image(8)
 		turn.save_png(output_dir.path_join("turn_%d.png" % yaw))
+		if yaw == 180 and ClassDB.class_has_integer_constant("RenderingServer", "INSTANCE_FLAG_REFLECTION_CAPTURE_ONLY"):
+			var away_stats: Dictionary = terrain.get_cdlod_stats()
+			require(int(away_stats.get("selected_patches", 0)) > int(away_stats.get("visible_patches", 0)),
+					"offscreen terrain remains available to captures even with shadows disabled")
 		if yaw == 0: require(classify(turn.get_pixel(160,160)) == "red", "turning back restores visible patches")
 	terrain.material.world_background = Terrain3DMaterial.FLAT
 	await frame_image(8)

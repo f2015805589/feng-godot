@@ -3144,7 +3144,10 @@
 			Use 16 bits for the directional shadow depth map. Enabling this results in shadows having less precision and may result in shadow acne, but can lead to performance improvements on some devices.
 		</member>
 		<member name="rendering/lights_and_shadows/directional_shadow/size" type="int" setter="" getter="" default="4096">
-			The directional shadow's size in pixels. Higher values will result in sharper shadows, at the cost of performance. The value is rounded up to the nearest power of 2.
+			The legacy shared directional shadow atlas edge length in pixels. Non-FRP renderers subdivide this atlas among directional lights and their active shadow slots. The FRP renderer uses [member rendering/frp/shadows/directional_shadow/cascade_size] for the square edge length of each directional shadow map. Higher values result in sharper shadows at the cost of memory and rendering performance. The value is rounded up to the nearest power of 2.
+		</member>
+		<member name="rendering/frp/shadows/directional_shadow/cascade_size" type="int" setter="" getter="" default="4096">
+			FRP-only directional shadow map edge length in pixels. Each CSM cascade and reserved object-shadow map is a square of this size: [code]4096[/code] means each map is [code]4096x4096[/code], not the entire atlas. Values are clamped to [code]256..8192[/code], then rounded up to the nearest power of 2 (for example, [code]3000[/code] becomes [code]4096[/code]). Multiple maps are packed into an atlas subject to the device's maximum texture size. Higher values increase shadow detail and memory use; a 4096x4096 D32 map uses approximately 64 MiB.
 		</member>
 		<member name="rendering/lights_and_shadows/directional_shadow/size.mobile" type="int" setter="" getter="" default="2048">
 			Lower-end override for [member rendering/lights_and_shadows/directional_shadow/size] on mobile devices, due to performance concerns or driver support.

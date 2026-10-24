@@ -136,6 +136,24 @@ func trace_emitter_connection(origin: Vector3, direction: Vector3,
 			return {}
 	return _emitter_visibility_hit(ray_hit, normalized_direction)
 
+## Test an infinitely distant directional source against the captured static BVH.
+## Only a t≈0 hit on the face we just left is ignored; other triangles, however
+## close or thin, remain blockers.
+func trace_directional_visibility(origin: Vector3, direction: Vector3,
+		start_face_index := -1) -> bool:
+	if bvh == null or direction.length_squared() <= 0.000000000001:
+		return false
+	var normalized_direction := direction.normalized()
+	var hit: Dictionary = bvh.intersect_ray(origin, normalized_direction)
+	if hit.is_empty():
+		return true
+	var start_step := EmitterBakeSet.ray_epsilon(origin)
+	if int(hit.get("face_index", -1)) == start_face_index \
+			and hit.position.distance_to(origin) <= start_step * 2.0:
+		hit = bvh.intersect_ray(origin + normalized_direction * start_step,
+				normalized_direction)
+	return hit.is_empty()
+
 func _emitter_visibility_hit(hit: Dictionary, normalized_direction: Vector3) -> Dictionary:
 	if hit.is_empty():
 		return {}

@@ -1,18 +1,110 @@
 #ifndef FENG_MAGIC_GI_CLV_LAYOUT_GLSLINC
 #define FENG_MAGIC_GI_CLV_LAYOUT_GLSLINC
 
-// One CLV world cell stores independent X/Y/Z dominant-absolute-normal slots.
-// Radiance remains directional for curved and normal-mapped receivers. Aligned
-// receivers use the diffuse projection computed once during cache updates.
-const int CLV_LAYOUT_VERSION = 8;
+// Layout 9 remains the directional three-axis receiver cache. Layout 12 uses
+// three independently certified surface charts, 23 columns each, plus a
+// three-column common-cylinder summary. Layout 13 keeps that storage and adds
+// an exact 16-bit per-corner chart map in summary_domain.w. Layout 10 remains
+// a legacy reader.
+const int CLV_LAYOUT_VERSION = 9;
+// Layouts 10 and 12 remain available as compatibility readers.
+const int CLV_BLOCK_LAYOUT_VERSION_LEGACY = 10;
+const int CLV_BLOCK_LAYOUT_VERSION_V12 = 12;
+const int CLV_BLOCK_LAYOUT_VERSION = 13;
+const int CLV_BLOCK_LEGACY_TEXTURE_COLUMNS = 22;
+const int CLV_BLOCK_TEXTURE_COLUMNS = 72;
+const int CLV_BLOCK_CHART_COLUMNS = 23;
+const int CLV_BLOCK_SECONDARY_DIFFUSE_COLUMN = 18;
+const int CLV_BLOCK_PRIMARY_DIFFUSE_COLUMN = 19;
+const int CLV_BLOCK_RECEIVER_METADATA_COLUMN = 20;
+const int CLV_BLOCK_RECEIVER_ANCHOR_COLUMN = 21;
+const int CLV_BLOCK_DOMAIN_COLUMN = 22;
+const int CLV_BLOCK_CHART1_BASE_COLUMN = 23;
+const int CLV_BLOCK_CHART2_BASE_COLUMN = 46;
+const int CLV_BLOCK_SUMMARY_NORMAL_PATCH_COLUMN = 69;
+const int CLV_BLOCK_SUMMARY_CENTER_COMPONENT_COLUMN = 70;
+const int CLV_BLOCK_SUMMARY_DOMAIN_COLUMN = 71;
+// Layout 10 keeps its legacy visible/certified bits at 0/1. Layouts 12/13 use
+// two bits per chart (visible, domain-certified), then summary state and slot
+// hint. In layout 13, hint 3 denotes a mixed per-corner map.
+const uint CLV_BLOCK_SUPPORT_VISIBLE = 1u;
+const uint CLV_BLOCK_SUPPORT_BOX_CERTIFIED = 2u;
+const uint CLV_BLOCK12_SUPPORT_CHART0_VISIBLE = 1u << 0u;
+const uint CLV_BLOCK12_SUPPORT_CHART0_CERTIFIED = 1u << 1u;
+const uint CLV_BLOCK12_SUPPORT_CHART1_VISIBLE = 1u << 2u;
+const uint CLV_BLOCK12_SUPPORT_CHART1_CERTIFIED = 1u << 3u;
+const uint CLV_BLOCK12_SUPPORT_CHART2_VISIBLE = 1u << 4u;
+const uint CLV_BLOCK12_SUPPORT_CHART2_CERTIFIED = 1u << 5u;
+const uint CLV_BLOCK12_SUPPORT_SUMMARY_READY = 1u << 6u;
+const uint CLV_BLOCK12_SUPPORT_SUMMARY_SLOT_SHIFT = 7u;
+const uint CLV_BLOCK12_SUPPORT_SUMMARY_SLOT_MASK = 3u << CLV_BLOCK12_SUPPORT_SUMMARY_SLOT_SHIFT; // 13: 0..2 uniform, 3 mixed
+const uint CLV_BLOCK12_SUPPORT_POSITIVE_CORNER_MASK = 0x0001fe00u;
+const uint CLV_BLOCK12_SUPPORT_SUMMARY_MASK = CLV_BLOCK12_SUPPORT_SUMMARY_READY
+		| CLV_BLOCK12_SUPPORT_SUMMARY_SLOT_MASK | CLV_BLOCK12_SUPPORT_POSITIVE_CORNER_MASK;
+const int CLV_BLOCK12_RECORD_STRIDE_BYTES = 208;
+const uint CLV_BLOCK12_JOB_WRITE_CHARTS = 1u;
+const uint CLV_BLOCK12_JOB_WRITE_SUMMARY = 2u;
+const uint CLV_BLOCK12_JOB_RELIGHT_CACHED = 4u;
+const uint CLV_BLOCK12_DOMAIN_POLICY_VERSION = 12u;
+const uint CLV_BLOCK13_DOMAIN_POLICY_VERSION = 13u;
+const uint CLV_BLOCK13_SLOT_MAP_MAX = 65535u;
+const uint CLV_BLOCK13_INVALID_SLOT = 3u;
+const float CLV_BLOCK12_MEMBER_NORMAL_DOT_MIN = 0.55;
+const float CLV_BLOCK12_CONSUMER_NORMAL_DOT_MIN = 0.72;
 const int CLV_FACE_SLOT_COUNT = 3;
-const int CLV_FACE_SLOT_COLUMNS = 22;
+const int CLV_FACE_SLOT_COLUMNS = 24;
 const int CLV_FACE_RADIANCE_COLUMNS = 18;
 const int CLV_FACE_METADATA_COLUMN = 18;
 const int CLV_FACE_ANCHOR_COLUMN = 19;
 const int CLV_FACE_DIFFUSE_COLUMN = 20;
+const int CLV_FACE_APPROX_GEOMETRY_COLUMN = 22;
+const int CLV_FACE_APPROX_PATCH_PLANE_MOMENTS_COLUMN = 23;
+// Set when the parent cell's complete 2x2x2 logical tag neighborhood has been
+// checked for one matching geometry epoch by the CLV certify dispatch.
+const uint CLV_SUPPORT_NEIGHBOR_TAGS_READY = 128u;
+// Layout-9 parent-cube domain certificates. These bits are set only after all
+// eight current-epoch corners and their dynamic-transfer payloads are checked.
+// Legacy readers continue to consume only the original axis bits and READY.
+const uint CLV_SUPPORT_DIFFUSE_DOMAIN_X = 1u << 3u;
+const uint CLV_SUPPORT_DIFFUSE_DOMAIN_Y = 1u << 4u;
+const uint CLV_SUPPORT_DIFFUSE_DOMAIN_Z = 1u << 5u;
+const uint CLV_SUPPORT_CURVED_SH_DOMAIN_X = 1u << 8u;
+const uint CLV_SUPPORT_CURVED_SH_DOMAIN_Y = 1u << 9u;
+const uint CLV_SUPPORT_CURVED_SH_DOMAIN_Z = 1u << 10u;
+// Negative-filter hints for the legacy approximate receiver predicate. These
+// bits only mean that the positive guide corners could share one patch; the
+// consumer must still run its normal, coverage, and plane checks.
+const uint CLV_SUPPORT_APPROX_POSSIBLE_X = 1u << 11u;
+const uint CLV_SUPPORT_APPROX_POSSIBLE_Y = 1u << 12u;
+const uint CLV_SUPPORT_APPROX_POSSIBLE_Z = 1u << 13u;
+// The diffuse fast consumer keeps the existing squared normal-delta test of
+// 0.01^2. For normalized directions, |a-b|^2 <= 0.0001 is equivalent to
+// dot(a,b) >= 1 - 0.0001/2.
+const float CLV_DIFFUSE_DOMAIN_NORMAL_DOT_MIN = 0.99995;
+const float CLV_DOMAIN_MIN_GUIDE_ALPHA = 0.55;
 const float CLV_DIFFUSE_NORMAL_ERROR = 0.01;
 const float CLV_DIFFUSE_NORMAL_ERROR_SQUARED = CLV_DIFFUSE_NORMAL_ERROR * CLV_DIFFUSE_NORMAL_ERROR;
+
+// Exact corner order is i = x + 2*y + 4*z. Each 2-bit field is chart slot
+// 0..2; 3 is invalid and makes the whole summary unusable.
+bool clv_block13_decode_slot_map(float encoded, out uint slot_map, out int uniform_slot) {
+	slot_map = 0u;
+	uniform_slot = -1;
+	if (isnan(encoded) || isinf(encoded) || encoded < 0.0
+			|| encoded > float(CLV_BLOCK13_SLOT_MAP_MAX) || floor(encoded) != encoded) { return false; }
+	slot_map = uint(encoded);
+	for (int corner = 0; corner < 8; corner++) {
+		uint slot = (slot_map >> uint(corner * 2)) & 3u;
+		if (slot >= 3u) { return false; }
+		if (corner == 0) { uniform_slot = int(slot); }
+		else if (uniform_slot >= 0 && uniform_slot != int(slot)) { uniform_slot = -1; }
+	}
+	return true;
+}
+
+uint clv_block13_slot_for_corner(uint slot_map, int corner) {
+	return (slot_map >> uint(corner * 2)) & 3u;
+}
 
 int clv_dominant_absolute_normal_axis(vec3 normal) {
 	vec3 magnitude = abs(normal);

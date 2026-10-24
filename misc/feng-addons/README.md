@@ -44,8 +44,15 @@ of runtime addons and native libraries for the destination platform.
 ## Native builds
 
 On Windows, `build-feng-godot.bat` in the repository root builds the x86_64 D3D12
-editor and both native debug extensions. Double-clicking keeps the result window
-open; use `--no-pause` from a terminal. To build the extensions separately:
+editor, both native debug extensions, and the NRD extension. Install Python 3.9+
+and Visual Studio with the Desktop development with C++ workload,
+a Windows SDK 10.0.22621.0 or newer, and C++ CMake tools (CMake 3.30+).
+The script refreshes PATH, uses SCons from the selected Python (installing it if
+needed), and finds Visual Studio's bundled CMake automatically. The first build
+downloads D3D12, AccessKit, and NRD dependencies, so network access is required.
+Double-clicking keeps the result window open; use `--no-pause` from a terminal.
+Set `FENG_BUILD_JOBS` to override the default of 8 parallel jobs.
+To build the extensions separately:
 
 ```powershell
 scons -C misc/feng-addons/feng-idweight-terrain/native platform=windows target=template_debug arch=x86_64

@@ -41,6 +41,9 @@ void RendererSceneRenderRDClustered::_render_shadow_pass(RID p_light, RID p_shad
 	ERR_FAIL_COND(!light_storage->owns_light_instance(p_light));
 
 	RID base = light_storage->light_instance_get_base_light(p_light);
+	current_shadow_pass_context = {};
+	current_shadow_pass_context.light_instance = p_light;
+	current_shadow_pass_context.pass_index = p_pass;
 
 	Rect2i atlas_rect;
 	uint32_t atlas_size = 1;
@@ -64,6 +67,11 @@ void RendererSceneRenderRDClustered::_render_shadow_pass(RID p_light, RID p_shad
 	Transform3D light_transform;
 
 	if (light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL) {
+		current_shadow_pass_context.directional = true;
+		current_shadow_pass_context.cascade_count = light_storage->light_instance_get_directional_shadow_cascade_count(p_light);
+		current_shadow_pass_context.object_slot_reserved = light_storage->light_instance_get_directional_object_shadow_reserved(p_light);
+		current_shadow_pass_context.object_slot_active = light_storage->light_instance_get_directional_object_shadow_active(p_light);
+
 		//set pssm stuff
 		uint64_t last_scene_shadow_pass = light_storage->light_instance_get_shadow_pass(p_light);
 		if (last_scene_shadow_pass != get_scene_pass()) {
@@ -76,9 +84,15 @@ void RendererSceneRenderRDClustered::_render_shadow_pass(RID p_light, RID p_shad
 		light_projection = light_storage->light_instance_get_shadow_camera(p_light, p_pass);
 		light_transform = light_storage->light_instance_get_shadow_transform(p_light, p_pass);
 
-		atlas_rect = light_storage->light_instance_get_directional_rect(p_light);
+		const bool per_layer_resolution = light_storage->directional_shadow_uses_per_layer_resolution();
+		if (per_layer_resolution) {
+			atlas_rect = light_storage->get_directional_shadow_slot_rect(p_light, p_pass);
+			ERR_FAIL_COND(atlas_rect.size.x <= 0 || atlas_rect.size.y <= 0);
+		} else {
+			atlas_rect = light_storage->light_instance_get_directional_rect(p_light);
+		}
 
-		if (light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS) {
+		if (!per_layer_resolution && (light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS || light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS)) {
 			atlas_rect.size.width /= 2;
 			atlas_rect.size.height /= 2;
 
@@ -89,7 +103,7 @@ void RendererSceneRenderRDClustered::_render_shadow_pass(RID p_light, RID p_shad
 			} else if (p_pass == 3) {
 				atlas_rect.position += atlas_rect.size;
 			}
-		} else if (light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_2_SPLITS) {
+		} else if (!per_layer_resolution && light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_2_SPLITS) {
 			atlas_rect.size.height /= 2;
 
 			if (p_pass == 0) {
@@ -98,10 +112,10 @@ void RendererSceneRenderRDClustered::_render_shadow_pass(RID p_light, RID p_shad
 			}
 		}
 
-		float directional_shadow_size = light_storage->directional_shadow_get_size();
+		const Size2i directional_shadow_dimensions = light_storage->directional_shadow_get_dimensions();
 		Rect2 atlas_rect_norm = atlas_rect;
-		atlas_rect_norm.position /= directional_shadow_size;
-		atlas_rect_norm.size /= directional_shadow_size;
+		atlas_rect_norm.position /= Vector2(directional_shadow_dimensions.width, directional_shadow_dimensions.height);
+		atlas_rect_norm.size /= Vector2(directional_shadow_dimensions.width, directional_shadow_dimensions.height);
 		light_storage->light_instance_set_directional_shadow_atlas_rect(p_light, p_pass, atlas_rect_norm);
 
 		zfar = RSG::light_storage->light_get_param(base, RSE::LIGHT_PARAM_RANGE);

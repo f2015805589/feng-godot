@@ -1,0 +1,512 @@
+#ifndef FRP_MAGIC_GI_BAKED_SH_GLSLINC
+#define FRP_MAGIC_GI_BAKED_SH_GLSLINC
+
+// Layout 17 is deliberately separate from the layout-9 PRT resources and its
+// optional general queue. These are borrowed, homogeneous RGBA16F or RGBA32F
+// cache fields published for the current render context; there is no source-probe
+// search in this shader.
+layout(set = 1, binding = 69) uniform texture3D frp_magic_gi_baked_sh_field0_0;
+layout(set = 1, binding = 70) uniform texture3D frp_magic_gi_baked_sh_field0_1;
+layout(set = 1, binding = 71) uniform texture3D frp_magic_gi_baked_sh_field0_2;
+layout(set = 1, binding = 72) uniform texture3D frp_magic_gi_baked_sh_field0_3;
+layout(set = 1, binding = 73) uniform texture3D frp_magic_gi_baked_sh_field0_4;
+layout(set = 1, binding = 74) uniform texture3D frp_magic_gi_baked_sh_field0_5;
+layout(set = 1, binding = 75) uniform texture3D frp_magic_gi_baked_sh_field0_6;
+layout(set = 1, binding = 76, std140) uniform FRPMagicGIBakedSHClipmapParameters0 {
+	ivec4 origins[3];
+	vec4 spacing; // x = base cell size; yzw = camera position.
+	ivec4 control; // resolution, level count, geometry epoch, layout version.
+	vec4 codec; // decode scale, encode scale, cache format tag (16/32), codec revision.
+} frp_magic_gi_baked_sh_clv0;
+layout(set = 1, binding = 77, std140) uniform FRPMagicGIBakedSHOwnerParameters0 {
+	mat4 world_to_local;
+	vec4 owner_size_enabled; // xyz = full local extent; w = owner bounds enabled.
+	vec4 control; // x = strength; y = replace native Sky; z = scene normalization; w = receiver QA mode (0 default, 1 half-step, 2 per-LOD L1 bound).
+} frp_magic_gi_baked_sh_owner0;
+
+#ifdef USE_MULTIVIEW
+layout(set = 1, binding = 78) uniform texture3D frp_magic_gi_baked_sh_field1_0;
+layout(set = 1, binding = 79) uniform texture3D frp_magic_gi_baked_sh_field1_1;
+layout(set = 1, binding = 80) uniform texture3D frp_magic_gi_baked_sh_field1_2;
+layout(set = 1, binding = 81) uniform texture3D frp_magic_gi_baked_sh_field1_3;
+layout(set = 1, binding = 82) uniform texture3D frp_magic_gi_baked_sh_field1_4;
+layout(set = 1, binding = 83) uniform texture3D frp_magic_gi_baked_sh_field1_5;
+layout(set = 1, binding = 84) uniform texture3D frp_magic_gi_baked_sh_field1_6;
+layout(set = 1, binding = 85, std140) uniform FRPMagicGIBakedSHClipmapParameters1 {
+	ivec4 origins[3];
+	vec4 spacing;
+	ivec4 control;
+	vec4 codec;
+} frp_magic_gi_baked_sh_clv1;
+layout(set = 1, binding = 86, std140) uniform FRPMagicGIBakedSHOwnerParameters1 {
+	mat4 world_to_local;
+	vec4 owner_size_enabled;
+	vec4 control;
+} frp_magic_gi_baked_sh_owner1;
+#endif
+
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_baked_sh_layout.glslinc"
+
+bool frp_magic_gi_baked_sh_finite3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool frp_magic_gi_baked_sh_finite4(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool frp_magic_gi_baked_sh_finite1(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+int frp_magic_gi_baked_sh_axis_tag(vec3 n) {
+	int axis = 0;
+	float major = abs(n.x);
+	if (abs(n.y) > major) {
+		axis = 1;
+		major = abs(n.y);
+	}
+	if (abs(n.z) > major) {
+		axis = 2;
+	}
+	float perpendicular_squared;
+	float axis_component;
+	if (axis == 0) {
+		perpendicular_squared = n.y * n.y + n.z * n.z;
+		axis_component = n.x;
+	} else if (axis == 1) {
+		perpendicular_squared = n.x * n.x + n.z * n.z;
+		axis_component = n.y;
+	} else {
+		perpendicular_squared = n.x * n.x + n.y * n.y;
+		axis_component = n.z;
+	}
+	// sqrt(3)/1023 + 2e-5, squared. UNORM10 component quantization
+	// bounds each signed-normal component error by 1/1023; the orthonormal
+	// view-to-world transform preserves this conservative 3D error bound.
+	if (perpendicular_squared > 2.9347435e-6) {
+		return 0;
+	}
+	return axis_component < 0.0 ? -(axis + 1) : (axis + 1);
+}
+
+vec4 frp_magic_gi_baked_sh_clv_spacing(int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_baked_sh_clv1.spacing;
+	}
+#endif
+	return frp_magic_gi_baked_sh_clv0.spacing;
+}
+
+vec4 frp_magic_gi_baked_sh_codec(int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_baked_sh_clv1.codec;
+	}
+#endif
+	return frp_magic_gi_baked_sh_clv0.codec;
+}
+
+ivec4 frp_magic_gi_baked_sh_clv_control(int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_baked_sh_clv1.control;
+	}
+#endif
+	return frp_magic_gi_baked_sh_clv0.control;
+}
+
+ivec3 frp_magic_gi_baked_sh_origin(int view, int level) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_baked_sh_clv1.origins[level].xyz;
+	}
+#endif
+	return frp_magic_gi_baked_sh_clv0.origins[level].xyz;
+}
+
+mat4 frp_magic_gi_baked_sh_world_to_local(int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_baked_sh_owner1.world_to_local;
+	}
+#endif
+	return frp_magic_gi_baked_sh_owner0.world_to_local;
+}
+
+vec4 frp_magic_gi_baked_sh_owner_size_enabled(int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_baked_sh_owner1.owner_size_enabled;
+	}
+#endif
+	return frp_magic_gi_baked_sh_owner0.owner_size_enabled;
+}
+
+vec4 frp_magic_gi_baked_sh_owner_control(int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return frp_magic_gi_baked_sh_owner1.control;
+	}
+#endif
+	return frp_magic_gi_baked_sh_owner0.control;
+}
+
+bool frp_magic_gi_baked_sh_owner_contains(vec3 world, vec4 size_enabled, mat4 world_to_local) {
+	if (size_enabled.w <= 0.5) {
+		return true;
+	}
+	vec3 local_position = (world_to_local * vec4(world, 1.0)).xyz;
+	return frp_magic_gi_baked_sh_finite3(local_position) &&
+			all(lessThanEqual(abs(local_position), size_enabled.xyz * 0.5));
+}
+
+vec3 frp_magic_gi_baked_sh_receiver_position(vec3 world, vec3 geometric_normal,
+		float step_size, int receiver_mode) {
+	if (receiver_mode == 0) {
+		return world;
+	}
+	float epsilon = max(0.001, step_size * 0.005);
+	float offset_distance = 0.0;
+	if (receiver_mode == 1) {
+		// Diagnostic half-step offset retained as the axis-aligned Box comparison.
+		offset_distance = 0.5 * step_size + epsilon;
+	} else if (receiver_mode == 2) {
+		// QA-only conservative same-side bound for this LOD's trilinear stencil.
+		// Every cell center in the stencil differs from the query by at most h on
+		// each axis, so its worst signed projection is bounded by h * ||n||_1.
+		offset_distance = step_size * dot(abs(geometric_normal), vec3(1.0)) + epsilon;
+	} else {
+		return world;
+	}
+	return world + geometric_normal * offset_distance;
+}
+
+float frp_magic_gi_baked_sh_edge_distance(vec3 sample_position, int view,
+		int level, out bool in_window) {
+	vec4 spacing = frp_magic_gi_baked_sh_clv_spacing(view);
+	ivec4 control = frp_magic_gi_baked_sh_clv_control(view);
+	float step_size = spacing.x * float(1 << level);
+	int resolution = control.x;
+	vec3 logical_position = sample_position / step_size - vec3(0.5);
+	ivec3 origin = frp_magic_gi_baked_sh_origin(view, level);
+	vec3 lower = vec3(origin + ivec3(1));
+	vec3 upper = vec3(origin + ivec3(resolution - 2));
+	in_window = frp_magic_gi_baked_sh_finite3(logical_position) &&
+			all(greaterThanEqual(logical_position, lower)) &&
+			all(lessThan(logical_position, upper));
+	if (!in_window) {
+		return 0.0;
+	}
+	vec3 axis_margin = min(logical_position - lower, upper - logical_position);
+	return min(min(axis_margin.x, axis_margin.y), axis_margin.z) * step_size;
+}
+
+float frp_magic_gi_baked_sh_fade_width(int view, int level) {
+	float step_size = frp_magic_gi_baked_sh_clv_spacing(view).x * float(1 << level);
+	int resolution = frp_magic_gi_baked_sh_clv_control(view).x;
+	float half_extent = 0.5 * float(max(resolution - 3, 2)) * step_size;
+	return max(2.0 * step_size, 0.15 * half_extent);
+}
+
+vec4 frp_magic_gi_baked_sh_field_0(vec3 coordinate, int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return textureLod(sampler3D(frp_magic_gi_baked_sh_field1_0, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+	}
+#endif
+	return textureLod(sampler3D(frp_magic_gi_baked_sh_field0_0, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+}
+vec4 frp_magic_gi_baked_sh_field_1(vec3 coordinate, int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return textureLod(sampler3D(frp_magic_gi_baked_sh_field1_1, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+	}
+#endif
+	return textureLod(sampler3D(frp_magic_gi_baked_sh_field0_1, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+}
+vec4 frp_magic_gi_baked_sh_field_2(vec3 coordinate, int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return textureLod(sampler3D(frp_magic_gi_baked_sh_field1_2, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+	}
+#endif
+	return textureLod(sampler3D(frp_magic_gi_baked_sh_field0_2, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+}
+vec4 frp_magic_gi_baked_sh_field_3(vec3 coordinate, int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return textureLod(sampler3D(frp_magic_gi_baked_sh_field1_3, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+	}
+#endif
+	return textureLod(sampler3D(frp_magic_gi_baked_sh_field0_3, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+}
+vec4 frp_magic_gi_baked_sh_field_4(vec3 coordinate, int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return textureLod(sampler3D(frp_magic_gi_baked_sh_field1_4, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+	}
+#endif
+	return textureLod(sampler3D(frp_magic_gi_baked_sh_field0_4, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+}
+vec4 frp_magic_gi_baked_sh_field_5(vec3 coordinate, int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return textureLod(sampler3D(frp_magic_gi_baked_sh_field1_5, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+	}
+#endif
+	return textureLod(sampler3D(frp_magic_gi_baked_sh_field0_5, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+}
+vec4 frp_magic_gi_baked_sh_field_6(vec3 coordinate, int view) {
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		return textureLod(sampler3D(frp_magic_gi_baked_sh_field1_6, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+	}
+#endif
+	return textureLod(sampler3D(frp_magic_gi_baked_sh_field0_6, SAMPLER_LINEAR_CLAMP), coordinate, 0.0);
+}
+
+
+bool frp_magic_gi_baked_sh_sample_level(vec3 sample_position, vec3 normal_world, int axis_tag,
+		int view, int level, out vec3 incident, out float coverage) {
+	incident = vec3(0.0);
+	coverage = 0.0;
+	ivec4 control = frp_magic_gi_baked_sh_clv_control(view);
+	vec4 spacing = frp_magic_gi_baked_sh_clv_spacing(view);
+	int resolution = control.x;
+	int level_count = control.y;
+	if (control.w != MAGIC_GI_CLV_BAKED_SH_LAYOUT_VERSION ||
+			level < 0 || level >= level_count || level_count < 1 ||
+			level_count > MAGIC_GI_CLV_BAKED_SH_LEVEL_COUNT ||
+			(resolution != 16 && resolution != 24 && resolution != 32) ||
+			!(spacing.x > 0.0) || !frp_magic_gi_baked_sh_finite3(sample_position)) {
+		return false;
+	}
+	float step_size = spacing.x * float(1 << level);
+	vec3 grid_position = sample_position / step_size - vec3(0.5);
+	if (!frp_magic_gi_baked_sh_finite3(grid_position)) { return false; }
+	ivec3 base = ivec3(floor(grid_position));
+	vec3 fraction = fract(grid_position);
+	ivec3 origin = frp_magic_gi_baked_sh_origin(view, level);
+	ivec3 min_corner = origin + ivec3(1);
+	ivec3 max_corner = origin + ivec3(resolution - 2);
+	if (any(lessThan(base, min_corner)) || any(greaterThan(base + ivec3(1), max_corner))) { return false; }
+	ivec3 physical = ((base % resolution) + resolution) % resolution;
+	int stride = resolution + MAGIC_GI_CLV_BAKED_SH_GUARD;
+	ivec3 texture_extent = ivec3(stride, stride, level_count * stride);
+	vec3 texel_center = vec3(physical.x, physical.y, level * stride + physical.z) +
+			fraction + vec3(0.5);
+	vec3 coordinate = texel_center / vec3(texture_extent);
+	bool coverage_finite = true;
+	if (axis_tag == 0) {
+		vec4 field_sample = frp_magic_gi_baked_sh_field_0(coordinate, view);
+		incident = field_sample.xyz * (normal_world.x * normal_world.x);
+		float qxy_r = field_sample.w;
+		field_sample = frp_magic_gi_baked_sh_field_1(coordinate, view);
+		incident += field_sample.xyz * normal_world.x;
+		float qxy_g = field_sample.w;
+		field_sample = frp_magic_gi_baked_sh_field_2(coordinate, view);
+		incident += field_sample.xyz * (normal_world.y * normal_world.y);
+		incident += vec3(qxy_r, qxy_g, field_sample.w) * (normal_world.x * normal_world.y);
+		field_sample = frp_magic_gi_baked_sh_field_3(coordinate, view);
+		incident += field_sample.xyz * normal_world.y;
+		float qyz_r = field_sample.w;
+		field_sample = frp_magic_gi_baked_sh_field_4(coordinate, view);
+		incident += field_sample.xyz * (normal_world.z * normal_world.z);
+		float qyz_g = field_sample.w;
+		field_sample = frp_magic_gi_baked_sh_field_5(coordinate, view);
+		incident += field_sample.xyz * normal_world.z;
+		incident += vec3(qyz_r, qyz_g, field_sample.w) * (normal_world.y * normal_world.z);
+		field_sample = frp_magic_gi_baked_sh_field_6(coordinate, view);
+		incident += field_sample.xyz * (normal_world.x * normal_world.z);
+		coverage_finite = frp_magic_gi_baked_sh_finite1(field_sample.a);
+		coverage = clamp(field_sample.a, 0.0, 1.0);
+	} else {
+		vec4 f6 = frp_magic_gi_baked_sh_field_6(coordinate, view);
+		coverage_finite = frp_magic_gi_baked_sh_finite1(f6.a);
+		coverage = clamp(f6.a, 0.0, 1.0);
+		float sign_axis = axis_tag > 0 ? 1.0 : -1.0;
+		if (abs(axis_tag) == 1) {
+			vec4 e = frp_magic_gi_baked_sh_field_0(coordinate, view);
+			vec4 l = frp_magic_gi_baked_sh_field_1(coordinate, view);
+			incident = e.xyz + l.xyz * sign_axis;
+		} else if (abs(axis_tag) == 2) {
+			vec4 e = frp_magic_gi_baked_sh_field_2(coordinate, view);
+			vec4 l = frp_magic_gi_baked_sh_field_3(coordinate, view);
+			incident = e.xyz + l.xyz * sign_axis;
+		} else {
+			vec4 e = frp_magic_gi_baked_sh_field_4(coordinate, view);
+			vec4 l = frp_magic_gi_baked_sh_field_5(coordinate, view);
+			incident = e.xyz + l.xyz * sign_axis;
+		}
+	}
+	if (!coverage_finite || !frp_magic_gi_baked_sh_finite3(incident)) {
+		incident = vec3(0.0);
+		coverage = 0.0;
+		return false;
+	}
+	return true;
+}
+
+void frp_magic_gi_apply_baked_sh(vec3 world, vec3 normal_world, vec3 albedo,
+		vec3 geometric_normal_world, float ao, float diffuse_ao, int view,
+		inout vec3 ambient_light,
+		vec3 global_sky_light_diffuse) {
+	vec4 owner_size_enabled = frp_magic_gi_baked_sh_owner_size_enabled(view);
+	mat4 world_to_local = frp_magic_gi_baked_sh_world_to_local(view);
+	vec4 owner_control = frp_magic_gi_baked_sh_owner_control(view);
+	float strength = max(owner_control.x, 0.0);
+	if (!(strength > 0.0) || !frp_magic_gi_baked_sh_finite1(strength) ||
+			!frp_magic_gi_baked_sh_finite1(owner_control.z) ||
+			!frp_magic_gi_baked_sh_finite1(owner_control.w) || !(ao > 0.0) ||
+			all(equal(albedo, vec3(0.0))) ||
+			!frp_magic_gi_baked_sh_finite3(world) || !frp_magic_gi_baked_sh_finite3(normal_world) ||
+			!frp_magic_gi_baked_sh_owner_contains(world, owner_size_enabled, world_to_local)) {
+		return;
+	}
+	float normal_length_squared = dot(normal_world, normal_world);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared) || isinf(normal_length_squared)) {
+		return;
+	}
+	normal_world *= inversesqrt(normal_length_squared);
+	// owner_control.w is an opt-in QA selector: 0=default, 1=legacy half-step
+	// Box comparison, 2=conservative per-LOD footprint offset, 3=mode-0 position
+	// with valid-weight normalization, 4=mode-0 SH with outer-only Sky ownership.
+	int receiver_mode = abs(owner_control.w - 1.0) < 0.01 ? 1 :
+			(abs(owner_control.w - 2.0) < 0.01 ? 2 : 0);
+	vec3 geometric_normal = geometric_normal_world;
+	if (receiver_mode != 0) {
+		float geometric_length_squared = dot(geometric_normal, geometric_normal);
+		if (!(geometric_length_squared > 1e-12) || isnan(geometric_length_squared) ||
+				isinf(geometric_length_squared) ||
+				!frp_magic_gi_baked_sh_finite3(geometric_normal)) {
+			return;
+		}
+		geometric_normal *= inversesqrt(geometric_length_squared);
+		if (dot(geometric_normal, normal_world) < 0.0) {
+			geometric_normal = -geometric_normal;
+		}
+	}
+	ivec4 clipmap_control = frp_magic_gi_baked_sh_clv_control(view);
+	vec4 clipmap_spacing = frp_magic_gi_baked_sh_clv_spacing(view);
+	vec4 codec = frp_magic_gi_baked_sh_codec(view);
+	if (clipmap_control.w != MAGIC_GI_CLV_BAKED_SH_LAYOUT_VERSION ||
+			!(clipmap_spacing.x > 0.0) || !frp_magic_gi_baked_sh_finite1(clipmap_spacing.x) ||
+			!(owner_control.z > 0.0) ||
+			clipmap_control.y < 1 || clipmap_control.y > MAGIC_GI_CLV_BAKED_SH_LEVEL_COUNT ||
+			!frp_magic_gi_baked_sh_finite4(codec) || !(codec.x > 0.0) || !(codec.y > 0.0) ||
+			abs(codec.x * codec.y - 1.0) > 2e-6 ||
+			!(codec.z == 16.0 || codec.z == 32.0) || codec.w != 1.0 ||
+			(codec.z == 32.0 && (codec.x != 1.0 || codec.y != 1.0))) {
+		return;
+	}
+	int level_count = clipmap_control.y;
+	int fine_level = -1;
+	float fine_edge_distance = 0.0;
+	vec3 fine_position = world;
+	for (int level = 0; level < level_count; level++) {
+		float step_size = clipmap_spacing.x * float(1 << level);
+		vec3 candidate = frp_magic_gi_baked_sh_receiver_position(world,
+				geometric_normal, step_size, receiver_mode);
+		bool in_window;
+		float edge_distance = frp_magic_gi_baked_sh_edge_distance(candidate, view, level, in_window);
+		if (in_window) {
+			fine_level = level;
+			fine_edge_distance = edge_distance;
+			fine_position = candidate;
+			break;
+		}
+	}
+	if (fine_level < 0) {
+		return;
+	}
+	int axis_tag = frp_magic_gi_baked_sh_axis_tag(normal_world);
+	float coarse_weight = 0.0;
+	float outer_weight = 1.0;
+	float fade_width = frp_magic_gi_baked_sh_fade_width(view, fine_level);
+	bool transition = false;
+	bool outer_fade = false;
+	if (fine_level + 1 < level_count) {
+		float coarse_step = clipmap_spacing.x * float(1 << (fine_level + 1));
+		vec3 coarse_position = frp_magic_gi_baked_sh_receiver_position(world,
+				geometric_normal, coarse_step, receiver_mode);
+		bool coarse_in_window;
+		frp_magic_gi_baked_sh_edge_distance(coarse_position, view, fine_level + 1, coarse_in_window);
+		if (fine_edge_distance < fade_width && coarse_in_window) {
+			coarse_weight = 1.0 - smoothstep(0.0, fade_width, fine_edge_distance);
+			transition = coarse_weight > 0.0;
+		} else if (fine_edge_distance < fade_width) {
+			outer_weight = smoothstep(0.0, fade_width, fine_edge_distance);
+			outer_fade = outer_weight < 1.0;
+		}
+	} else {
+		outer_weight = smoothstep(0.0, fade_width, fine_edge_distance);
+		outer_fade = outer_weight < 1.0;
+	}
+	vec3 fine_incident;
+	float fine_coverage;
+	bool fine_valid = frp_magic_gi_baked_sh_sample_level(fine_position, normal_world, axis_tag,
+			view, fine_level, fine_incident, fine_coverage);
+	vec3 incident = fine_valid ? fine_incident : vec3(0.0);
+	float coverage = fine_valid ? fine_coverage : 0.0;
+	if (transition && coarse_weight > 0.0) {
+		float coarse_step = clipmap_spacing.x * float(1 << (fine_level + 1));
+		vec3 coarse_position = frp_magic_gi_baked_sh_receiver_position(world,
+				geometric_normal, coarse_step, receiver_mode);
+		vec3 coarse_incident;
+		float coarse_coverage;
+		bool coarse_valid = frp_magic_gi_baked_sh_sample_level(coarse_position,
+				normal_world, axis_tag, view, fine_level + 1, coarse_incident, coarse_coverage);
+		if (!coarse_valid) {
+			coarse_incident = vec3(0.0);
+			coarse_coverage = 0.0;
+		}
+		incident = mix(incident, coarse_incident, coarse_weight);
+		coverage = mix(coverage, coarse_coverage, coarse_weight);
+	}
+	bool normalize_valid_qa = abs(owner_control.w - 3.0) < 0.01;
+	bool outer_only_sky_qa = abs(owner_control.w - 4.0) < 0.01;
+	float sky_ownership_coverage = coverage;
+	if (normalize_valid_qa) {
+		if (coverage > 0.0) {
+			// incident and coverage are the same fine/coarse weighted,
+			// pre-outer pair. Normalize only when some ready field contributes.
+			incident /= coverage;
+			sky_ownership_coverage = 1.0;
+		} else {
+			// c=0 is unknown/empty: preserve native Sky and do not invent SH.
+			incident = vec3(0.0);
+			sky_ownership_coverage = 0.0;
+		}
+	}
+	if (outer_only_sky_qa) {
+		// Diagnostic only: decouple Sky ownership from ready coverage while
+		// keeping the premultiplied SH response unchanged, including c=0.
+		sky_ownership_coverage = 1.0;
+	}
+	incident *= outer_weight;
+	coverage *= outer_weight;
+	sky_ownership_coverage *= outer_weight;
+	// Layout17 stores tensor coefficients in the selected codec scale. Decode once after
+	// the fine/coarse mix; readiness coverage and Sky ownership are unscaled.
+	incident *= codec.x;
+	if (!frp_magic_gi_baked_sh_finite3(incident) ||
+			!frp_magic_gi_baked_sh_finite1(coverage) ||
+			(!(coverage > 0.0) && !outer_only_sky_qa)) {
+		return;
+	}
+	incident = max(incident, vec3(0.0));
+	float sky_ownership = owner_control.y > 0.5 ?
+			clamp(strength, 0.0, 1.0) *
+			clamp(sky_ownership_coverage, 0.0, 1.0) : 0.0;
+	// The cached rev2 stream includes frozen, visibility-filtered primary Sky.
+	// Modes 0–3 preserve native Sky where coverage is zero; mode 4 is diagnostic.
+	// The standalone attachment remains untouched for the fallback owner bridge.
+	ambient_light -= global_sky_light_diffuse * sky_ownership;
+	// owner_control.z is scene normalization, not camera/pre-exposure. The normal
+	// FRP combine tail applies implementation_data.pre_exposure exactly once.
+	ambient_light += incident * albedo * ao * strength * owner_control.z;
+}
+
+#endif // FRP_MAGIC_GI_BAKED_SH_GLSLINC

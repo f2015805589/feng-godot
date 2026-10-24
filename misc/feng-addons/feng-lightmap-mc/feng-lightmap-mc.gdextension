@@ -1,0 +1,9 @@
+[configuration]
+entry_symbol = "feng_lightmap_mc_init"
+compatibility_minimum = 4.5
+
+[libraries]
+windows.debug.x86_64 = "res://addons/feng-lightmap-mc/bin/libfeng-lightmap-mc.windows.debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/feng-lightmap-mc/bin/libfeng-lightmap-mc.windows.release.x86_64.dll"
+linux.debug.x86_64 = "res://addons/feng-lightmap-mc/bin/libfeng-lightmap-mc.linux.debug.x86_64.so"
+linux.release.x86_64 = "res://addons/feng-lightmap-mc/bin/libfeng-lightmap-mc.linux.release.x86_64.so"

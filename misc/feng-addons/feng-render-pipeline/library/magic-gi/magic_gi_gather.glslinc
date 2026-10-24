@@ -11,8 +11,36 @@
 #ifndef MAGIC_GI_WIDE_VISIBLE_PROBE_LIMIT
 #define MAGIC_GI_WIDE_VISIBLE_PROBE_LIMIT 8
 #endif
+#ifdef MAGIC_GI_FAST_VARIANT_SPECIALIZATION
+#define MAGIC_GI_GATHER_COUNTER_ACTIVE (MAGIC_GI_FULL_FEATURES && collect_work)
+#else
+#define MAGIC_GI_GATHER_COUNTER_ACTIVE collect_work
+#endif
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+#define MAGIC_GI_GATHER_RECORD_RADIANCE() if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_radiance_samples++; }
+#else
+#define MAGIC_GI_GATHER_RECORD_RADIANCE()
+#endif
 const float SURFACE_FALLBACK_COVERAGE_LOW = 0.01;
 const float SURFACE_FALLBACK_COVERAGE_HIGH = 0.05;
+
+// Default fetch preserves calibrated 20-vec4/probe layout outside Layout14.
+#ifndef MAGIC_GI_DIRECTIONAL_SH_COEFFICIENT
+#define MAGIC_GI_DIRECTIONAL_SH_COEFFICIENT(probe_index, coefficient_index) \
+	directional_lighting.values[(probe_index) * 20 + (coefficient_index)]
+#define MAGIC_GI_GATHER_OWNS_SH_ACCESSOR
+#endif
+
+#ifdef MAGIC_GI_USE_PROBE_NEIGHBOR_MASK
+layout(set = 0, binding = 28, std430) readonly buffer ProbeNeighborMasks {
+	uint words[];
+} probe_neighbor_masks;
+#endif
+#ifdef MAGIC_GI_USE_PROBE_NEIGHBOR_CELL_LIST
+layout(set = 0, binding = 29, std430) readonly buffer ProbeNeighborCellLists {
+	uint words[]; // receiver-cell offsets, then ordered occupied source-cell flat IDs.
+} probe_neighbor_cell_lists;
+#endif
 
 bool probe_connection_visible(vec3 sample_position, vec3 world, int receiver_triangle,
 		int receiver_patch, bool curved_patch, vec3 biased_world, int endpoint_triangle) {
@@ -30,7 +58,11 @@ void accumulate_probe_lighting(int probe, float normal_match, float weight, floa
 		float receiving_basis[9], inout vec4 coefficients[18], inout vec3 indirect,
 		inout float unoccluded_weight, inout vec3 primary_sky_indirect,
 		inout float primary_sky_weight, inout float visible_support_weight,
-		inout float coverage_confidence) {
+		inout float coverage_confidence
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+		, bool collect_work, inout uint diagnostic_radiance_samples
+#endif
+		) {
 	unoccluded_weight += weight;
 	if (visibility <= 0.0001) { return; }
 	visible_support_weight += weight * visibility;
@@ -38,18 +70,35 @@ void accumulate_probe_lighting(int probe, float normal_match, float weight, floa
 			clamp(coverage_base * visibility, 0.0, 1.0));
 	if (angular) {
 		for (int k = 0; k < 9; k++) {
-			coefficients[k] += directional_lighting.values[probe * 20 + k] * weight * visibility;
+			coefficients[k] += MAGIC_GI_DIRECTIONAL_SH_COEFFICIENT(probe, k) * weight * visibility;
+			MAGIC_GI_GATHER_RECORD_RADIANCE();
 		}
 	} else {
-		vec3 response = probe_lighting.values[probe * 2].rgb;
+		vec3 response;
 		if (directional_source) {
-			response = directional_lighting.values[probe * 20 + 18].rgb;
+#ifdef MAGIC_GI_RAW_SOURCE_SH
+			// Raw Layout14 source has no calibrated normal-aligned proxy slot.
+			// Evaluate the same nine SH terms at the receiver shading normal.
+			response = vec3(0.0);
+			for (int k = 0; k < 9; k++) {
+				response += MAGIC_GI_DIRECTIONAL_SH_COEFFICIENT(probe, k).rgb * receiving_basis[k];
+				MAGIC_GI_GATHER_RECORD_RADIANCE();
+			}
+#else
 			if (normal_match < 0.9998) {
 				response = vec3(0.0);
 				for (int k = 0; k < 9; k++) {
 					response += directional_lighting.values[probe * 20 + k].rgb * receiving_basis[k];
+					MAGIC_GI_GATHER_RECORD_RADIANCE();
 				}
+			} else {
+				response = directional_lighting.values[probe * 20 + 18].rgb;
+				MAGIC_GI_GATHER_RECORD_RADIANCE();
 			}
+#endif
+		} else {
+			response = probe_lighting.values[probe * 2].rgb;
+			MAGIC_GI_GATHER_RECORD_RADIANCE();
 		}
 		indirect += response * weight * visibility;
 	}
@@ -59,18 +108,33 @@ void accumulate_probe_lighting(int probe, float normal_match, float weight, floa
 		float visible_sky_weight = sky_weight * visibility;
 		if (angular) {
 			for (int k = 0; k < 9; k++) {
-				coefficients[9 + k] += directional_lighting.values[probe * 20 + 9 + k] * visible_sky_weight;
+				coefficients[9 + k] += MAGIC_GI_DIRECTIONAL_SH_COEFFICIENT(probe, 9 + k) * visible_sky_weight;
+				MAGIC_GI_GATHER_RECORD_RADIANCE();
 			}
 		} else {
-			vec3 response = probe_lighting.values[probe * 2 + 1].rgb;
+			vec3 response;
 			if (directional_source) {
-				response = directional_lighting.values[probe * 20 + 19].rgb;
+#ifdef MAGIC_GI_RAW_SOURCE_SH
+				response = vec3(0.0);
+				for (int k = 0; k < 9; k++) {
+					response += MAGIC_GI_DIRECTIONAL_SH_COEFFICIENT(probe, 9 + k).rgb * receiving_basis[k];
+					MAGIC_GI_GATHER_RECORD_RADIANCE();
+				}
+#else
 				if (normal_match < 0.9998) {
 					response = vec3(0.0);
 					for (int k = 0; k < 9; k++) {
 						response += directional_lighting.values[probe * 20 + 9 + k].rgb * receiving_basis[k];
+						MAGIC_GI_GATHER_RECORD_RADIANCE();
 					}
+				} else {
+					response = directional_lighting.values[probe * 20 + 19].rgb;
+					MAGIC_GI_GATHER_RECORD_RADIANCE();
 				}
+#endif
+			} else {
+				response = probe_lighting.values[probe * 2 + 1].rgb;
+				MAGIC_GI_GATHER_RECORD_RADIANCE();
 			}
 			primary_sky_indirect += response * visible_sky_weight;
 		}
@@ -80,19 +144,65 @@ void accumulate_probe_lighting(int probe, float normal_match, float weight, floa
 }
 
 void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_triangle,
-		bool angular, bool directional_source, bool wide_surface_fallback, bool same_patch_only,
+		bool angular, bool directional_source, bool normalize_visible_support,
+		bool wide_surface_fallback, bool same_patch_only,
 		out vec4 coefficients[18], out float candidate_weight, out float visible_support_weight,
-		out float coverage_confidence, bool candidate_only) {
+		out float coverage_confidence, bool candidate_only
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+		, bool collect_work, inout uvec4 diagnostic_cell_work,
+		inout uvec4 diagnostic_probe_work, inout uvec4 diagnostic_radiance_work,
+		inout uvec4 diagnostic_wide_work
+#endif
+		) {
 	MAGIC_GI_GATHER_BEGIN();
 	if (angular) { for (int k = 0; k < 18; k++) { coefficients[k] = vec4(0.0); } }
 	else { coefficients[0] = vec4(0.0); coefficients[9] = vec4(0.0); }
 	float receiving_basis[9];
 	if (directional_source && !angular) { diffuse_basis(normal_world, receiving_basis); }
 	float spacing = max(params.control.y, 0.001);
+	int lookup_radius = LOOKUP_CELL_RADIUS;
 	vec3 dimensions = params.grid.xyz;
 	vec3 grid_position = clamp((params.world_to_grid * vec4(world, 1.0)).xyz, vec3(0.0), dimensions);
 	ivec3 grid_dims = ivec3(dimensions);
+	bool compact_index_map = textureSize(index_map, 0).x == grid_dims.x;
 	ivec3 center = clamp(ivec3(floor(grid_position)), ivec3(0), grid_dims - 1);
+	bool neighbor_mask_active = false;
+	uvec4 neighbor_mask_words = uvec4(0u);
+	bool neighbor_cell_list_active = false;
+	uint neighbor_cell_list_begin = 0u;
+	uint neighbor_cell_list_end = 0u;
+#ifdef MAGIC_GI_USE_PROBE_NEIGHBOR_CELL_LIST
+	neighbor_cell_list_active = params.sky_lighting_sh[6].w > 0.5;
+	if (neighbor_cell_list_active) {
+		uint grid_cell_count = uint(grid_dims.x * grid_dims.y * grid_dims.z);
+		uint receiver_flat = uint(center.x + center.y * grid_dims.x
+				+ center.z * grid_dims.x * grid_dims.y);
+		uint list_word_count = uint(probe_neighbor_cell_lists.words.length());
+		if (grid_cell_count + 1u > list_word_count || receiver_flat + 1u >= grid_cell_count + 1u) {
+			neighbor_cell_list_active = false;
+		} else {
+			neighbor_cell_list_begin = probe_neighbor_cell_lists.words[receiver_flat];
+			neighbor_cell_list_end = probe_neighbor_cell_lists.words[receiver_flat + 1u];
+			if (neighbor_cell_list_begin > neighbor_cell_list_end
+					|| grid_cell_count + 1u + neighbor_cell_list_end
+						> list_word_count) {
+				neighbor_cell_list_active = false;
+			}
+		}
+	}
+#endif
+#ifdef MAGIC_GI_USE_PROBE_NEIGHBOR_MASK
+	neighbor_mask_active = params.lighting_sh[6].w > 0.5 && !neighbor_cell_list_active;
+	if (neighbor_mask_active) {
+		uint receiver_flat = uint(center.x + center.y * grid_dims.x
+				+ center.z * grid_dims.x * grid_dims.y);
+		uint word_base = receiver_flat * 4u;
+		neighbor_mask_words = uvec4(probe_neighbor_masks.words[word_base],
+				probe_neighbor_masks.words[word_base + 1u],
+				probe_neighbor_masks.words[word_base + 2u],
+				probe_neighbor_masks.words[word_base + 3u]);
+	}
+#endif
 	vec3 indirect = vec3(0.0);
 	float unoccluded_weight = 0.0;
 	vec3 primary_sky_indirect = vec3(0.0);
@@ -126,43 +236,89 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 		biased_world = world;
 	}
 	float variance_floor = max(0.0001, spacing * spacing * 0.0001);
-	// The global one-probe-per-world-cell layout is sparse relative to the Volume's
-	// lookup grid. Keep a wider fixed support, while feathering only its outer shell.
-	// Inner cells remain fully weighted so occupied nearby cells cannot disappear at
-	// a lookup-grid boundary.
+	// The legacy support radius is two. The scaled raw-PRT performance profile can
+	// reduce it to one; feather only the selected radius's outer shell so neighbors
+	// remain continuous across lookup-cell boundaries.
 	vec3 grid_fraction = grid_position - vec3(center);
 	float back_tolerance = max(spacing * 0.12, 0.02);
 	float kernel_epsilon = max(spacing * spacing * 0.16, 0.0001);
-	for (int dz = -LOOKUP_CELL_RADIUS; dz <= LOOKUP_CELL_RADIUS; dz++) {
-		for (int dy = -LOOKUP_CELL_RADIUS; dy <= LOOKUP_CELL_RADIUS; dy++) {
-			for (int dx = -LOOKUP_CELL_RADIUS; dx <= LOOKUP_CELL_RADIUS; dx++) {
-				ivec3 cell = center + ivec3(dx, dy, dz);
-				if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, grid_dims))) {
-					continue;
+	int neighbor_cell_count = neighbor_cell_list_active
+			? int(neighbor_cell_list_end - neighbor_cell_list_begin)
+			: (lookup_radius * 2 + 1) * (lookup_radius * 2 + 1) * (lookup_radius * 2 + 1);
+	for (int neighbor_index = 0; neighbor_index < neighbor_cell_count; neighbor_index++) {
+		ivec3 cell;
+		int dx;
+		int dy;
+		int dz;
+#ifdef MAGIC_GI_USE_PROBE_NEIGHBOR_CELL_LIST
+		if (neighbor_cell_list_active) {
+			uint grid_cell_count = uint(grid_dims.x * grid_dims.y * grid_dims.z);
+			uint source_flat = probe_neighbor_cell_lists.words[grid_cell_count + 1u
+					+ neighbor_cell_list_begin + uint(neighbor_index)];
+			if (source_flat >= grid_cell_count) { continue; }
+			cell = ivec3(int(source_flat % uint(grid_dims.x)),
+					int((source_flat / uint(grid_dims.x)) % uint(grid_dims.y)),
+					int(source_flat / uint(grid_dims.x * grid_dims.y)));
+			ivec3 offset = cell - center;
+			dx = offset.x;
+			dy = offset.y;
+			dz = offset.z;
+		} else
+#endif
+		{
+			// Flattening follows the legacy dz outer / dy / dx inner order.
+			dx = neighbor_index % (lookup_radius * 2 + 1) - lookup_radius;
+			dy = (neighbor_index / (lookup_radius * 2 + 1))
+					% (lookup_radius * 2 + 1) - lookup_radius;
+			dz = neighbor_index / ((lookup_radius * 2 + 1) * (lookup_radius * 2 + 1))
+					- lookup_radius;
+			cell = center + ivec3(dx, dy, dz);
+			if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, grid_dims))) {
+				continue;
+			}
+		}
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+		if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_cell_work.x++; }
+#endif
+#ifdef MAGIC_GI_USE_PROBE_NEIGHBOR_MASK
+		if (neighbor_mask_active) {
+			uint neighbor_ordinal = uint((dz + 2) * 25 + (dy + 2) * 5 + dx + 2);
+			uint word = neighbor_mask_words[int(neighbor_ordinal >> 5u)];
+			if (((word >> (neighbor_ordinal & 31u)) & 1u) == 0u) {
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+				if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_cell_work.y++; }
+#endif
+				continue;
+			}
+		}
+#endif
+		ivec3 cell_offset = cell - center;
+		float cell_window = 1.0;
+		for (int axis = 0; axis < 3; axis++) {
+			if (abs(cell_offset[axis]) == lookup_radius) {
+				if (cell_offset[axis] < 0) {
+					cell_window *= 1.0 - smoothstep(0.0, 1.0, grid_fraction[axis]);
+				} else {
+					cell_window *= smoothstep(0.0, 1.0, grid_fraction[axis]);
 				}
-				ivec3 cell_offset = cell - center;
-				float cell_window = 1.0;
-				for (int axis = 0; axis < 3; axis++) {
-					if (abs(cell_offset[axis]) == LOOKUP_CELL_RADIUS) {
-						if (cell_offset[axis] < 0) {
-							cell_window *= 1.0 - smoothstep(0.0, 1.0, grid_fraction[axis]);
-						} else {
-							cell_window *= smoothstep(0.0, 1.0, grid_fraction[axis]);
-						}
-					}
-				}
-				if (cell_window <= 0.0) {
-					continue;
-				}
-				int cell_count = cell_probe_count(cell, grid_dims);
-				if (cell_count <= 0) { continue; }
-				uint first_cluster = 0u;
-				uint cluster_count = 0u;
-				bool clustered = probe_cluster_cell_range(cell, grid_dims, cell_count,
-						first_cluster, cluster_count);
-				int group_count = clustered ? int(cluster_count) : 1;
-				bool cell_has_missing_probe = false;
-				for (int group = 0; group < group_count; group++) {
+			}
+		}
+		if (cell_window <= 0.0) {
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+			if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_cell_work.z++; }
+#endif
+			continue;
+		}
+		ivec2 probe_map_range = cell_probe_map_range(cell, grid_dims, compact_index_map);
+		int cell_count = probe_map_range.y;
+		if (cell_count <= 0) { continue; }
+		uint first_cluster = 0u;
+		uint cluster_count = 0u;
+		bool clustered = probe_cluster_cell_range(cell, grid_dims, cell_count,
+				first_cluster, cluster_count);
+		int group_count = clustered ? int(cluster_count) : 1;
+		bool cell_has_missing_probe = false;
+		for (int group = 0; group < group_count; group++) {
 					if (clustered && probe_cluster_is_prunable(first_cluster + uint(group),
 							uint(group), cell_count, world, normal_world, spacing,
 							directional_source, wide_surface_fallback)) {
@@ -172,7 +328,10 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 					int slot_end = clustered ? min(cell_count,
 							slot_start + int(MAGIC_GI_PROBE_CLUSTER_SLOTS)) : cell_count;
 					for (int slot = slot_start; slot < slot_end; slot++) {
-						int probe = cell_probe(cell, slot, grid_dims);
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+					if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_cell_work.w++; }
+#endif
+						int probe = cell_probe(cell, slot, grid_dims, compact_index_map, probe_map_range.x);
 						if (probe < 0) {
 							cell_has_missing_probe = true;
 							break; // Build slots are dense; the remaining slots in this cell are empty.
@@ -180,6 +339,9 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 						if (float(probe) >= params.grid.w) {
 							continue;
 						}
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+					if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_probe_work.x++; diagnostic_probe_work.y++; }
+#endif
 						ivec2 geometry_xy = ivec2((probe % 32) * 3, probe / 32);
 						vec4 surface_record = texelFetch(geometry_atlas, geometry_xy, 0);
 						vec3 sample_surface = surface_record.xyz;
@@ -212,6 +374,9 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 						if (gate <= 0.0) {
 							continue;
 						}
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+					if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_probe_work.z++; }
+#endif
 						float normalized_residual = plane_residual / (0.25 * spacing);
 						// Flat/parallel candidates always need a direct visible segment.
 						// Only a convex continuation of this connected smooth patch may use
@@ -274,6 +439,9 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 						// A complete geometry query supersedes the coarse directional moments.
 						// Near corners their angular footprint includes an adjacent wall even
 						// when this connection is visible, producing dark probe-shaped patches.
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+						if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_probe_work.w++; }
+#endif
 						if (!probe_connection_visible(sample_position, world, receiver_triangle,
 								receiver_patch, curved_patch, biased_world, endpoint_triangle)) {
 							continue;
@@ -285,6 +453,9 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 								&& params.control.w < 0.5
 #endif
 								) {
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+							if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_radiance_work.x++; }
+#endif
 							vec2 moments = sample_visibility_moments(probe, visibility_delta / visibility_distance);
 							visibility = chebyshev_visibility(moments, visibility_distance, variance_floor);
 						}
@@ -296,11 +467,16 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 								kernel_epsilon, gate * cell_window * density_window, angular,
 								directional_source, receiving_basis, coefficients, indirect,
 								unoccluded_weight, primary_sky_indirect, primary_sky_weight,
-								visible_support_weight, coverage_confidence);
+								visible_support_weight, coverage_confidence
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+								, collect_work, diagnostic_radiance_work.z
+#endif
+								);
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+						if (MAGIC_GI_GATHER_COUNTER_ACTIVE && visibility > 0.0001) { diagnostic_radiance_work.y++; }
+#endif
 						}
-					if (cell_has_missing_probe) { break; }
-				}
-			}
+			if (cell_has_missing_probe) { break; }
 		}
 	}
 	if (wide_surface_fallback) {
@@ -309,6 +485,9 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 		// lighting budget; keep checking the bounded pool until eight are visible.
 		for (int selected = 0; selected < MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT; selected++) {
 			if (visible_probe_count >= MAGIC_GI_WIDE_VISIBLE_PROBE_LIMIT) { break; }
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+			if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_wide_work.y++; }
+#endif
 			int probe = selected_probe[selected];
 			if (probe < 0) { continue; }
 			ivec2 geometry_xy = ivec2((probe % 32) * 3, probe / 32);
@@ -358,6 +537,9 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 #endif
 			if (visibility <= 0.0001) { continue; }
 			visible_probe_count++;
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+			if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_wide_work.z++; }
+#endif
 			if (angular && selected_score[selected] < proxy_score) {
 				proxy_score = selected_score[selected];
 				visibility_probe = probe;
@@ -366,20 +548,32 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 					selected_score[selected], kernel_epsilon, selected_coverage[selected],
 					angular, directional_source, receiving_basis, coefficients, indirect,
 					unoccluded_weight, primary_sky_indirect, primary_sky_weight,
-					visible_support_weight, coverage_confidence);
+					visible_support_weight, coverage_confidence
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+					, collect_work, diagnostic_radiance_work.z
+#endif
+					);
 		}
 	}
-	MAGIC_GI_GATHER_NORMALIZE(unoccluded_weight, primary_sky_weight);
+	// Visibility weights define the retained interpolation support. Keep the
+	// existing candidate and positive-support guards; normalize accepted support
+	// by its own mass instead of attenuating a constant field by support ratio.
+	float secondary_normalization_weight = unoccluded_weight;
+	if (normalize_visible_support && unoccluded_weight > 1e-7
+			&& visible_support_weight > 1e-10) {
+		secondary_normalization_weight = visible_support_weight;
+	}
+	MAGIC_GI_GATHER_NORMALIZE(secondary_normalization_weight, primary_sky_weight);
 	if (angular) {
 		for (int k = 0; k < 9; k++) {
-			coefficients[k] /= max(unoccluded_weight, 1e-7);
+			coefficients[k] /= max(secondary_normalization_weight, 1e-7);
 			coefficients[k + 9] /= max(primary_sky_weight, 1e-7);
 		}
 		// Radiance uses RGB only. The first coefficient's unused alpha keeps
 		// one real visible probe as the baked distance-moment reference.
 		coefficients[0].w = float(visibility_probe + 1);
 	} else {
-		coefficients[0] = vec4(indirect / max(unoccluded_weight, 1e-7), 0.0);
+		coefficients[0] = vec4(indirect / max(secondary_normalization_weight, 1e-7), 0.0);
 		coefficients[9] = vec4(primary_sky_indirect / max(primary_sky_weight, 1e-7), 0.0);
 	}
 }
@@ -388,16 +582,47 @@ void gather_probe_neighborhood(vec3 world, vec3 normal_world, int receiver_trian
 // narrow neighborhood stays the default; only weak directional coverage with a
 // complete static BVH can request a same-patch wide gather.
 void gather_probe_field(vec3 world, vec3 normal_world, int receiver_triangle,
-		bool angular, bool directional_source, out vec4 coefficients[18],
-		out float candidate_weight, out float visible_support_weight, bool candidate_only) {
+		bool angular, bool directional_source, bool normalize_visible_support,
+		out vec4 coefficients[18],
+		out float candidate_weight, out float visible_support_weight, bool candidate_only
+#ifdef MAGIC_GI_GATHER_DIAGNOSTIC_OUTPUTS
+		, out float diagnostic_narrow_confidence, out float diagnostic_narrow_support,
+		out bool diagnostic_wide_fallback
+#endif
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+		, bool collect_work, out uvec4 diagnostic_cell_work,
+		out uvec4 diagnostic_probe_work, out uvec4 diagnostic_radiance_work,
+		out uvec4 diagnostic_wide_work
+#endif
+		) {
 	float narrow_candidate_weight = 0.0;
 	float narrow_visible_support_weight = 0.0;
 	float narrow_coverage_confidence = 0.0;
+#ifdef MAGIC_GI_GATHER_DIAGNOSTIC_OUTPUTS
+	diagnostic_narrow_confidence = 0.0;
+	diagnostic_narrow_support = 0.0;
+	diagnostic_wide_fallback = false;
+#endif
+	#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+	diagnostic_cell_work = uvec4(0u);
+	diagnostic_probe_work = uvec4(0u);
+	diagnostic_radiance_work = uvec4(0u);
+	diagnostic_wide_work = uvec4(0u);
+	#endif
 	gather_probe_neighborhood(world, normal_world, receiver_triangle, angular, directional_source,
-			false, false, coefficients, narrow_candidate_weight,
-			narrow_visible_support_weight, narrow_coverage_confidence, candidate_only);
+			normalize_visible_support, false, false, coefficients, narrow_candidate_weight,
+			narrow_visible_support_weight, narrow_coverage_confidence, candidate_only
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+			, collect_work, diagnostic_cell_work, diagnostic_probe_work,
+			diagnostic_radiance_work, diagnostic_wide_work
+#endif
+			);
 	candidate_weight = narrow_candidate_weight;
 	visible_support_weight = narrow_visible_support_weight;
+#ifdef MAGIC_GI_GATHER_DIAGNOSTIC_OUTPUTS
+	diagnostic_narrow_confidence = narrow_coverage_confidence;
+	diagnostic_narrow_support = narrow_visible_support_weight;
+#endif
 	if (candidate_only && narrow_candidate_weight > 0.0) { return; }
 	int receiver_patch = receiver_triangle >= 0
 			? int(visibility_geometry.triangles[receiver_triangle * 3 + 2].w) : 0;
@@ -410,9 +635,20 @@ void gather_probe_field(vec3 world, vec3 normal_world, int receiver_triangle,
 	float wide_candidate_weight = 0.0;
 	float wide_visible_support_weight = 0.0;
 	float wide_coverage_confidence = 0.0;
+#ifdef MAGIC_GI_GATHER_DIAGNOSTIC_OUTPUTS
+	diagnostic_wide_fallback = true;
+#endif
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+	if (MAGIC_GI_GATHER_COUNTER_ACTIVE) { diagnostic_wide_work.x++; }
+#endif
 	gather_probe_neighborhood(world, normal_world, receiver_triangle, angular, directional_source,
-			true, true, wide_coefficients, wide_candidate_weight,
-			wide_visible_support_weight, wide_coverage_confidence, candidate_only);
+			normalize_visible_support, true, true, wide_coefficients, wide_candidate_weight,
+			wide_visible_support_weight, wide_coverage_confidence, candidate_only
+#ifdef MAGIC_GI_GATHER_WORK_OUTPUTS
+			, collect_work, diagnostic_cell_work, diagnostic_probe_work,
+			diagnostic_radiance_work, diagnostic_wide_work
+#endif
+			);
 	// Preserve the original candidate accumulator whenever the narrow geometric
 	// neighborhood contains any candidate. If it is empty, same-patch wide geometry
 	// can establish support even when every checked connection is blocked.
@@ -442,3 +678,10 @@ void gather_probe_field(vec3 world, vec3 normal_world, int receiver_triangle,
 	visible_support_weight = wide_visible_support_weight * wide_mix
 			+ narrow_visible_support_weight * narrow_mix;
 }
+
+#undef MAGIC_GI_GATHER_COUNTER_ACTIVE
+
+#ifdef MAGIC_GI_GATHER_OWNS_SH_ACCESSOR
+#undef MAGIC_GI_GATHER_OWNS_SH_ACCESSOR
+#undef MAGIC_GI_DIRECTIONAL_SH_COEFFICIENT
+#endif

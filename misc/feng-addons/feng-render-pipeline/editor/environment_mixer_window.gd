@@ -12,11 +12,22 @@ const MODULE_IDS: Array[StringName] = [
 const DETAIL_MINIMAL := 0
 const DETAIL_NORMAL := 1
 const DETAIL_NORMAL_ADVANCED := 2
+# Directional shadow configuration belongs to the renderer's Shadow Pass.
+const DIRECTIONAL_SHADOW_PROPERTIES: Array[StringName] = [
+	&"shadow_enabled", &"directional_shadow_mode",
+	&"directional_shadow_object_shadow_enabled", &"directional_shadow_object_shadow_target",
+	&"directional_shadow_split_1", &"directional_shadow_split_2", &"directional_shadow_split_3",
+	&"directional_shadow_blend_splits", &"directional_shadow_fade_start",
+	&"directional_shadow_max_distance", &"directional_shadow_pancake_size",
+	&"light_angular_distance", &"shadow_blur",
+	&"shadow_bias", &"shadow_normal_bias", &"shadow_reverse_cull_face",
+	&"shadow_transmittance_bias", &"shadow_opacity", &"shadow_caster_mask", &"distance_fade_shadow",
+]
 
 const MINIMAL_PROPERTIES := {
 	"DirectionalLight3D": [
 		"rotation", "light_color", "light_energy", "light_intensity_lux",
-		"light_temperature", "shadow_enabled", "sky_mode",
+		"light_temperature", "sky_mode",
 	],
 	"FengSkyLight": [
 		"position", "rotation", "enabled", "source_mode", "radiance_energy", "realtime_capture",
@@ -475,7 +486,7 @@ func _update_filter_context(p_rebuild := false) -> void:
 
 func _visible_properties_for(p_object: Object) -> PackedStringArray:
 	var level := _detail_mode_picker.get_selected_id()
-	if level == DETAIL_NORMAL_ADVANCED or p_object == null or not is_instance_valid(p_object):
+	if p_object == null or not is_instance_valid(p_object):
 		return PackedStringArray()
 	var kind := _component_kind(p_object)
 	var minimal: Array = MINIMAL_PROPERTIES.get(kind, [])
@@ -500,6 +511,11 @@ func _visible_properties_for(p_object: Object) -> PackedStringArray:
 		if (usage & PROPERTY_USAGE_EDITOR) == 0:
 			continue
 		var property_name := StringName(property_info.get("name", ""))
+		if kind == "DirectionalLight3D" and DIRECTIONAL_SHADOW_PROPERTIES.has(property_name):
+			continue
+		if level == DETAIL_NORMAL_ADVANCED:
+			visible.append(String(property_name))
+			continue
 		if level == DETAIL_MINIMAL:
 			if minimal.has(String(property_name)):
 				visible.append(String(property_name))

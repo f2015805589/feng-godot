@@ -53,12 +53,13 @@ class ControlledBakeJob:
 
 	func run(geometry: RefCounted, signature: int, probe: int,
 			coordinates: Array[PackedFloat64Array], minimum_coordinates: Array[PackedFloat64Array],
-			extra_coordinates: Array[PackedFloat64Array], visibility_rays: int) -> void:
+			extra_coordinates: Array[PackedFloat64Array], visibility_rays: int,
+			directional_sources: Array[Dictionary] = []) -> void:
 		tracker.record_started()
 		if delay_usec > 0:
 			OS.delay_usec(delay_usec)
 		super.run(geometry, signature, probe, coordinates, minimum_coordinates,
-			extra_coordinates, visibility_rays)
+			extra_coordinates, visibility_rays, directional_sources)
 		if force_failure:
 			valid = false
 		tracker.record_finished(probe_index)

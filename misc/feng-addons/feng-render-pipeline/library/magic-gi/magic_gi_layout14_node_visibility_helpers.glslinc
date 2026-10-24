@@ -1,0 +1,177 @@
+#ifndef FENG_MAGIC_GI_LAYOUT14_NODE_VISIBILITY_HELPERS_GLSLINC
+#define FENG_MAGIC_GI_LAYOUT14_NODE_VISIBILITY_HELPERS_GLSLINC
+
+// B-side helpers. Callers still own epoch/tag and radiance validity gates.
+// These moments originate at CLV field nodes, unlike visibility_moments in
+// FMagicGIData, which originate at surface probes.
+const int B14_MOMENT_TILE_SIZE = 8;
+
+bool b14_helper_finite3(vec3 v) { return !any(isnan(v)) && !any(isinf(v)); }
+
+float b14_helper_sign_nz(float v) { return v < 0.0 ? -1.0 : 1.0; }
+
+vec2 b14_oct_encode(vec3 direction) {
+	float n2 = dot(direction, direction);
+	if (!(n2 > 1e-20) || isnan(n2) || isinf(n2)) { return vec2(0.5); }
+	vec3 n = direction * inversesqrt(n2);
+	float sum_abs = abs(n.x) + abs(n.y) + abs(n.z);
+	vec2 p = n.xy / max(sum_abs, 1e-7);
+	if (n.z < 0.0) {
+		p = vec2((1.0 - abs(p.y)) * b14_helper_sign_nz(p.x),
+			(1.0 - abs(p.x)) * b14_helper_sign_nz(p.y));
+	}
+	return p * 0.5 + 0.5;
+}
+
+ivec2 b14_fold_moment_texel(ivec2 p) {
+	for (int i = 0; i < 4; i++) {
+		if (p.x < 0) { p = ivec2(-p.x - 1, 7 - p.y); }
+		else if (p.x >= 8) { p = ivec2(15 - p.x, 7 - p.y); }
+		if (p.y < 0) { p = ivec2(7 - p.x, -p.y - 1); }
+		else if (p.y >= 8) { p = ivec2(7 - p.x, 15 - p.y); }
+		if (all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, ivec2(8)))) {
+			return p;
+		}
+	}
+	return clamp(p, ivec2(0), ivec2(7));
+}
+
+vec2 b14_sample_node_moments(sampler3D atlas, ivec3 physical_node,
+		int level, int resolution, vec3 node_to_receiver) {
+	vec2 uv = b14_oct_encode(node_to_receiver);
+	vec2 p = uv * 8.0 - 0.5;
+	ivec2 base = ivec2(floor(p));
+	vec2 fraction = p - vec2(base);
+	vec2 result = vec2(0.0);
+	for (int y = 0; y < 2; y++) {
+		for (int x = 0; x < 2; x++) {
+			float wx = x == 0 ? 1.0 - fraction.x : fraction.x;
+			float wy = y == 0 ? 1.0 - fraction.y : fraction.y;
+			ivec2 angular = b14_fold_moment_texel(base + ivec2(x, y));
+			ivec3 texel = ivec3(physical_node.xy * 8 + angular,
+				level * resolution + physical_node.z);
+			result += texelFetch(atlas, texel, 0).rg * (wx * wy);
+		}
+	}
+	return result;
+}
+
+// Same one-sided Chebyshev-squared form and variance floor as the current
+// project visibility helper. This is an estimate, not exact segment LOS.
+float b14_chebyshev_visibility(vec2 moments, float distance, float step_size,
+		float range_scale) {
+	if (any(isnan(moments)) || any(isinf(moments)) || isnan(distance)
+			|| isinf(distance) || isnan(step_size) || isinf(step_size)
+			|| isnan(range_scale) || isinf(range_scale)
+			|| distance < 0.0 || !(step_size > 0.0) || !(range_scale > 0.0)) { return -1.0; }
+	float max_distance = range_scale * step_size;
+	if (!(max_distance > 0.0) || isnan(max_distance) || isinf(max_distance)
+			|| !(distance < max_distance)) { return -1.0; }
+	if (moments.x < 0.0 || moments.y < 0.0) { return -1.0; }
+	float mean = moments.x;
+	float second_moment = moments.y;
+	float raw_variance = second_moment - mean * mean;
+	if (isnan(raw_variance) || isinf(raw_variance) || raw_variance < 0.0) { return -1.0; }
+	float delta = distance - mean;
+	if (delta <= 0.0) { return 1.0; }
+	float variance_floor = max(0.0001, step_size * step_size * 0.0001);
+	float variance = max(raw_variance, variance_floor);
+	float denominator = variance + delta * delta;
+	if (!(denominator > 0.0) || isnan(denominator) || isinf(denominator)) {
+		return -1.0;
+	}
+	float bound = clamp(variance / denominator, 0.0, 1.0);
+	return bound * bound;
+}
+
+// Returns false when the four-depth stencil cannot provide a trustworthy
+// geometric normal. The caller then uses the ordinary source gather. Inputs
+// are already reconstructed world positions; center is the current G-buffer
+// world position and the other four positions come from four depth loads.
+bool b14_reconstruct_depth_geometry_normal(vec3 center, vec3 left, vec3 right,
+		vec3 up, vec3 down, vec3 to_camera, out vec3 normal_out) {
+	normal_out = vec3(0.0);
+	if (!b14_helper_finite3(center) || !b14_helper_finite3(left)
+			|| !b14_helper_finite3(right) || !b14_helper_finite3(up)
+			|| !b14_helper_finite3(down) || !b14_helper_finite3(to_camera)) {
+		return false;
+	}
+	vec3 dx0 = center - left;
+	vec3 dx1 = right - center;
+	vec3 dy0 = center - up;
+	vec3 dy1 = down - center;
+	float lx0 = length(dx0), lx1 = length(dx1);
+	float ly0 = length(dy0), ly1 = length(dy1);
+	if (!(min(min(lx0, lx1), min(ly0, ly1)) > 1e-7)
+			|| !b14_helper_finite3(vec3(lx0, lx1, ly0)) || !b14_helper_finite3(vec3(ly1))) {
+		return false;
+	}
+	float asym_x = abs(lx0 - lx1) / max(lx0, lx1);
+	float asym_y = abs(ly0 - ly1) / max(ly0, ly1);
+	if (asym_x > 0.25 || asym_y > 0.25) { return false; }
+	float lo01 = min(lx0, lx1), hi01 = max(lx0, lx1);
+	float lo23 = min(ly0, ly1), hi23 = max(ly0, ly1);
+	float median_step = 0.5 * (max(lo01, lo23) + min(hi01, hi23));
+	float max_step = max(max(lx0, lx1), max(ly0, ly1));
+	if (!(median_step > 1e-7) || isnan(median_step) || isinf(median_step)
+			|| isnan(max_step) || isinf(max_step) || max_step > 3.5 * median_step) {
+		return false;
+	}
+	vec3 candidates[4];
+	candidates[0] = cross(dx0, dy0);
+	candidates[1] = cross(dx1, dy0);
+	candidates[2] = cross(dx0, dy1);
+	candidates[3] = cross(dx1, dy1);
+	vec3 sum_normal = vec3(0.0);
+	for (int i = 0; i < 4; i++) {
+		float n2 = dot(candidates[i], candidates[i]);
+		if (!(n2 > 1e-14) || isnan(n2) || isinf(n2)
+				|| !b14_helper_finite3(candidates[i])) { return false; }
+		candidates[i] *= inversesqrt(n2);
+		if (dot(candidates[i], to_camera) < 0.0) { candidates[i] = -candidates[i]; }
+		sum_normal += candidates[i];
+	}
+	float sum2 = dot(sum_normal, sum_normal);
+	if (!(sum2 > 1e-14) || isnan(sum2) || isinf(sum2)) { return false; }
+	vec3 average = sum_normal * inversesqrt(sum2);
+	for (int i = 0; i < 4; i++) {
+		for (int j = i + 1; j < 4; j++) {
+			if (dot(candidates[i], candidates[j]) < 0.996194698) { return false; }
+		}
+	}
+	if (dot(average, to_camera) <= 1e-4) { return false; }
+	normal_out = average;
+	return true;
+}
+
+// Facing is a receiver-side ownership factor only. The returned false means
+// invalid input and requires source fallback; weight==0 is a valid back-facing
+// node contribution. SH evaluation still uses the caller's shading normal.
+bool b14_node_receiver_weight(vec2 moments, vec3 node_world, vec3 receiver_world,
+		vec3 reliable_geom_normal, float step_size, float range_scale,
+		out float weight_out) {
+	weight_out = 0.0;
+	if (!b14_helper_finite3(node_world) || !b14_helper_finite3(receiver_world)
+			|| !b14_helper_finite3(reliable_geom_normal)) { return false; }
+	float normal2 = dot(reliable_geom_normal, reliable_geom_normal);
+	vec3 to_node = node_world - receiver_world;
+	float distance2 = dot(to_node, to_node);
+	if (!(normal2 > 1e-12) || !(distance2 > 1e-12)
+			|| isnan(normal2) || isinf(normal2) || isnan(distance2) || isinf(distance2)) {
+		return false;
+	}
+	float distance = sqrt(distance2);
+	float visible = b14_chebyshev_visibility(moments, distance, step_size, range_scale);
+	if (visible < 0.0) { return false; }
+	float facing = max(dot(reliable_geom_normal * inversesqrt(normal2),
+			to_node * inversesqrt(distance2)), 0.0);
+	weight_out = visible * facing * facing;
+	return !isnan(weight_out) && !isinf(weight_out);
+}
+
+bool b14_node_tag_matches(ivec4 tag, ivec3 logical_node, int geometry_epoch) {
+	return geometry_epoch > 0 && tag.w == geometry_epoch
+			&& all(equal(tag.xyz, logical_node));
+}
+
+#endif

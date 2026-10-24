@@ -1,0 +1,13 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://8g45pmadfmsm"
+path="res://.godot/imported/magic_gi_apply_compact_b14.glsl-2ceab28d1222f22291d19ed15eb0c512.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply_compact_b14.glsl"
+dest_files=["res://.godot/imported/magic_gi_apply_compact_b14.glsl-2ceab28d1222f22291d19ed15eb0c512.res"]
+
+[params]

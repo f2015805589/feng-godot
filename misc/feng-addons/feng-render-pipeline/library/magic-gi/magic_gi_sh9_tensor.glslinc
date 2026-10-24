@@ -1,0 +1,137 @@
+#ifndef MAGIC_GI_SH9_TENSOR_GLSLINC
+#define MAGIC_GI_SH9_TENSOR_GLSLINC
+
+// Convert raw incident-radiance SH9 into the existing seven-RGBA E/pi tensor
+// layout used by Magic GI layout17. Inputs are signed RGB radiance SH
+// coefficients in the engine's world-axis order:
+//   [Y00, y, z, x, xy, yz, z^2, xz, x^2-y^2].
+// Callers must combine signed radiance families before packing. This helper
+// applies the Lambert cosine-convolution divided by PI exactly once. It does
+// not apply material response, exposure, sky ownership, or RGB clamping.
+//
+// For this per-cell runtime source cache, packed[6].a is binary validity,
+// independent of RGB. A valid black sample therefore has zero RGB and alpha 1.
+// Invalid-cell stores must clear all seven fields to zero. After hardware
+// trilinear filtering, alpha is the fractional valid-corner weight and every
+// RGB polynomial lane has been premultiplied by that same weight. Decode
+// divides by it and returns it separately as coverage; consumers must not
+// multiply the normalized incident result by coverage a second time.
+
+const float MAGIC_GI_SH9_TENSOR_Y00 = 0.2820947918;
+const float MAGIC_GI_SH9_TENSOR_L1 = 0.325735007933; // 0.4886025119 * (2/3)
+const float MAGIC_GI_SH9_TENSOR_L2 = 0.27313710765; // 1.0925484306 * (1/4)
+const float MAGIC_GI_SH9_TENSOR_Z2 = 0.078847891325; // 0.3153915653 * (1/4)
+const float MAGIC_GI_SH9_TENSOR_X2Y2 = 0.136568553825; // 0.5462742153 * (1/4)
+
+bool magic_gi_sh9_tensor_finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool magic_gi_sh9_tensor_finite_vec4(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+// Packed order and carries match the existing consumer:
+//   0=(Ex.rgb,Qxy.r), 1=(Lx.rgb,Qxy.g), 2=(Ey.rgb,Qxy.b),
+//   3=(Ly.rgb,Qyz.r), 4=(Ez.rgb,Qyz.g), 5=(Lz.rgb,Qyz.b),
+//   6=(Qxz.rgb,validity).
+// `coverage` is interpreted as a binary validity input (1=valid, 0=invalid).
+void magic_gi_sh9_tensor_pack_e_over_pi(const vec3 raw_radiance_sh[9],
+		float coverage, out vec4 packed[7]) {
+	bool valid = coverage > 0.5 && !isnan(coverage) && !isinf(coverage);
+	for (int coefficient = 0; coefficient < 9; coefficient++) {
+		valid = valid && magic_gi_sh9_tensor_finite_vec3(raw_radiance_sh[coefficient]);
+	}
+	if (!valid) {
+		for (int field = 0; field < 7; field++) {
+			packed[field] = vec4(0.0);
+		}
+		return;
+	}
+
+	vec3 c0 = raw_radiance_sh[0];
+	vec3 c1 = raw_radiance_sh[1];
+	vec3 c2 = raw_radiance_sh[2];
+	vec3 c3 = raw_radiance_sh[3];
+	vec3 c4 = raw_radiance_sh[4];
+	vec3 c5 = raw_radiance_sh[5];
+	vec3 c6 = raw_radiance_sh[6];
+	vec3 c7 = raw_radiance_sh[7];
+	vec3 c8 = raw_radiance_sh[8];
+
+	vec3 ex = MAGIC_GI_SH9_TENSOR_Y00 * c0
+			- MAGIC_GI_SH9_TENSOR_Z2 * c6
+			+ MAGIC_GI_SH9_TENSOR_X2Y2 * c8;
+	vec3 ey = MAGIC_GI_SH9_TENSOR_Y00 * c0
+			- MAGIC_GI_SH9_TENSOR_Z2 * c6
+			- MAGIC_GI_SH9_TENSOR_X2Y2 * c8;
+	vec3 ez = MAGIC_GI_SH9_TENSOR_Y00 * c0
+			+ (2.0 * MAGIC_GI_SH9_TENSOR_Z2) * c6;
+	vec3 lx = MAGIC_GI_SH9_TENSOR_L1 * c3;
+	vec3 ly = MAGIC_GI_SH9_TENSOR_L1 * c1;
+	vec3 lz = MAGIC_GI_SH9_TENSOR_L1 * c2;
+	vec3 qxy = MAGIC_GI_SH9_TENSOR_L2 * c4;
+	vec3 qyz = MAGIC_GI_SH9_TENSOR_L2 * c5;
+	vec3 qxz = MAGIC_GI_SH9_TENSOR_L2 * c7;
+
+	packed[0] = vec4(ex, qxy.r);
+	packed[1] = vec4(lx, qxy.g);
+	packed[2] = vec4(ey, qxy.b);
+	packed[3] = vec4(ly, qyz.r);
+	packed[4] = vec4(ez, qyz.g);
+	packed[5] = vec4(lz, qyz.b);
+	packed[6] = vec4(qxz, 1.0);
+	for (int field = 0; field < 7; field++) {
+		if (!magic_gi_sh9_tensor_finite_vec4(packed[field])) {
+			for (int clear_field = 0; clear_field < 7; clear_field++) {
+				packed[clear_field] = vec4(0.0);
+			}
+			return;
+		}
+	}
+}
+
+// Decode the signed E/pi polynomial. Clamp RGB only after the caller has
+// accumulated every signed contribution that belongs in the output.
+vec3 magic_gi_sh9_tensor_decode_e_over_pi(const vec4 packed[7],
+		vec3 normal_world, out float coverage) {
+	coverage = 0.0;
+	if (!magic_gi_sh9_tensor_finite_vec3(normal_world)) {
+		return vec3(0.0);
+	}
+	for (int field = 0; field < 7; field++) {
+		if (!magic_gi_sh9_tensor_finite_vec4(packed[field])) {
+			return vec3(0.0);
+		}
+	}
+	float filtered_coverage = packed[6].a;
+	if (!(filtered_coverage > 1e-6) || filtered_coverage > 1.000001) {
+		return vec3(0.0);
+	}
+	float normal_length_squared = dot(normal_world, normal_world);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared)) {
+		return vec3(0.0);
+	}
+	vec3 n = normal_world * inversesqrt(normal_length_squared);
+	float x = n.x;
+	float y = n.y;
+	float z = n.z;
+	vec3 result = packed[0].xyz * (x * x)
+			+ packed[1].xyz * x
+			+ packed[2].xyz * (y * y)
+			+ vec3(packed[0].a, packed[1].a, packed[2].a) * (x * y)
+			+ packed[3].xyz * y
+			+ packed[4].xyz * (z * z)
+			+ vec3(packed[3].a, packed[4].a, packed[5].a) * (y * z)
+			+ packed[5].xyz * z
+			+ packed[6].xyz * (x * z);
+	result /= filtered_coverage;
+	if (!magic_gi_sh9_tensor_finite_vec3(result)) {
+		return vec3(0.0);
+	}
+	coverage = clamp(filtered_coverage, 0.0, 1.0);
+	return result;
+}
+
+#endif

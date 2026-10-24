@@ -253,7 +253,7 @@ private:
 	} cloud_capture_lighting_cache;
 
 	void _update_render_base_uniform_set();
-	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID(), RID p_environment_radiance_texture = RID(), const Ref<FRPPassContext> &p_cloud_context = Ref<FRPPassContext>());
+	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID(), RID p_environment_radiance_texture = RID(), const Ref<FRPPassContext> &p_cloud_context = Ref<FRPPassContext>(), bool p_magic_gi_baked_sh = false, bool p_magic_gi_screen_cache = false, bool p_magic_gi_dynamic_volume = false, bool p_magic_gi_dynamic_screen_cache = false);
 
 	struct BestFitNormal {
 		FrpBestFitNormalShaderRD shader;
@@ -292,7 +292,23 @@ private:
 		FRP_LIGHTING_MODE_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
 		FRP_LIGHTING_MODE_SEPARATE_SPECULAR_MULTIVIEW_SKY_LIGHT_DIFFUSE_INDIRECT_SPECULAR,
 		FRP_LIGHTING_MODE_REFLECTION_COMPONENTS = 16,
-		FRP_LIGHTING_MODE_MAX = 32
+		FRP_LIGHTING_MODE_MAGIC_GI_CLV = 32,
+		FRP_LIGHTING_MODE_MAGIC_GI_GENERAL_QUEUE = 64,
+		// The low bit combination is intentionally disjoint: bit 64 alone selects
+		// the layout-15 baked-SH path; 32|64 remains layout-9 CLV plus its queue.
+		FRP_LIGHTING_MODE_MAGIC_GI_BAKED_SH = 64,
+		FRP_LIGHTING_MODE_MAGIC_GI_SCREEN_CACHE = 128,
+		FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME = 256,
+		// Reuse the previously unused 256|64 combination for the prepared-transfer
+		// sampler. It keeps the mode table size and startup compilation unchanged.
+		FRP_LIGHTING_MODE_MAGIC_GI_PREINTERPOLATED_VOLUME = 320,
+		// Combined 128|256 selects the compact dynamic-volume screen-cache
+		// consumer while preserving existing mode count and the direct fallback.
+		FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE = 384,
+		// 256|128|64 is reserved for layout-6 prepared volumes; the extra bit
+		// distinguishes its 208-byte parameter ABI from the layout-5 sampler.
+		FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME = 448,
+		FRP_LIGHTING_MODE_MAX = 512
 	};
 
 	struct FrpLighting {
@@ -563,8 +579,16 @@ private:
 
 			RID framebuffer;
 			Rect2i rect;
+			Size2i framebuffer_size;
 			bool clear_depth;
 			bool flip_cull;
+
+			RID light_instance;
+			int pass_index = -1;
+			uint32_t cascade_count = 0;
+			bool directional = false;
+			bool object_slot_reserved = false;
+			bool object_slot_active = false;
 
 			uint32_t uniform_buffer_index;
 		};

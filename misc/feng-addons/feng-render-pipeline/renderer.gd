@@ -54,7 +54,7 @@ const NATIVE_PASS_SCRIPTS := {
 const NativePass = preload("passes/native/native_pass.gd")
 
 ## Library entries a fresh pipeline seeds at the anchors in their manifest metadata:
-## Shadow Precompute, VT, GBuffer, Cloud Shadows, GTAO, Lighting, Magic GI, optional RTGI, SSR,
+## Shadow Pass, VT, GBuffer, Cloud Shadows, GTAO, Lighting, Magic GI, optional RTGI, SSR,
 ## the hidden reflection resolver, Sky,
 ## Volumetric Cloud, Height Fog, Cloud Trace, Transparent, Temporal AA, Eye Adaptation,
 ## Bloom, Color Grade, Post Process, Debug Buffers.
@@ -627,12 +627,12 @@ func apply_volume(compositor: Compositor, parameters: Dictionary, pass_states: D
 ## Immutable plan shared by views. Volume switches are evaluated without writing
 ## into this Renderer or changing any authored effect's enabled RID.
 func compile_view_plan(states: Dictionary) -> Dictionary:
-	for cached in _view_plans:
-		if cached.states == states:
-			return cached.plan
 	_ensure_pipeline_initialized(false)
 	var enabled_fn := func(entry): return ExecutionPlan.is_entry_enabled(entry, states)
 	var indirect_owner := IndirectGISelection.resolve(_passes, enabled_fn)
+	for cached in _view_plans:
+		if cached.states == states and cached.get("indirect_owner", {}) == indirect_owner:
+			return cached.plan
 	var provided := ExecutionPlan.provided_native_ids(_passes, enabled_fn)
 	var declared := ExecutionPlan.declared_provided_ids(_passes, enabled_fn)
 	var warnings := ExecutionPlan.validation_warnings(_passes, provided, declared, enabled_fn)
@@ -657,7 +657,8 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 	}
 	if _view_plans.size() == 2:
 		_view_plans.pop_front()
-	_view_plans.append({"states": states.duplicate(true), "plan": plan})
+	_view_plans.append({"states": states.duplicate(true),
+		"indirect_owner": indirect_owner.duplicate(true), "plan": plan})
 	return plan
 
 ## Compatibility entry point for ViewState. The policy owns the implementation

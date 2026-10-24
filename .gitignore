@@ -104,6 +104,15 @@ platform/web/node_modules/
 # Misc
 *.debug
 
+# Local scratch builds and validation artifacts.
+/Temp/
+
+# Local renderer resource from an external validation project.
+/box_renderer.tres
+
+# Godot import metadata for SCons-generated object files.
+/misc/feng-addons/feng-lightmap-mc/native/src/*.obj.import
+
 #############################
 ### IDE and tool specific ###
 #############################

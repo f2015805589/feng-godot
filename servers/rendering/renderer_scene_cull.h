@@ -276,6 +276,7 @@ public:
 			FLAG_VISIBILITY_DEPENDENCY_FADE_CHILDREN = (1 << 22),
 			FLAG_GEOM_PROJECTOR_SOFTSHADOW_DIRTY = (1 << 23),
 			FLAG_IGNORE_ALL_CULLING = (1 << 24),
+			FLAG_REFLECTION_CAPTURE_ONLY = (1 << 25),
 		};
 
 		uint32_t flags = 0;
@@ -415,6 +416,7 @@ public:
 		float lod_bias;
 
 		bool ignore_occlusion_culling;
+		bool reflection_capture_only = false;
 		bool ignore_all_culling;
 
 		Vector<RID> materials;
@@ -1079,7 +1081,7 @@ public:
 	_FORCE_INLINE_ void _update_instance_lightmap_captures(Instance *p_instance) const;
 	void _unpair_instance(Instance *p_instance);
 
-	void _light_instance_setup_directional_shadow(int p_shadow_index, Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
+	void _light_instance_setup_directional_shadow(int p_shadow_index, Instance *p_instance, Scenario *p_scenario, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
 
 	_FORCE_INLINE_ bool _light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers = 0xFFFFFF);
 
@@ -1090,6 +1092,8 @@ public:
 		struct Shadow {
 			RID light_instance;
 			uint32_t caster_mask;
+			uint32_t csm_cascade_count = 0;
+			HashSet<RID> object_shadow_casters;
 			struct Cascade {
 				Frustum frustum;
 
@@ -1103,7 +1107,7 @@ public:
 				Vector2 uv_scale;
 
 			} cascades[RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES]; //max 4 cascades
-			uint32_t cascade_count;
+			uint32_t cascade_count; // Total render passes, including an optional object-focused pass.
 
 		} shadows[RendererSceneRender::MAX_DIRECTIONAL_LIGHTS];
 
@@ -1145,6 +1149,7 @@ public:
 		Transform3D cam_transform;
 		uint32_t visible_layers;
 		Instance *render_reflection_probe = nullptr;
+		bool rendering_reflection_capture = false;
 		const RendererSceneOcclusionCull::HZBuffer *occlusion_buffer;
 		const Projection *camera_matrix;
 		uint64_t visibility_viewport_mask;

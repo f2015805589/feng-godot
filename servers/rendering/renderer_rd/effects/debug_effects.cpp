@@ -198,6 +198,8 @@ void DebugEffects::draw_shadow_frustum(RID p_light, const Projection &p_cam_proj
 	int splits = 1;
 	if (shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS) {
 		splits = 4;
+	} else if (shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS) {
+		splits = 3;
 	} else if (shadow_mode == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_2_SPLITS) {
 		splits = 2;
 	}

@@ -1,0 +1,16 @@
+#ifndef MAGIC_GI_CLV_BAKED_SH_LAYOUT_GLSLINC
+#define MAGIC_GI_CLV_BAKED_SH_LAYOUT_GLSLINC
+
+// Layout 17 stores a quadratic irradiance tensor derived exactly from the persisted schema-rev2 SH9:
+// secondary indirect plus visibility-filtered primary Sky, with real-time direct
+// directional lighting excluded. The source asset remains 27 scene-linear SH scalars per probe;
+// seven homogeneous RGBA16F or RGBA32F CLV textures pack the exact 9-RGB quadratic
+// E/pi tensor plus one unscaled cache-validity lane. The 96-byte clipmap UBO tail
+// declares decode/encode scale, format tag, and codec revision.
+const int MAGIC_GI_CLV_BAKED_SH_LAYOUT_VERSION = 17;
+const int MAGIC_GI_CLV_BAKED_SH_TEXTURE_COUNT = 7;
+const int MAGIC_GI_CLV_BAKED_SH_LEVEL_COUNT = 3;
+const int MAGIC_GI_CLV_BAKED_SH_GUARD = 1;
+const uint MAGIC_GI_CLV_BAKED_SH_SUPPORT_VALID = 1u;
+
+#endif

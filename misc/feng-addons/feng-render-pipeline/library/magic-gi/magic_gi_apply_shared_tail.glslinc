@@ -1,0 +1,849 @@
+const int CLV_DEBUG_OFF = 0;
+const int CLV_DEBUG_CASCADE_LEVELS = 1;
+const int CLV_DEBUG_CACHE_VALIDITY = 2;
+const int CLV_DEBUG_CELLS = 3;
+const int CLV_DEBUG_RECONSTRUCTED_LIGHTING = 4;
+// Temporary profiling-only raw Gather mode. The runner can pass .w=100 while
+// scale > 1 to read cache/fallback/support metrics from the raw RGBA16F target.
+const int CLV_DEBUG_GATHER_DIAGNOSTICS = 100;
+// Full-resolution point-reference modes. These force the exact gather after the
+// regular GBuffer reconstruction and receiver snap/hint preprocessing.
+const int CLV_DEBUG_POINT_REFERENCE_SECONDARY = 100;
+const int CLV_DEBUG_POINT_REFERENCE_SKY = 101;
+const int CLV_DEBUG_POINT_REFERENCE_WORLD_TRIANGLE = 102;
+const int CLV_DEBUG_POINT_REFERENCE_NORMAL_TRIANGLE = 103;
+const int CLV_DEBUG_POINT_REFERENCE_TRIANGLE_ID = 104;
+const int CLV_DEBUG_POINT_REFERENCE_CALLER = 105;
+const int CLV_DEBUG_STATS_CAPTURE = 106;
+// One-pixel linear HDR captures: certified, approximate, general, and source paths.
+const int CLV_DEBUG_POINT_CERTIFIED_RAW = 107;
+const int CLV_DEBUG_POINT_GENERAL_RAW = 108;
+const int CLV_DEBUG_POINT_SOURCE_RAW = 109;
+const int CLV_DEBUG_POINT_APPROX_RAW = 110;
+const uint CLV_POINT_FIELDS_MARKER = 0x50525444u;
+
+void write_prt_point_fields(vec3 secondary, vec3 primary, uint status,
+		vec3 receiver_world, vec3 receiver_normal, int receiver_triangle, ivec2 pixel) {
+	exact_point_diagnostic.words[0] = floatBitsToUint(secondary.x);
+	exact_point_diagnostic.words[1] = floatBitsToUint(secondary.y);
+	exact_point_diagnostic.words[2] = floatBitsToUint(secondary.z);
+	exact_point_diagnostic.words[3] = floatBitsToUint(primary.x);
+	exact_point_diagnostic.words[4] = floatBitsToUint(primary.y);
+	exact_point_diagnostic.words[5] = floatBitsToUint(primary.z);
+	exact_point_diagnostic.words[6] = status;
+	exact_point_diagnostic.words[7] = CLV_POINT_FIELDS_MARKER;
+	exact_point_diagnostic.words[10] = floatBitsToUint(receiver_world.x);
+	exact_point_diagnostic.words[11] = floatBitsToUint(receiver_world.y);
+	exact_point_diagnostic.words[12] = floatBitsToUint(receiver_world.z);
+	exact_point_diagnostic.words[13] = floatBitsToUint(receiver_normal.x);
+	exact_point_diagnostic.words[14] = floatBitsToUint(receiver_normal.y);
+	exact_point_diagnostic.words[15] = floatBitsToUint(receiver_normal.z);
+	exact_point_diagnostic.words[16] = receiver_triangle >= 0
+			? uint(receiver_triangle) : 0xffffffffu;
+	// Sidecar facts are sampled from the same receiver pixel and frame. The two
+	// raw PRT fields above are incident linear radiance before material, AO, GI
+	// strength, exposure, Sky replacement, or final composition.
+	vec3 sky_diffuse = texelFetch(sky_light_diffuse_buffer, pixel, 0).rgb;
+	vec3 scene_before_magic_gi = imageLoad(color_image, pixel).rgb;
+	vec3 albedo = texelFetch(gbuffer_albedo, pixel, 0).rgb;
+	vec4 orm = texelFetch(gbuffer_orm, pixel, 0);
+	float diffuse_ao = texture(diffuse_ambient_occlusion_texture,
+			(vec2(pixel) + 0.5) / vec2(textureSize(depth_buffer, 0))).r;
+	if (isnan(diffuse_ao) || isinf(diffuse_ao)) { diffuse_ao = 1.0; }
+	exact_point_diagnostic.words[18] = floatBitsToUint(sky_diffuse.r);
+	exact_point_diagnostic.words[19] = floatBitsToUint(sky_diffuse.g);
+	exact_point_diagnostic.words[20] = floatBitsToUint(sky_diffuse.b);
+	exact_point_diagnostic.words[21] = floatBitsToUint(scene_before_magic_gi.r);
+	exact_point_diagnostic.words[22] = floatBitsToUint(scene_before_magic_gi.g);
+	exact_point_diagnostic.words[23] = floatBitsToUint(scene_before_magic_gi.b);
+	exact_point_diagnostic.words[24] = floatBitsToUint(albedo.r);
+	exact_point_diagnostic.words[25] = floatBitsToUint(albedo.g);
+	exact_point_diagnostic.words[26] = floatBitsToUint(albedo.b);
+	exact_point_diagnostic.words[27] = floatBitsToUint(clamp(orm.r, 0.0, 1.0));
+	exact_point_diagnostic.words[28] = floatBitsToUint(clamp(orm.b, 0.0, 1.0));
+	exact_point_diagnostic.words[29] = floatBitsToUint(clamp(diffuse_ao, 0.0, 1.0));
+	exact_point_diagnostic.words[30] = floatBitsToUint(params.control.x);
+	exact_point_diagnostic.words[31] = floatBitsToUint(pc.parameters.x);
+	exact_point_diagnostic.words[32] = floatBitsToUint(pc.parameters.y);
+}
+
+void write_prt_approx_point_fields(vec3 secondary, vec3 primary, uint status,
+		float confidence, int selected_level, vec3 receiver_world,
+		vec3 receiver_normal, int receiver_triangle, ivec2 pixel) {
+	write_prt_point_fields(secondary, primary, status, receiver_world,
+			receiver_normal, receiver_triangle, pixel);
+	exact_point_diagnostic.words[17] = floatBitsToUint(confidence);
+	exact_point_diagnostic.words[33] = uint(max(selected_level + 1, 0));
+}
+
+void write_prt_approx_reject_diagnostic(uvec4 level_reasons,
+		uint global_reason, bool hit, int selected_level) {
+	exact_point_diagnostic.words[34] = (level_reasons.x & 0xffu)
+			| ((level_reasons.y & 0xffu) << 8u)
+			| ((level_reasons.z & 0xffu) << 16u)
+			| ((global_reason & 0xffu) << 24u);
+	// Top byte is a format marker. Low bits carry hit and selected-level+1.
+	exact_point_diagnostic.words[35] = 0xa9000000u | (hit ? 1u : 0u)
+			| (uint(max(selected_level + 1, 0)) << 1u);
+}
+
+vec3 clv_level_color(int level) {
+	switch (level) {
+		case 0: return vec3(0.08, 0.9, 0.12);
+		case 1: return vec3(1.0, 0.55, 0.04);
+		case 2: return vec3(0.12, 0.35, 1.0);
+	}
+	return vec3(0.0);
+}
+
+vec3 clv_reject_color(int reason) {
+	switch (reason) {
+		case CLV_REJECT_DISABLED: return vec3(0.8, 0.05, 0.8);
+		case CLV_REJECT_OUTSIDE: return vec3(0.05, 0.15, 0.8);
+		case CLV_REJECT_NO_VALID_CORNERS: return vec3(1.0, 0.45, 0.02);
+		case CLV_REJECT_GEOMETRY_BLOCKED: return vec3(1.0, 0.04, 0.02);
+		case CLV_REJECT_NO_EXACT_SUPPORT: return vec3(0.95, 0.1, 0.65);
+		case CLV_REJECT_NO_EXACT_CANDIDATE: return vec3(0.18, 0.18, 0.18);
+		case CLV_REJECT_OUTSIDE_BAKE_GRID: return vec3(0.1, 0.65, 0.8);
+		case CLV_REJECT_INCOMPLETE_SUPPORT: return vec3(1.0, 0.45, 0.02);
+		case CLV_REJECT_UNCERTIFIED: return vec3(0.2, 0.7, 0.7);
+	}
+	return vec3(0.0);
+}
+
+vec3 clv_debug_color(int view, int sample_status, int reject_reason,
+		int selected_level, float coverage, vec3 cell_fraction, vec3 lighting) {
+	if (view == CLV_DEBUG_RECONSTRUCTED_LIGHTING) {
+		return max(lighting, vec3(0.0));
+	}
+	vec3 level_color = clv_level_color(selected_level);
+	if (view == CLV_DEBUG_CASCADE_LEVELS) {
+		return sample_status == CLV_SAMPLE_EXACT ? vec3(1.0, 0.0, 1.0) : level_color;
+	}
+	if (view == CLV_DEBUG_CACHE_VALIDITY) {
+		if (sample_status == CLV_SAMPLE_EXACT) {
+			vec3 reject_color = clv_reject_color(reject_reason);
+			if (reject_reason == CLV_REJECT_INCOMPLETE_SUPPORT) {
+				return mix(reject_color, vec3(1.0, 0.82, 0.03), clamp(coverage, 0.0, 1.0));
+			}
+			return reject_color;
+		}
+		if (sample_status == CLV_SAMPLE_FULL) {
+			return vec3(0.05, 0.9, 0.12);
+		}
+		if (sample_status == CLV_SAMPLE_FILTERED) {
+			return mix(vec3(1.0, 0.55, 0.04), vec3(0.05, 0.9, 0.12), clamp(coverage, 0.0, 1.0));
+		}
+		return clv_reject_color(reject_reason);
+	}
+	if (view == CLV_DEBUG_CELLS) {
+		if (sample_status == CLV_SAMPLE_EXACT) {
+			return vec3(1.0, 0.0, 1.0);
+		}
+		vec3 edge_distance = min(cell_fraction, vec3(1.0) - cell_fraction);
+		float edge = min(edge_distance.x, min(edge_distance.y, edge_distance.z));
+		float line = 1.0 - smoothstep(0.02, 0.06, edge);
+		return level_color * mix(0.12, 1.0, line);
+	}
+	return vec3(0.0);
+}
+
+void main() {
+	bool native_fallback_only = pc.parameters.z < 0.0;
+	int gather_scale = int(round(clamp(abs(pc.parameters.z), 1.0, 16.0)));
+	bool raw_gather = gather_scale > 1;
+	#if MAGIC_GI_PRT_COMPACT_QUEUE_VARIANT
+	bool prt_compact_queue_consumer = MAGIC_GI_PRT_QUEUE_CONSUMER;
+#else
+	bool prt_compact_queue_consumer = false;
+#endif
+	bool dispatch_grid_in_bounds = true;
+	ivec2 dispatch_pixel;
+#if MAGIC_GI_PRT_COMPACT_QUEUE_VARIANT
+	if (prt_compact_queue_consumer) {
+		uint rect_width = uint(page.dispatch_rect.z);
+		uint rect_height = uint(page.dispatch_rect.w);
+		if (rect_width == 0u || rect_height == 0u) { return; }
+		if (prt_miss_queue_control.overflow != 0u) {
+			uvec2 full_pixel = gl_GlobalInvocationID.xy;
+			dispatch_grid_in_bounds = !any(greaterThanEqual(full_pixel, uvec2(page.dispatch_rect.zw)));
+			if (!dispatch_grid_in_bounds) { return; }
+			dispatch_pixel = ivec2(full_pixel) + page.dispatch_rect.xy;
+			if (any(lessThan(dispatch_pixel, ivec2(0)))
+					|| any(greaterThanEqual(dispatch_pixel, imageSize(prt_source_pending)))) { return; }
+			if (imageLoad(prt_source_pending, dispatch_pixel).r != 1u) { return; }
+		} else {
+			uint queue_index = gl_WorkGroupID.x * 64u + uint(gl_LocalInvocationIndex);
+			uint queue_count = prt_miss_queue_control.count;
+			if (queue_index >= queue_count) { return; }
+			uint pixel_id = prt_miss_pixel_queue.values[queue_index];
+			uint capacity = rect_width * rect_height;
+			if (pixel_id >= capacity) { return; }
+			uvec2 local_pixel = uvec2(pixel_id % rect_width, pixel_id / rect_width);
+			dispatch_pixel = ivec2(local_pixel) + page.dispatch_rect.xy;
+			if (any(lessThan(dispatch_pixel, ivec2(0)))
+					|| any(greaterThanEqual(dispatch_pixel, imageSize(prt_source_pending)))) { return; }
+		}
+	} else {
+		uvec2 full_pixel = gl_GlobalInvocationID.xy;
+		dispatch_grid_in_bounds = !any(greaterThanEqual(full_pixel, uvec2(page.dispatch_rect.zw)));
+		dispatch_pixel = ivec2(full_pixel) + page.dispatch_rect.xy;
+	}
+#else
+	dispatch_pixel = ivec2(gl_GlobalInvocationID.xy) + page.dispatch_rect.xy;
+	dispatch_grid_in_bounds = !any(greaterThanEqual(gl_GlobalInvocationID.xy, uvec2(page.dispatch_rect.zw)));
+#endif
+	ivec2 dispatch_extent = raw_gather ? imageSize(gi_output) : imageSize(color_image);
+	if (any(greaterThanEqual(dispatch_pixel, dispatch_extent)) || !dispatch_grid_in_bounds) {
+		return;
+	}
+	bool prt_v2_cache_stage = MAGIC_GI_PRT_STAGE_CACHE_GENERAL
+			&& !MAGIC_GI_PRT_STAGE_SOURCE && !MAGIC_GI_PRT_STAGE_CERT_ONLY
+			&& !MAGIC_GI_PRT_STAGE_GENERAL_ONLY;
+	bool prt_v2_source_stage = MAGIC_GI_PRT_STAGE_SOURCE
+			&& !MAGIC_GI_PRT_STAGE_CACHE_GENERAL && !MAGIC_GI_PRT_STAGE_CERT_ONLY
+			&& !MAGIC_GI_PRT_STAGE_GENERAL_ONLY;
+	bool prt_v3_cert_stage = MAGIC_GI_PRT_STAGE_CERT_ONLY
+			&& !MAGIC_GI_PRT_STAGE_CACHE_GENERAL && !MAGIC_GI_PRT_STAGE_SOURCE
+			&& !MAGIC_GI_PRT_STAGE_GENERAL_ONLY;
+	bool prt_v3_general_stage = MAGIC_GI_PRT_STAGE_GENERAL_ONLY
+			&& !MAGIC_GI_PRT_STAGE_CACHE_GENERAL && !MAGIC_GI_PRT_STAGE_SOURCE
+			&& !MAGIC_GI_PRT_STAGE_CERT_ONLY;
+	// V3 source uses the v2 CACHE_GENERAL+SOURCE pair to distinguish marker value 2.
+	bool prt_v3_source_stage = MAGIC_GI_PRT_STAGE_CACHE_GENERAL
+			&& MAGIC_GI_PRT_STAGE_SOURCE && !MAGIC_GI_PRT_STAGE_CERT_ONLY
+			&& !MAGIC_GI_PRT_STAGE_GENERAL_ONLY;
+	bool prt_stage_active = MAGIC_GI_PRT_STAGE_CACHE_GENERAL || MAGIC_GI_PRT_STAGE_SOURCE
+			|| MAGIC_GI_PRT_STAGE_CERT_ONLY || MAGIC_GI_PRT_STAGE_GENERAL_ONLY;
+	if (prt_stage_active
+			&& (any(lessThan(dispatch_pixel, ivec2(0)))
+				|| any(greaterThanEqual(dispatch_pixel, imageSize(prt_source_pending))))) {
+		return;
+	}
+	// Marker values: 0 = no deferred work, 1 = general-CLV stage needed,
+	// 2 = source gather stage needed. Stage A resets every valid dispatched pixel.
+	if (prt_v2_cache_stage || prt_v3_cert_stage) {
+		imageStore(prt_source_pending, dispatch_pixel, uvec4(0u));
+	} else if (prt_v2_source_stage) {
+		if (imageLoad(prt_source_pending, dispatch_pixel).r != 1u) { return; }
+	} else if (prt_v3_general_stage) {
+		if (imageLoad(prt_source_pending, dispatch_pixel).r != 1u) { return; }
+		imageStore(prt_source_pending, dispatch_pixel, uvec4(0u));
+	} else if (prt_v3_source_stage
+			&& imageLoad(prt_source_pending, dispatch_pixel).r != 2u) {
+		return;
+	}
+	// In scaled mode binding 5 is a reduced-resolution raw-radiance buffer. Clear
+	// every dispatched sample before any surface/CLV early-out so invalid samples
+	// can never leak radiance from an earlier frame into the full-resolution resolve.
+	if (raw_gather) {
+		imageStore(gi_output, dispatch_pixel, vec4(0.0));
+	}
+	ivec2 extent = textureSize(depth_buffer, 0);
+	ivec2 pixel = raw_gather
+			? min(dispatch_pixel * gather_scale + ivec2(gather_scale / 2), extent - ivec2(1))
+			: dispatch_pixel;
+	if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, extent))) {
+		return;
+	}
+	int debug_view = int(round(pc.parameters.w));
+	bool stats_capture = MAGIC_GI_FULL_FEATURES && debug_view == CLV_DEBUG_STATS_CAPTURE;
+	if (stats_capture) {
+		// 0 = dispatched samples, 1 = shaded receivers, 2 = in-bake receivers,
+		// 3 = certified hardware-trilinear hits, 4 = general CLV hits,
+		// 5 = exact probe gathers, 6 = supported samples, 7 = nonzero output.
+		atomicAdd(clv_stats.counts[0], 1u);
+	}
+	// Runtime selects full-resolution mode for the CLV debug views because those
+	// visualizations describe individual screen samples, not a filtered GI field.
+	bool point_capture_debug = MAGIC_GI_FULL_FEATURES && !raw_gather && debug_view >= CLV_DEBUG_POINT_CERTIFIED_RAW
+			&& debug_view <= CLV_DEBUG_POINT_APPROX_RAW;
+	bool debug_enabled = MAGIC_GI_FULL_FEATURES && debug_view != CLV_DEBUG_OFF && !stats_capture && !raw_gather
+			&& !point_capture_debug;
+	bool diagnostic_mode = MAGIC_GI_FULL_FEATURES && raw_gather && debug_view == CLV_DEBUG_GATHER_DIAGNOSTICS;
+	bool caller_point_debug = MAGIC_GI_FULL_FEATURES && !raw_gather && debug_view == CLV_DEBUG_POINT_REFERENCE_CALLER;
+	bool point_certified_debug = MAGIC_GI_FULL_FEATURES && !raw_gather && debug_view == CLV_DEBUG_POINT_CERTIFIED_RAW;
+	bool point_general_debug = MAGIC_GI_FULL_FEATURES && !raw_gather && debug_view == CLV_DEBUG_POINT_GENERAL_RAW;
+	bool point_source_debug = MAGIC_GI_FULL_FEATURES && !raw_gather && debug_view == CLV_DEBUG_POINT_SOURCE_RAW;
+	bool point_approximate_debug = MAGIC_GI_FULL_FEATURES && !raw_gather && debug_view == CLV_DEBUG_POINT_APPROX_RAW;
+	bool point_raw_debug = point_certified_debug || point_general_debug || point_source_debug
+			|| point_approximate_debug;
+	if (point_raw_debug) {
+		ivec2 requested_pixel = ivec2(int(exact_point_diagnostic.words[8]),
+				int(exact_point_diagnostic.words[9]));
+		if (any(notEqual(pixel, requested_pixel))) { return; }
+	}
+	bool point_reference_debug = MAGIC_GI_FULL_FEATURES && !raw_gather
+			&& debug_view >= CLV_DEBUG_POINT_REFERENCE_SECONDARY
+			&& debug_view <= CLV_DEBUG_POINT_REFERENCE_CALLER;
+	if (caller_point_debug) {
+		ivec2 requested_pixel = ivec2(int(exact_point_diagnostic.words[8]),
+				int(exact_point_diagnostic.words[9]));
+		if (any(notEqual(pixel, requested_pixel))) { return; }
+	}
+	float depth = texelFetch(depth_buffer, pixel, 0).r;
+	if (depth <= 0.0 || (!debug_enabled && !stats_capture
+			&& (params.control.x <= 0.0 || pc.parameters.x <= 0.0 || params.grid.w <= 0.0))) {
+		return;
+	}
+	vec4 orm = texelFetch(gbuffer_orm, pixel, 0);
+	uint packed_metadata = uint(round(clamp(orm.a, 0.0, 1.0) * 255.0));
+	uint shading_model_id = packed_metadata & 0x0Fu;
+	if (shading_model_id == 0u) {
+		return; // Unlit G-buffer pixels have no SkyLight diffuse term to replace.
+	}
+	if (stats_capture) { atomicAdd(clv_stats.counts[1], 1u); }
+
+	vec2 screen_uv = (vec2(pixel) + vec2(0.5)) / vec2(extent);
+	vec4 clip = vec4(screen_uv * 2.0 - 1.0, depth, 1.0);
+	vec4 view_h = params.inverse_projection * clip;
+	if (abs(view_h.w) < 1e-7) {
+		return;
+	}
+	vec3 view_position = view_h.xyz / view_h.w;
+	vec3 world = (params.view_to_world * vec4(view_position, 1.0)).xyz;
+	if (page.core_min_enabled.w > 0.5 && (any(lessThan(world, page.core_min_enabled.xyz))
+			|| any(greaterThanEqual(world, page.core_max.xyz)))) {
+		return; // Support halos never own pixels; ownership stays half-open and unique.
+	}
+	if (page.owner_size_enabled.w > 0.5) {
+		vec3 owner_local = (page.owner_world_to_local * vec4(world, 1.0)).xyz;
+		if (any(greaterThan(abs(owner_local), page.owner_size_enabled.xyz * 0.5))) {
+			return; // World-aligned page AABBs are additionally clipped to the source OBB.
+		}
+	}
+	int receiver_triangle = -1;
+	// Only clv_cached_receiver may set receiver_triangle; hints supply the family token below.
+	int receiver_family_triangle = -1;
+	vec3 normal_view = normalize(texelFetch(normal_roughness, pixel, 0).xyz * 2.0 - 1.0);
+	vec3 normal_world = normalize(mat3(params.view_to_world) * normal_view);
+	vec3 secondary_emission = vec3(0.0);
+	vec3 primary_sky = vec3(0.0);
+	float gather_narrow_confidence = 0.0;
+	float gather_narrow_support = 0.0;
+	bool gather_wide_fallback = false;
+	int selected_level = -1;
+	vec3 cell_fraction = vec3(0.0);
+	int certified_reject_reason = 0;
+	// The reference modes deliberately force the exact fallback, while preserving
+	// the same depth/normal reconstruction and subsequent receiver snap/hint used
+	// by this caller. They do not alter the normal production cache path.
+	bool cached_light = false;
+	bool certified_hit = false;
+	bool approximate_hit = false;
+	float approximate_confidence = 0.0;
+	if (!MAGIC_GI_PRT_STAGE_SOURCE && !MAGIC_GI_PRT_STAGE_GENERAL_ONLY
+			&& !point_reference_debug && !point_general_debug && !point_source_debug
+			&& !point_approximate_debug
+			&& clv.control.w != CLV_FIELD_LAYOUT_VERSION) {
+		certified_hit = sample_clv_certified(world, normal_world,
+				secondary_emission, primary_sky, selected_level, cell_fraction,
+				certified_reject_reason, !native_fallback_only);
+		cached_light = certified_hit;
+	}
+	if (prt_v3_cert_stage && !certified_hit) {
+		imageStore(prt_source_pending, dispatch_pixel, uvec4(1u));
+#if MAGIC_GI_PRT_COMPACT_QUEUE_VARIANT
+		prt_compact_append_cert_miss(dispatch_pixel);
+#endif
+		return; // Defer this certified miss to the queue consumer.
+	}
+	if (point_certified_debug) {
+		write_prt_point_fields(secondary_emission, primary_sky,
+				certified_hit ? 1u : (0x80000000u | uint(certified_reject_reason)),
+				world, normal_world, receiver_triangle, pixel);
+		return;
+	}
+	if (point_approximate_debug) {
+		vec3 approximate_secondary;
+		vec3 approximate_primary;
+		int approximate_level;
+		float approximate_confidence;
+		uvec4 approximate_level_reasons;
+		uint approximate_global_reason;
+		bool approximate_hit = sample_clv_volume_approx_diagnostic(world, normal_world,
+				approximate_secondary, approximate_primary, approximate_level,
+				approximate_confidence, true, approximate_level_reasons,
+				approximate_global_reason);
+		write_prt_approx_point_fields(approximate_secondary, approximate_primary,
+				approximate_hit ? (1u | (uint(approximate_level + 1) << 1u)) : 0x80000000u,
+				approximate_confidence, approximate_level, world, normal_world,
+				receiver_triangle, pixel);
+		write_prt_approx_reject_diagnostic(approximate_level_reasons,
+				approximate_global_reason, approximate_hit, approximate_level);
+		return;
+	}
+	// The deferred-lighting shader already added certified and approximate volume
+	// samples this frame. Re-evaluate only their cheap ownership predicates here;
+	// never add either contribution twice.
+	vec3 approximate_grid_position = (params.world_to_grid * vec4(world, 1.0)).xyz;
+	float approximate_grid_spacing = max(params.control.y, 0.001);
+	mat3 approximate_world_to_grid_basis = mat3(params.world_to_grid);
+	float approximate_grid_epsilon = max(1e-5, approximate_grid_spacing * 0.001 * max(
+			length(approximate_world_to_grid_basis[0]),
+			max(length(approximate_world_to_grid_basis[1]), length(approximate_world_to_grid_basis[2]))));
+	bool approximate_in_bake = params.grid.w > 0.0
+			&& visibility_finite_vec3(approximate_grid_position)
+			&& all(greaterThanEqual(approximate_grid_position, vec3(-approximate_grid_epsilon)))
+			&& all(lessThanEqual(approximate_grid_position, params.grid.xyz + vec3(approximate_grid_epsilon)));
+	if (!prt_stage_active
+			&& clv.control.w != CLV_FIELD_LAYOUT_VERSION
+			&& MAGIC_GI_FULL_FEATURES && !cached_light && approximate_in_bake && !point_reference_debug
+			&& !point_general_debug && !point_source_debug && !raw_gather) {
+		vec3 approximate_secondary;
+		vec3 approximate_primary;
+		int approximate_level;
+		approximate_hit = sample_clv_volume_approx(world, normal_world,
+				approximate_secondary, approximate_primary, approximate_level,
+				approximate_confidence, !native_fallback_only);
+		if (stats_capture) {
+			// This second pass is restricted to the untimed stats capture. It mirrors
+			// the production call and records its disjoint reason for each level.
+			vec3 diagnostic_secondary;
+			vec3 diagnostic_primary;
+			int diagnostic_level;
+			float diagnostic_confidence;
+			uvec4 diagnostic_level_reasons;
+			uint diagnostic_global_reason;
+			bool diagnostic_hit = sample_clv_volume_approx_diagnostic(world, normal_world,
+					diagnostic_secondary, diagnostic_primary, diagnostic_level,
+					diagnostic_confidence, !native_fallback_only,
+					diagnostic_level_reasons, diagnostic_global_reason);
+			atomicAdd(clv_stats.counts[70], 1u);
+			atomicAdd(clv_stats.counts[diagnostic_hit ? 71 : 72], 1u);
+			if (diagnostic_hit != approximate_hit
+					|| (diagnostic_hit && diagnostic_level != approximate_level)) {
+				atomicAdd(clv_stats.counts[73], 1u);
+			}
+			if (diagnostic_global_reason > 0u && diagnostic_global_reason <= 6u) {
+				atomicAdd(clv_stats.counts[73u + diagnostic_global_reason], 1u);
+			}
+			for (int diagnostic_level_index = 0; diagnostic_level_index < 3;
+					diagnostic_level_index++) {
+				uint level_reason = diagnostic_level_reasons[diagnostic_level_index];
+				if (level_reason == 255u) { continue; }
+				uint counter_base = 80u + uint(diagnostic_level_index) * 20u;
+				atomicAdd(clv_stats.counts[counter_base], 1u);
+				if (level_reason == CLV_APPROX_REJECT_NONE) {
+					atomicAdd(clv_stats.counts[counter_base + 1u], 1u);
+				} else if (level_reason <= CLV_APPROX_REJECT_PLANE_PRECISION) {
+					atomicAdd(clv_stats.counts[counter_base + 1u + level_reason], 1u);
+				}
+			}
+		}
+		if (approximate_hit) {
+			selected_level = approximate_level;
+			if (!native_fallback_only) {
+				secondary_emission = approximate_secondary;
+				primary_sky = approximate_primary;
+			}
+			cached_light = true;
+		}
+	}
+	if (native_fallback_only && (certified_hit || approximate_hit)) {
+		return;
+	}
+	if (!cached_light && clv.control.w != CLV_FIELD_LAYOUT_VERSION && params.control.w > 0.5
+			&& !point_general_debug && !point_source_debug) {
+		// Resolve off-center MSAA depth only when the certified plane did not match.
+		vec4 adjacent_x = params.inverse_projection * vec4(clip.xy + vec2(2.0 / float(extent.x), 0.0), depth, 1.0);
+		vec4 adjacent_y = params.inverse_projection * vec4(clip.xy + vec2(0.0, 2.0 / float(extent.y)), depth, 1.0);
+		float receiver_radius = max(length(adjacent_x.xyz / adjacent_x.w - view_position),
+				length(adjacent_y.xyz / adjacent_y.w - view_position)) + 0.00001;
+		vec3 view_direction = abs(params.inverse_projection[2][3]) > 1e-6
+				? normalize(world - params.view_to_world[3].xyz)
+				: -normalize(params.view_to_world[2].xyz);
+		vec3 cached_receiver;
+		if (clv_cached_receiver(world, view_direction, receiver_radius, normal_world,
+				cached_receiver, receiver_triangle)) {
+			world = cached_receiver;
+			receiver_family_triangle = receiver_triangle;
+		} else {
+			receiver_family_triangle = clv_receiver_hint(world, normal_world);
+		}
+	}
+	if (caller_point_debug) {
+		// Full-precision one-pixel capture after the same GBuffer reconstruction
+		// and optional receiver snap/hint used by the production caller.
+		// words 0..2 = world float bits, 3..5 = normal float bits, 6 = signed
+		// receiver-triangle bits (0xffffffff means -1), and 7 = completion marker.
+		exact_point_diagnostic.words[0] = floatBitsToUint(world.x);
+		exact_point_diagnostic.words[1] = floatBitsToUint(world.y);
+		exact_point_diagnostic.words[2] = floatBitsToUint(world.z);
+		exact_point_diagnostic.words[3] = floatBitsToUint(normal_world.x);
+		exact_point_diagnostic.words[4] = floatBitsToUint(normal_world.y);
+		exact_point_diagnostic.words[5] = floatBitsToUint(normal_world.z);
+		exact_point_diagnostic.words[6] = receiver_triangle >= 0
+				? uint(receiver_triangle) : 0xffffffffu;
+		exact_point_diagnostic.words[7] = 0x4D474944u;
+		return;
+	}
+	vec3 albedo = texelFetch(gbuffer_albedo, pixel, 0).rgb;
+	float ao = clamp(orm.r, 0.0, 1.0);
+	float metallic = clamp(orm.b, 0.0, 1.0);
+	// Skip only radiance work for exact-zero diffuse; ownership and Sky subtraction still run below.
+	bool candidate_only = !raw_gather && !debug_enabled && (metallic == 1.0 || ao == 0.0
+			|| all(equal(albedo, vec3(0.0))));
+	float spacing = max(params.control.y, 0.001);
+	vec3 dimensions = params.grid.xyz;
+	vec3 grid_position = (params.world_to_grid * vec4(world, 1.0)).xyz;
+	mat3 world_to_grid_basis = mat3(params.world_to_grid);
+	float grid_epsilon = max(1e-5, spacing * 0.001 * max(
+		length(world_to_grid_basis[0]),
+		max(length(world_to_grid_basis[1]), length(world_to_grid_basis[2]))));
+	if (any(lessThan(grid_position, vec3(-grid_epsilon)))
+			|| any(greaterThan(grid_position, dimensions + vec3(grid_epsilon)))) {
+		if (debug_enabled) {
+			imageStore(gi_output, pixel,
+					vec4(clv_debug_color(debug_view, CLV_SAMPLE_EXACT,
+							CLV_REJECT_OUTSIDE_BAKE_GRID, -1, 0.0, vec3(0.0), vec3(0.0)), 0.0));
+		}
+		return;
+	}
+	if (stats_capture) {
+		atomicAdd(clv_stats.counts[2], 1u);
+		if (certified_hit) {
+			atomicAdd(clv_stats.counts[3], 1u);
+			if (selected_level >= 0 && selected_level < 3) {
+				atomicAdd(clv_stats.counts[29 + selected_level], 1u);
+			}
+		} else if (approximate_hit) {
+			atomicAdd(clv_stats.counts[52], 1u);
+			if (selected_level >= 0 && selected_level < 3) {
+				atomicAdd(clv_stats.counts[53 + selected_level], 1u);
+			}
+			float measured_confidence = clamp(approximate_confidence, 0.0, 1.0);
+			atomicAdd(clv_stats.counts[56], uint(round(measured_confidence * 1000.0)));
+			uint confidence_bin = min(uint(floor(measured_confidence * 10.0)), 9u);
+			atomicAdd(clv_stats.counts[60 + confidence_bin], 1u);
+		} else if (certified_reject_reason >= 1 && certified_reject_reason <= 6) {
+			atomicAdd(clv_stats.counts[7 + certified_reject_reason], 1u);
+		}
+	}
+	grid_position = clamp(grid_position, vec3(0.0), dimensions);
+
+	float candidate_weight = 1.0;
+	float cache_weight = certified_hit ? 1.0 : (approximate_hit ? approximate_confidence : 0.0);
+	float cache_blend_weight = cache_weight;
+	float visible_support_weight = cached_light ? cache_weight : 0.0;
+	vec3 secondary_raw = vec3(0.0);
+	vec3 primary_sky_raw = vec3(0.0);
+	bool complete_support = certified_hit;
+	int sample_status = certified_hit ? CLV_SAMPLE_FULL
+			: (approximate_hit ? CLV_SAMPLE_APPROX : CLV_SAMPLE_EXACT);
+	int reject_reason = CLV_REJECT_NONE;
+	int receiver_patch = receiver_family_triangle >= 0
+			? int(visibility_geometry.triangles[receiver_family_triangle * 3 + 2].w) : 0;
+	uvec4 clv_level_corner_box_work = uvec4(0u);
+	uvec4 clv_visibility_radiance_work = uvec4(0u);
+	uint clv_exact_visibility_source_side_rejects = 0u;
+	if (!MAGIC_GI_PRT_STAGE_SOURCE && !MAGIC_GI_PRT_STAGE_CERT_ONLY
+			&& !cached_light && !point_reference_debug && !point_source_debug) {
+		if (stats_capture) { atomicAdd(clv_stats.counts[14], 1u); }
+		if (clv.control.w == CLV_LAYOUT_VERSION
+				&& (debug_enabled || diagnostic_mode || stats_capture || point_general_debug)) {
+			cached_light = sample_clv_diagnostic(world, normal_world, receiver_triangle, receiver_patch,
+					secondary_emission, primary_sky, cache_weight, complete_support,
+					selected_level, sample_status, reject_reason, cell_fraction,
+					clv_level_corner_box_work, clv_visibility_radiance_work,
+					clv_exact_visibility_source_side_rejects);
+		} else if (clv.control.w == CLV_LAYOUT_VERSION
+				|| (clv.control.w == CLV_BLOCK_LAYOUT_VERSION
+					&& !debug_enabled && !diagnostic_mode && !stats_capture
+					&& !raw_gather && !candidate_only && !point_certified_debug
+					&& !point_general_debug && !point_source_debug
+					&& !point_approximate_debug && !point_reference_debug)
+				|| (clv.control.w == CLV_FIELD_LAYOUT_VERSION
+					&& !native_fallback_only
+#ifdef MAGIC_GI_LAYOUT14_B_CACHE_STAGE_ALLOWED
+					&& MAGIC_GI_LAYOUT14_B_CACHE_STAGE_ALLOWED
+#else
+					&& !prt_stage_active
+#endif
+					&& !prt_compact_queue_consumer
+					&& !debug_enabled && !diagnostic_mode && !stats_capture
+					&& !raw_gather && !candidate_only && !point_certified_debug
+					&& !point_general_debug && !point_source_debug
+					&& !point_approximate_debug && !point_reference_debug)) {
+			cached_light = sample_clv(world, normal_world, receiver_triangle, receiver_patch,
+					secondary_emission, primary_sky, cache_weight, complete_support, cache_blend_weight);
+		} else {
+			reject_reason = CLV_REJECT_DISABLED;
+		}
+	}
+	bool cache_support_finite = !(isnan(cache_weight) || isinf(cache_weight));
+	float clv_support_weight = cache_support_finite
+			? clamp(cache_weight, 0.0, 1.0) : 0.0;
+	bool cache_blend_finite = !(isnan(cache_blend_weight) || isinf(cache_blend_weight));
+	float clv_blend_weight = cache_blend_finite
+			? clamp(cache_blend_weight, 0.0, 1.0) : 0.0;
+	vec3 cached_secondary = secondary_emission;
+	vec3 cached_primary_sky = primary_sky;
+	bool cached_secondary_finite = visibility_finite_vec3(cached_secondary);
+	bool cached_primary_finite = visibility_finite_vec3(cached_primary_sky);
+	if (!cached_secondary_finite) { cached_secondary = vec3(0.0); }
+	if (!cached_primary_finite) { cached_primary_sky = vec3(0.0); }
+	if (cached_light) {
+		if (!cached_secondary_finite) { secondary_emission = vec3(0.0); }
+		if (!cached_primary_finite) { primary_sky = vec3(0.0); }
+	}
+	// cache_weight remains the retained visibility mass for existing diagnostics.
+	// Ordinary partial compute blends use cache_blend_weight from positive-weight
+	// metadata/normal support, softly faded only at the existing rejection edges.
+	// complete_support keeps its original meaning for other pipeline contracts.
+	bool partial_cache_blend = cached_light && !certified_hit && !approximate_hit
+			&& !prt_stage_active && !prt_compact_queue_consumer
+			&& !debug_enabled && !diagnostic_mode && !stats_capture && !raw_gather
+			&& !candidate_only && !point_certified_debug && !point_general_debug
+			&& !point_source_debug && !point_approximate_debug && !point_reference_debug
+			&& (!cache_blend_finite || clv_blend_weight < 1.0 || !cache_support_finite
+					|| !cached_secondary_finite || !cached_primary_finite);
+	if (prt_v3_general_stage && !cached_light && !prt_compact_queue_consumer) {
+		imageStore(prt_source_pending, dispatch_pixel, uvec4(2u));
+		return; // Defer only the general-CLV miss to the source-only dispatch.
+	}
+	if (prt_v2_cache_stage && !cached_light) {
+		imageStore(prt_source_pending, dispatch_pixel, uvec4(1u));
+		return; // Defer only this pixel's original source fallback to stage B.
+	}
+	if (point_general_debug) {
+		uvec4 approximate_level_reasons = uvec4(255u);
+		uint approximate_global_reason = 0u;
+		bool approximate_diagnostic_hit = false;
+		int approximate_diagnostic_level = -1;
+		if (approximate_in_bake) {
+			vec3 diagnostic_secondary;
+			vec3 diagnostic_primary;
+			float diagnostic_confidence;
+			approximate_diagnostic_hit = sample_clv_volume_approx_diagnostic(world,
+					normal_world, diagnostic_secondary, diagnostic_primary,
+					approximate_diagnostic_level, diagnostic_confidence, true,
+					approximate_level_reasons, approximate_global_reason);
+		} else {
+			approximate_global_reason = CLV_APPROX_GLOBAL_OUTSIDE_BAKE;
+		}
+		write_prt_point_fields(secondary_emission, primary_sky,
+				cached_light ? 1u : (0x80000000u | uint(reject_reason)),
+				world, normal_world, receiver_triangle, pixel);
+		write_prt_approx_reject_diagnostic(approximate_level_reasons,
+				approximate_global_reason, approximate_diagnostic_hit,
+				approximate_diagnostic_level);
+		return;
+	}
+	if (stats_capture && !certified_hit && !approximate_hit && !point_reference_debug) {
+		if (cached_light) {
+			atomicAdd(clv_stats.counts[4], 1u);
+			atomicAdd(clv_stats.counts[complete_support ? 24 : 25], 1u);
+			if (selected_level >= 0 && selected_level < 3) {
+				atomicAdd(clv_stats.counts[26 + selected_level], 1u);
+			}
+		} else if (reject_reason >= CLV_REJECT_DISABLED && reject_reason <= CLV_REJECT_UNCERTIFIED) {
+			atomicAdd(clv_stats.counts[14 + reject_reason], 1u);
+		}
+		atomicAdd(clv_stats.counts[32], clv_level_corner_box_work.x);
+		atomicAdd(clv_stats.counts[33], clv_level_corner_box_work.y);
+		atomicAdd(clv_stats.counts[34], clv_level_corner_box_work.z);
+		atomicAdd(clv_stats.counts[35], clv_level_corner_box_work.w);
+		atomicAdd(clv_stats.counts[36], clv_visibility_radiance_work.x);
+		atomicAdd(clv_stats.counts[37], clv_visibility_radiance_work.y);
+		atomicAdd(clv_stats.counts[57], clv_visibility_radiance_work.z);
+		atomicAdd(clv_stats.counts[58], clv_visibility_radiance_work.w);
+		atomicAdd(clv_stats.counts[59], clv_exact_visibility_source_side_rejects);
+	}
+	if (cached_light) { visible_support_weight = clv_support_weight; }
+	if ((!MAGIC_GI_PRT_STAGE_CACHE_GENERAL || prt_v3_source_stage)
+			&& !MAGIC_GI_PRT_STAGE_CERT_ONLY
+			&& (!MAGIC_GI_PRT_STAGE_GENERAL_ONLY || prt_compact_queue_consumer)
+			&& (!cached_light || partial_cache_blend || point_source_debug)) {
+		if (stats_capture) { atomicAdd(clv_stats.counts[5], 1u); }
+
+		vec4 coefficients[18];
+		uvec4 gather_cell_work = uvec4(0u);
+		uvec4 gather_probe_work = uvec4(0u);
+		uvec4 gather_radiance_work = uvec4(0u);
+		uvec4 gather_wide_work = uvec4(0u);
+		// The baked-visibility gather consumes this representative only as a patch-family token.
+		// Non-baked gather still needs its own split before a hint may enter its geometry tests.
+		gather_probe_field(world, normal_world, receiver_family_triangle, false, clv.control.w > 0,
+				clv.control.w > 0.5,
+				coefficients, candidate_weight, visible_support_weight, candidate_only,
+				gather_narrow_confidence, gather_narrow_support, gather_wide_fallback,
+				stats_capture, gather_cell_work, gather_probe_work,
+				gather_radiance_work, gather_wide_work);
+		if (stats_capture) {
+			atomicAdd(clv_stats.counts[38], gather_cell_work.x);
+			atomicAdd(clv_stats.counts[39], gather_cell_work.y);
+			atomicAdd(clv_stats.counts[40], gather_cell_work.z);
+			atomicAdd(clv_stats.counts[41], gather_cell_work.w);
+			atomicAdd(clv_stats.counts[42], gather_probe_work.x);
+			atomicAdd(clv_stats.counts[43], gather_probe_work.y);
+			atomicAdd(clv_stats.counts[44], gather_probe_work.z);
+			atomicAdd(clv_stats.counts[45], gather_probe_work.w);
+			atomicAdd(clv_stats.counts[46], gather_radiance_work.x);
+			atomicAdd(clv_stats.counts[47], gather_radiance_work.y);
+			atomicAdd(clv_stats.counts[48], gather_radiance_work.z);
+			atomicAdd(clv_stats.counts[49], gather_wide_work.x);
+			atomicAdd(clv_stats.counts[50], gather_wide_work.y);
+			atomicAdd(clv_stats.counts[51], gather_wide_work.z);
+		}
+		bool gathered_secondary_finite = visibility_finite_vec3(coefficients[0].rgb);
+		bool gathered_primary_finite = visibility_finite_vec3(coefficients[9].rgb);
+		secondary_raw = gathered_secondary_finite ? coefficients[0].rgb : vec3(0.0);
+		primary_sky_raw = gathered_primary_finite
+				? max(coefficients[9].rgb, vec3(0.0)) : vec3(0.0);
+		if (partial_cache_blend) {
+			bool source_candidate_finite = candidate_weight > 0.0
+					&& !isnan(candidate_weight) && !isinf(candidate_weight);
+			bool source_support_finite = visible_support_weight > 1e-10
+					&& !isnan(visible_support_weight) && !isinf(visible_support_weight);
+			bool source_available = source_candidate_finite && source_support_finite;
+			vec3 source_secondary = coefficients[0].rgb;
+			vec3 source_primary_sky = coefficients[9].rgb;
+			bool source_secondary_finite = source_available && gathered_secondary_finite;
+			bool source_primary_finite = source_available && gathered_primary_finite;
+			if (source_secondary_finite) { source_secondary = max(source_secondary, vec3(0.0)); }
+			if (source_primary_finite) { source_primary_sky = max(source_primary_sky, vec3(0.0)); }
+			if (cached_secondary_finite && source_secondary_finite) {
+				secondary_emission = mix(source_secondary, cached_secondary, clv_blend_weight);
+			} else if (cached_secondary_finite) {
+				secondary_emission = cached_secondary;
+			} else if (source_secondary_finite) {
+				secondary_emission = source_secondary;
+			} else {
+				secondary_emission = vec3(0.0);
+			}
+			if (cached_primary_finite && source_primary_finite) {
+				primary_sky = mix(source_primary_sky, cached_primary_sky, clv_blend_weight);
+			} else if (cached_primary_finite) {
+				primary_sky = cached_primary_sky;
+			} else if (source_primary_finite) {
+				primary_sky = source_primary_sky;
+			} else {
+				primary_sky = vec3(0.0);
+			}
+			// The cache support is the diagnostic weight after a mixed result; keep
+			// source support out of this field so it is not mistaken for CLV coverage.
+			visible_support_weight = clv_support_weight;
+		} else {
+			secondary_emission = gathered_secondary_finite
+					? max(coefficients[0].rgb, vec3(0.0)) : vec3(0.0);
+			primary_sky = gathered_primary_finite
+					? max(coefficients[9].rgb, vec3(0.0)) : vec3(0.0);
+		}
+		if (debug_enabled && reject_reason == CLV_REJECT_INCOMPLETE_SUPPORT
+				&& visible_support_weight <= 1e-10) {
+			sample_status = CLV_SAMPLE_EXACT;
+			reject_reason = CLV_REJECT_NO_EXACT_SUPPORT;
+		}
+	}
+	if (point_source_debug) {
+		write_prt_point_fields(secondary_raw, primary_sky_raw,
+				candidate_weight > 0.0 ? 1u : 0x80000000u,
+				world, normal_world, receiver_triangle, pixel);
+		return;
+	}
+	if (params.control.z < 0.5) { primary_sky = vec3(0.0); }
+	if (point_reference_debug) {
+		vec4 debug_payload;
+		if (debug_view == CLV_DEBUG_POINT_REFERENCE_SECONDARY) {
+			debug_payload = vec4(secondary_raw, candidate_weight);
+		} else if (debug_view == CLV_DEBUG_POINT_REFERENCE_SKY) {
+			debug_payload = vec4(primary_sky_raw, visible_support_weight);
+		} else if (debug_view == CLV_DEBUG_POINT_REFERENCE_WORLD_TRIANGLE) {
+			debug_payload = vec4(world, float(receiver_triangle));
+		} else if (debug_view == CLV_DEBUG_POINT_REFERENCE_NORMAL_TRIANGLE) {
+			debug_payload = vec4(normal_world, float(receiver_triangle));
+		} else {
+			// RGBA16F exactly represents integer chunks up to 2048. Encode the
+			// nonnegative 22-bit triangle ID as low 11 bits in R and high bits in G.
+			// B=1 denotes receiver_triangle == -1; B=0 is a valid triangle. A is a
+			// mode marker so the reader can reject mismatched/cleared pixels.
+			int triangle_low = receiver_triangle >= 0 ? (receiver_triangle & 2047) : 0;
+			int triangle_high = receiver_triangle >= 0 ? (receiver_triangle >> 11) : 0;
+			float no_receiver = receiver_triangle < 0 ? 1.0 : 0.0;
+			debug_payload = vec4(float(triangle_low), float(triangle_high), no_receiver,
+					float(CLV_DEBUG_POINT_REFERENCE_TRIANGLE_ID));
+		}
+		imageStore(gi_output, pixel, debug_payload);
+		return;
+	}
+	if (MAGIC_GI_FULL_FEATURES && raw_gather && debug_view == CLV_DEBUG_GATHER_DIAGNOSTICS) {
+		// flags: bit 0 = valid in-grid surface, bit 1 = CLV cache hit,
+		// bit 2 = wide same-patch fallback, bits 3-4 = selected CLV level
+		// (1/2/3 means level 0/1/2; zero means none), bit 5 = filtered CLV support.
+		// The other channels are narrow confidence, narrow support, and final/cache
+		// support respectively.
+		uint level_code = selected_level >= 0 && selected_level < 3
+				? uint(selected_level + 1) : 0u;
+		uint diagnostic_flags = 1u | (cached_light ? 2u : 0u)
+				| (gather_wide_fallback ? 4u : 0u)
+				| ((level_code & 0x3u) << 3u)
+				| (sample_status == CLV_SAMPLE_FILTERED ? 32u : 0u);
+		float diagnostic_support = visible_support_weight;
+		if (isnan(diagnostic_support) || isinf(diagnostic_support)) {
+			diagnostic_support = 0.0;
+		}
+		imageStore(gi_output, dispatch_pixel, vec4(float(diagnostic_flags),
+				isnan(gather_narrow_confidence) || isinf(gather_narrow_confidence)
+						? 0.0 : clamp(gather_narrow_confidence, 0.0, 65504.0),
+				isnan(gather_narrow_support) || isinf(gather_narrow_support)
+						? 0.0 : clamp(gather_narrow_support, 0.0, 65504.0),
+				clamp(diagnostic_support, 0.0, 65504.0)));
+		return;
+	}
+	bool source_candidate_available = candidate_weight > 0.0
+			&& !isnan(candidate_weight) && !isinf(candidate_weight);
+	if (!source_candidate_available && !cached_light && !candidate_only) {
+		if (debug_enabled) {
+			if (reject_reason == CLV_REJECT_NONE) {
+				reject_reason = CLV_REJECT_NO_EXACT_CANDIDATE;
+			}
+			imageStore(gi_output, pixel,
+					vec4(clv_debug_color(debug_view, CLV_SAMPLE_EXACT, reject_reason,
+							selected_level, cache_weight, cell_fraction, vec3(0.0)), 0.0));
+		}
+		return;
+	}
+	if (stats_capture && visible_support_weight > 0.0) {
+		atomicAdd(clv_stats.counts[6], 1u);
+	}
+	if (raw_gather) {
+		// Keep receiver/material weighting for the full-resolution resolve. This
+		// buffer contains only the current sample's incident PRT radiance.
+		vec3 incident = max(secondary_emission + primary_sky, vec3(0.0));
+		if (any(isnan(incident)) || any(isinf(incident))) {
+			return;
+		}
+		// Pack HDR incident radiance into the half-float raw target. Resolve
+		// multiplies this encoding back by 16 before receiver weighting. The
+		// alpha also carries the valid surface's material ID (1 + ID).
+		imageStore(gi_output, dispatch_pixel,
+				vec4(min(incident / 16.0, vec3(65504.0)), float(shading_model_id + 1u)));
+		return;
+	}
+	float total_strength = max(params.control.x * pc.parameters.x, 0.0);
+	float ownership_weight = params.control.z > 0.5 ? clamp(total_strength, 0.0, 1.0) : 0.0;
+	float diffuse_ao = texture(diffuse_ambient_occlusion_texture, (vec2(pixel) + 0.5) / vec2(extent)).r;
+	if (isnan(diffuse_ao) || isinf(diffuse_ao)) {
+		diffuse_ao = 1.0;
+	}
+	vec3 contribution = (secondary_emission + primary_sky)
+			* albedo * (1.0 - metallic) * ao * clamp(diffuse_ao, 0.0, 1.0) * total_strength * pc.parameters.y;
+	if (stats_capture && any(greaterThan(contribution, vec3(1e-7)))) {
+		atomicAdd(clv_stats.counts[7], 1u);
+	}
+	vec3 output_rgb = debug_enabled
+			? clv_debug_color(debug_view, sample_status, reject_reason, selected_level,
+					cache_weight, cell_fraction, secondary_emission + primary_sky)
+			: contribution;
+	if (debug_enabled && debug_view == CLV_DEBUG_RECONSTRUCTED_LIGHTING) {
+		output_rgb *= pc.parameters.y;
+	}
+	imageStore(gi_output, pixel, vec4(output_rgb, ownership_weight));
+	vec4 scene_color = imageLoad(color_image, pixel);
+	if (ownership_weight > 0.0) {
+		vec3 sky_light_diffuse = texelFetch(sky_light_diffuse_buffer, pixel, 0).rgb;
+		scene_color.rgb -= sky_light_diffuse * ownership_weight;
+	}
+	imageStore(color_image, pixel, vec4(scene_color.rgb + contribution, scene_color.a));
+}

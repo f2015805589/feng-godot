@@ -88,6 +88,10 @@ public:
 	virtual void light_omni_set_shadow_mode(RID p_light, RSE::LightOmniShadowMode p_mode) override {}
 
 	virtual void light_directional_set_shadow_mode(RID p_light, RSE::LightDirectionalShadowMode p_mode) override {}
+	virtual void light_directional_set_shadow_object_shadow_enabled(RID p_light, bool p_enabled) override {}
+	virtual bool light_directional_get_shadow_object_shadow_enabled(RID p_light) const override { return false; }
+	virtual void light_directional_set_shadow_object_shadow_instances(RID p_light, const Vector<RID> &p_instances) override {}
+	virtual Vector<RID> light_directional_get_shadow_object_shadow_instances(RID p_light) const override { return Vector<RID>(); }
 	virtual void light_directional_set_blend_splits(RID p_light, bool p_enable) override {}
 	virtual bool light_directional_get_blend_splits(RID p_light) const override { return false; }
 	virtual void light_directional_set_sky_mode(RID p_light, RSE::LightDirectionalSkyMode p_mode) override {}
@@ -122,6 +126,7 @@ public:
 	void light_instance_free(RID p_light) override {}
 	void light_instance_set_transform(RID p_light_instance, const Transform3D &p_transform) override {}
 	void light_instance_set_aabb(RID p_light_instance, const AABB &p_aabb) override {}
+	void light_instance_set_directional_shadow_object_state(RID p_light_instance, uint32_t p_cascade_count, bool p_object_reserved, bool p_object_active) override {}
 	void light_instance_set_shadow_transform(RID p_light_instance, const Projection &p_projection, const Transform3D &p_transform, float p_far, float p_split, int p_pass, float p_shadow_texel_size, float p_bias_scale = 1.0, float p_range_begin = 0, const Vector2 &p_uv_scale = Vector2()) override {}
 	void light_instance_mark_visible(RID p_light_instance) override {}
 	virtual bool light_instance_is_shadow_visible_at_position(RID p_light_instance, const Vector3 &p_position) const override { return false; }
@@ -244,6 +249,7 @@ public:
 	virtual void directional_shadow_atlas_set_size(int p_size, bool p_16_bits = true) override {}
 	virtual int get_directional_light_shadow_size(RID p_light_instance) override { return 0; }
 	virtual void set_directional_shadow_count(int p_count) override {}
+	virtual bool set_directional_shadow_lights(const Vector<RID> &p_light_instances) override { return false; }
 };
 
 } // namespace RendererDummy

@@ -160,7 +160,7 @@ public:
 
 	// Directional lights are prepared in advance, and can be culled multithreaded chopping and changing between
 	// different directional_light_id.
-	void prepare_directional_light(const RendererSceneCull::Instance *p_instance, int32_t p_directional_light_id);
+	void prepare_directional_light(const RendererSceneCull::Instance *p_instance, int32_t p_directional_light_id, int32_t p_cascade_count = -1, const real_t *p_cascade_distances = nullptr);
 
 	// Return false if the instance is to be culled.
 	bool cull_directional_light(const RendererSceneCull::InstanceBounds &p_bound, int32_t p_directional_light_id, int32_t p_cascade);
@@ -183,7 +183,7 @@ private:
 		LightCullPlanes planes[4]; // One set of cull planes per cascade
 	};
 
-	bool _prepare_light(const RendererSceneCull::Instance &p_instance, int32_t p_directional_light_id = -1);
+	bool _prepare_light(const RendererSceneCull::Instance &p_instance, int32_t p_directional_light_id = -1, int32_t p_directional_cascade_count = -1, const real_t *p_cascade_distances = nullptr);
 
 	// Avoid adding extra culling planes derived from near colinear triangles.
 	// The normals derived from these will be inaccurate, and can lead to false

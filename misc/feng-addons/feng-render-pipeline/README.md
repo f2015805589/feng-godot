@@ -11,6 +11,20 @@ FRP 使用 `FengRenderer` 资源编排原生渲染操作与插件 Pass，使用 
 4. 在 Inspector 的 Passes 数组中编辑参数、Enabled 和顺序。工具菜单
    **Add Pass from Library** 可添加库效果；添加、删除和排序支持 UndoRedo。
 
+展开 `FengRenderer → Passes → Shadow Pass`，直接设置方向光的 CSM、PCSS 和 Bias。
+它就是原生 ID 0 的实际阴影绘制阶段，排在 VT 和 GBuffer 之前。环境选择器不再提供重复的阴影面板。
+
+- CSM 支持 1–4 个槽位，默认每层 **4096 × 4096**；每级距离是相机空间深度的米制终点，默认 10 / 25 / 50 / 100 m。
+- `Reserve Object Shadow Slot` 预留最后一个槽位给角色：4 槽变成 3 级 CSM + 1 个对象阴影。
+  对象的 `Directional Shadow Object Shadow Target` 仍在场景 DirectionalLight3D 上指定；无需再开启光源的预留开关。
+- `Shadow Filtering` 提供 Hard / PCF / PCSS、采样质量、滤波尺寸和 PCSS 光源角直径。
+  PCSS 的角直径只控制阴影半影，不改变太阳外观或材质高光。
+- `Shadow Bias` 提供深度偏移、法线偏移、透射偏移和阴影不透明度。
+
+参数按相机实际使用的 compositor 在阴影裁剪之前应用，投影和裁剪共用同一组级联边界。
+`Shadow Settings Enabled` 关闭时恢复光源和项目的原有设置。光源仍需开启 `Shadow Enabled`。
+设置保存于 Shadow Pass 的实现资源；列表条目直接转发这些控件，不重复保存一套值。
+
 ### 项目默认管线
 
 **Project Settings → Rendering → Renderer → Compositor** 接受 `FengCompositor`
@@ -51,7 +65,7 @@ Post Process 保持 ID 7，Bloom 使用 ID 8。
 
 | ID | 原生条目 | 工作 |
 |---|---|---|
-| 0 | Shadow Precompute | 绘制光源阴影贴图 |
+| 0 | Shadow Pass | CSM / PCSS / Bias 配置并绘制光源阴影贴图 |
 | 1 | VT Pass | 执行已注册的虚拟纹理页面生产和材质烘焙 |
 | 2 | GBuffer | 写入不透明材质、深度及按需启用的运动矢量 |
 | 3 | Lighting | 准备灯光、Cluster、decal 和体积雾；执行 Pre Lighting 回调、延迟光照、次表面/高光合并与不透明附件 resolve |
@@ -76,6 +90,14 @@ Transparent 和 Eye Adaptation 也必须先于已启用的 Bloom。自定义纹�
 完整帧必须提供 ID `0,1,2,3,7` 的工作。可通过原生条目或声明接管的自定义 Pass 提供。
 无效配置会显示告警，保留上一次有效调度并暂停不安全的自定义效果；修正后恢复。
 
+Shadow Pass 是真实执行方向光 CSM / 预留角色图以及点光、聚光阴影图绘制的阶段，位于
+Lighting 之前。直接展开 Passes 中的条目配置方向光阴影。无有效阴影光源、caster 或在 reflection-probe
+view 中，该阶段可能没有本帧阴影图绘制。Visual Profiler 的 `FRP Shadow Precompute` 覆盖 setup、cull
+和 draw，不应当作单个级联的 draw 时间。开启 timestamp capture 后，逐 draw range 使用
+`FRP Directional Shadow Light <RID> Cascade <i>/<count> ...`、`... Reserved Object` 与
+`FRP Positional Shadow Light ...` 标签；RenderDoc capture 有对应 draw label。
+`Prepare Directional/Spot Shadow Passes` 只表示 setup，不是 GPU 阴影 draw 总时间。
+
 有显式 FRP 管线时，Temporal AA 条目同时控制 TAA 和视口 jitter。
 `jitter_phases` 默认 16，设为 1 可冻结采样位置。项目/视口的 `use_taa` 只用于没有
 FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；即使关闭 Temporal AA
@@ -83,9 +105,14 @@ FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；
 
 ### 默认库效果
 
-- **Magic GI**：在 Lighting 后把有效 surface PRT 烘焙与当前太阳/环境 SH 组合为漫反射间接光。
-  按当前 render target 匹配快照；没有匹配的有效烘焙时保持场景色不变，贡献纹理清零。
-  光照变化更新 SH，无需重烘焙。烘焙由可选的 feng-magic-gi 插件提供。
+- **Magic GI**：新 backend 1 / layout 5 在 Lighting 前用当前太阳、天空和自发光重照明
+  预插值 TransferMatrix，原生 Lighting 从 `4×16³` CLV 硬件插值采样；运行时没有 BVH、
+  逐像素邻居循环或额外全屏 Apply。最细 source 间距 0.25 m，完整 SH9，FP32 relight 和
+  带 HDR 缩放的 RGBA16F 缓存。Bake 由 feng-magic-gi 的 **Bake Free-space CLV PRT** 提供。
+  Debug Buffers → Magic GI 按需输出当前贡献。有效 TransferMatrix 缺失时需重新 Bake。
+  架构参考腾讯公开的 CLV PRT 流程，不宣称与其私有代码或 SH2 资源兼容。白盒 RTX 3080 Ti /
+  D3D12 / 1080p 连续重光照总 GPU 增量约 0.266 ms，P95 0.281 ms；未过滤尖峰仍存在，
+  不是所有帧的硬上限。完整方法和旧路径说明见 `feng-magic-gi/README.md`。
 - **RTGI**：默认加入并关闭。启用 ray-tracing 插件后，可在 Lighting 后提供漫反射 GI 和镜面候选；
   漫反射 GI 和镜面反射是独立槽位，Magic GI 可继续提供漫反射。
   RTGI 资源携带完整 GBuffer 和间接高光输入，仅在启用且设备支持硬件光追时启动场景快照运行时。
@@ -150,6 +177,60 @@ FRP 原生光照提供 SkyLight 间接漫反射和 SkyLight 镜面基线；独�
 feng-reflect-probe 提供，再由内部 Reflection Resolve 按配置合成。Magic GI 只提供漫反射，不发布
 反射候选。Environment 的 SSAO、SSIL、SSR、SDFGI、VoxelGI 与原生调试几何不会为 FRP 自动生成对应效果。
 材质与缓冲调试使用 Debug Buffers。
+
+### Directional CSM Shadows and PCSS
+
+For an authored FRP renderer, expand **Passes → Shadow Pass** to configure cascade count, each cascade's
+end distance in meters, resolution per slot, object reservation, filtering and bias. The last active CSM
+distance is the maximum shadow distance. Enabling object reservation leaves one fewer CSM cascade;
+its inactive distance control is hidden and retained for later reuse. These settings are read before
+shadow projection/caster culling and apply only to the current compositor's view. Disabling
+`shadow_settings_enabled` falls back to the following legacy light/project controls.
+
+`DirectionalLight3D.directional_shadow_mode` selects Orthogonal, PSSM 2, PSSM 3, or PSSM 4. Existing
+serialized values remain unchanged; PSSM 3 is an additional option. With object-shadow reservation disabled,
+PSSM 4 uses all four slots for camera CSM. Enabling `directional_shadow_object_shadow_enabled` reserves one
+of the selected mode's slots for the object map: PSSM 2 becomes one camera split plus the object map, PSSM 3
+becomes two plus the object map, and PSSM 4 becomes three plus the object map. Orthogonal mode has no split
+slot to reserve, so the reservation control is unavailable there.
+
+Set `directional_shadow_object_shadow_target` to the character or role-root `Node3D`. The target and its
+descendants supply casters to that object's map; visible geometry still receives the result through FRP's
+direct-light path. Geometry participates only when it is visible, casts shadows, and matches the light's
+`shadow_caster_mask`. The target may be a multi-mesh character root. If the path is empty, does not resolve to
+a usable root, or has no eligible casters, the reserved map is cleared while the selected CSM budget remains
+reduced; provide a valid role root to receive the focused shadow. This is one scene `NodePath` on the light,
+so save the target on the scene light and the reservation on the Shadow Pass. Under FRP the native light
+Inspector keeps the target assignable even when the light's legacy reservation switch is off. The
+Environment Light Mixer retains light direction/color/intensity controls and omits shadow configuration.
+
+Shadow Pass uses `cascade_resolution`; without an active pass override FRP uses
+`rendering/frp/shadows/directional_shadow/cascade_size` for the resolution of each shadow slot.
+The default is 4096, so every camera cascade and a reserved object-shadow map each receive a 4096×4096
+viewport. FRP packs only active maps into atlas cells: one map uses a 1×1 grid, two use 2×1, and three or
+four use 2×2. At the default resolution, one light with four active maps therefore uses an 8192×8192 atlas;
+two maps use 8192×4096. A reserved object map is one active map at the same resolution as each CSM split.
+Additional lights add their active maps to the atlas. The Project Settings control accepts any integer from
+256–8192, while FRP rounds each entered value up to the next power of two for the actual slot edge: for
+example, 3000 allocates 4096 pixels and 4097 allocates 8192 pixels. Values loaded from a project file are
+clamped to 256–8192 before rounding. If the device cannot allocate the requested atlas, FRP logs the requested
+dimensions and device limit, then disables directional shadows instead of silently lowering the per-slot
+resolution. Depth precision still follows `rendering/lights_and_shadows/directional_shadow/16_bits`: the
+default D16 format uses about 32 MiB per 4096×4096 map (about 128 MiB for four maps); D32 uses about 64 MiB
+per map (about 256 MiB for four). These estimates cover only the shadow depth maps.
+
+The existing `rendering/lights_and_shadows/directional_shadow/size` setting remains the total atlas edge
+for renderers that use the legacy directional-shadow atlas. FRP does not read that setting, so changing it
+does not change FRP cascade resolution; its existing behavior remains available to non-FRP renderers.
+
+The shadow section reports the configured filter path for the selected light. For PCSS, set the directional
+light's `light_angular_distance` above `0°`, keep `shadow_blur` above zero, and choose a non-Hard global quality.
+The angle is the apparent light-source size in degrees; the Sun is about `0.5°`. A `0°` angular size leaves
+PCF soft filtering available but disables variable-penumbra PCSS; `shadow_blur=0` or Hard quality selects hard
+shadows. Larger light angles produce wider PCSS penumbrae at additional sampling cost. The current scene setting
+must satisfy all three conditions before the UI reports PCSS; angle `0°` is shown as PCF, not as enabled PCSS.
+`rendering/lights_and_shadows/directional_shadow/soft_shadow_filter_quality` remains the global directional-filter
+quality and sample-cost control; it is not a separate PCSS enable switch.
 
 ## 编写 Pass
 

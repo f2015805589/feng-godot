@@ -37,8 +37,22 @@ func check(condition: bool, message: String) -> void:
 		push_error(message)
 
 func run() -> void:
+	if OS.get_cmdline_user_args().has("--patch-identity-precision-only"):
+		_test_patch_identity_precision_contract()
+		_test_approx_patch_prefilter_contract()
+		_test_manual_confidence_gate()
+		_test_hardware_trilinear_equivalence()
+		_test_curved_sh_evaluation_contract()
+		_test_receiver_domain_bounds()
+		_finish()
+		return
 	_test_focus_for_bounds()
 	_test_debug_view_parameter()
+	_test_patch_identity_precision_contract()
+	_test_approx_patch_prefilter_contract()
+	_test_manual_confidence_gate()
+	_test_curved_sh_evaluation_contract()
+	_test_receiver_domain_bounds()
 	_test_gpu_byte_estimate()
 	_test_clv_fill_surface_search_domain()
 	rd = RenderingServer.create_local_rendering_device()
@@ -115,6 +129,512 @@ func run() -> void:
 			" cases=interior,x,y,z,xyz,level1,level2,geometric_query,negative_world,contact_invalid_blocker,zero_weight_blocker,partial_blocked_corner,valid_weight_blocker gates=incomplete_exact,zero_weight_metadata,thin_wall,geometry_fallback,focus_bounds,diagnostics")
 	_finish()
 
+func _test_patch_identity_precision_contract() -> void:
+	# Reproduce shader f32 accumulation for the old E[id^2]-E[id]^2 test.
+	# These deterministic random interpolation fractions use patch IDs observed
+	# in the active CLV snapshot; the exact identity predicate must accept both.
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 20261023
+	var false_rejects_63 := 0
+	var false_rejects_73 := 0
+	var exact_rejects_63 := 0
+	var exact_rejects_73 := 0
+	const SAMPLE_COUNT := 1024
+	var same_63 := [63.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0]
+	var same_73 := [73.0, 73.0, 73.0, 73.0, 73.0, 73.0, 73.0, 73.0]
+	var all_supported := [true, true, true, true, true, true, true, true]
+	for _sample_index in SAMPLE_COUNT:
+		var fraction := Vector3(_f32(rng.randf()), _f32(rng.randf()), _f32(rng.randf()))
+		if _old_float32_patch_variance(63, fraction) > 1e-4:
+			false_rejects_63 += 1
+		if _old_float32_patch_variance(73, fraction) > 1e-4:
+			false_rejects_73 += 1
+		var supported_corners := _trilinear_corner_support(fraction)
+		if not _patch_ids_match(same_63, supported_corners):
+			exact_rejects_63 += 1
+		if not _patch_ids_match(same_73, supported_corners):
+			exact_rejects_73 += 1
+	check(false_rejects_63 > 0 and false_rejects_73 > 0,
+			"The f32 regression must reproduce cancellation false-rejects for actual patch IDs 63 and 73; counts="
+			+ str([false_rejects_63, false_rejects_73]) + ".")
+	check(exact_rejects_63 == 0 and exact_rejects_73 == 0,
+			"Exact patch identity must accept same-ID supported corners for every random interpolation fraction; counts="
+			+ str([exact_rejects_63, exact_rejects_73]) + ".")
+	var mixed_patch := [63.0, 73.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0]
+	check(not _patch_ids_match(mixed_patch, all_supported),
+			"Exact patch identity must continue rejecting neighborhoods that mix patch IDs 63 and 73.")
+	var unsupported_zero_patch := [63.0, 0.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0]
+	var one_unsupported := [true, false, true, true, true, true, true, true]
+	check(_patch_ids_match(unsupported_zero_patch, one_unsupported),
+			"Unsupported zero-ID corners must not create a false patch mismatch.")
+	var invalid_fractional_id := [63.0, 63.5, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0]
+	check(not _patch_ids_match(invalid_fractional_id, all_supported),
+			"A supported non-integer patch marker must fail closed.")
+	print("CLV_PATCH_ID_NUMERIC samples=", SAMPLE_COUNT,
+			" old_false_rejects_63=", false_rejects_63,
+			" old_false_rejects_73=", false_rejects_73,
+			" exact_rejects_63=", exact_rejects_63,
+			" exact_rejects_73=", exact_rejects_73,
+			" exact_same_patch=accepted mixed_patch=rejected unsupported_zero=ignored")
+
+func _test_approx_patch_prefilter_contract() -> void:
+	# The producer's candidate bit examines moments.w for all eight corners.
+	# Interior hardware filtering uses that same per-corner validity for the old
+	# patch test. A false candidate must therefore imply that the old patch gate
+	# would reject; boundary fractions retain the original positive-weight path.
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 20261024
+	var samples := 0
+	var prefiltered_rejects := 0
+	var false_skips := 0
+	var manual_samples := 0
+	var manual_prefiltered_rejects := 0
+	var manual_false_skips := 0
+	for _sample_index in 4096:
+		var fraction := Vector3(
+				rng.randf_range(0.01, 0.99),
+				rng.randf_range(0.01, 0.99),
+				rng.randf_range(0.01, 0.99))
+		var patch_ids: Array = []
+		var moments_valid: Array = []
+		var secondary_valid: Array = []
+		var primary_valid: Array = []
+		var manual_valid: Array = []
+		var reference_patch := 63.0 if rng.randf() < 0.5 else 73.0
+		for corner in 8:
+			var is_valid := rng.randf() < 0.72
+			moments_valid.append(is_valid)
+			var secondary_is_valid := rng.randf() < 0.82
+			var primary_is_valid := rng.randf() < 0.82
+			secondary_valid.append(secondary_is_valid)
+			primary_valid.append(primary_is_valid)
+			manual_valid.append(is_valid and secondary_is_valid and primary_is_valid)
+			var patch := reference_patch
+			if rng.randf() < 0.18:
+				patch = 73.0 if reference_patch == 63.0 else 63.0
+			patch_ids.append(patch if is_valid else 0.0)
+		var supported := _trilinear_corner_support(fraction)
+		for corner in 8:
+			supported[corner] = bool(supported[corner]) and bool(moments_valid[corner])
+		var old_patch_gate := _patch_ids_match(patch_ids, supported)
+		var candidate := _approx_candidate_possible(patch_ids, moments_valid)
+		if not candidate:
+			prefiltered_rejects += 1
+			if old_patch_gate:
+				false_skips += 1
+		var manual_supported := _trilinear_corner_support(fraction)
+		for corner in 8:
+			manual_supported[corner] = bool(manual_supported[corner]) and bool(manual_valid[corner])
+		var old_manual_patch_gate := _patch_ids_match(patch_ids, manual_supported)
+		var manual_candidate := _approx_candidate_possible(patch_ids, manual_valid)
+		if not manual_candidate:
+			manual_prefiltered_rejects += 1
+			if old_manual_patch_gate:
+				manual_false_skips += 1
+		manual_samples += 1
+		samples += 1
+	check(samples == 4096 and prefiltered_rejects > 0 and false_skips == 0
+			and manual_samples == 4096 and manual_prefiltered_rejects > 0
+			and manual_false_skips == 0,
+			"The hardware and manual candidate prefilters may reject only neighborhoods rejected by their old patch gates; counts="
+			+ str([samples, prefiltered_rejects, false_skips,
+				manual_samples, manual_prefiltered_rejects, manual_false_skips]) + ".")
+	var boundary_ids: Array = [73.0, 63.0, 73.0, 63.0, 73.0, 63.0, 73.0, 63.0]
+	var boundary_valid: Array = [true, true, true, true, true, true, true, true]
+	var boundary_fraction := Vector3(0.0, 0.37, 0.61)
+	var boundary_supported := _trilinear_corner_support(boundary_fraction)
+	check(not _approx_candidate_possible(boundary_ids, boundary_valid)
+			and _patch_ids_match(boundary_ids, boundary_supported)
+			and _approx_prefilter_boundary(boundary_fraction),
+			"At an exact cell face, mismatched zero-weight corners must take the legacy slow path and preserve the passing positive-weight subset.")
+	var empty_valid: Array = [false, false, false, false, false, false, false, false]
+	check(not _approx_candidate_possible([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], empty_valid)
+			and not _patch_ids_match([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+				_trilinear_corner_support(Vector3(0.2, 0.3, 0.4))),
+			"An all-invalid neighborhood may be prefiltered because the old patch gate has no positive reference.")
+	print("CLV_APPROX_PATCH_PREFILTER hardware_samples=", samples,
+			" hardware_rejects=", prefiltered_rejects, " hardware_false_skips=", false_skips,
+			" manual_samples=", manual_samples,
+			" manual_rejects=", manual_prefiltered_rejects,
+			" manual_false_skips=", manual_false_skips,
+			" exact_boundary=slow_path")
+
+func _approx_candidate_possible(patch_ids: Array, moments_valid: Array) -> bool:
+	var have_patch := false
+	var reference_patch := 0.0
+	for index in mini(patch_ids.size(), moments_valid.size()):
+		if not bool(moments_valid[index]):
+			continue
+		var patch_id := _f32(float(patch_ids[index]))
+		if is_nan(patch_id) or is_inf(patch_id) or patch_id <= 0.0 \
+				or floor(patch_id) != patch_id:
+			return false
+		if not have_patch:
+			reference_patch = patch_id
+			have_patch = true
+		elif patch_id != reference_patch:
+			return false
+	return have_patch
+
+func _approx_prefilter_boundary(fraction: Vector3) -> bool:
+	const EPSILON := 1e-6
+	return fraction.x <= EPSILON or fraction.y <= EPSILON or fraction.z <= EPSILON \
+			or fraction.x >= 1.0 - EPSILON or fraction.y >= 1.0 - EPSILON \
+			or fraction.z >= 1.0 - EPSILON
+
+func _test_curved_sh_evaluation_contract() -> void:
+	# Layout-9 columns 0..8 and 9..17 are relit secondary/primary SH9
+	# radiance coefficients. Both the existing producer's diffuse columns and
+	# the curved consumer must use the same cosine-convolved basis exactly once.
+	var secondary_coefficients: Array[Vector3] = []
+	var primary_coefficients: Array[Vector3] = []
+	for coefficient in 9:
+		var scalar := float(coefficient + 1)
+		secondary_coefficients.append(Vector3(
+				0.013 * scalar - 0.041,
+				0.027 * float((coefficient * 5) % 7) - 0.052,
+				0.019 * float((coefficient * 3) % 5) - 0.033))
+		primary_coefficients.append(Vector3(
+				0.021 * float((coefficient * 2) % 6) - 0.048,
+				0.017 * scalar - 0.061,
+				0.029 * float((coefficient * 4) % 8) - 0.077))
+	var normals: Array[Vector3] = [
+		Vector3.UP,
+		Vector3.RIGHT,
+		Vector3.BACK,
+		Vector3(0.2, 0.9, -0.35).normalized(),
+		Vector3(-0.63, 0.31, 0.71).normalized(),
+	]
+	var up_basis := _diffuse_basis(Vector3.UP)
+	var right_basis := _diffuse_basis(Vector3.RIGHT)
+	check(absf(up_basis[0] - 0.2820947918) <= 1e-9
+			and absf(up_basis[1] - 0.4886025119 * (2.0 / 3.0)) <= 1e-9
+			and absf(right_basis[3] - 0.4886025119 * (2.0 / 3.0)) <= 1e-9
+			and absf(right_basis[1]) <= 1e-9,
+			"SH9 coefficient order must stay [Y00,Y1-1,Y10,Y11,...] with the producer's Lambert/pi band factors.")
+	var max_anchor_error := 0.0
+	var max_arbitrary_error := 0.0
+	var arbitrary_values: Array[Vector3] = []
+	for normal in normals:
+		var basis := _diffuse_basis(normal)
+		var producer_secondary := Vector3.ZERO
+		var producer_primary := Vector3.ZERO
+		var consumer_secondary := Vector3.ZERO
+		var consumer_primary := Vector3.ZERO
+		for coefficient in 9:
+			# Mirrors magic_gi_clv_relight.glsl's column 0..8 / 9..17
+			# dot-products that populate the preconvolved diffuse columns.
+			producer_secondary += secondary_coefficients[coefficient] * basis[coefficient]
+			producer_primary += primary_coefficients[coefficient] * basis[coefficient]
+		# The curved consumer evaluates the same relit coefficients for the
+		# receiver's actual normal; it must not multiply by an extra 1/pi.
+		for coefficient in 9:
+			consumer_secondary += secondary_coefficients[coefficient] * basis[coefficient]
+			consumer_primary += primary_coefficients[coefficient] * basis[coefficient]
+		var secondary_error := (producer_secondary - consumer_secondary).length()
+		var primary_error := (producer_primary - consumer_primary).length()
+		max_anchor_error = maxf(max_anchor_error, maxf(secondary_error, primary_error))
+		check(secondary_error <= 1e-7 and primary_error <= 1e-7,
+				"Raw-SH curved evaluation must reproduce the current diffuse20/21 values at the anchor normal.")
+		arbitrary_values.append(consumer_secondary + consumer_primary)
+		if normal != normals[0]:
+			var expected_secondary := Vector3.ZERO
+			var expected_primary := Vector3.ZERO
+			for coefficient in 9:
+				expected_secondary += secondary_coefficients[coefficient] * basis[coefficient]
+				expected_primary += primary_coefficients[coefficient] * basis[coefficient]
+			var arbitrary_error := (expected_secondary + expected_primary
+					- consumer_secondary - consumer_primary).length()
+			max_arbitrary_error = maxf(max_arbitrary_error, arbitrary_error)
+			check(arbitrary_error <= 1e-7,
+					"Curved SH must evaluate the actual arbitrary receiver normal without changing coefficient order.")
+	check(max_anchor_error <= 1e-7 and max_arbitrary_error <= 1e-7,
+			"Curved SH evaluation must match the preconvolved cache formula within FP32 tolerance.")
+	var normal_response := false
+	for value_index in range(1, arbitrary_values.size()):
+		if arbitrary_values[0].distance_to(arbitrary_values[value_index]) > 1e-4:
+			normal_response = true
+			break
+	check(normal_response,
+			"Relit raw-SH sampling must respond to an arbitrary surface normal rather than reuse the anchor's preconvolved value.")
+
+	var zero_coefficients: Array[Vector3] = []
+	for _coefficient in 9:
+		zero_coefficients.append(Vector3.ZERO)
+	var black_valid_output := _evaluate_clv_sh_pair(zero_coefficients,
+			zero_coefficients, Vector3(0.4, -0.2, 0.9).normalized(), true)
+	check(bool(black_valid_output.get("valid", false))
+			and (black_valid_output.get("incident", Vector3.ONE) as Vector3).length() == 0.0,
+			"A supported black SH payload is a valid zero-radiance sample, not a miss.")
+	var black_invalid_output := _evaluate_clv_sh_pair(zero_coefficients,
+			zero_coefficients, Vector3.UP, false)
+	check(not bool(black_invalid_output.get("valid", true)),
+			"A black but uncertified slot must remain a miss; radiance values do not replace domain validity.")
+
+	var negative_secondary: Array[Vector3] = []
+	var negative_primary: Array[Vector3] = []
+	for coefficient in 9:
+		negative_secondary.append(Vector3.ZERO)
+		negative_primary.append(Vector3.ZERO)
+	negative_secondary[0] = Vector3(-0.8, 0.5, -0.4)
+	negative_primary[0] = Vector3(0.3, -0.9, 0.1)
+	var negative_result := _evaluate_clv_sh_pair(negative_secondary,
+			negative_primary, Vector3.UP, true)
+	var expected_clamped := Vector3.ZERO
+	var negative_basis := _diffuse_basis(Vector3.UP)
+	var raw_sum := (negative_secondary[0] + negative_primary[0]) * negative_basis[0]
+	expected_clamped = Vector3(maxf(raw_sum.x, 0.0), maxf(raw_sum.y, 0.0), maxf(raw_sum.z, 0.0))
+	var separately_clamped := Vector3(
+			maxf(negative_secondary[0].x, 0.0) + maxf(negative_primary[0].x, 0.0),
+			maxf(negative_secondary[0].y, 0.0) + maxf(negative_primary[0].y, 0.0),
+			maxf(negative_secondary[0].z, 0.0) + maxf(negative_primary[0].z, 0.0)) * negative_basis[0]
+	check(bool(negative_result.get("valid", false))
+			and (negative_result.get("incident", Vector3.ZERO) as Vector3).distance_to(expected_clamped) <= 1e-7
+			and separately_clamped.distance_to(expected_clamped) > 0.01,
+			"Negative SH lobes must sum across secondary+primary before the existing final nonnegative clamp.")
+	print("CLV_CURVED_SH anchor_max_error=", max_anchor_error,
+			" arbitrary_max_error=", max_arbitrary_error,
+			" zero_radiance_valid=true negative_lobes_clamped_after_sum=true")
+
+func _test_receiver_domain_bounds() -> void:
+	# The diffuse path mirrors clv_receiver_domain_half_extent() in the producer
+	# and layout-9 consumers. Curved SH instead uses the fixed parent cube tested
+	# below, with a same-facing hemisphere check.
+	var min_dot := cos(deg_to_rad(25.0))
+	var step_size := 0.25
+	var axis := Vector3.UP
+	var extent := _receiver_domain_half_extent(axis, step_size, min_dot)
+	var cone_sine := sin(deg_to_rad(25.0))
+	var expected := Vector3(0.5 + 0.75 * cone_sine, 1.25,
+			0.5 + 0.75 * cone_sine) * step_size
+	check(extent.distance_to(expected) <= 1e-7,
+			"A 25-degree Y-axis cone must use the producer's tight anisotropic AABB.")
+	var x_extent := _receiver_domain_half_extent(Vector3.RIGHT, step_size, min_dot)
+	check(x_extent.distance_to(Vector3(expected.y, expected.x, expected.z)) <= 1e-7,
+			"Cone-domain bounds must rotate with the selected dominant receiver axis.")
+	var axis_diagonal := Vector3(0.3, 0.4, 0.5).normalized()
+	var diagonal_extent := _receiver_domain_half_extent(axis_diagonal, step_size, min_dot)
+	check(diagonal_extent.x > 0.5 * step_size
+			and diagonal_extent.y > 0.5 * step_size
+			and diagonal_extent.z > 0.5 * step_size,
+			"An oblique parent normal must include the cone's normal-offset in every affected coordinate.")
+	var curved_half_extent := Vector3.ONE * (1.25 * step_size)
+	var sphere_base_normal := Vector3(-0.856, 0.0, 0.517).normalized()
+	var sphere_left_dot := Vector3.LEFT.dot(sphere_base_normal)
+	var opposite_side_dot := Vector3.RIGHT.dot(sphere_base_normal)
+	check(curved_half_extent.distance_to(Vector3(0.3125, 0.3125, 0.3125)) <= 1e-7
+			and sphere_left_dot > 0.0 and sphere_left_dot < min_dot
+			and opposite_side_dot <= 0.0,
+			"Curved SH must use the fixed 1.25-cell AABB, accept same-facing sphere normals outside the retired 25-degree cone, and reject the opposite hemisphere.")
+	print("CLV_DOMAIN_BOUNDS axis_y=", extent, " axis_x=", x_extent,
+			" curved_half_extent=", curved_half_extent,
+			" old_cone_dot=", min_dot, " same_facing_dot=", sphere_left_dot,
+			" cell_step=", step_size)
+
+func _receiver_domain_half_extent(cone_axis: Vector3, step_size: float,
+		min_normal_dot: float) -> Vector3:
+	var axis := cone_axis.normalized().abs()
+	var cone_sine := sqrt(maxf(1.0 - min_normal_dot * min_normal_dot, 0.0))
+	var axis_sine := Vector3(
+			sqrt(maxf(1.0 - axis.x * axis.x, 0.0)),
+		sqrt(maxf(1.0 - axis.y * axis.y, 0.0)),
+		sqrt(maxf(1.0 - axis.z * axis.z, 0.0)))
+	var max_component := axis * min_normal_dot + axis_sine * cone_sine
+	if axis.x >= min_normal_dot:
+		max_component.x = 1.0
+	if axis.y >= min_normal_dot:
+		max_component.y = 1.0
+	if axis.z >= min_normal_dot:
+		max_component.z = 1.0
+	return Vector3.ONE * (0.5 * step_size) + max_component * (0.75 * step_size)
+
+func _evaluate_clv_sh_pair(secondary_coefficients: Array[Vector3],
+		primary_coefficients: Array[Vector3], normal: Vector3, payload_valid: bool) -> Dictionary:
+	if not payload_valid or secondary_coefficients.size() != 9 \
+			or primary_coefficients.size() != 9 or normal.length_squared() <= 1e-12:
+		return {"valid": false, "incident": Vector3.ZERO}
+	var basis := _diffuse_basis(normal.normalized())
+	var secondary := Vector3.ZERO
+	var primary := Vector3.ZERO
+	for coefficient in 9:
+		secondary += secondary_coefficients[coefficient] * basis[coefficient]
+		primary += primary_coefficients[coefficient] * basis[coefficient]
+	var incident := secondary + primary
+	return {"valid": true, "incident": Vector3(maxf(incident.x, 0.0),
+			maxf(incident.y, 0.0), maxf(incident.z, 0.0))}
+
+func _f32(value: float) -> float:
+	var packed := PackedFloat32Array()
+	packed.push_back(value)
+	return packed[0]
+
+func _old_float32_patch_variance(patch_id: int, fraction: Vector3) -> float:
+	var sum_patch := 0.0
+	var sum_patch_squared := 0.0
+	var sum_weight := 0.0
+	for corner in 8:
+		var weight := 1.0
+		for axis in 3:
+			var component := fraction.x if axis == 0 else (fraction.y if axis == 1 else fraction.z)
+			var term := component if (corner & (1 << axis)) != 0 else _f32(1.0 - component)
+			weight = _f32(weight * term)
+		sum_weight = _f32(sum_weight + weight)
+		sum_patch = _f32(sum_patch + _f32(_f32(float(patch_id)) * weight))
+		sum_patch_squared = _f32(sum_patch_squared
+				+ _f32(_f32(float(patch_id * patch_id)) * weight))
+	var mean_patch := _f32(sum_patch / sum_weight)
+	var mean_patch_squared := _f32(mean_patch * mean_patch)
+	var second_moment := _f32(sum_patch_squared / sum_weight)
+	return maxf(_f32(second_moment - mean_patch_squared), 0.0)
+
+func _trilinear_corner_support(fraction: Vector3) -> Array:
+	var supported: Array = []
+	for corner in 8:
+		var weight := 1.0
+		for axis in 3:
+			var component := fraction.x if axis == 0 else (fraction.y if axis == 1 else fraction.z)
+			var term := component if (corner & (1 << axis)) != 0 else _f32(1.0 - component)
+			weight = _f32(weight * term)
+		supported.append(weight > 0.0)
+	return supported
+
+func _patch_ids_match(patch_ids: Array, supported: Array) -> bool:
+	var have_reference := false
+	var reference_id := 0.0
+	for index in mini(patch_ids.size(), supported.size()):
+		if not bool(supported[index]):
+			continue
+		var patch_id := _f32(float(patch_ids[index]))
+		if is_nan(patch_id) or is_inf(patch_id) or patch_id <= 0.0 \
+				or floor(patch_id) != patch_id:
+			return false
+		if not have_reference:
+			reference_id = patch_id
+			have_reference = true
+		elif patch_id != reference_id:
+			return false
+	return have_reference
+
+func _test_hardware_trilinear_equivalence() -> void:
+	# The native sampler uses one hardware trilinear read per radiance field only
+	# when the toroidal eight-corner neighborhood is contiguous. At wrapped seams
+	# it retains the explicit gather, whose logical corners wrap independently.
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 20261024
+	var interior_samples := 0
+	var seam_samples := 0
+	var max_relative_error := 0.0
+	for resolution_value in [16, 24]:
+		var resolution := int(resolution_value)
+		for level in LEVELS:
+			for _sample_index in 256:
+				var base := Vector3i(rng.randi_range(-256, 256),
+						rng.randi_range(-256, 256), rng.randi_range(-256, 256))
+				var fraction := Vector3(_f32(rng.randf()), _f32(rng.randf()), _f32(rng.randf()))
+				var physical := _wrap_test_cell(base, resolution)
+				var can_filter: bool = physical.x < resolution - 1 \
+						and physical.y < resolution - 1 \
+						and physical.z < resolution - 1
+				var manual := _manual_filter_test_sample(base, fraction, resolution, level)
+				if not can_filter:
+					seam_samples += 1
+					continue
+				interior_samples += 1
+				var hardware := _hardware_filter_test_sample(base, fraction, resolution, level)
+				for component in 4:
+					var expected := manual[component]
+					var actual := hardware[component]
+					var relative_error := absf(actual - expected) / maxf(1.0, absf(expected))
+					max_relative_error = maxf(max_relative_error, relative_error)
+	check(interior_samples > 0 and seam_samples > 0,
+			"Randomized filter regression must cover both contiguous cells and toroidal seams.")
+	check(max_relative_error <= 1e-6,
+			"Hardware trilinear coordinate must match the explicit eight-corner result; max relative error="
+			+ str(max_relative_error) + ".")
+	print("CLV_TRILINEAR_EQUIVALENCE interior=", interior_samples,
+			" seam_fallback=", seam_samples,
+			" max_relative_error=", max_relative_error,
+			" layout_resolutions=16,24 levels=3")
+func _test_manual_confidence_gate() -> void:
+	# Only radiance RGB uses hardware filtering. The producer writes the same
+	# binary validity to diffuse alpha and moment.w; use the manually weighted
+	# moment values for the existing 0.55 gate so sampler precision cannot relax
+	# or tighten geometry acceptance.
+	var support := [false, true, false, true, false, true, false, true]
+	var below_fraction := Vector3(0.5499, 0.37, 0.61)
+	var above_fraction := Vector3(0.5501, 0.37, 0.61)
+	var below_weight := _manual_validity_weight(support, below_fraction)
+	var above_weight := _manual_validity_weight(support, above_fraction)
+	check(below_weight < 0.55 and above_weight >= 0.55,
+			"Manual corner validity must preserve the existing 0.55 gate on both sides of its boundary; weights="
+			+ str([below_weight, above_weight]) + ".")
+	# A hardware-filter alpha can differ by implementation precision. It is not
+	# consulted for validity after the shader replaces it with the guide sum.
+	var perturbed_filtered_alpha := [above_weight - 0.002, above_weight + 0.002]
+	for filtered_alpha in perturbed_filtered_alpha:
+		var accepted := _manual_confidence_accept(filtered_alpha, above_weight)
+		check(accepted, "Filtered alpha must not override manual geometry validity.")
+	print("CLV_MANUAL_CONFIDENCE_GATE below=", below_weight,
+			" above=", above_weight,
+			" filtered_alpha_ignored=", perturbed_filtered_alpha)
+
+func _manual_validity_weight(supported: Array, fraction: Vector3) -> float:
+	var validity := 0.0
+	for corner in 8:
+		var offset := Vector3i(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1)
+		var weight := (fraction.x if offset.x != 0 else 1.0 - fraction.x) \
+				* (fraction.y if offset.y != 0 else 1.0 - fraction.y) \
+				* (fraction.z if offset.z != 0 else 1.0 - fraction.z)
+		if bool(supported[corner]):
+			validity += weight
+	return validity
+
+func _manual_confidence_accept(_filtered_alpha: float, manual_weight: float) -> bool:
+	return manual_weight >= 0.55
+
+func _wrap_test_cell(cell: Vector3i, resolution: int) -> Vector3i:
+	return Vector3i(posmod(cell.x, resolution), posmod(cell.y, resolution),
+			posmod(cell.z, resolution))
+
+func _sample_filter_test_texel(cell: Vector3i, resolution: int, level: int) -> Vector4:
+	var physical := _wrap_test_cell(cell, resolution)
+	var z := physical.z + level * resolution
+	return Vector4(
+		_f32(float(physical.x * 7 + physical.y * 11 + z * 13) * 0.003),
+		_f32(float(physical.x * 5 - physical.y * 3 + z * 17) * 0.002),
+		_f32(float(physical.x * physical.y + z * 19) * 0.001),
+		_f32(float(physical.x + physical.y * 2 + z * 3) / float(resolution * 12)))
+
+func _manual_filter_test_sample(base: Vector3i, fraction: Vector3,
+		resolution: int, level: int) -> Vector4:
+	var result := Vector4.ZERO
+	for corner in 8:
+		var offset := Vector3i(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1)
+		var weight := (fraction.x if offset.x != 0 else 1.0 - fraction.x) \
+				* (fraction.y if offset.y != 0 else 1.0 - fraction.y) \
+				* (fraction.z if offset.z != 0 else 1.0 - fraction.z)
+		result += _sample_filter_test_texel(base + offset, resolution, level) * weight
+	return result
+
+func _hardware_filter_test_sample(base: Vector3i, fraction: Vector3,
+		resolution: int, level: int) -> Vector4:
+	var physical := _wrap_test_cell(base, resolution)
+	var c000 := _sample_filter_test_texel(physical, resolution, level)
+	var c100 := _sample_filter_test_texel(physical + Vector3i(1, 0, 0), resolution, level)
+	var c010 := _sample_filter_test_texel(physical + Vector3i(0, 1, 0), resolution, level)
+	var c110 := _sample_filter_test_texel(physical + Vector3i(1, 1, 0), resolution, level)
+	var c001 := _sample_filter_test_texel(physical + Vector3i(0, 0, 1), resolution, level)
+	var c101 := _sample_filter_test_texel(physical + Vector3i(1, 0, 1), resolution, level)
+	var c011 := _sample_filter_test_texel(physical + Vector3i(0, 1, 1), resolution, level)
+	var c111 := _sample_filter_test_texel(physical + Vector3i(1, 1, 1), resolution, level)
+	var x00 := c000.lerp(c100, fraction.x)
+	var x10 := c010.lerp(c110, fraction.x)
+	var x01 := c001.lerp(c101, fraction.x)
+	var x11 := c011.lerp(c111, fraction.x)
+	var y0 := x00.lerp(x10, fraction.y)
+	var y1 := x01.lerp(x11, fraction.y)
+	return y0.lerp(y1, fraction.z)
+
 func _test_focus_for_bounds() -> void:
 	var streamed_small_source_bounds: Array[AABB] = [
 		AABB(Vector3(-3.0, 0.0, -3.0), Vector3(6.0, 3.0, 6.0)),
@@ -188,17 +708,37 @@ func _test_debug_view_parameter() -> void:
 	gi_pass.clv_debug_view = 99
 	check(gi_pass.clv_debug_view == 4 and int(round(gi_pass._parameter_bytes().decode_float(12))) == 4,
 			"CLV debug view values must clamp to the supported enum range.")
+	gi_pass._last_clv_cache_backend = 1
+	var debug_property := {"name": "clv_debug_view", "usage": PROPERTY_USAGE_DEFAULT}
+	gi_pass._validate_property(debug_property)
+	check((int(debug_property["usage"]) & PROPERTY_USAGE_READ_ONLY) != 0,
+			"MagicDawn backend must disable unsupported CLV diagnostic choices in the Inspector.")
+	var status_property := {"name": "clv_debug_view_status", "usage": PROPERTY_USAGE_DEFAULT}
+	gi_pass._validate_property(status_property)
+	check((int(status_property["usage"]) & PROPERTY_USAGE_READ_ONLY) != 0
+			and (int(status_property["usage"]) & PROPERTY_USAGE_EDITOR) != 0
+			and (int(status_property["usage"]) & PROPERTY_USAGE_STORAGE) == 0,
+			"MagicDawn Inspector must show a read-only explanation without serializing it.")
+	var state := gi_pass.get_magicdawn_runtime_state()
+	check(not bool(state.get("clv_debug_view_supported", true))
+			and String(state.get("clv_debug_view_status", "")).contains("unsupported_ignored_gi_remains_active"),
+			"Unsupported MagicDawn views must report that the normal GI apply remains active.")
+	gi_pass._last_clv_cache_backend = 0
+	debug_property = {"name": "clv_debug_view", "usage": PROPERTY_USAGE_DEFAULT}
+	gi_pass._validate_property(debug_property)
+	check((int(debug_property["usage"]) & PROPERTY_USAGE_READ_ONLY) == 0,
+			"Legacy backend must keep its supported CLV diagnostic control editable.")
 
 func _test_gpu_byte_estimate() -> void:
 	var breakdown: Dictionary = Clipmap.estimate_gpu_bytes_breakdown()
-	check(breakdown.get("coefficient_texture_dimensions") == Vector3i(1056, 16, 48)
+	check(breakdown.get("coefficient_texture_dimensions") == Vector3i(1152, 16, 48)
 			and breakdown.get("coefficient_texture_format") == "R32G32B32A32_SFLOAT"
-			and int(breakdown.get("coefficient_texture_bytes", 0)) == 12976128
+			and int(breakdown.get("coefficient_texture_bytes", 0)) == 14155776
 			and int(breakdown.get("layout_version", 0)) == Clipmap.LAYOUT_VERSION
-			and Clipmap.LAYOUT_VERSION == 8
+			and Clipmap.LAYOUT_VERSION == 9
 			and Clipmap.CLV_FACE_COUNT == 3
-			and Clipmap.CLV_FACE_SLOT_COLUMNS == 22
-			and Clipmap.CLV_TEXTURE_COLUMNS == 66
+			and Clipmap.CLV_FACE_SLOT_COLUMNS == 24
+			and Clipmap.CLV_TEXTURE_COLUMNS == 72
 			and Clipmap.RADIANCE_COEFFICIENT_COLUMNS == 18
 			and Clipmap.SURFACE_METADATA_COLUMN == 18
 			and Clipmap.SURFACE_ANCHOR_COLUMN == 19 and Clipmap.DIFFUSE_PROJECTION_COLUMN == 20,
@@ -212,8 +752,8 @@ func _test_gpu_byte_estimate() -> void:
 			and int(breakdown.get("fallback_cluster_buffer_bytes", 0)) == 16
 			and int(breakdown.get("support_texture_bytes", 0)) == 49152
 			and int(breakdown.get("stencil_buffer_bytes", 0)) == 7667712
-			and int(breakdown.get("total_bytes", 0)) == 20897888
-			and Clipmap.estimate_gpu_bytes() == 20897888,
+			and int(breakdown.get("total_bytes", 0)) == 22077536
+			and Clipmap.estimate_gpu_bytes() == 22077536,
 			"The CLV estimate must include each allocated size-bearing buffer and preserve its exact total.")
 
 func _test_clv_fill_surface_search_domain() -> void:
@@ -537,7 +1077,7 @@ func _run_certified_cache_tests() -> void:
 		var triangle_buffer := rd.storage_buffer_create(bvh.triangles.size() * 4, bvh.triangles.to_byte_array())
 		var uniforms := rd.uniform_set_create([U.image(0, cache.texture), U.image(1, cache.tags),
 			U.image(2, cache.support), _storage(3, cache._jobs), _storage(4, node_buffer),
-			_storage(5, triangle_buffer)], cache._certify_shader, 0)
+			_storage(5, triangle_buffer), _storage(6, cache._stencils)], cache._certify_shader, 0)
 		check(uniforms.is_valid(), "The production certification shader must accept the fixture bindings.")
 		if not uniforms.is_valid(): continue
 		var list := rd.compute_list_begin()

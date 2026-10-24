@@ -1,0 +1,13 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cfusnxtsnv7mk"
+path="res://.godot/imported/magic_gi_clv_screen_classify.glsl-e252146b0dc13b3abb16e1c3488fce92.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_screen_classify.glsl"
+dest_files=["res://.godot/imported/magic_gi_clv_screen_classify.glsl-e252146b0dc13b3abb16e1c3488fce92.res"]
+
+[params]

@@ -81,6 +81,15 @@ no terrain native library or graphics driver is required.
 turns a real TAA camera, then renders 400 stationary frames. It requires a nonzero
 ordinary turn lead and zero axis-normalization errors as the predictor decays.
 
+## Camera rotation normal regression
+
+`python misc/feng-addons/feng-idweight-terrain/native/tests/terrain_normal_rotation_runner.py --driver d3d12`
+renders a non-flat region with a non-neutral normal map through orthographic and perspective
+cameras. It compares the same center world point through rolls and constant-radius orbits,
+converting the view-space G-buffer normal back to world space before comparison. World-normal
+error must stay below one degree; fixed-position roll also checks final fixed-light color.
+The odd viewport size keeps the sampled texel centered on that world point at every roll.
+
 ## Running one test
 
 Run `texture_layers.gd` from an imported project with the terrain extension:

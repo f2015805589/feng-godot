@@ -185,7 +185,13 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
 
 	// Create our color buffer.
 	const bool resolve_target = msaa_3d != RSE::VIEWPORT_MSAA_DISABLED;
-	create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR, get_base_data_format(), get_color_usage_bits(resolve_target, false, can_be_storage));
+	const RD::DataFormat color_format = get_base_data_format();
+	uint32_t color_usage_bits = get_color_usage_bits(resolve_target, false, can_be_storage, can_copy_from_color);
+	if (can_copy_from_color && !RD::get_singleton()->texture_is_format_supported_for_usage(color_format, color_usage_bits)) {
+		// Keep normal rendering available when this optional diagnostic capability is unsupported.
+		color_usage_bits = get_color_usage_bits(resolve_target, false, can_be_storage);
+	}
+	create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR, color_format, color_usage_bits);
 
 	// TODO: Detect when it is safe to use RD::TEXTURE_USAGE_TRANSIENT_BIT for RB_TEX_DEPTH, RB_TEX_COLOR_MSAA and/or RB_TEX_DEPTH_MSAA.
 	// (it means we cannot sample from it, we cannot copy from/to it) to save VRAM (and maybe performance too).
@@ -798,7 +804,7 @@ RID RenderSceneBuffersRD::get_velocity_depth_buffer() {
 	return velocity_depth;
 }
 
-uint32_t RenderSceneBuffersRD::get_color_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
+uint32_t RenderSceneBuffersRD::get_color_usage_bits(bool p_resolve, bool p_msaa, bool p_storage, bool p_can_copy_from) {
 	DEV_ASSERT((!p_resolve && !p_msaa) || (p_resolve != p_msaa));
 
 	uint32_t usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_INPUT_ATTACHMENT_BIT;
@@ -808,6 +814,9 @@ uint32_t RenderSceneBuffersRD::get_color_usage_bits(bool p_resolve, bool p_msaa,
 		usage_bits |= RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | (p_storage ? RD::TEXTURE_USAGE_STORAGE_BIT : 0);
 	} else {
 		usage_bits |= (p_storage ? RD::TEXTURE_USAGE_STORAGE_BIT : 0);
+	}
+	if (p_can_copy_from) {
+		usage_bits |= RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 	}
 
 	return usage_bits;

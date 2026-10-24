@@ -1,0 +1,142 @@
+#ifndef FENG_MAGIC_GI_CLV_APPROX_CONTRACT_GLSLINC
+#define FENG_MAGIC_GI_CLV_APPROX_CONTRACT_GLSLINC
+
+// Shared geometry-acceptance contract for the addon compute fallback and FRP's
+// deferred lighting shader. Keep this in the addon tree so its own shaders and
+// the engine include compile the exact same predicate implementation.
+const float CLV_APPROX_MIN_VALID_WEIGHT = 0.55;
+const float CLV_APPROX_MIN_NORMAL_LENGTH_SQUARED = 0.90;
+const float CLV_APPROX_MIN_NORMAL_ALIGNMENT = 0.95;
+const float CLV_APPROX_MAX_PLANE_VARIANCE_STEP = 0.06;
+const float CLV_APPROX_MAX_RECEIVER_PLANE_ERROR_STEP = 0.15;
+const float CLV_APPROX_MAX_PLANE_PRECISION_ERROR_FRACTION = 0.25;
+const float CLV_APPROX_MIN_EPSILON = 1e-4;
+
+// Stable reason codes for the opt-in, untimed approximate-volume diagnosis.
+// The diagnostic mirror returns the first failing stage from the contract
+// shared with production sampling.
+const uint CLV_APPROX_REJECT_NONE = 0u;
+const uint CLV_APPROX_REJECT_INVALID_STEP = 1u;
+const uint CLV_APPROX_REJECT_NONFINITE_POSITION = 2u;
+const uint CLV_APPROX_REJECT_OUTSIDE_WINDOW = 3u;
+const uint CLV_APPROX_REJECT_SEAM = 4u;
+const uint CLV_APPROX_REJECT_BASE_TAG = 5u;
+const uint CLV_APPROX_REJECT_NEIGHBOR_TAG = 6u;
+const uint CLV_APPROX_REJECT_NEIGHBOR_NOT_READY = 7u;
+const uint CLV_APPROX_REJECT_LOW_COVERAGE = 8u;
+const uint CLV_APPROX_REJECT_NONFINITE_SAMPLES = 9u;
+const uint CLV_APPROX_REJECT_NORMAL_MAGNITUDE = 10u;
+const uint CLV_APPROX_REJECT_NORMAL_ALIGNMENT = 11u;
+const uint CLV_APPROX_REJECT_PLANE_VARIANCE = 12u;
+const uint CLV_APPROX_REJECT_PATCH_MISMATCH = 13u;
+const uint CLV_APPROX_REJECT_RECEIVER_PLANE = 15u;
+const uint CLV_APPROX_REJECT_NONFINITE_RADIANCE = 16u;
+const uint CLV_APPROX_REJECT_PLANE_RESIDUAL = 17u;
+const uint CLV_APPROX_REJECT_PLANE_PRECISION = 18u;
+
+const uint CLV_APPROX_GLOBAL_DISABLED = 1u;
+const uint CLV_APPROX_GLOBAL_LAYOUT = 2u;
+const uint CLV_APPROX_GLOBAL_INVALID_INPUT = 3u;
+const uint CLV_APPROX_GLOBAL_INVALID_NORMAL = 4u;
+const uint CLV_APPROX_GLOBAL_NO_LEVELS = 5u;
+const uint CLV_APPROX_GLOBAL_OUTSIDE_BAKE = 6u;
+
+bool clv_approx_finite_vec4(vec4 value) {
+	return all(not(isnan(value))) && all(not(isinf(value)));
+}
+
+// geometry_sample stores weighted normals. moment_sample.z is the consumer's
+// exact same-patch flag, derived from the already-fetched per-corner patch IDs;
+// it is not the source texture's plane-offset-squared lane. plane_moments are
+// recomputed per corner in the receiver's local frame from each cell's local
+// plane offset, avoiding a clipmap-wide reference and its large-world
+// precision loss. .z is the maximum residual and .w is a conservative bound
+// on coordinate quantization at the current world scale.
+bool clv_approx_geometry_valid(vec3 receiver_normal, vec4 geometry_sample,
+		vec4 moment_sample, vec4 plane_moments, float valid_weight,
+		float step_size, float base_spacing) {
+	if (!(valid_weight >= CLV_APPROX_MIN_VALID_WEIGHT)
+			|| isnan(valid_weight) || isinf(valid_weight)
+			|| !clv_approx_finite_vec4(geometry_sample)
+			|| !clv_approx_finite_vec4(moment_sample)
+			|| any(isnan(plane_moments)) || any(isinf(plane_moments))) { return false; }
+	vec3 mean_normal = geometry_sample.xyz / valid_weight;
+	float normal_length_squared = dot(mean_normal, mean_normal);
+	if (!(normal_length_squared >= CLV_APPROX_MIN_NORMAL_LENGTH_SQUARED)
+			|| isnan(normal_length_squared) || isinf(normal_length_squared)) { return false; }
+	mean_normal *= inversesqrt(normal_length_squared);
+	float normal_alignment = dot(mean_normal, normalize(receiver_normal));
+	if (isnan(normal_alignment) || isinf(normal_alignment)
+			|| normal_alignment < CLV_APPROX_MIN_NORMAL_ALIGNMENT) { return false; }
+	float mean_plane_delta = plane_moments.x / valid_weight;
+	float plane_variance = max(plane_moments.y / valid_weight
+			- mean_plane_delta * mean_plane_delta, 0.0);
+	float plane_limit = max(step_size * CLV_APPROX_MAX_PLANE_VARIANCE_STEP,
+			CLV_APPROX_MIN_EPSILON);
+	float precision_limit = max(base_spacing * CLV_APPROX_MAX_PLANE_VARIANCE_STEP
+			* CLV_APPROX_MAX_PLANE_PRECISION_ERROR_FRACTION, CLV_APPROX_MIN_EPSILON);
+	float receiver_plane_error = mean_plane_delta;
+	return sqrt(plane_variance) <= plane_limit
+			&& plane_moments.z <= max(base_spacing
+				* CLV_APPROX_MAX_PLANE_VARIANCE_STEP, CLV_APPROX_MIN_EPSILON)
+			&& plane_moments.w <= precision_limit
+			&& moment_sample.z > 0.5
+			&& abs(receiver_plane_error) <= max(step_size
+				* CLV_APPROX_MAX_RECEIVER_PLANE_ERROR_STEP, CLV_APPROX_MIN_EPSILON);
+}
+
+// Diagnostic mirror of clv_approx_geometry_valid. Keep each reason at the
+// same stage as its matching predicate; only the returned code is diagnostic.
+uint clv_approx_geometry_reject_reason(vec3 receiver_normal,
+		vec4 geometry_sample, vec4 moment_sample, vec4 plane_moments,
+		float valid_weight, float step_size, float base_spacing) {
+	if (!clv_approx_finite_vec4(geometry_sample)
+			|| !clv_approx_finite_vec4(moment_sample)
+			|| any(isnan(plane_moments)) || any(isinf(plane_moments))) {
+		return CLV_APPROX_REJECT_NONFINITE_SAMPLES;
+	}
+	if (!(valid_weight >= CLV_APPROX_MIN_VALID_WEIGHT)
+			|| isnan(valid_weight) || isinf(valid_weight)) {
+		return CLV_APPROX_REJECT_LOW_COVERAGE;
+	}
+	vec3 mean_normal = geometry_sample.xyz / valid_weight;
+	float normal_length_squared = dot(mean_normal, mean_normal);
+	if (!(normal_length_squared >= CLV_APPROX_MIN_NORMAL_LENGTH_SQUARED)
+			|| isnan(normal_length_squared) || isinf(normal_length_squared)) {
+		return CLV_APPROX_REJECT_NORMAL_MAGNITUDE;
+	}
+	mean_normal *= inversesqrt(normal_length_squared);
+	float normal_alignment = dot(mean_normal, normalize(receiver_normal));
+	if (isnan(normal_alignment) || isinf(normal_alignment)
+			|| normal_alignment < CLV_APPROX_MIN_NORMAL_ALIGNMENT) {
+		return CLV_APPROX_REJECT_NORMAL_ALIGNMENT;
+	}
+	float mean_plane_delta = plane_moments.x / valid_weight;
+	float plane_variance = max(plane_moments.y / valid_weight
+			- mean_plane_delta * mean_plane_delta, 0.0);
+	float plane_limit = max(step_size * CLV_APPROX_MAX_PLANE_VARIANCE_STEP,
+			CLV_APPROX_MIN_EPSILON);
+	float precision_limit = max(base_spacing * CLV_APPROX_MAX_PLANE_VARIANCE_STEP
+			* CLV_APPROX_MAX_PLANE_PRECISION_ERROR_FRACTION, CLV_APPROX_MIN_EPSILON);
+	float receiver_plane_error = mean_plane_delta;
+	if (!(sqrt(plane_variance) <= plane_limit)) {
+		return CLV_APPROX_REJECT_PLANE_VARIANCE;
+	}
+	if (!(plane_moments.z <= max(base_spacing
+			* CLV_APPROX_MAX_PLANE_VARIANCE_STEP, CLV_APPROX_MIN_EPSILON))) {
+		return CLV_APPROX_REJECT_PLANE_RESIDUAL;
+	}
+	if (!(plane_moments.w <= precision_limit)) {
+		return CLV_APPROX_REJECT_PLANE_PRECISION;
+	}
+	if (!(moment_sample.z > 0.5)) {
+		return CLV_APPROX_REJECT_PATCH_MISMATCH;
+	}
+	if (!(abs(receiver_plane_error) <= max(step_size
+			* CLV_APPROX_MAX_RECEIVER_PLANE_ERROR_STEP, CLV_APPROX_MIN_EPSILON))) {
+		return CLV_APPROX_REJECT_RECEIVER_PLANE;
+	}
+	return CLV_APPROX_REJECT_NONE;
+}
+
+#endif

@@ -1,0 +1,193 @@
+#ifndef FRP_MAGIC_GI_GENERAL_GLSLINC
+#define FRP_MAGIC_GI_GENERAL_GLSLINC
+
+// ABI9 cache/bake resources stay unchanged. These per-frame borrowed resources
+// are present only in the single-view, single-sample general-queue variant.
+layout(set = 1, binding = 61) uniform texture2D frp_magic_gi_geometry_atlas;
+layout(set = 1, binding = 62) uniform texture2D frp_magic_gi_visibility_moments;
+layout(set = 1, binding = 63, std430) readonly buffer FRPMagicGIVisibilityNodes {
+	vec4 nodes[];
+} frp_magic_gi_visibility_bvh;
+layout(set = 1, binding = 64, std430) readonly buffer FRPMagicGIVisibilityTriangles {
+	vec4 triangles[];
+} frp_magic_gi_visibility_geometry;
+layout(set = 1, binding = 65, std430) readonly buffer FRPMagicGIDirectionalLighting {
+	vec4 values[];
+} frp_magic_gi_directional_lighting;
+layout(set = 1, binding = 66, std430) buffer FRPMagicGIMissPixelQueue {
+	uint values[];
+} frp_magic_gi_miss_queue;
+layout(set = 1, binding = 67, std430) buffer FRPMagicGIMissQueueControl {
+	uint count;
+	uint overflow;
+} frp_magic_gi_miss_queue_control;
+layout(r32ui, set = 1, binding = 68) uniform writeonly uimage2D frp_magic_gi_source_pending;
+
+// Reuse the exact add-on sampler source and shared baked-visibility helper.
+// The renderer-only descriptors have different sets, so the sampler's names
+// resolve through these source-level aliases instead of a copied algorithm.
+#define MAGIC_GI_CLV_EXTERNAL_RESOURCES
+#define MAGIC_GI_CLV_EXTERNAL_SPECIALIZATIONS
+#define MAGIC_GI_BAKED_VISIBILITY
+#define MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT 16
+#define MAGIC_GI_WIDE_VISIBLE_PROBE_LIMIT 8
+#define MAGIC_GI_FULL_FEATURES false
+#define MAGIC_GI_CLV_METADATA_REUSE false
+#define MAGIC_GI_CLV_POWER_OF_TWO_WRAP false
+#define MAGIC_GI_CLV_REUSE_CORNER_FLOAT_ARRAY false
+#define clv frp_magic_gi_clv_parameters0
+#define clv_texture sampler3D(frp_magic_gi_clv_texture0, SAMPLER_LINEAR_CLAMP)
+#define clv_tags isampler3D(frp_magic_gi_clv_tags0, SAMPLER_NEAREST_CLAMP)
+#define clv_support usampler3D(frp_magic_gi_clv_support0, SAMPLER_NEAREST_CLAMP)
+#define directional_lighting frp_magic_gi_directional_lighting
+#define geometry_atlas sampler2D(frp_magic_gi_geometry_atlas, SAMPLER_NEAREST_CLAMP)
+#define visibility_moment_atlas sampler2D(frp_magic_gi_visibility_moments, SAMPLER_NEAREST_CLAMP)
+#define visibility_bvh frp_magic_gi_visibility_bvh
+#define visibility_geometry frp_magic_gi_visibility_geometry
+#define params frp_magic_gi_bake_parameters
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_layout.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_approx_contract.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_visibility.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_probe_visibility.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_field_layout.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_sample.glslinc"
+#undef MAGIC_GI_CLV_EXTERNAL_RESOURCES
+#undef MAGIC_GI_CLV_EXTERNAL_SPECIALIZATIONS
+#undef MAGIC_GI_CLV_METADATA_REUSE
+#undef MAGIC_GI_BAKED_VISIBILITY
+#undef MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT
+#undef MAGIC_GI_WIDE_VISIBLE_PROBE_LIMIT
+#undef MAGIC_GI_FULL_FEATURES
+#undef MAGIC_GI_CLV_POWER_OF_TWO_WRAP
+#undef MAGIC_GI_CLV_REUSE_CORNER_FLOAT_ARRAY
+#undef clv
+#undef clv_texture
+#undef clv_tags
+#undef clv_support
+#undef directional_lighting
+#undef geometry_atlas
+#undef visibility_moment_atlas
+#undef visibility_bvh
+#undef visibility_geometry
+#undef params
+
+ivec2 frp_magic_gi_general_depth_extent() {
+#ifdef USE_MULTIVIEW
+	return textureSize(sampler2DArray(depth_buffer, SAMPLER_NEAREST_CLAMP), 0).xy;
+#else
+	return textureSize(sampler2D(depth_buffer, SAMPLER_NEAREST_CLAMP), 0);
+#endif
+}
+void frp_magic_gi_append_source_miss(ivec2 pixel, ivec2 extent) {
+	// This root is eligible only for one sample, one view and one full-screen
+	// triangle, so every output pixel has at most one producer invocation.
+	imageStore(frp_magic_gi_source_pending, pixel, uvec4(1u));
+	uint capacity = uint(extent.x) * uint(extent.y);
+	uint queue_index = atomicAdd(frp_magic_gi_miss_queue_control.count, 1u);
+	if (queue_index < capacity) {
+		frp_magic_gi_miss_queue.values[queue_index] = uint(pixel.y) * uint(extent.x) + uint(pixel.x);
+	} else {
+		// A future execution-contract change must still recover by scanning the
+		// marker image; never write beyond the pixel-count-sized queue.
+		atomicOr(frp_magic_gi_miss_queue_control.overflow, 1u);
+	}
+}
+
+bool frp_magic_gi_apply_general(vec3 world, vec3 view_position, float depth,
+		vec3 normal_world, vec3 albedo, float ao, float diffuse_ao, vec2 screen_uv,
+		int view, inout vec3 ambient_light, vec3 global_sky_light_diffuse) {
+	vec4 owner_size_enabled;
+	mat4 world_to_local;
+	vec4 owner_control;
+#ifdef USE_MULTIVIEW
+	if (view == 1) {
+		owner_size_enabled = frp_magic_gi_owner_parameters1.owner_size_enabled;
+		world_to_local = frp_magic_gi_owner_parameters1.world_to_local;
+		owner_control = frp_magic_gi_owner_parameters1.control;
+	} else
+#endif
+	{
+		owner_size_enabled = frp_magic_gi_owner_parameters0.owner_size_enabled;
+		world_to_local = frp_magic_gi_owner_parameters0.world_to_local;
+		owner_control = frp_magic_gi_owner_parameters0.control;
+	}
+	float total_strength = max(owner_control.x, 0.0);
+	if (!(total_strength > 0.0)
+			|| !frp_magic_gi_owner_contains(world, owner_size_enabled, world_to_local)
+			|| !frp_magic_gi_in_bake_bounds(world)) {
+		return false;
+	}
+
+	vec3 receiver_world = world;
+	int receiver_triangle = -1;
+	int receiver_family_triangle = -1;
+	// Match the production compute caller's radius, ray direction and receiver
+	// preprocessing exactly. The cache hit may adjust world within the existing
+	// depth-derived pixel radius; a hint is only a family token in the companion
+	// family/exact split patch.
+	if (frp_magic_gi_bake_parameters.control.w > 0.5) {
+#ifdef USE_MULTIVIEW
+		mat4 receiver_inverse_projection = scene_data_block.data.inv_projection_matrix_view[view];
+#else
+		mat4 receiver_inverse_projection = scene_data_block.data.inv_projection_matrix;
+#endif
+		ivec2 extent = frp_magic_gi_general_depth_extent();
+		vec4 clip = vec4(screen_uv * 2.0 - 1.0, depth, 1.0);
+		vec4 adjacent_x = receiver_inverse_projection * vec4(clip.xy + vec2(2.0 / float(extent.x), 0.0), depth, 1.0);
+		vec4 adjacent_y = receiver_inverse_projection * vec4(clip.xy + vec2(0.0, 2.0 / float(extent.y)), depth, 1.0);
+		float receiver_radius = max(length(adjacent_x.xyz / adjacent_x.w - view_position),
+				length(adjacent_y.xyz / adjacent_y.w - view_position)) + 0.00001;
+		vec3 view_origin = frp_cloud_world_position(vec3(0.0), scene_data_block.data);
+		vec3 view_direction = abs(receiver_inverse_projection[2][3]) > 1e-6
+				? normalize(world - view_origin)
+				: -normalize(scene_data_block.data.inv_view_matrix[2].xyz);
+		vec3 cached_receiver;
+		if (clv_cached_receiver(world, view_direction, receiver_radius, normal_world,
+				cached_receiver, receiver_triangle)) {
+			receiver_world = cached_receiver;
+			receiver_family_triangle = receiver_triangle;
+		} else {
+			receiver_triangle = -1;
+			receiver_family_triangle = clv_receiver_hint(world, normal_world);
+		}
+	}
+	// The hint selects a baked patch family only. Exact CLV geometry tests receive
+	// a triangle only when the cached ray query proved an actual triangle hit.
+	int receiver_patch = receiver_family_triangle >= 0
+			? int(frp_magic_gi_visibility_geometry.triangles[receiver_family_triangle * 3 + 2].w) : 0;
+	vec3 secondary;
+	vec3 primary;
+	float cache_weight;
+	bool complete_support;
+	// Preserve the ordinary tail's candidate_only path for zero-diffuse
+	// receivers: it skips radiance but still evaluates its ownership/Sky rules.
+	// Queue them so the source-only consumer can make that same decision.
+	if (ao <= 0.0 || all(equal(albedo, vec3(0.0)))) {
+		ivec2 pixel = ivec2(gl_FragCoord.xy);
+		ivec2 extent = frp_magic_gi_general_depth_extent();
+		if (all(greaterThanEqual(pixel, ivec2(0))) && all(lessThan(pixel, extent))) {
+			frp_magic_gi_append_source_miss(pixel, extent);
+		}
+		return false;
+	}
+	if (!sample_clv(receiver_world, normal_world, receiver_triangle, receiver_patch,
+			secondary, primary, cache_weight, complete_support)) {
+		ivec2 pixel = ivec2(gl_FragCoord.xy);
+		ivec2 extent = frp_magic_gi_general_depth_extent();
+		if (all(greaterThanEqual(pixel, ivec2(0))) && all(lessThan(pixel, extent))) {
+			frp_magic_gi_append_source_miss(pixel, extent);
+		}
+		return false;
+	}
+	if (owner_control.y <= 0.5) {
+		primary = vec3(0.0);
+	} else {
+		ambient_light -= global_sky_light_diffuse * clamp(total_strength, 0.0, 1.0);
+	}
+	ambient_light += max(secondary + primary, vec3(0.0)) * albedo * ao * diffuse_ao
+			* total_strength * max(owner_control.z, 0.0);
+	return true;
+}
+
+#endif // FRP_MAGIC_GI_GENERAL_GLSLINC

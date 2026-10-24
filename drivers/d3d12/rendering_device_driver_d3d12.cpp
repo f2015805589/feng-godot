@@ -41,6 +41,7 @@
 #include <dxgi1_6.h>
 #include <d3d12shader.h>
 #include <memory>
+#include <vector>
 
 #if !defined(_MSC_VER)
 #include <thirdparty/directx_headers/include/dxguids/dxguids.h>
@@ -73,6 +74,188 @@ using Microsoft::WRL::ComPtr;
 #define D3D12_DESCRIPTOR_HEAP_VERBOSE 0
 
 static const D3D12_RANGE VOID_RANGE = {};
+
+static String _d3d12_error_with_removal_reason(ID3D12Device *p_device, const String &p_operation, HRESULT p_result) {
+	String message = vformat("D3D12: %s failed with HRESULT 0x%08x.", p_operation, (uint32_t)p_result);
+	if (p_device != nullptr) {
+		const HRESULT removed_reason = p_device->GetDeviceRemovedReason();
+		message += vformat(" GetDeviceRemovedReason=0x%08x.", (uint32_t)removed_reason);
+		if (FAILED(removed_reason)) {
+			ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+			if (SUCCEEDED(p_device->QueryInterface(IID_PPV_ARGS(dred.GetAddressOf())))) {
+				D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
+				if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+					uint32_t node_index = 0;
+					for (const D3D12_AUTO_BREADCRUMB_NODE *node = breadcrumbs.pHeadAutoBreadcrumbNode; node != nullptr && node_index < 8; node = node->pNext, node_index++) {
+						const uint32_t last_breadcrumb = node->pLastBreadcrumbValue != nullptr ? *node->pLastBreadcrumbValue : UINT32_MAX;
+						const char *list_name = node->pCommandListDebugNameA != nullptr ? node->pCommandListDebugNameA : "(unnamed)";
+						const char *queue_name = node->pCommandQueueDebugNameA != nullptr ? node->pCommandQueueDebugNameA : "(unnamed)";
+						message += String(" DRED breadcrumb[") + String::num_uint64(node_index) + String("] list='") + String(list_name) + String("' queue='") + String(queue_name) + String("' completed=") + String::num_uint64(last_breadcrumb) + String("/") + String::num_uint64(node->BreadcrumbCount);
+						if (node->pCommandHistory != nullptr && last_breadcrumb < node->BreadcrumbCount) {
+							message += String(" next_op=") + String::num_uint64((uint32_t)node->pCommandHistory[last_breadcrumb]);
+						}
+					}
+				}
+
+				D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
+				if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) && page_fault.PageFaultVA != 0) {
+					message += " DRED page_fault_va=0x" + String::num_uint64(page_fault.PageFaultVA, 16);
+					const D3D12_DRED_ALLOCATION_NODE *allocation = page_fault.pHeadExistingAllocationNode;
+					if (allocation != nullptr) {
+						message += String(" existing_allocation_type=") + String::num_uint64((uint32_t)allocation->AllocationType) + String(" name='") + String(allocation->ObjectNameA != nullptr ? allocation->ObjectNameA : "(unnamed)") + String("'");
+					} else if (page_fault.pHeadRecentFreedAllocationNode != nullptr) {
+						allocation = page_fault.pHeadRecentFreedAllocationNode;
+						message += String(" recently_freed_allocation_type=") + String::num_uint64((uint32_t)allocation->AllocationType) + String(" name='") + String(allocation->ObjectNameA != nullptr ? allocation->ObjectNameA : "(unnamed)") + String("'");
+					}
+				}
+			}
+		}
+	}
+	return message;
+}
+
+static const char *_d3d12_message_severity_name(D3D12_MESSAGE_SEVERITY p_severity) {
+	switch (p_severity) {
+		case D3D12_MESSAGE_SEVERITY_CORRUPTION:
+			return "CORRUPTION";
+		case D3D12_MESSAGE_SEVERITY_ERROR:
+			return "ERROR";
+		case D3D12_MESSAGE_SEVERITY_WARNING:
+			return "WARNING";
+		case D3D12_MESSAGE_SEVERITY_INFO:
+			return "INFO";
+		case D3D12_MESSAGE_SEVERITY_MESSAGE:
+			return "MESSAGE";
+		default:
+			return "UNKNOWN";
+	}
+}
+
+static String _d3d12_command_list_close_error(ID3D12Device *p_device, HRESULT p_result) {
+	String message = _d3d12_error_with_removal_reason(p_device, "command list Close", p_result);
+	if (p_device == nullptr || Engine::get_singleton() == nullptr || !Engine::get_singleton()->is_validation_layers_enabled()) {
+		return message;
+	}
+	OS *os = OS::get_singleton();
+	if (os == nullptr || os->get_environment("FENG_D3D12_INFOQUEUE_CLOSE_DIAGNOSTICS") != "1" || p_device->GetDeviceRemovedReason() != S_OK) {
+		return message;
+	}
+
+	ComPtr<ID3D12InfoQueue> info_queue;
+	const HRESULT query_result = p_device->QueryInterface(IID_PPV_ARGS(info_queue.GetAddressOf()));
+	if (FAILED(query_result)) {
+		message += vformat("\nD3D12 InfoQueue snapshot unavailable: QueryInterface failed with HRESULT 0x%08x.", (uint32_t)query_result);
+		return message;
+	}
+
+	const UINT64 stored_count = info_queue->GetNumStoredMessages();
+	const UINT64 retrievable_count = info_queue->GetNumStoredMessagesAllowedByRetrievalFilter();
+	message += "\nD3D12 InfoQueue snapshot (FENG_D3D12_INFOQUEUE_CLOSE_DIAGNOSTICS=1): stored=" + String::num_uint64(stored_count) + " retrievable=" + String::num_uint64(retrievable_count) + ".";
+	if (retrievable_count == 0) {
+		message += " No messages are available through the retrieval filter.";
+		return message;
+	}
+
+	Vector<String> recent_messages;
+	Vector<String> messages_before_first_error;
+	Vector<String> messages_after_first_error;
+	Vector<String> read_failures;
+	String first_error_message;
+	UINT64 first_error_index = 0;
+	uint32_t unreadable_count = 0;
+	bool found_first_error = false;
+	auto read_message = [&](UINT64 p_index, String &r_formatted, D3D12_MESSAGE_SEVERITY &r_severity) -> bool {
+		SIZE_T message_size = 0;
+		const HRESULT size_result = info_queue->GetMessage(p_index, nullptr, &message_size);
+		if ((FAILED(size_result) && size_result != DXGI_ERROR_MORE_DATA) || message_size < sizeof(D3D12_MESSAGE) || message_size > 4u * 1024u * 1024u) {
+			unreadable_count++;
+			if (read_failures.size() < 4) {
+				read_failures.push_back(vformat("index=%s size-query HRESULT=0x%08x bytes=%s", String::num_uint64(p_index), (uint32_t)size_result, String::num_uint64(message_size)));
+			}
+			return false;
+		}
+
+		std::vector<uint8_t> buffer(message_size);
+		SIZE_T retrieved_size = message_size;
+		const HRESULT retrieve_result = info_queue->GetMessage(p_index, reinterpret_cast<D3D12_MESSAGE *>(buffer.data()), &retrieved_size);
+		if (FAILED(retrieve_result)) {
+			unreadable_count++;
+			if (read_failures.size() < 4) {
+				read_failures.push_back(vformat("index=%s retrieval HRESULT=0x%08x", String::num_uint64(p_index), (uint32_t)retrieve_result));
+			}
+			return false;
+		}
+
+		const D3D12_MESSAGE *d3d_message = reinterpret_cast<const D3D12_MESSAGE *>(buffer.data());
+		r_severity = d3d_message->Severity;
+		String description = "(no description)";
+		if (d3d_message->pDescription != nullptr && d3d_message->DescriptionByteLength <= retrieved_size) {
+			int description_length = (int)d3d_message->DescriptionByteLength;
+			if (description_length > 0 && d3d_message->pDescription[description_length - 1] == '\0') {
+				description_length--;
+			}
+			description = description_length > 0 ? String::utf8(d3d_message->pDescription, description_length) : String("(empty description)");
+		}
+		r_formatted = String("index=") + String::num_uint64(p_index);
+		r_formatted += String(" severity=") + String(_d3d12_message_severity_name(d3d_message->Severity));
+		r_formatted += String(" category=") + String::num_uint64((uint32_t)d3d_message->Category);
+		r_formatted += String(" id=") + String::num_uint64((uint32_t)d3d_message->ID);
+		r_formatted += String(": ") + description;
+		return true;
+	};
+
+	for (UINT64 i = 0; i < retrievable_count; i++) {
+		String formatted;
+		D3D12_MESSAGE_SEVERITY severity = D3D12_MESSAGE_SEVERITY_MESSAGE;
+		if (!read_message(i, formatted, severity)) {
+			continue;
+		}
+		if (!found_first_error) {
+			if (severity == D3D12_MESSAGE_SEVERITY_CORRUPTION || severity == D3D12_MESSAGE_SEVERITY_ERROR) {
+				found_first_error = true;
+				first_error_index = i;
+				first_error_message = formatted;
+			} else {
+				messages_before_first_error.push_back(formatted);
+				if (messages_before_first_error.size() > 4) {
+					messages_before_first_error.remove_at(0);
+				}
+				recent_messages.push_back(formatted);
+				if (recent_messages.size() > 8) {
+					recent_messages.remove_at(0);
+				}
+			}
+		} else {
+			messages_after_first_error.push_back(formatted);
+			if (messages_after_first_error.size() == 4) {
+				break;
+			}
+		}
+	}
+
+	if (found_first_error) {
+		message += "\nFirst stored error/corruption at retrieval index " + String::num_uint64(first_error_index) + "; nearby entries follow (up to four on each side):";
+		for (int i = 0; i < messages_before_first_error.size(); i++) {
+			message += "\n  before: " + messages_before_first_error[i];
+		}
+		message += "\n  FIRST ERROR: " + first_error_message;
+		for (int i = 0; i < messages_after_first_error.size(); i++) {
+			message += "\n  after: " + messages_after_first_error[i];
+		}
+	} else {
+		message += "\nNo readable error/corruption entry was found; the last available messages follow:";
+		for (int i = 0; i < recent_messages.size(); i++) {
+			message += "\n  " + recent_messages[i];
+		}
+	}
+	if (unreadable_count > 0) {
+		message += "\nUnreadable InfoQueue entries=" + String::num_uint64(unreadable_count) + ".";
+		for (int i = 0; i < read_failures.size(); i++) {
+			message += "\n  read failure: " + read_failures[i];
+		}
+	}
+	return message;
+}
 
 static const uint32_t MAX_DYNAMIC_BUFFERS = 8u; // Minimum guaranteed by Vulkan.
 
@@ -2560,7 +2743,7 @@ Error RenderingDeviceDriverD3D12::command_queue_execute_and_present(CommandQueue
 		SwapChain *swap_chain = (SwapChain *)(p_swap_chains[i].id);
 		res = swap_chain->d3d_swap_chain->Present(swap_chain->sync_interval, swap_chain->present_flags);
 		if (!SUCCEEDED(res)) {
-			print_verbose(vformat("D3D12: Presenting swapchain failed with error 0x%08ux.", (uint64_t)res));
+			print_verbose(_d3d12_error_with_removal_reason(device.Get(), "swapchain Present", res));
 			any_present_failed = true;
 		}
 	}
@@ -2684,18 +2867,18 @@ RDD::CommandBufferID RenderingDeviceDriverD3D12::command_buffer_create(CommandPo
 bool RenderingDeviceDriverD3D12::command_buffer_begin(CommandBufferID p_cmd_buffer) {
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
 	HRESULT res = cmd_buf_info->cmd_allocator->Reset();
-	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, _d3d12_error_with_removal_reason(device.Get(), "command allocator Reset", res));
 	res = cmd_buf_info->cmd_list->Reset(cmd_buf_info->cmd_allocator.Get(), nullptr);
-	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, _d3d12_error_with_removal_reason(device.Get(), "command list Reset", res));
 	return true;
 }
 
 bool RenderingDeviceDriverD3D12::command_buffer_begin_secondary(CommandBufferID p_cmd_buffer, RenderPassID p_render_pass, uint32_t p_subpass, FramebufferID p_framebuffer) {
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
 	HRESULT res = cmd_buf_info->cmd_allocator->Reset();
-	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, _d3d12_error_with_removal_reason(device.Get(), "secondary command allocator Reset", res));
 	res = cmd_buf_info->cmd_list->Reset(cmd_buf_info->cmd_allocator.Get(), nullptr);
-	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, _d3d12_error_with_removal_reason(device.Get(), "secondary command list Reset", res));
 	return true;
 }
 
@@ -2703,7 +2886,7 @@ void RenderingDeviceDriverD3D12::command_buffer_end(CommandBufferID p_cmd_buffer
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	HRESULT res = cmd_buf_info->cmd_list->Close();
 
-	ERR_FAIL_COND_MSG(!SUCCEEDED(res), "Close failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	ERR_FAIL_COND_MSG(!SUCCEEDED(res), _d3d12_command_list_close_error(device.Get(), res));
 	cmd_buf_info->graphics_pso = nullptr;
 	cmd_buf_info->graphics_root_signature_crc = 0;
 	cmd_buf_info->compute_pso = nullptr;
@@ -2854,7 +3037,7 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 	if (swap_chain->d3d_swap_chain != nullptr) {
 		_swap_chain_release_buffers(swap_chain);
 		res = swap_chain->d3d_swap_chain->ResizeBuffers(p_desired_framebuffer_count, surface->width, surface->height, DXGI_FORMAT_UNKNOWN, creation_flags);
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_UNAVAILABLE);
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_UNAVAILABLE, _d3d12_error_with_removal_reason(device.Get(), "swapchain ResizeBuffers", res));
 	} else {
 		DEV_ASSERT(swap_chain->render_pass.id == 0);
 		swap_chain->render_pass = _swap_chain_create_render_pass(new_data_format);
@@ -2892,18 +3075,18 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 			res = context_driver->dxgi_factory_get()->CreateSwapChainForHwnd(command_queue->d3d_queue.Get(), surface->hwnd, &swap_chain_desc, nullptr, nullptr, swap_chain_1.GetAddressOf());
 		}
 
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, _d3d12_error_with_removal_reason(device.Get(), "swapchain CreateSwapChainForHwnd", res));
 
 		swap_chain_1.As(&swap_chain->d3d_swap_chain);
 		ERR_FAIL_NULL_V(swap_chain->d3d_swap_chain, ERR_CANT_CREATE);
 
 		res = context_driver->dxgi_factory_get()->MakeWindowAssociation(surface->hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, _d3d12_error_with_removal_reason(device.Get(), "swapchain MakeWindowAssociation", res));
 	}
 
 	if (swap_chain->color_space != new_color_space) {
 		res = swap_chain->d3d_swap_chain->SetColorSpace1(RD_TO_DXGI_COLOR_SPACE_TYPE[new_color_space]);
-		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, _d3d12_error_with_removal_reason(device.Get(), "swapchain SetColorSpace1", res));
 
 		swap_chain->color_space = new_color_space;
 	}

@@ -1,0 +1,356 @@
+#ifndef MAGIC_GI_CLV_PROBE_BLOCK_FIELD_FILL_BODY_GLSLINC
+#define MAGIC_GI_CLV_PROBE_BLOCK_FIELD_FILL_BODY_GLSLINC
+
+const int FIELD_COLUMN_COUNT = MAGIC_GI_CLV_BAKED_SH_TEXTURE_COUNT;
+const int FIELD_LEVEL_COUNT = MAGIC_GI_CLV_BAKED_SH_LEVEL_COUNT;
+const int FIELD_GUARD = MAGIC_GI_CLV_BAKED_SH_GUARD;
+const float FIELD_WEIGHT_EPSILON_SCALE = 0.16;
+shared vec4 reduce_coefficients[FIELD_COLUMN_COUNT][64];
+shared vec2 reduce_weights[64]; // potential support, visible support
+shared uint reduce_invalid[64];
+
+bool field_finite_vec4(vec4 v) {
+	return !any(isnan(v)) && !any(isinf(v));
+}
+
+bool field_codec_valid() {
+	return clipmap.control.x == config.resolution &&
+			clipmap.control.y == FIELD_LEVEL_COUNT &&
+			clipmap.control.z == config.geometry_epoch &&
+			clipmap.control.w == MAGIC_GI_CLV_BAKED_SH_LAYOUT_VERSION &&
+			field_finite_vec4(clipmap.codec) && clipmap.codec.x > 0.0 &&
+			clipmap.codec.y > 0.0 && abs(clipmap.codec.x * clipmap.codec.y - 1.0) <= 2e-6 &&
+			clipmap.codec.z == MAGIC_GI_CLV_BAKED_SH_FORMAT_TAG && clipmap.codec.w == 1.0 &&
+			(MAGIC_GI_CLV_BAKED_SH_FORMAT_TAG != 32.0 ||
+					(clipmap.codec.x == 1.0 && clipmap.codec.y == 1.0));
+}
+
+bool field_resolution_valid(int resolution) {
+	return resolution == 16 || resolution == 24 || resolution == 32;
+}
+
+ivec3 field_wrap(ivec3 logical, int resolution) {
+	return ((logical % resolution) + resolution) % resolution;
+}
+
+float field_cell_window(ivec3 cell, ivec3 center, vec3 fraction, int radius) {
+	float window = 1.0;
+	for (int axis = 0; axis < 3; axis++) {
+		int offset = cell[axis] - center[axis];
+		if (abs(offset) == radius) {
+			window *= offset < 0 ? 1.0 - smoothstep(0.0, 1.0, fraction[axis])
+					: smoothstep(0.0, 1.0, fraction[axis]);
+		}
+	}
+	return window;
+}
+
+void field_store_lane(ivec3 wrapped_slot, int level, int lane, vec4 value) {
+	int resolution = config.resolution;
+	int stride = resolution + FIELD_GUARD;
+	ivec3 base = ivec3(wrapped_slot.x, wrapped_slot.y,
+		level * stride + wrapped_slot.z);
+	for (int mask = 0; mask < 8; mask++) {
+		if ((mask & 1) != 0 && wrapped_slot.x != 0) { continue; }
+		if ((mask & 2) != 0 && wrapped_slot.y != 0) { continue; }
+		if ((mask & 4) != 0 && wrapped_slot.z != 0) { continue; }
+		ivec3 dst = base + ivec3((mask & 1) != 0 ? resolution : 0,
+				(mask & 2) != 0 ? resolution : 0,
+				(mask & 4) != 0 ? resolution : 0);
+		switch (lane) {
+			case 0: imageStore(field_image_0, dst, value); break;
+			case 1: imageStore(field_image_1, dst, value); break;
+			case 2: imageStore(field_image_2, dst, value); break;
+			case 3: imageStore(field_image_3, dst, value); break;
+			case 4: imageStore(field_image_4, dst, value); break;
+			case 5: imageStore(field_image_5, dst, value); break;
+			case 6: imageStore(field_image_6, dst, value); break;
+		}
+	}
+}
+
+void main() {
+	uint lane = gl_LocalInvocationIndex;
+	uint job_index = gl_WorkGroupID.x;
+	if (config.job_count <= 0 || job_index >= uint(config.job_count)) { return; }
+	FieldJob job = jobs.values[job_index];
+	bool clear_only = job.center_spacing.w < 0.0;
+	float step_size = abs(job.center_spacing.w);
+	int level = job.logical_level.w;
+	ivec3 logical_cell = job.logical_level.xyz;
+	if (!field_resolution_valid(config.resolution) || level < 0 || level >= FIELD_LEVEL_COUNT) { return; }
+	ivec3 slot = field_wrap(logical_cell, config.resolution);
+	ivec3 tag_slot = slot + ivec3(0, 0, level * config.resolution);
+	if (clear_only) {
+		if (lane == 0u) {
+			for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+				field_store_lane(slot, level, k, vec4(0.0));
+			}
+			imageStore(field_tags, tag_slot, ivec4(logical_cell, 0));
+			imageStore(field_support, tag_slot, uvec4(0u));
+		}
+		return;
+	}
+	if (!field_codec_valid()) {
+		if (lane == 0u) {
+			for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+				field_store_lane(slot, level, k, vec4(0.0));
+			}
+			imageStore(field_tags, tag_slot, ivec4(logical_cell, 0));
+			imageStore(field_support, tag_slot, uvec4(0u));
+		}
+		return;
+	}
+	vec3 block_center = job.center_spacing.xyz;
+	// Sparse boundary records are keyed by absolute logical cell coordinates.
+	// They are valid only for this current clipmap window, exact job lattice,
+	// format/epoch-validated UBO, and a matching record key. The clear branch above
+	// always wins, so recycled slots cannot be revived by an old sidecar record.
+	int boundary_record_id = job.boundary_record.x;
+	int boundary_record_count = boundary_tensor_records.values.length();
+	bool boundary_job_valid = config.resolution > 1 && step_size > 0.0
+			&& !isnan(step_size) && !isinf(step_size)
+			&& !any(isnan(block_center)) && !any(isinf(block_center))
+			&& !any(notEqual(job.boundary_record.yzw, ivec3(0)))
+			&& clipmap.spacing.x > 0.0 && !isnan(clipmap.spacing.x)
+			&& !isinf(clipmap.spacing.x);
+	if (boundary_job_valid) {
+		ivec3 current_origin = clipmap.origins[level].xyz;
+		boundary_job_valid = all(greaterThanEqual(logical_cell, current_origin))
+				&& all(lessThan(logical_cell, current_origin + ivec3(config.resolution)));
+		float expected_step = clipmap.spacing.x * float(1 << level);
+		vec3 expected_center = (vec3(logical_cell) + vec3(0.5)) * expected_step;
+		float lattice_tolerance = max(expected_step * 2e-5, 1e-5);
+		boundary_job_valid = boundary_job_valid && !isnan(expected_step)
+				&& !isinf(expected_step) && abs(step_size - expected_step) <= lattice_tolerance
+				&& all(lessThanEqual(abs(block_center - expected_center),
+					vec3(lattice_tolerance)));
+	}
+	bool boundary_record_valid = boundary_job_valid && boundary_record_id > 0
+			&& boundary_record_id <= boundary_record_count;
+	vec4 boundary_values[FIELD_COLUMN_COUNT];
+	if (boundary_record_valid) {
+		BoundaryTensorRecord record = boundary_tensor_records.values[boundary_record_id - 1];
+		boundary_record_valid = all(equal(record.logical_level, ivec4(logical_cell, level)));
+		for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+			vec4 encoded = record.tensor[k] * clipmap.codec.y;
+			if (k == FIELD_COLUMN_COUNT - 1) { encoded.a = 1.0; }
+			bool value_valid = field_finite_vec4(record.tensor[k]) && field_finite_vec4(encoded);
+#ifdef MAGIC_GI_CLV_BAKED_SH_RGBA16F
+			value_valid = value_valid && all(lessThanEqual(abs(encoded), vec4(60000.0)));
+#endif
+			boundary_record_valid = boundary_record_valid && value_valid;
+			boundary_values[k] = encoded;
+		}
+	}
+	if (boundary_record_valid) {
+		if (lane == 0u) {
+			for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+				field_store_lane(slot, level, k, boundary_values[k]);
+			}
+			imageStore(field_tags, tag_slot, ivec4(logical_cell, config.geometry_epoch));
+			imageStore(field_support, tag_slot,
+					uvec4(MAGIC_GI_CLV_BAKED_SH_SUPPORT_VALID, 0u, 0u, 0u));
+		}
+		return;
+	}
+	int cluster_word_count = probe_cluster_data.values.length();
+	vec4 lane_coefficients[FIELD_COLUMN_COUNT];
+	for (int k = 0; k < FIELD_COLUMN_COUNT; k++) { lane_coefficients[k] = vec4(0.0); }
+	float lane_potential_weight = 0.0;
+	float lane_visible_weight = 0.0;
+	uint lane_bad_data = 0u;
+	bool job_valid = level >= 0 && level < FIELD_LEVEL_COUNT
+			&& config.resolution > 1 && step_size > 0.0
+			&& cluster_word_count >= 4
+			&& !any(isnan(block_center)) && !any(isinf(block_center))
+			&& !isnan(step_size) && !isinf(step_size);
+	vec3 grid_position = vec3(0.0);
+	ivec3 grid_dimensions = ivec3(params.grid.xyz);
+	ivec3 center_cell = ivec3(0);
+	vec3 grid_fraction = vec3(0.0);
+	int radius = 2;
+	float source_spacing = max(params.control.y, 0.001);
+	if (job_valid && all(greaterThan(grid_dimensions, ivec3(0)))) {
+		grid_position = (params.world_to_grid * vec4(block_center, 1.0)).xyz;
+		job_valid = !any(isnan(grid_position)) && !any(isinf(grid_position))
+				&& all(greaterThanEqual(grid_position, vec3(0.0)))
+				&& all(lessThan(grid_position, vec3(grid_dimensions)));
+		if (job_valid) {
+			center_cell = ivec3(floor(grid_position));
+			grid_fraction = grid_position - vec3(center_cell);
+			// Keep the same world support radius as two CLV cells while enumerating
+			// the finer source grid completely at coarser clipmap levels.
+			radius = max(2, int(ceil(2.0 * step_size / source_spacing)));
+		}
+	}
+	if (job_valid && params.grid.w > 0.0) {
+		int side = radius * 2 + 1;
+		int neighbor_count = side * side * side;
+		float kernel_epsilon = max(step_size * step_size * FIELD_WEIGHT_EPSILON_SCALE, 0.0001);
+		bool compact_index_map = textureSize(index_map, 0).x == grid_dimensions.x;
+		for (int neighbor_ordinal = int(lane); neighbor_ordinal < neighbor_count;
+				neighbor_ordinal += 64) {
+			int dx = neighbor_ordinal % side - radius;
+			int dy = (neighbor_ordinal / side) % side - radius;
+			int dz = neighbor_ordinal / (side * side) - radius;
+			ivec3 cell = center_cell + ivec3(dx, dy, dz);
+			if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, grid_dimensions))) { continue; }
+			float cell_window = field_cell_window(cell, center_cell, grid_fraction, radius);
+			if (!(cell_window > 0.0)) { continue; }
+			ivec2 map_range = cell_probe_map_range(cell, grid_dimensions, compact_index_map);
+			int cell_count = map_range.y;
+			if (cell_count <= 0) { continue; }
+			for (int probe_slot = 0; probe_slot < cell_count; probe_slot++) {
+				int probe = cell_probe(cell, probe_slot, grid_dimensions, compact_index_map, map_range.x);
+				if (probe < 0) { break; } // Build slots are dense.
+				if (float(probe) >= params.grid.w) { continue; }
+				ivec2 geometry_xy = ivec2((probe % 32) * 3, probe / 32);
+				vec3 sample_position = texelFetch(geometry_atlas, geometry_xy + ivec2(1, 0), 0).xyz;
+				vec4 normal_record = texelFetch(geometry_atlas, geometry_xy + ivec2(2, 0), 0);
+				float local_spacing = max(normal_record.w, 0.001);
+				float distance_squared = dot(block_center - sample_position, block_center - sample_position);
+				float distance = sqrt(max(distance_squared, 0.0));
+				float density_window = 1.0;
+				// Match gather_probe_neighborhood(): density feathering is relative
+				// to the source-grid spacing, not this coarser CLV block step.
+				if (local_spacing < source_spacing * 0.999) {
+					float local_support = local_spacing * 2.5;
+					if (distance >= local_support) { continue; }
+					density_window = 1.0 - smoothstep(local_spacing * 1.5,
+						local_support, distance);
+				}
+				float spatial_weight = cell_window * density_window
+						* local_spacing * local_spacing
+						* inversesqrt(kernel_epsilon + distance_squared);
+				if (!(spatial_weight > 0.0) || isnan(spatial_weight) || isinf(spatial_weight)) { continue; }
+				// Count possible support before visibility, then resolve geometry and
+				// exact visibility once at this block center.
+				lane_potential_weight += spatial_weight;
+				if (segment_blocked(sample_position, block_center, -1, 0)) { continue; }
+				// A validated exact-BVH path already resolved this source-to-cell segment.
+				// Do not apply the coarse angular moment estimate a second time.
+				float visible_weight = spatial_weight;
+				bool data_finite = true;
+				for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+					vec4 coefficient_pack = raw_directional.values[
+							probe * FIELD_COLUMN_COUNT + k];
+					data_finite = data_finite && field_finite_vec4(coefficient_pack);
+				}
+				if (data_finite) {
+					lane_visible_weight += visible_weight;
+					for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+						lane_coefficients[k] += raw_directional.values[
+								probe * FIELD_COLUMN_COUNT + k] * visible_weight;
+					}
+				} else {
+					lane_bad_data = 1u;
+				}
+			}
+		}
+	}
+	for (int k = 0; k < FIELD_COLUMN_COUNT; k++) { reduce_coefficients[k][lane] = lane_coefficients[k]; }
+	reduce_weights[lane] = vec2(lane_potential_weight, lane_visible_weight);
+	reduce_invalid[lane] = lane_bad_data;
+	barrier();
+	for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+		if (lane < stride) {
+			for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+				reduce_coefficients[k][lane] += reduce_coefficients[k][lane + stride];
+			}
+			reduce_weights[lane] += reduce_weights[lane + stride];
+			reduce_invalid[lane] |= reduce_invalid[lane + stride];
+		}
+		barrier();
+	}
+	if (lane != 0u) { return; }
+	float potential = reduce_weights[0].x;
+	float visible = reduce_weights[0].y;
+	bool field_valid = potential > 0.0 && visible > 0.0
+			&& !isnan(potential) && !isinf(potential)
+			&& !isnan(visible) && !isinf(visible) && reduce_invalid[0] == 0u;
+	// Coverage is only data readiness/validity. Visibility weights normalize the
+	// SH estimate, but must not darken a valid constant-radiance field merely
+	// because some neighboring probes are occluded.
+	float coverage = field_valid ? 1.0 : 0.0;
+	uint support = field_valid && coverage > 0.0
+			? MAGIC_GI_CLV_BAKED_SH_SUPPORT_VALID : 0u;
+	vec4 normalized_sh[FIELD_COLUMN_COUNT];
+	for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+		normalized_sh[k] = field_valid ? reduce_coefficients[k][0] / visible : vec4(0.0);
+		if (!field_finite_vec4(normalized_sh[k])) {
+			field_valid = false;
+			coverage = 0.0;
+			support = 0u;
+		}
+	}
+	if (field_valid) {
+		// Unpack RGB-interleaved SH9 in the existing 7-vec4 source ABI.
+		vec3 c0 = normalized_sh[0].xyz;
+		vec3 c1 = vec3(normalized_sh[0].w, normalized_sh[1].xy);
+		vec3 c2 = vec3(normalized_sh[1].zw, normalized_sh[2].x);
+		vec3 c3 = normalized_sh[2].yzw;
+		vec3 c4 = normalized_sh[3].xyz;
+		vec3 c5 = vec3(normalized_sh[3].w, normalized_sh[4].xy);
+		vec3 c6 = vec3(normalized_sh[4].zw, normalized_sh[5].x);
+		vec3 c7 = normalized_sh[5].yzw;
+		vec3 c8 = normalized_sh[6].xyz;
+		// Exact polynomial coefficients for the existing SH cosine-convolved E/pi basis.
+		vec3 ex = 0.2820947918 * c0 - 0.078847891325 * c6 + 0.136568553825 * c8;
+		vec3 ey = 0.2820947918 * c0 - 0.078847891325 * c6 - 0.136568553825 * c8;
+		vec3 ez = 0.2820947918 * c0 + 0.15769578265 * c6;
+		vec3 lx = 0.325735007933 * c3;
+		vec3 ly = 0.325735007933 * c1;
+		vec3 lz = 0.325735007933 * c2;
+		vec3 qxy = 0.27313710765 * c4;
+		vec3 qyz = 0.27313710765 * c5;
+		vec3 qxz = 0.27313710765 * c7;
+		lane_coefficients[0] = vec4(ex, qxy.x);
+		lane_coefficients[1] = vec4(lx, qxy.y);
+		lane_coefficients[2] = vec4(ey, qxy.z);
+		lane_coefficients[3] = vec4(ly, qyz.x);
+		lane_coefficients[4] = vec4(ez, qyz.y);
+		lane_coefficients[5] = vec4(lz, qyz.z);
+		lane_coefficients[6] = vec4(qxz, 0.0);
+		for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+			if (!field_finite_vec4(lane_coefficients[k])) {
+				field_valid = false;
+				coverage = 0.0;
+				support = 0u;
+			}
+		}
+	}
+	if (!field_valid) {
+		for (int k = 0; k < FIELD_COLUMN_COUNT; k++) { lane_coefficients[k] = vec4(0.0); }
+	}
+	for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+		vec4 value = lane_coefficients[k] * coverage;
+		// Tensor coefficients use the same codec scale as the SH fields did.
+		value *= clipmap.codec.y;
+		if (!field_finite_vec4(value)) {
+			field_valid = false;
+			coverage = 0.0;
+			support = 0u;
+		}
+#ifdef MAGIC_GI_CLV_BAKED_SH_RGBA16F
+		if (any(greaterThan(abs(value), vec4(60000.0)))) {
+			field_valid = false;
+			coverage = 0.0;
+			support = 0u;
+		}
+#endif
+		lane_coefficients[k] = value;
+	}
+	// The final lane remains binary data readiness, unscaled and unpremultiplied.
+	lane_coefficients[6].w = coverage;
+	if (!field_valid) {
+		for (int k = 0; k < FIELD_COLUMN_COUNT; k++) { lane_coefficients[k] = vec4(0.0); }
+	}
+	for (int k = 0; k < FIELD_COLUMN_COUNT; k++) {
+		field_store_lane(slot, level, k, lane_coefficients[k]);
+	}
+	imageStore(field_tags, tag_slot, ivec4(logical_cell, config.geometry_epoch));
+	imageStore(field_support, tag_slot, uvec4(support, 0u, 0u, 0u));
+}
+
+#endif

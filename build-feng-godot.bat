@@ -31,17 +31,21 @@ if not exist "%REPO_ROOT%\SConstruct" (
 echo [INFO] Repository: %REPO_ROOT%
 echo [INFO] Parallel jobs: %JOBS%
 
+rem Pick up tools installed after this terminal (or Codex) was started.
+for /f "delims=" %%I in ('powershell.exe -NoProfile -Command "[Environment]::ExpandEnvironmentVariables([Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User'))"') do set "PATH=%%I;%PATH%"
+
 call :find_python || exit /b 1
 call :find_scons || exit /b 1
 call :setup_msvc || exit /b 1
+call :find_cmake || exit /b 1
 call :prepare_dependencies || exit /b 1
 
 echo.
 echo [1/4] Building Windows x86_64 editor with D3D12 and AccessKit...
 if defined AGILITY_ARG (
-    call scons platform=windows target=editor arch=x86_64 dev_build=no d3d12=yes accesskit=yes -j%JOBS% "%MESA_ARG%" "%ACCESSKIT_ARG%" "%AGILITY_ARG%"
+    call %PYTHON_CMD% -m SCons platform=windows target=editor arch=x86_64 dev_build=no d3d12=yes accesskit=yes -j%JOBS% "%MESA_ARG%" "%ACCESSKIT_ARG%" "%AGILITY_ARG%"
 ) else (
-    call scons platform=windows target=editor arch=x86_64 dev_build=no d3d12=yes accesskit=yes -j%JOBS% "%MESA_ARG%" "%ACCESSKIT_ARG%"
+    call %PYTHON_CMD% -m SCons platform=windows target=editor arch=x86_64 dev_build=no d3d12=yes accesskit=yes -j%JOBS% "%MESA_ARG%" "%ACCESSKIT_ARG%"
 )
 if errorlevel 1 exit /b 1
 if not exist "%REPO_ROOT%\bin\godot.windows.editor.x86_64.exe" (
@@ -51,7 +55,7 @@ if not exist "%REPO_ROOT%\bin\godot.windows.editor.x86_64.exe" (
 
 echo.
 echo [2/4] Building Terrain3D native debug addon...
-call scons -C "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\native" platform=windows target=template_debug arch=x86_64 -j%JOBS%
+call %PYTHON_CMD% -m SCons -C "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\native" platform=windows target=template_debug arch=x86_64 -j%JOBS%
 if errorlevel 1 exit /b 1
 if not exist "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\bin\libfeng-idweight-terrain.windows.debug.x86_64.dll" (
     echo [ERROR] Terrain3D DLL is missing after SCons completed.
@@ -60,7 +64,8 @@ if not exist "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\bin\libfeng-idw
 
 echo.
 echo [3/4] Building RenderDoc capture native debug addon...
-call scons -C "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\native" platform=windows target=template_debug arch=x86_64 -j%JOBS%
+rem Terrain3D already built the same shared godot-cpp debug library.
+call %PYTHON_CMD% -m SCons -C "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\native" platform=windows target=template_debug arch=x86_64 build_library=no -j%JOBS%
 if errorlevel 1 exit /b 1
 if not exist "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\bin\libfeng-renderdoc-capture.windows.debug.x86_64.dll" (
     echo [ERROR] RenderDoc DLL is missing after SCons completed.
@@ -69,24 +74,23 @@ if not exist "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\bin\libfeng-re
 
 echo.
 echo [4/4] Building NRD native addon...
-where cmake >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] CMake 3.30 or newer is required for NRD.
-    exit /b 1
-)
 set "GODOT_CPP=%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\native\godot-cpp"
 set "NRD_NATIVE=%REPO_ROOT%\misc\feng-addons\feng-raytracing\native"
-call scons -C "%GODOT_CPP%" platform=windows target=template_release arch=x86_64 -j%JOBS%
+call %PYTHON_CMD% -m SCons -C "%GODOT_CPP%" platform=windows target=template_release arch=x86_64 -j%JOBS%
 if errorlevel 1 exit /b 1
 cmake -S "%NRD_NATIVE%" -B "%NRD_NATIVE%\_build" "-DGODOT_CPP_ROOT=%GODOT_CPP%" "-DGODOT_CPP_LIBRARY=%GODOT_CPP%\bin\libgodot-cpp.windows.template_release.x86_64.lib"
 if errorlevel 1 exit /b 1
 cmake --build "%NRD_NATIVE%\_build" --config Release --parallel %JOBS%
 if errorlevel 1 exit /b 1
-if not exist "%NRD_NATIVE%\..\bin\feng_nrd.dll" exit /b 1
+if not exist "%NRD_NATIVE%\..\bin\feng_nrd.dll" (
+    echo [ERROR] NRD DLL is missing after CMake completed.
+    exit /b 1
+)
 
 echo.
 echo [DONE] Editor: %REPO_ROOT%\bin\godot.windows.editor.x86_64.exe
 echo [DONE] Native debug DLLs: misc\feng-addons\feng-idweight-terrain\bin and misc\feng-addons\feng-renderdoc-capture\bin
+echo [DONE] NRD: %NRD_NATIVE%\..\bin\feng_nrd.dll
 echo [INFO] GDScript addons use their source files directly. Restart open editors to reload rebuilt DLLs.
 exit /b 0
 
@@ -109,16 +113,13 @@ echo [ERROR] Python 3 is required. Install it and run this script again.
 exit /b 1
 
 :find_scons
-where scons >nul 2>nul
+call %PYTHON_CMD% -c "import SCons; assert tuple(int(x) for x in SCons.__version__.split('.')[:3]) >= (4, 10, 1)" >nul 2>nul
 if not errorlevel 1 exit /b 0
-echo [SETUP] Installing SCons for the current Python user...
-call %PYTHON_CMD% -m pip install --user scons
+echo [SETUP] Installing SCons 4.10.1 or newer for the selected Python...
+call %PYTHON_CMD% -m pip install --user --upgrade "scons>=4.10.1,<5"
 if errorlevel 1 exit /b 1
-for /f "delims=" %%I in ('%PYTHON_CMD% -m site --user-base') do set "PATH=%%I\Scripts;%PATH%"
-where scons >nul 2>nul
-if not errorlevel 1 exit /b 0
-echo [ERROR] SCons was installed but scons.exe is not on PATH.
-exit /b 1
+call %PYTHON_CMD% -m SCons --version
+exit /b %ERRORLEVEL%
 
 :setup_msvc
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -129,6 +130,14 @@ if defined VS_INSTALL if exist "%VS_INSTALL%\Common7\Tools\VsDevCmd.bat" (
     if not errorlevel 1 exit /b 0
 )
 echo [ERROR] MSVC C++ Build Tools are unavailable. Install the Visual Studio Desktop development with C++ workload.
+exit /b 1
+
+:find_cmake
+where cmake >nul 2>nul
+if errorlevel 1 if exist "%VS_INSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" set "PATH=%VS_INSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%PATH%"
+call %PYTHON_CMD% -c "import re, subprocess; version = subprocess.check_output(['cmake', '--version'], text=True); print(version.splitlines()[0]); assert tuple(map(int, re.search(r'(\d+)\.(\d+)\.(\d+)', version).groups())) >= (3, 30, 0)" 2>nul
+if not errorlevel 1 exit /b 0
+echo [ERROR] CMake 3.30 or newer is required for NRD. Install the Visual Studio C++ CMake tools component or add CMake to PATH.
 exit /b 1
 
 :prepare_dependencies

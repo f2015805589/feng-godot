@@ -1,0 +1,13 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bkxqq04hn645a"
+path="res://.godot/imported/magic_gi_prt_queue_finalize.glsl-d7dcf166186314df4d8fe879a1737044.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_prt_queue_finalize.glsl"
+dest_files=["res://.godot/imported/magic_gi_prt_queue_finalize.glsl-d7dcf166186314df4d8fe879a1737044.res"]
+
+[params]

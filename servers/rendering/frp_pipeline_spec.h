@@ -136,7 +136,7 @@ struct NativePass {
 // after Bloom and before Post Process, which is what lets its shader and its
 // parameters be replaced without an engine change.
 inline constexpr NativePass NATIVE_PASSES[] = {
-	{ 0, "Shadow Precompute", { OP_SHADOW_PRECOMPUTE }, 1, false },
+	{ 0, "Shadow Pass", { OP_SHADOW_PRECOMPUTE }, 1, false },
 	{ 1, "VT Pass", { OP_VIRTUAL_TEXTURE }, 1, false },
 	{ 2, "GBuffer", { OP_GBUFFER, OP_MOTION_VECTORS }, 2, false },
 	{ 3, "Lighting", { OP_LIGHTING_PREPARE, OP_PRE_LIGHTING_STAGE, OP_DEFERRED_LIGHTING, OP_SUBSURFACE_AND_SPECULAR, OP_OPAQUE_RESOLVE }, 5, false },

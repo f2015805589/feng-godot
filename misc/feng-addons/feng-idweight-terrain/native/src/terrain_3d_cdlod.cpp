@@ -3,6 +3,7 @@
 #include "terrain_3d.h"
 #include <godot_cpp/classes/world3d.hpp>
 #include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/classes/class_db_singleton.hpp>
 #include <functional>
 #include <cstring>
 
@@ -18,6 +19,11 @@ Terrain3DCDLOD::~Terrain3DCDLOD() {
 
 void Terrain3DCDLOD::initialize(Terrain3D *p_terrain, RID p_material) {
 	_terrain = p_terrain;
+	// Resolve the extended engine capability at runtime so stock Godot can
+	// conservatively retain geometry instead of submitting an unknown enum.
+	if (ClassDBSingleton::get_singleton()->class_has_integer_constant("RenderingServer", "INSTANCE_FLAG_REFLECTION_CAPTURE_ONLY")) {
+		_capture_only_flag = int(ClassDBSingleton::get_singleton()->class_get_integer_constant("RenderingServer", "INSTANCE_FLAG_REFLECTION_CAPTURE_ONLY"));
+	}
 	_adaptive = _terrain->is_cdlod_enabled();
 	_grid = _adaptive ? _terrain->get_cdlod_patch_size() : _terrain->get_region_size();
 	PackedVector3Array vertices, normals;
@@ -243,10 +249,10 @@ void Terrain3DCDLOD::_snap_impl() {
 			const Vector3 extent = patch.bounds.size * .5f;
 			const Vector3 center = patch.bounds.position + extent;
 			bool visible = true;
-			for (int i = 0; i < 6; ++i) {
+			for (int i = 0; i < 6 && _capture_only_flag >= 0; ++i) {
 				if (planes[i].distance_to(center) > absolute_normals[i].dot(extent)) { visible = false; break; }
 			}
-			const uint8_t classification = visible ? 0 : (shadows ? 1 : 2);
+			const uint8_t classification = visible ? 0 : 1;
 			visibility_changed |= _visibility[index] != classification;
 			_visibility[index] = classification;
 		}
@@ -271,7 +277,8 @@ void Terrain3DCDLOD::_snap_impl() {
 		for (size_t index = 0; index < _patches.size(); ++index) {
 			const Patch &patch = _patches[index];
 			const bool visible = _visibility[index] == 0;
-			if (!visible && !shadows) { continue; }
+			// Offscreen ground must still occlude the sky in capture cameras,
+			// including when the terrain's shadow casting is disabled.
 			const int list = visible ? 0 : 1;
 			lists[list].insert(lists[list].end(), patch.transform.begin(), patch.transform.end());
 			bounds[list] = has_bounds[list] ? bounds[list].merge(patch.bounds) : patch.bounds;
@@ -308,9 +315,12 @@ void Terrain3DCDLOD::update() {
 		std::vector<RID> instances = _batches[i].region_instances;
 		if (_adaptive) { instances.push_back(_batches[i].instance); }
 		for (const RID instance : instances) {
-			RS->instance_set_visible(instance, _terrain->is_visible_in_tree() && (i == 0 || _terrain->get_cast_shadows() != RenderingServer::SHADOW_CASTING_SETTING_OFF));
+			RS->instance_set_visible(instance, _terrain->is_visible_in_tree());
 			RS->instance_set_layer_mask(instance, _terrain->get_render_layers());
-			RS->instance_geometry_set_cast_shadows_setting(instance, i == 0 ? _terrain->get_cast_shadows() : RenderingServer::SHADOW_CASTING_SETTING_SHADOWS_ONLY);
+			RS->instance_geometry_set_cast_shadows_setting(instance, _terrain->get_cast_shadows());
+			if (_capture_only_flag >= 0) {
+				RS->instance_geometry_set_flag(instance, static_cast<RenderingServer::InstanceFlags>(_capture_only_flag), i == 1);
+			}
 			RS->instance_geometry_set_flag(instance, RenderingServer::INSTANCE_FLAG_USE_BAKED_LIGHT, _terrain->get_gi_mode() == GeometryInstance3D::GI_MODE_STATIC);
 			RS->instance_geometry_set_flag(instance, RenderingServer::INSTANCE_FLAG_USE_DYNAMIC_GI, _terrain->get_gi_mode() == GeometryInstance3D::GI_MODE_DYNAMIC);
 		}

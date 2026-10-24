@@ -12,6 +12,26 @@ if "RD_GLSL" in env["BUILDERS"]:
 
     # make sure we recompile shaders if include files change
     env.Depends([f + ".gen.h" for f in glsl_files], gl_include_files + ["#glsl_builders.py"])
+    # This CLV include is .glslinc (not matched by the shared *_inc.glsl glob).
+    # Keep its dependency local to the deferred lighting shader that includes it.
+    env.Depends(["frp_lighting.glsl.gen.h"], [
+        "frp_magic_gi_screen_cache.glslinc",
+        "frp_magic_gi_dynamic_screen_cache.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_sample.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh9_tensor.glslinc",
+        "frp_magic_gi_clv.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_approx_contract.glslinc",
+        "frp_magic_gi_general.glslinc",
+        "frp_magic_gi_baked_sh.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_baked_sh_layout.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_layout.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_visibility.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_probe_visibility.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_field_layout.glslinc",
+        "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_sample.glslinc",
+    ])
 
     # compile shaders
     for glsl_file in glsl_files:

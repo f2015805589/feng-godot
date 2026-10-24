@@ -53,6 +53,21 @@ LightStorage::LightStorage() {
 
 	directional_shadow.size = GLOBAL_GET("rendering/lights_and_shadows/directional_shadow/size");
 	directional_shadow.use_16_bits = GLOBAL_GET("rendering/lights_and_shadows/directional_shadow/16_bits");
+	directional_shadow.frp_per_layer = OS::get_singleton()->get_current_rendering_method() == "frp";
+	if (directional_shadow.frp_per_layer) {
+		const int requested_layer_size = (int)GLOBAL_GET("rendering/frp/shadows/directional_shadow/cascade_size");
+		const int clamped_layer_size = CLAMP(requested_layer_size, 256, 8192);
+		if (clamped_layer_size != requested_layer_size) {
+			WARN_PRINT_ONCE("FRP directional shadow cascade_size " + itos(requested_layer_size) + " is outside the supported range 256..8192; clamping to " + itos(clamped_layer_size) + " before rounding up to a power of two.");
+		}
+		directional_shadow.frp_layer_size = Math::nearest_power_of_2_templated(clamped_layer_size);
+		frp_shadow_default_resolution = directional_shadow.frp_layer_size;
+		directional_shadow.width = 0;
+		directional_shadow.height = 0;
+	} else {
+		directional_shadow.width = directional_shadow.size;
+		directional_shadow.height = directional_shadow.size;
+	}
 
 	using_lightmap_array = true; // high end
 	if (using_lightmap_array) {
@@ -392,6 +407,40 @@ void LightStorage::light_directional_set_shadow_mode(RID p_light, RSE::LightDire
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
 }
 
+void LightStorage::light_directional_set_shadow_object_shadow_enabled(RID p_light, bool p_enabled) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+	if (light->directional_object_shadow_enabled == p_enabled) {
+		return;
+	}
+	light->directional_object_shadow_enabled = p_enabled;
+	light->version++;
+	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
+}
+
+bool LightStorage::light_directional_get_shadow_object_shadow_enabled(RID p_light) const {
+	const Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL_V(light, false);
+	return frp_shadow_settings.enabled ? frp_shadow_settings.reserve_object_shadow_slot : light->directional_object_shadow_enabled;
+}
+
+void LightStorage::light_directional_set_shadow_object_shadow_instances(RID p_light, const Vector<RID> &p_instances) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+	if (light->directional_object_shadow_instances == p_instances) {
+		return;
+	}
+	light->directional_object_shadow_instances = p_instances;
+	light->version++;
+	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
+}
+
+Vector<RID> LightStorage::light_directional_get_shadow_object_shadow_instances(RID p_light) const {
+	const Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL_V(light, Vector<RID>());
+	return light->directional_object_shadow_instances;
+}
+
 void LightStorage::light_directional_set_blend_splits(RID p_light, bool p_enable) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
@@ -405,7 +454,7 @@ bool LightStorage::light_directional_get_blend_splits(RID p_light) const {
 	const Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL_V(light, false);
 
-	return light->directional_blend_splits;
+	return frp_shadow_settings.enabled ? frp_shadow_settings.blend_cascades : light->directional_blend_splits;
 }
 
 void LightStorage::light_directional_set_sky_mode(RID p_light, RSE::LightDirectionalSkyMode p_mode) {
@@ -426,7 +475,63 @@ RSE::LightDirectionalShadowMode LightStorage::light_directional_get_shadow_mode(
 	const Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL_V(light, RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL);
 
-	return light->directional_shadow_mode;
+	return frp_shadow_settings.enabled ? frp_shadow_settings.get_shadow_mode() : light->directional_shadow_mode;
+}
+
+void LightStorage::_set_frp_shadow_resolution(int p_resolution) {
+	if (directional_shadow.frp_layer_size == p_resolution) {
+		return;
+	}
+	directional_shadow.frp_layer_size = p_resolution;
+	// The next set_directional_shadow_lights() computes the full atlas dimensions
+	// and replaces its allocation if necessary. Projection setup needs the new
+	// per-slot texel size first, even if a previous view's allocation failed.
+	directional_shadow.allocation_supported = true;
+	directional_shadow.resource_failed = false;
+	directional_shadow.allocation_retry_frames = 0;
+	directional_shadow.allocation_error = String();
+}
+
+void LightStorage::begin_frp_shadow_view(const FRPShadowSettings &p_settings) {
+	if (!directional_shadow.frp_per_layer) {
+		return;
+	}
+	RendererSceneRenderRD *renderer = RendererSceneRenderRD::get_singleton();
+	FRPShadowViewState previous;
+	previous.settings = frp_shadow_settings;
+	previous.cascade_resolution = directional_shadow.frp_layer_size;
+	previous.filter_quality = renderer->directional_shadow_quality_get();
+	frp_shadow_view_stack.push_back(previous);
+	frp_shadow_settings = p_settings;
+	// A nested view with no authored override uses the original renderer defaults,
+	// never the outer camera's override (e.g. a reflection capture).
+	const FRPShadowViewState &defaults = frp_shadow_view_stack[0];
+	_set_frp_shadow_resolution(p_settings.enabled ? p_settings.cascade_resolution : frp_shadow_default_resolution);
+	const RSE::ShadowQuality quality = p_settings.enabled ? p_settings.get_filter_quality() : defaults.filter_quality;
+	if (renderer->directional_shadow_quality_get() != quality) {
+		renderer->directional_soft_shadow_filter_set_quality_for_view(quality);
+	}
+}
+
+void LightStorage::end_frp_shadow_view() {
+	if (!directional_shadow.frp_per_layer) {
+		return;
+	}
+	ERR_FAIL_COND(frp_shadow_view_stack.is_empty());
+	const FRPShadowViewState previous = frp_shadow_view_stack[frp_shadow_view_stack.size() - 1];
+	frp_shadow_view_stack.resize(frp_shadow_view_stack.size() - 1);
+	frp_shadow_settings = previous.settings;
+	if (!frp_shadow_view_stack.is_empty()) {
+		_set_frp_shadow_resolution(previous.cascade_resolution);
+	}
+	// Retain the last allocation's size outside a view, just like its width and
+	// height. Each new view selects its own size before culling. Reverting the
+	// allocation metadata here would reset failed-allocation retry state every
+	// frame for a non-default resolution.
+	RendererSceneRenderRD *renderer = RendererSceneRenderRD::get_singleton();
+	if (renderer->directional_shadow_quality_get() != previous.filter_quality) {
+		renderer->directional_soft_shadow_filter_set_quality_for_view(previous.filter_quality);
+	}
 }
 
 void LightStorage::light_area_set_size(RID p_light, const Vector2 &p_size) {
@@ -817,18 +922,21 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				float size = light->param[RSE::LIGHT_PARAM_SIZE];
 
 				light_data.size = 1.0 - Math::cos(Math::deg_to_rad(size)); //angle to cosine offset
+				auto shadow_param = [&](RSE::LightParam p_param) {
+					return frp_shadow_settings.get_light_param(p_param, light->param[p_param]);
+				};
 
-				light_data.shadow_opacity = (p_using_shadows && light->shadow)
-						? light->param[RSE::LIGHT_PARAM_SHADOW_OPACITY]
+				light_data.shadow_opacity = (p_using_shadows && light->shadow && (!directional_shadow.frp_per_layer || directional_shadow.allocation_supported))
+						? shadow_param(RSE::LIGHT_PARAM_SHADOW_OPACITY)
 						: 0.0;
 
-				float angular_diameter = light->param[RSE::LIGHT_PARAM_SIZE];
+				float angular_diameter = frp_shadow_settings.enabled ? frp_shadow_settings.get_angular_diameter() : light->param[RSE::LIGHT_PARAM_SIZE];
 				if (angular_diameter > 0.0) {
 					// I know tan(0) is 0, but let's not risk it with numerical precision.
 					// technically this will keep expanding until reaching the sun, but all we care
 					// is expand until we reach the radius of the near plane (there can't be more occluders than that)
 					angular_diameter = Math::tan(Math::deg_to_rad(angular_diameter));
-					if (light->shadow && light->param[RSE::LIGHT_PARAM_SHADOW_BLUR] > 0.0) {
+					if (light->shadow && shadow_param(RSE::LIGHT_PARAM_SHADOW_BLUR) > 0.0) {
 						// Only enable PCSS-like soft shadows if blurring is enabled.
 						// Otherwise, performance would decrease with no visual difference.
 						r_directional_light_soft_shadows = true;
@@ -840,17 +948,18 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				light_data.bake_mode = light->bake_mode;
 
 				if (light_data.shadow_opacity > 0.001) {
-					RSE::LightDirectionalShadowMode smode = light->directional_shadow_mode;
+					RSE::LightDirectionalShadowMode smode = frp_shadow_settings.enabled ? frp_shadow_settings.get_shadow_mode() : light->directional_shadow_mode;
 
-					light_data.soft_shadow_scale = light->param[RSE::LIGHT_PARAM_SHADOW_BLUR];
+					light_data.soft_shadow_scale = shadow_param(RSE::LIGHT_PARAM_SHADOW_BLUR);
 					light_data.softshadow_angle = angular_diameter;
 
 					if (angular_diameter <= 0.0) {
 						light_data.soft_shadow_scale *= RendererSceneRenderRD::get_singleton()->directional_shadow_quality_radius_get(); // Only use quality radius for PCF
 					}
 
-					int limit = smode == RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL ? 0 : (smode == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_2_SPLITS ? 1 : 3);
-					light_data.blend_splits = (smode != RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL) && light->directional_blend_splits;
+					uint32_t cascade_count = light_instance->directional_shadow_cascade_count;
+					int limit = MAX((int)cascade_count - 1, 0);
+					light_data.blend_splits = (smode != RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL) && (frp_shadow_settings.enabled ? frp_shadow_settings.blend_cascades : light->directional_blend_splits);
 					for (int j = 0; j < 4; j++) {
 						Rect2 atlas_rect = light_instance->shadow_transform[j].atlas_rect;
 						Projection correction;
@@ -867,10 +976,12 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 
 						Projection shadow_mtx = rectm * bias * matrix * modelview;
 						light_data.shadow_split_offsets[j] = split;
-						float bias_scale = light_instance->shadow_transform[j].bias_scale * light_data.soft_shadow_scale;
-						light_data.shadow_bias[j] = light->param[RSE::LIGHT_PARAM_SHADOW_BIAS] / 100.0 * bias_scale;
-						light_data.shadow_normal_bias[j] = light->param[RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS] * light_instance->shadow_transform[j].shadow_texel_size;
-						light_data.shadow_transmittance_bias[j] = light->param[RSE::LIGHT_PARAM_TRANSMITTANCE_BIAS] / 100.0 * bias_scale;
+						// Hard filtering disables blur, not the authored depth bias.
+						const float blur_bias_scale = frp_shadow_settings.enabled && light_data.soft_shadow_scale == 0.0f ? 1.0f : light_data.soft_shadow_scale;
+						float bias_scale = light_instance->shadow_transform[j].bias_scale * blur_bias_scale;
+						light_data.shadow_bias[j] = shadow_param(RSE::LIGHT_PARAM_SHADOW_BIAS) / 100.0 * bias_scale;
+						light_data.shadow_normal_bias[j] = shadow_param(RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS) * light_instance->shadow_transform[j].shadow_texel_size;
+						light_data.shadow_transmittance_bias[j] = shadow_param(RSE::LIGHT_PARAM_TRANSMITTANCE_BIAS) / 100.0 * bias_scale;
 						light_data.shadow_z_range[j] = light_instance->shadow_transform[j].farplane;
 						light_data.shadow_range_begin[j] = light_instance->shadow_transform[j].range_begin;
 						RendererRD::MaterialStorage::store_camera(shadow_mtx, light_data.shadow_matrices[j]);
@@ -897,7 +1008,73 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 						}
 					}
 
-					float fade_start = light->param[RSE::LIGHT_PARAM_SHADOW_FADE_START];
+					// Forward Mobile's shared directional shader still expects a four-entry
+					// PSSM payload. For three (or fewer) real cascades, alias the unused
+					// fourth entry to the last active CSM. Never do this for a reserved
+					// object map, whose final slot has its own receiver/caster semantics.
+					if (!light_instance->directional_object_shadow_reserved && cascade_count < 4) {
+						const uint32_t last_cascade = MAX(cascade_count, 1U) - 1U;
+						for (int element = 0; element < 16; element++) {
+							light_data.shadow_matrices[3][element] = light_data.shadow_matrices[last_cascade][element];
+						}
+						light_data.shadow_bias[3] = light_data.shadow_bias[last_cascade];
+						light_data.shadow_normal_bias[3] = light_data.shadow_normal_bias[last_cascade];
+						light_data.shadow_transmittance_bias[3] = light_data.shadow_transmittance_bias[last_cascade];
+						light_data.shadow_z_range[3] = light_data.shadow_z_range[last_cascade];
+						light_data.shadow_range_begin[3] = light_data.shadow_range_begin[last_cascade];
+						const float *last_uv_scale = last_cascade == 0 ? light_data.uv_scale1 : last_cascade == 1 ? light_data.uv_scale2 : light_data.uv_scale3;
+						light_data.uv_scale4[0] = last_uv_scale[0];
+						light_data.uv_scale4[1] = last_uv_scale[1];
+					}
+
+					if (light_instance->directional_object_shadow_reserved && cascade_count < 4) {
+						const uint32_t object_map_index = cascade_count;
+						for (int element = 0; element < 16; element++) {
+							light_data.shadow_matrices[3][element] = light_data.shadow_matrices[object_map_index][element];
+						}
+						light_data.shadow_bias[3] = light_data.shadow_bias[object_map_index];
+						light_data.shadow_normal_bias[3] = light_data.shadow_normal_bias[object_map_index];
+						light_data.shadow_transmittance_bias[3] = light_data.shadow_transmittance_bias[object_map_index];
+						light_data.shadow_z_range[3] = light_data.shadow_z_range[object_map_index];
+						light_data.shadow_range_begin[3] = light_data.shadow_range_begin[object_map_index];
+						const float *object_uv_scale = object_map_index == 1 ? light_data.uv_scale2 : object_map_index == 2 ? light_data.uv_scale3 : light_data.uv_scale4;
+						light_data.uv_scale4[0] = object_uv_scale[0];
+						light_data.uv_scale4[1] = object_uv_scale[1];
+					}
+
+					// Keep the directional light ABI at 464 bytes. The high bit in each
+					// Keep the directional light ABI at 464 bytes. FRP stores a global
+					// linear slot index and per-layer size; legacy renderers retain the
+					// old rect encoding and atlas subdivision.
+					const uint32_t cascade_count_code = CLAMP(cascade_count, 1U, 4U) - 1U;
+					const bool object_shadow_active = light_instance->directional_object_shadow_active;
+					const bool object_shadow_reserved = light_instance->directional_object_shadow_reserved;
+					if (directional_shadow.frp_per_layer) {
+						uint32_t layer_log2 = 0;
+						while ((1U << layer_log2) < (uint32_t)directional_shadow.frp_layer_size && layer_log2 < 31) {
+							layer_log2++;
+						}
+						light_data.pad[0] = (light_instance->directional_shadow_base_slot & 0xFFFU) |
+							(((uint32_t)(MAX(directional_shadow.atlas_columns, 1) - 1) & 0x3FU) << 12) |
+							((cascade_count_code & 0x3U) << 18) |
+							(uint32_t(object_shadow_active) << 20) |
+							(uint32_t(object_shadow_reserved) << 21);
+						// pad[1] is the FRP layout tag: it stores only log2(slot size),
+						// while a valid legacy directional rect always has nonzero height
+						// in bits 16..30. This keeps the marker disjoint from every legacy
+						// x/y/width/height encoding, including large legacy rect_y values.
+						light_data.pad[1] = layer_log2 & 0xFU;
+					} else {
+						const Rect2 rect = light_instance->directional_rect;
+						const uint32_t rect_x = uint32_t(CLAMP((int)Math::round(rect.position.x), 0, 0x7FFF));
+						const uint32_t rect_y = uint32_t(CLAMP((int)Math::round(rect.position.y), 0, 0x7FFF));
+						const uint32_t rect_w = uint32_t(CLAMP((int)Math::round(rect.size.x), 0, 0x7FFF));
+						const uint32_t rect_h = uint32_t(CLAMP((int)Math::round(rect.size.y), 0, 0x7FFF));
+						light_data.pad[0] = rect_x | (cascade_count_code & 1U) << 15 | rect_y << 16 | ((cascade_count_code >> 1) & 1U) << 31;
+						light_data.pad[1] = rect_w | uint32_t(object_shadow_active) << 15 | rect_h << 16 | (uint32_t(object_shadow_reserved) << 31);
+					}
+
+					float fade_start = shadow_param(RSE::LIGHT_PARAM_SHADOW_FADE_START);
 					light_data.fade_from = -light_data.shadow_split_offsets[3] * MIN(fade_start, 0.999); //using 1.0 would break smoothstep
 					light_data.fade_to = -light_data.shadow_split_offsets[3];
 				}
@@ -3154,32 +3331,96 @@ uint32_t LightStorage::get_shadow_atlas_depth_usage_bits() {
 /* DIRECTIONAL SHADOW */
 
 void LightStorage::update_directional_shadow_atlas() {
-	if (directional_shadow.depth.is_null() && directional_shadow.size > 0) {
+	if (directional_shadow.depth.is_null() && directional_shadow.allocation_supported && directional_shadow.width > 0 && directional_shadow.height > 0) {
 		RD::TextureFormat tf;
 		tf.format = get_shadow_atlas_depth_format(directional_shadow.use_16_bits);
-		tf.width = directional_shadow.size;
-		tf.height = directional_shadow.size;
+		tf.width = directional_shadow.width;
+		tf.height = directional_shadow.height;
 		tf.usage_bits = get_shadow_atlas_depth_usage_bits();
 
 		directional_shadow.depth = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		if (directional_shadow.depth.is_null() || !RD::get_singleton()->texture_is_valid(directional_shadow.depth)) {
+			directional_shadow.depth = RID();
+			directional_shadow.fb = RID();
+			directional_shadow.allocation_supported = false;
+			directional_shadow.resource_failed = true;
+			directional_shadow.allocation_retry_frames = 120;
+			const int max_texture_size = RD::get_singleton()->limit_get(RD::LIMIT_MAX_TEXTURE_SIZE_2D);
+			const String error = "FRP directional shadow atlas allocation failed: texture_create rejected " + itos(directional_shadow.width) + "x" + itos(directional_shadow.height) + " for " + itos(directional_shadow.total_slots) + " slots at " + itos(directional_shadow.frp_layer_size) + "px per slot; device maximum is " + itos(max_texture_size) + "x" + itos(max_texture_size) + ". Directional shadows are disabled until the retry.";
+			if (directional_shadow.allocation_error != error) {
+				ERR_PRINT(error);
+			}
+			directional_shadow.allocation_error = error;
+			RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+			return;
+		}
 		Vector<RID> fb_tex;
 		fb_tex.push_back(directional_shadow.depth);
 		directional_shadow.fb = RD::get_singleton()->framebuffer_create(fb_tex);
+		if (directional_shadow.fb.is_null() || !RD::get_singleton()->framebuffer_is_valid(directional_shadow.fb)) {
+			RD::get_singleton()->free_rid(directional_shadow.depth);
+			directional_shadow.depth = RID();
+			directional_shadow.fb = RID();
+			directional_shadow.allocation_supported = false;
+			directional_shadow.resource_failed = true;
+			directional_shadow.allocation_retry_frames = 120;
+			const int max_texture_size = RD::get_singleton()->limit_get(RD::LIMIT_MAX_TEXTURE_SIZE_2D);
+			const String error = "FRP directional shadow atlas allocation failed: framebuffer_create rejected " + itos(directional_shadow.width) + "x" + itos(directional_shadow.height) + " for " + itos(directional_shadow.total_slots) + " slots at " + itos(directional_shadow.frp_layer_size) + "px per slot; device maximum is " + itos(max_texture_size) + "x" + itos(max_texture_size) + ". Directional shadows are disabled until the retry.";
+			if (directional_shadow.allocation_error != error) {
+				ERR_PRINT(error);
+			}
+			directional_shadow.allocation_error = error;
+			RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+		}
+		if (directional_shadow.fb.is_valid() && RD::get_singleton()->framebuffer_is_valid(directional_shadow.fb)) {
+			directional_shadow.resource_failed = false;
+			directional_shadow.allocation_retry_frames = 0;
+			directional_shadow.allocation_error = String();
+			RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+		}
 	}
 }
 void LightStorage::directional_shadow_atlas_set_size(int p_size, bool p_16_bits) {
 	p_size = Math::nearest_power_of_2_templated(p_size);
+	if (directional_shadow.frp_per_layer && p_size != 0) {
+		// This legacy API continues to size the whole atlas on other renderers.
+		// FRP derives its atlas from the per-layer project setting instead.
+		if (directional_shadow.use_16_bits != p_16_bits) {
+			directional_shadow.use_16_bits = p_16_bits;
+			if (directional_shadow.depth.is_valid()) {
+				if (directional_shadow.fb.is_valid()) {
+					RD::get_singleton()->free_rid(directional_shadow.fb);
+				}
+				RD::get_singleton()->free_rid(directional_shadow.depth);
+				directional_shadow.depth = RID();
+				directional_shadow.fb = RID();
+				RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+			}
+		}
+		return;
+	}
 
-	if (directional_shadow.size == p_size && directional_shadow.use_16_bits == p_16_bits) {
+	if (directional_shadow.size == p_size && directional_shadow.use_16_bits == p_16_bits && (!directional_shadow.frp_per_layer || (directional_shadow.width == p_size && directional_shadow.height == p_size))) {
 		return;
 	}
 
 	directional_shadow.size = p_size;
 	directional_shadow.use_16_bits = p_16_bits;
+	if (!directional_shadow.frp_per_layer) {
+		directional_shadow.width = p_size;
+		directional_shadow.height = p_size;
+	} else {
+		directional_shadow.width = 0;
+		directional_shadow.height = 0;
+	}
 
 	if (directional_shadow.depth.is_valid()) {
+		if (directional_shadow.fb.is_valid()) {
+			RD::get_singleton()->free_rid(directional_shadow.fb);
+		}
 		RD::get_singleton()->free_rid(directional_shadow.depth);
 		directional_shadow.depth = RID();
+		directional_shadow.fb = RID();
 		RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
 	}
 }
@@ -3187,6 +3428,165 @@ void LightStorage::directional_shadow_atlas_set_size(int p_size, bool p_16_bits)
 void LightStorage::set_directional_shadow_count(int p_count) {
 	directional_shadow.light_count = p_count;
 	directional_shadow.current_light = 0;
+}
+
+bool LightStorage::set_directional_shadow_lights(const Vector<RID> &p_light_instances) {
+	directional_shadow.light_count = p_light_instances.size();
+	directional_shadow.current_light = 0;
+	directional_shadow.light_instances = p_light_instances;
+
+	if (!directional_shadow.frp_per_layer) {
+		return true;
+	}
+
+	// Keep an idle atlas cached when a camera temporarily has no directional
+	// shadow lights (e.g. a reflection probe); active layouts below are exact.
+	if (p_light_instances.is_empty()) {
+		return true;
+	}
+
+	const int max_texture_size = RD::get_singleton()->limit_get(RD::LIMIT_MAX_TEXTURE_SIZE_2D);
+	const int max_axis_cells = max_texture_size / directional_shadow.frp_layer_size;
+	if (max_axis_cells < 1) {
+		const String error = "FRP directional shadow atlas allocation failed: requested " + itos(directional_shadow.frp_layer_size) + "x" + itos(directional_shadow.frp_layer_size) + " for 1 slot at " + itos(directional_shadow.frp_layer_size) + "px per slot; device maximum is " + itos(max_texture_size) + "x" + itos(max_texture_size) + ". Directional shadows are disabled.";
+		if (directional_shadow.allocation_error != error) {
+			ERR_PRINT(error);
+		}
+		directional_shadow.allocation_error = error;
+		directional_shadow.allocation_supported = false;
+		directional_shadow.width = 0;
+		directional_shadow.height = 0;
+		if (directional_shadow.depth.is_valid()) {
+			if (directional_shadow.fb.is_valid()) {
+				RD::get_singleton()->free_rid(directional_shadow.fb);
+			}
+			RD::get_singleton()->free_rid(directional_shadow.depth);
+			directional_shadow.depth = RID();
+			directional_shadow.fb = RID();
+			RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+		}
+		return false;
+	}
+	int required_slots = 0;
+	for (RID light_instance_rid : p_light_instances) {
+		LightInstance *light_instance = light_instance_owner.get_or_null(light_instance_rid);
+		ERR_FAIL_NULL_V(light_instance, false);
+		light_instance->directional_shadow_base_slot = required_slots;
+		const int light_slots = int(light_instance->directional_shadow_cascade_count) + (light_instance->directional_object_shadow_reserved ? 1 : 0);
+		required_slots += MAX(light_slots, 1);
+	}
+
+	// Find the smallest-area rectangular grid that fits all requested maps. When
+	// the device permits it, one through four slots use 1x1, 2x1, 3x1, and 2x2.
+	int columns = 0;
+	int rows = 0;
+	int best_area = INT_MAX;
+	for (int candidate_columns = 1; candidate_columns <= MIN(required_slots, max_axis_cells); candidate_columns++) {
+		const int candidate_rows = (required_slots + candidate_columns - 1) / candidate_columns;
+		if (candidate_rows > max_axis_cells) {
+			continue;
+		}
+		const int candidate_area = candidate_columns * candidate_rows;
+		const bool candidate_is_wider = candidate_columns >= candidate_rows;
+		const bool current_is_wider = columns >= rows;
+		if (candidate_area < best_area || (candidate_area == best_area && (Math::abs(candidate_columns - candidate_rows) < Math::abs(columns - rows) || (Math::abs(candidate_columns - candidate_rows) == Math::abs(columns - rows) && candidate_is_wider && !current_is_wider)))) {
+			columns = candidate_columns;
+			rows = candidate_rows;
+			best_area = candidate_area;
+		}
+	}
+	if (columns == 0 || rows == 0) {
+		const String error = "FRP directional shadow atlas allocation failed: requested " + itos(required_slots) + " slots at " + itos(directional_shadow.frp_layer_size) + "px per slot; device maximum is " + itos(max_texture_size) + "x" + itos(max_texture_size) + ". Directional shadows are disabled.";
+		if (directional_shadow.allocation_error != error) {
+			ERR_PRINT(error);
+		}
+		directional_shadow.allocation_error = error;
+		directional_shadow.allocation_supported = false;
+		directional_shadow.width = 0;
+		directional_shadow.height = 0;
+		if (directional_shadow.depth.is_valid()) {
+			if (directional_shadow.fb.is_valid()) {
+				RD::get_singleton()->free_rid(directional_shadow.fb);
+			}
+			RD::get_singleton()->free_rid(directional_shadow.depth);
+			directional_shadow.depth = RID();
+			directional_shadow.fb = RID();
+			RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+		}
+		return false;
+	}
+	const int required_width = columns * directional_shadow.frp_layer_size;
+	const int required_height = rows * directional_shadow.frp_layer_size;
+	directional_shadow.total_slots = required_slots;
+	directional_shadow.atlas_columns = columns;
+
+	if (max_axis_cells < 1 || required_width > max_texture_size || required_height > max_texture_size) {
+		const String error = "FRP directional shadow atlas allocation failed: requested " + itos(required_width) + "x" + itos(required_height) + " for " + itos(required_slots) + " slots at " + itos(directional_shadow.frp_layer_size) + "px per slot; device maximum is " + itos(max_texture_size) + "x" + itos(max_texture_size) + ". Directional shadows are disabled.";
+		if (directional_shadow.allocation_error != error) {
+			ERR_PRINT(error);
+		}
+		directional_shadow.allocation_error = error;
+		directional_shadow.allocation_supported = false;
+		directional_shadow.width = 0;
+		directional_shadow.height = 0;
+		if (directional_shadow.depth.is_valid()) {
+			if (directional_shadow.fb.is_valid()) {
+				RD::get_singleton()->free_rid(directional_shadow.fb);
+			}
+			RD::get_singleton()->free_rid(directional_shadow.depth);
+			directional_shadow.depth = RID();
+			directional_shadow.fb = RID();
+			RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+		}
+		return false;
+	}
+
+	const bool dimensions_changed = directional_shadow.width != required_width || directional_shadow.height != required_height;
+	if (dimensions_changed) {
+		directional_shadow.resource_failed = false;
+		directional_shadow.allocation_retry_frames = 0;
+		directional_shadow.allocation_error = String();
+	}
+	if (directional_shadow.resource_failed && !dimensions_changed) {
+		if (directional_shadow.allocation_retry_frames > 0) {
+			directional_shadow.allocation_retry_frames--;
+			directional_shadow.allocation_supported = false;
+			return false;
+		}
+		directional_shadow.resource_failed = false;
+	}
+	directional_shadow.allocation_supported = true;
+	directional_shadow.width = required_width;
+	directional_shadow.height = required_height;
+	if (dimensions_changed && directional_shadow.depth.is_valid()) {
+		if (directional_shadow.fb.is_valid()) {
+			RD::get_singleton()->free_rid(directional_shadow.fb);
+		}
+		RD::get_singleton()->free_rid(directional_shadow.depth);
+		directional_shadow.depth = RID();
+		directional_shadow.fb = RID();
+		RendererSceneRenderRD::get_singleton()->base_uniforms_changed();
+	}
+
+	String layout = "FRP directional shadow atlas: " + itos(required_width) + "x" + itos(required_height) + ", per-slot=" + itos(directional_shadow.frp_layer_size) + ", lights=" + itos(p_light_instances.size()) + ", slots=" + itos(required_slots) + ", format=" + (directional_shadow.use_16_bits ? "D16" : "D32") + ";";
+	for (RID light_instance_rid : p_light_instances) {
+		LightInstance *light_instance = light_instance_owner.get_or_null(light_instance_rid);
+		const int csm_count = light_instance->directional_shadow_cascade_count;
+		const int total_light_slots = csm_count + (light_instance->directional_object_shadow_reserved ? 1 : 0);
+		layout += " light=" + itos((int64_t)light_instance_rid.get_id()) + " csm=" + itos(csm_count) + " object_reserved=" + (light_instance->directional_object_shadow_reserved ? "true" : "false") + " object_active=" + (light_instance->directional_object_shadow_active ? "true" : "false") + " base_slot=" + itos(light_instance->directional_shadow_base_slot) + ";";
+		for (int pass = 0; pass < total_light_slots; pass++) {
+			const int slot = light_instance->directional_shadow_base_slot + pass;
+			const Rect2i rect((slot % columns) * directional_shadow.frp_layer_size, (slot / columns) * directional_shadow.frp_layer_size, directional_shadow.frp_layer_size, directional_shadow.frp_layer_size);
+			layout += " pass=" + itos(pass) + " rect=(" + itos(rect.position.x) + "," + itos(rect.position.y) + "," + itos(rect.size.x) + "," + itos(rect.size.y) + ");";
+		}
+	}
+	if (directional_shadow.layout_signature != layout) {
+		print_line(layout);
+		directional_shadow.layout_signature = layout;
+	}
+	// A rectangular packing grid may include one unused cell (three maps in a
+	// 2x2 grid); it is padding, not an allocated or sampled shadow slot.
+	return true;
 }
 
 static Rect2i _get_directional_shadow_rect(int p_size, int p_shadow_count, int p_shadow_index) {
@@ -3215,7 +3615,24 @@ Rect2i LightStorage::get_directional_shadow_rect() {
 	return _get_directional_shadow_rect(directional_shadow.size, directional_shadow.light_count, directional_shadow.current_light);
 }
 
+Rect2i LightStorage::get_directional_shadow_slot_rect(RID p_light_instance, int p_pass) const {
+	if (!directional_shadow.frp_per_layer || !directional_shadow.allocation_supported || directional_shadow.frp_layer_size <= 0 || directional_shadow.atlas_columns <= 0) {
+		return Rect2i();
+	}
+	const LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
+	ERR_FAIL_NULL_V(light_instance, Rect2i());
+	const uint32_t total_slots = light_instance->directional_shadow_cascade_count + (light_instance->directional_object_shadow_reserved ? 1U : 0U);
+	ERR_FAIL_INDEX_V(p_pass, (int)total_slots, Rect2i());
+	const uint32_t slot = light_instance->directional_shadow_base_slot + p_pass;
+	return Rect2i((slot % directional_shadow.atlas_columns) * directional_shadow.frp_layer_size, (slot / directional_shadow.atlas_columns) * directional_shadow.frp_layer_size, directional_shadow.frp_layer_size, directional_shadow.frp_layer_size);
+}
+
 int LightStorage::get_directional_light_shadow_size(RID p_light_instance) {
+	if (directional_shadow.frp_per_layer) {
+		// Projection/culling must remain finite while the allocation is unavailable;
+		// set_directional_shadow_lights() suppresses drawing after preparing views.
+		return directional_shadow.frp_layer_size;
+	}
 	ERR_FAIL_COND_V(directional_shadow.light_count == 0, 0);
 
 	Rect2i r = _get_directional_shadow_rect(directional_shadow.size, directional_shadow.light_count, 0);
@@ -3230,6 +3647,7 @@ int LightStorage::get_directional_light_shadow_size(RID p_light_instance) {
 			r.size.height /= 2;
 			break;
 		case RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS:
+		case RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS:
 			r.size /= 2;
 			break;
 	}

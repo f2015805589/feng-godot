@@ -21,10 +21,63 @@ bool visibility_finite_vec3(vec3 value) {
 	return !any(isnan(value)) && !any(isinf(value));
 }
 
+// Raw-SH receiver domains use the full same-facing hemisphere. Keep this in
+// the shared visibility include so legacy shaders that include it before the
+// CLV layout declarations still compile unchanged.
+const float CLV_CURVED_SH_SAME_FACING_DOT_MIN = 0.0;
+
 bool visibility_aabb_overlaps(vec3 first_lower, vec3 first_upper,
 		vec3 second_lower, vec3 second_upper) {
 	return all(greaterThanEqual(first_upper, second_lower))
 			&& all(lessThanEqual(first_lower, second_upper));
+}
+
+// Bound all receiver world positions that map to a fixed CLV parent under the
+// consumer's `floor((world + normal * 0.75 * step) / step - 0.5)` mapping.
+// A receiver normal in the cone around cone_axis can shift each coordinate by
+// at most 0.75 * step * max_abs_component(cone). The voxel interpolation cell
+// contributes the remaining half-cell extent. Producer and consumers share
+// this exact bound so the pre-certified domain is neither undersized nor based
+// on the old, overly broad isotropic 1.25-cell box.
+vec3 clv_receiver_domain_half_extent(vec3 cone_axis, float step_size,
+		float minimum_normal_dot) {
+	float axis_length_squared = dot(cone_axis, cone_axis);
+	if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)
+			|| !(axis_length_squared > 1e-12) || isnan(axis_length_squared)
+			|| isinf(axis_length_squared) || !(minimum_normal_dot > 0.0)
+			|| minimum_normal_dot > 1.0 || isnan(minimum_normal_dot)
+			|| isinf(minimum_normal_dot)) {
+		return vec3(0.0);
+	}
+	vec3 axis = abs(cone_axis * inversesqrt(axis_length_squared));
+	float cone_cos = minimum_normal_dot;
+	float cone_sin = sqrt(max(1.0 - cone_cos * cone_cos, 0.0));
+	vec3 max_component;
+	for (int component = 0; component < 3; component++) {
+		if (axis[component] >= cone_cos) {
+			max_component[component] = 1.0;
+		} else {
+			max_component[component] = axis[component] * cone_cos
+					+ sqrt(max(1.0 - axis[component] * axis[component], 0.0)) * cone_sin;
+		}
+	}
+	return vec3(0.5 * step_size) + 0.75 * step_size * max_component;
+}
+
+float clv_receiver_domain_margin(vec3 box_center, vec3 half_extent, float step_size) {
+	if (!visibility_finite_vec3(box_center) || !visibility_finite_vec3(half_extent)
+			|| any(lessThanEqual(half_extent, vec3(0.0)))
+			|| !(step_size > 0.0) || isnan(step_size) || isinf(step_size)) {
+		return 0.0;
+	}
+	float world_coordinate_bound = max(max(abs(box_center.x) + half_extent.x,
+			abs(box_center.y) + half_extent.y), abs(box_center.z) + half_extent.z);
+	float coordinate_scale = world_coordinate_bound + 2.0 * step_size;
+	const float FLOAT_RELATIVE_MARGIN = 1.9073486328125e-6;
+	// Include the tiny margin's own contribution to the world's coordinate scale
+	// so the producer AABB encloses every edge point the pixel consumer accepts.
+	return max(1e-5, coordinate_scale * FLOAT_RELATIVE_MARGIN
+			/ (1.0 - FLOAT_RELATIVE_MARGIN));
 }
 
 // Conservative CLV fast-path certificate. Every triangle whose AABB touches the
@@ -157,6 +210,85 @@ bool clv_surface_box_certificate_clear(vec3 box_center, float half_extent,
 			anchor, anchor_normal, anchor_patch, plane_tolerance, box_margin);
 }
 
+// Conservative parent-cube certificate for raw SH interpolation on a smooth
+// curved surface. Unlike the diffuse plane certificate above, this permits
+// curvature. Every triangle touching the complete interpolation domain must
+// still belong to the same connected patch and face the same hemisphere as the
+// base anchor. Any foreign/opposite-facing patch, malformed BVH range, or
+// traversal exhaustion rejects the domain so the consumer cannot blend across
+// a seam or the back side of a folded surface.
+bool clv_surface_patch_domain_certificate_clear(vec3 box_center, vec3 half_extent,
+		int domain_patch, vec3 reference_normal, float box_margin) {
+	if (domain_patch <= 0 || any(lessThanEqual(half_extent, vec3(0.0)))
+			|| !visibility_finite_vec3(box_center) || !visibility_finite_vec3(half_extent)
+			|| !visibility_finite_vec3(reference_normal) || !(box_margin >= 0.0)
+			|| isnan(box_margin) || isinf(box_margin)) {
+		return false;
+	}
+	float reference_length_squared = dot(reference_normal, reference_normal);
+	if (!(reference_length_squared > 1e-12) || isnan(reference_length_squared)
+			|| isinf(reference_length_squared)) { return false; }
+	vec3 normal = reference_normal * inversesqrt(reference_length_squared);
+	vec3 box_lower = box_center - vec3(half_extent + box_margin);
+	vec3 box_upper = box_center + vec3(half_extent + box_margin);
+	if (!visibility_finite_vec3(box_lower) || !visibility_finite_vec3(box_upper)) { return false; }
+	int node_value_count = visibility_bvh.nodes.length();
+	int triangle_value_count = visibility_geometry.triangles.length();
+	if (node_value_count <= 0 || (node_value_count % 2) != 0
+			|| triangle_value_count <= 0 || (triangle_value_count % 3) != 0) { return false; }
+	int node_count = node_value_count / 2;
+	int node = 0;
+	for (int visit = 0; visit < 256 && node < node_count; visit++) {
+		vec4 lower = visibility_bvh.nodes[node * 2];
+		vec4 upper = visibility_bvh.nodes[node * 2 + 1];
+		if (!visibility_finite_vec3(lower.xyz) || !visibility_finite_vec3(upper.xyz)
+				|| isnan(lower.w) || isinf(lower.w) || isnan(upper.w) || isinf(upper.w)
+				|| lower.w <= float(node) || lower.w > float(node_count)
+				|| floor(lower.w) != lower.w || any(greaterThan(lower.xyz, upper.xyz))) { return false; }
+		if (!visibility_aabb_overlaps(lower.xyz, upper.xyz, box_lower, box_upper)) {
+			node = int(lower.w);
+			continue;
+		}
+		if (upper.w < 0.0 || upper.w > 2147480000.0 || floor(upper.w) != upper.w) { return false; }
+		int leaf_range = int(upper.w);
+		if (leaf_range > 0) {
+			int first = leaf_range / 8 - 1;
+			int count = leaf_range % 8;
+			int triangle_count = triangle_value_count / 3;
+			if (first < 0 || count <= 0 || first + count > triangle_count) { return false; }
+			for (int leaf = 0; leaf < count; leaf++) {
+				int triangle = (first + leaf) * 3;
+				vec3 a = visibility_geometry.triangles[triangle].xyz;
+				vec3 edge1 = visibility_geometry.triangles[triangle + 1].xyz;
+				vec3 edge2 = visibility_geometry.triangles[triangle + 2].xyz;
+				vec3 b = a + edge1;
+				vec3 c = a + edge2;
+				if (!visibility_finite_vec3(a) || !visibility_finite_vec3(b)
+						|| !visibility_finite_vec3(c)) { return false; }
+				if (!visibility_aabb_overlaps(min(a, min(b, c)), max(a, max(b, c)),
+						box_lower, box_upper)) { continue; }
+				float patch_value = visibility_geometry.triangles[triangle + 2].w;
+				if (isnan(patch_value) || isinf(patch_value)
+						|| patch_value != float(domain_patch)) { return false; }
+				float determinant_epsilon = visibility_geometry.triangles[triangle + 1].w;
+				if (isnan(determinant_epsilon) || isinf(determinant_epsilon)
+						|| determinant_epsilon < 0.0) { return false; }
+				vec3 triangle_normal = cross(edge2, edge1);
+				float normal_length_squared = dot(triangle_normal, triangle_normal);
+				if (!visibility_finite_vec3(triangle_normal)
+						|| !(normal_length_squared > 1e-12)
+						|| isnan(normal_length_squared) || isinf(normal_length_squared)) { return false; }
+				triangle_normal *= inversesqrt(normal_length_squared);
+				if (dot(triangle_normal, normal) <= CLV_CURVED_SH_SAME_FACING_DOT_MIN) {
+					return false;
+				}
+			}
+		}
+		node++;
+	}
+	return node >= node_count;
+}
+
 // Validate a particular receiver-to-corner segment against the certificate's
 // finite box and anchor plane. The receiver triangle's geometric normal is used
 // instead of its potentially normal-mapped GBuffer normal.
@@ -276,7 +408,8 @@ vec3 nearest_surface(vec3 world, vec3 view_direction, float radius, int ignored_
 	return resolved;
 }
 
-bool segment_blocked(vec3 origin, vec3 target, int receiver_triangle, int receiver_patch) {
+bool segment_blocked_excluding_triangles(vec3 origin, vec3 target, int source_triangle,
+		int receiver_triangle, int receiver_patch) {
 	vec3 delta = target - origin;
 	float distance = length(delta);
 	if (distance <= 0.00002) {
@@ -300,7 +433,7 @@ bool segment_blocked(vec3 origin, vec3 target, int receiver_triangle, int receiv
 			int first = leaf_range / 8 - 1;
 			int count = leaf_range % 8;
 			for (int leaf = 0; leaf < count; leaf++) {
-				if (first + leaf == receiver_triangle) {
+				if (first + leaf == source_triangle || first + leaf == receiver_triangle) {
 					continue;
 				}
 				int triangle = (first + leaf) * 3;
@@ -335,5 +468,10 @@ bool segment_blocked(vec3 origin, vec3 target, int receiver_triangle, int receiv
 		node++;
 	}
 	return node < node_count;
+}
+
+bool segment_blocked(vec3 origin, vec3 target, int receiver_triangle, int receiver_patch) {
+	return segment_blocked_excluding_triangles(origin, target, -1,
+			receiver_triangle, receiver_patch);
 }
 

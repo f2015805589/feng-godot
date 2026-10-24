@@ -22,12 +22,16 @@ func initialize(data: Data, probe: int) -> void:
 	result.primary_sky_visibility.resize(9)
 	result.emitter_transport.resize(data.emitter_count() * 6)
 	result.visibility_moments.resize(Data.VISIBILITY_TEXELS_PER_PROBE * 2)
+	result.bake_exact_directional_secondary.resize(27)
+	result.bake_exact_directional_secondary.fill(0.0)
+	result.bake_exact_directional_secondary_valid = false
 	result.directional = Data.DirectionalData.new()
 	result.directional.allocate(1, data.emitter_count())
 
 func run(geometry: RefCounted, signature: int, probe: int,
 		coordinates: Array[PackedFloat64Array], minimum_coordinates: Array[PackedFloat64Array],
-		extra_coordinates: Array[PackedFloat64Array], visibility_rays: int) -> void:
+		extra_coordinates: Array[PackedFloat64Array], visibility_rays: int,
+		directional_sources: Array[Dictionary] = []) -> void:
 	var rng := RandomNumberGenerator.new()
 	var stable_id := int(result.stable_probe_ids[0]) if not result.stable_probe_ids.is_empty() else probe
 	rng.seed = int(hash(([Data.SAMPLER_REVISION, stable_id, "visibility-moments"]
@@ -57,7 +61,13 @@ func run(geometry: RefCounted, signature: int, probe: int,
 			for dimension in (result.bake_bounces + 1) * 3:
 				emitter_shifts[emitter * (result.bake_bounces + 1) * 3 + dimension] = emitter_rng.randf()
 	DirectionalBaker.bake_probe(result, geometry, 0, result.bake_samples, result.bake_bounces,
-		result.bake_distance, coordinates, shifts, emitter_shifts)
+		result.bake_distance, coordinates, shifts, emitter_shifts, directional_sources)
+	if not result.bake_exact_directional_secondary_valid \
+			or result.bake_exact_directional_secondary.size() != 27:
+		return
+	for value in result.bake_exact_directional_secondary:
+		if not is_finite(value):
+			return
 	valid = true
 
 func merge(destination: Data, probe: int) -> void:
@@ -69,6 +79,11 @@ func merge(destination: Data, probe: int) -> void:
 		destination.visibility_moments[probe * result.visibility_moments.size() + k] = result.visibility_moments[k]
 	for k in 243:
 		destination.directional.transfer[probe * 243 + k] = result.directional.transfer[k]
+	for k in 27:
+		destination.bake_exact_directional_secondary[probe * 27 + k] = \
+				result.bake_exact_directional_secondary[k]
+	if destination._bake_exact_directional_probe_complete.size() == destination.probe_count():
+		destination._bake_exact_directional_probe_complete[probe] = 1
 	for k in 81:
 		destination.directional.sky[probe * 81 + k] = result.directional.sky[k]
 	for emitter in result.emitter_count():

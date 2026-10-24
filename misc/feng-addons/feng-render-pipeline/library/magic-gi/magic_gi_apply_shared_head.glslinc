@@ -1,0 +1,73 @@
+// CLV ABI 9: certified and geometry-guided sampled-volume interpolation.
+// The included CLV sampler owns wrap-mode specialization and must be compiled with this root shader.
+// Its optional corner-array reuse specialization is declared in that sampler include.
+#define MAGIC_GI_WIDE_CANDIDATE_POOL_LIMIT 16
+#define MAGIC_GI_WIDE_VISIBLE_PROBE_LIMIT 8
+#define MAGIC_GI_BAKED_VISIBILITY
+layout(constant_id = 0) const bool MAGIC_GI_FULL_FEATURES = true;
+layout(constant_id = 2) const bool MAGIC_GI_CLV_METADATA_REUSE = false;
+// IDs 1/4 retain the v2 split; IDs 6/7 select v3 cert-only/general-only stages.
+layout(constant_id = 1) const bool MAGIC_GI_PRT_STAGE_CACHE_GENERAL = false;
+layout(constant_id = 4) const bool MAGIC_GI_PRT_STAGE_SOURCE = false;
+layout(constant_id = 6) const bool MAGIC_GI_PRT_STAGE_CERT_ONLY = false;
+layout(constant_id = 7) const bool MAGIC_GI_PRT_STAGE_GENERAL_ONLY = false;
+#if MAGIC_GI_PRT_COMPACT_QUEUE_VARIANT
+layout(constant_id = 8) const bool MAGIC_GI_PRT_QUEUE_CONSUMER = false;
+#endif
+#define MAGIC_GI_FAST_VARIANT_SPECIALIZATION
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const int LOOKUP_CELL_RADIUS = 2;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D color_image;
+layout(set = 0, binding = 1) uniform sampler2D depth_buffer;
+layout(set = 0, binding = 2) uniform sampler2D normal_roughness;
+layout(set = 0, binding = 3) uniform sampler2D gbuffer_albedo;
+layout(set = 0, binding = 4) uniform sampler2D gbuffer_orm;
+layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D gi_output;
+// R32_UINT per-pixel handoff from cache/general dispatch to source-only dispatch.
+layout(r32ui, set = 0, binding = 30) uniform uimage2D prt_source_pending;
+layout(set = 0, binding = 7) uniform sampler2D geometry_atlas;
+layout(set = 0, binding = 8) uniform isampler2D index_map;
+layout(set = 0, binding = 12) uniform sampler2D sky_light_diffuse_buffer;
+layout(set = 0, binding = 13) uniform sampler2D visibility_moment_atlas;
+layout(set = 0, binding = 14, std430) readonly buffer VisibilityNodes {
+	vec4 nodes[]; // min.xyz / escape index, max.xyz / packed leaf range.
+} visibility_bvh;
+layout(set = 0, binding = 15, std430) readonly buffer VisibilityTriangles {
+	vec4 triangles[]; // vertex, edge1, edge2; two-sided opaque blockers.
+} visibility_geometry;
+layout(set = 0, binding = 16) uniform sampler2D diffuse_ambient_occlusion_texture;
+layout(set = 0, binding = 17, std430) readonly buffer ProbeLighting {
+	vec4 values[];
+} probe_lighting;
+layout(set = 0, binding = 26, std430) buffer ExactPointDiagnostic {
+	uint words[];
+} exact_point_diagnostic;
+// Opt-in counters used by a one-frame CLV coverage diagnostic. Production
+// frames use debug_view 0 and execute no atomics.
+layout(set = 0, binding = 27, std430) buffer CLVStats {
+	uint counts[];
+} clv_stats;
+layout(set = 0, binding = 23, std140) uniform PageParams {
+	vec4 core_min_enabled;
+	vec4 core_max;
+	ivec4 dispatch_rect; // xy = pixel offset, zw = dispatched rectangle size.
+	mat4 owner_world_to_local;
+	vec4 owner_size_enabled; // xyz = original oriented volume size.
+} page;
+
+layout(set = 0, binding = 9, std140) uniform GIParams {
+	mat4 inverse_projection;
+	mat4 world_to_grid;
+	mat4 view_to_world;
+	vec4 grid; // xyz = lookup grid dimensions; w = surface sample count.
+	vec4 control; // x = strength; y = probe spacing; z = SkyLight replacement; w = static BVH available.
+	vec4 lighting_sh[7]; // 27 combined SkyLight + Directional SH floats for secondary transport.
+	vec4 sky_lighting_sh[7]; // 27 SkyLight-only SH floats for primary v4 transport.
+} params;
+
+layout(push_constant, std430) uniform PassParameters {
+	vec4 parameters;
+} pc;

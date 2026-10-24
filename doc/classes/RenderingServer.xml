@@ -5250,6 +5250,9 @@
 		<constant name="LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS" value="2" enum="LightDirectionalShadowMode">
 			Use 4 splits for shadow projection when using directional light.
 		</constant>
+		<constant name="LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS" value="3" enum="LightDirectionalShadowMode">
+			Use 3 splits for shadow projection when using directional light.
+		</constant>
 		<constant name="LIGHT_DIRECTIONAL_SKY_MODE_LIGHT_AND_SKY" value="0" enum="LightDirectionalSkyMode">
 			Use DirectionalLight3D in both sky rendering and scene lighting.
 		</constant>
@@ -6092,7 +6095,10 @@
 		<constant name="INSTANCE_FLAG_IGNORE_OCCLUSION_CULLING" value="3" enum="InstanceFlags">
 			Always draw, even if the instance would be culled by occlusion culling. Does not affect view frustum culling.
 		</constant>
-		<constant name="INSTANCE_FLAG_MAX" value="4" enum="InstanceFlags">
+		<constant name="INSTANCE_FLAG_REFLECTION_CAPTURE_ONLY" value="4" enum="InstanceFlags">
+			Draw the instance in reflection probe captures, including FengSkyLight captures, but not in regular camera color passes. Shadow casting still follows [enum ShadowCastingSetting]. This allows camera-culled geometry to remain available to independent capture views.
+		</constant>
+		<constant name="INSTANCE_FLAG_MAX" value="5" enum="InstanceFlags">
 			Represents the size of the [enum InstanceFlags] enum.
 		</constant>
 		<constant name="SHADOW_CASTING_SETTING_OFF" value="0" enum="ShadowCastingSetting">

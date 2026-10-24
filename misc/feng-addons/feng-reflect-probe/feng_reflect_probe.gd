@@ -24,6 +24,7 @@ const BuiltinPass = preload("res://addons/feng-render-pipeline/passes/builtin_pa
 const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
 const CaptureContextPass = preload("passes/reflection_capture_context_pass.gd")
 const CapturePass = preload("passes/feng_reflect_probe_capture_pass.gd")
+const ALL_3D_RENDER_LAYERS := 0xFFFFF
 const CUBE_FORWARDS := [Vector3(1, 0, 0), Vector3(-1, 0, 0), Vector3(0, 1, 0),
 		Vector3(0, -1, 0), Vector3(0, 0, 1), Vector3(0, 0, -1)]
 const CUBE_UPS := [Vector3(0, -1, 0), Vector3(0, -1, 0), Vector3(0, 0, -1),
@@ -141,6 +142,18 @@ const CUBE_UPS := [Vector3(0, -1, 0), Vector3(0, -1, 0), Vector3(0, 0, -1),
 		if is_inside_tree() and source_mode == SourceMode.SCENE_CAPTURE:
 			_request_automatic_scene_capture(true)
 		_mark_metadata_dirty()
+## Render layers allowed in scene captures. The active source camera's mask is
+## intersected with this value; the default preserves all 20 3D render layers.
+@export_flags_3d_render var capture_cull_mask := ALL_3D_RENDER_LAYERS:
+	set(value):
+		var next := value & ALL_3D_RENDER_LAYERS
+		if capture_cull_mask == next:
+			return
+		capture_cull_mask = next
+		_metadata_signature.clear()
+		if is_inside_tree() and source_mode == SourceMode.SCENE_CAPTURE:
+			_request_automatic_scene_capture(true)
+		_mark_metadata_dirty()
 @export_range(1, 8, 1) var prefilter_mips_per_frame := 2:
 	set(value):
 		var next := clampi(value, 1, 8)
@@ -176,6 +189,7 @@ var _capture_face := 0
 var _capture_mip := 0
 var _batch_capture_origin := Vector3.ZERO
 var _batch_capture_basis := Basis.IDENTITY
+var _batch_capture_cull_mask := ALL_3D_RENDER_LAYERS
 var _batch_probe_snapshot: Dictionary = {}
 var _bake_requested := false
 var _writing_bake_payload := false
@@ -281,6 +295,8 @@ func request_update() -> void:
 	_batch_probe_snapshot = _make_probe_snapshot()
 	_batch_capture_origin = _batch_probe_snapshot.get("capture_position", global_position)
 	_batch_capture_basis = _batch_probe_snapshot.get("source_basis", global_transform.basis.orthonormalized())
+	_batch_capture_cull_mask = _source_camera_cull_mask() & capture_cull_mask
+	_batch_probe_snapshot["capture_cull_mask"] = _batch_capture_cull_mask
 	_capture_active = true
 	_task_pending = false
 	Runtime.publish_capture_status(_owner_id, {"batch_id": _capture_batch,
@@ -429,6 +445,7 @@ func _poll_bake_payload() -> void:
 	probe_data.capture_position = _batch_capture_origin
 	probe_data.capture_basis = _batch_capture_basis
 	probe_data.capture_resolution = resolution
+	probe_data.captured_cull_mask = _batch_capture_cull_mask
 	probe_data.capture_generation += 1
 	probe_data.source_description = "FengReflectProbe scene bake"
 	_writing_bake_payload = false
@@ -499,7 +516,7 @@ func _ensure_capture_rig() -> bool:
 	camera.keep_aspect = Camera3D.KEEP_HEIGHT
 	camera.near = 0.05
 	camera.far = 1000.0
-	camera.cull_mask = _source_camera_cull_mask()
+	camera.cull_mask = _source_camera_cull_mask() & capture_cull_mask
 	var attributes := CameraAttributesPractical.new()
 	attributes.auto_exposure_enabled = false
 	attributes.exposure_multiplier = 1.0
@@ -595,12 +612,12 @@ func _set_capture_camera(face: int) -> void:
 	var face_basis := Basis(local_right, local_up, -local_forward)
 	var world_basis := _batch_capture_basis.orthonormalized() * face_basis
 	_capture_camera.transform = Transform3D(world_basis, _batch_capture_origin)
-	_capture_camera.cull_mask = _source_camera_cull_mask()
+	_capture_camera.cull_mask = _batch_capture_cull_mask
 
 func _source_camera_cull_mask() -> int:
 	var viewport := get_viewport()
 	var camera := viewport.get_camera_3d() if viewport != null else null
-	return camera.cull_mask if camera != null else 0xffffffff
+	return (camera.cull_mask & ALL_3D_RENDER_LAYERS) if camera != null else ALL_3D_RENDER_LAYERS
 
 func _effective_resolution() -> int:
 	var value := clampi(capture_resolution, 16, 2048)
@@ -614,6 +631,9 @@ func _make_probe_snapshot() -> Dictionary:
 	var size := Vector3(box_size.x * scale.x, box_size.y * scale.y, box_size.z * scale.z)
 	var origin := global_transform.origin + rotation * capture_position_offset
 	var source_basis := rotation
+	var captured_mask := probe_data.captured_cull_mask if probe_data != null else -1
+	var effective_capture_mask := captured_mask if captured_mask >= 0 \
+			else _source_camera_cull_mask() & capture_cull_mask
 	if source_mode == SourceMode.EXTERNAL_CUBEMAP and probe_data != null:
 		origin = probe_data.capture_position
 		source_basis = probe_data.capture_basis.orthonormalized()
@@ -627,6 +647,10 @@ func _make_probe_snapshot() -> Dictionary:
 		"intensity": intensity,
 		"capture_position": origin,
 		"source_basis": source_basis,
+		"capture_cull_mask": effective_capture_mask,
+		"capture_cull_mask_configured": capture_cull_mask,
+		"capture_cull_mask_current_camera": _source_camera_cull_mask(),
+		"capture_cull_mask_known": captured_mask >= 0,
 		"source_revision": _source_revision,
 		"prefilter_mips_per_frame": prefilter_mips_per_frame,
 		"has_saved_seed": source_mode == SourceMode.SCENE_CAPTURE and _has_saved_scene_seed(),

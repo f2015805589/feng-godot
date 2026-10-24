@@ -18,7 +18,7 @@ func _enter_tree() -> void:
 		if viewport != null:
 			_registered_viewports.append(viewport)
 			Runtime.register_viewport(viewport, self)
-			Runtime.register_editor_preview_viewport(viewport, self)
+			Runtime.register_editor_preview_viewport(viewport, self, i)
 
 func _exit_tree() -> void:
 	for viewport in _registered_viewports:

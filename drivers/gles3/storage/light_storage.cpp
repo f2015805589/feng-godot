@@ -1751,6 +1751,11 @@ void LightStorage::set_directional_shadow_count(int p_count) {
 	directional_shadow.current_light = 0;
 }
 
+bool LightStorage::set_directional_shadow_lights(const Vector<RID> &p_light_instances) {
+	directional_shadow.light_count = p_light_instances.size();
+	return true;
+}
+
 static Rect2i _get_directional_shadow_rect(int p_size, int p_shadow_count, int p_shadow_index) {
 	int split_h = 1;
 	int split_v = 1;
@@ -1792,6 +1797,7 @@ int LightStorage::get_directional_light_shadow_size(RID p_light_instance) {
 			r.size.height /= 2;
 			break;
 		case RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS:
+		case RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS:
 			r.size /= 2;
 			break;
 	}

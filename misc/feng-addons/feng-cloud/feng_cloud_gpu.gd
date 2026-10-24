@@ -5,6 +5,7 @@ extends RefCounted
 ## by FRPPassContext and Texture resources remain borrowed.
 
 const SHADER_ROOT := "res://addons/feng-cloud/shaders/"
+const CloudMaterialScript = preload("feng_cloud_material.gd")
 const BUFFER_SCOPE: StringName = &"frp_cloud_gpu"
 const WORKGROUP := 8
 const FRAME_BYTES := 304
@@ -626,7 +627,7 @@ func _ensure_buffer_state(buffers: RenderSceneBuffersRD, rd: RenderingDevice, ow
 			"last_frame_usec": 0,
 			"source_signature": -1,
 			"ambient_signature": -1,
-			"ue58_time_key": [],
+			"ue58_time_batch_key": [],
 			"ue58_time_seconds": 0.0,
 			"ue58_camera_world_m": Vector3.ZERO,
 			"ue58_time_valid": false,
@@ -1055,33 +1056,36 @@ func _add_material_layout_uniforms(uniforms: Array[RDUniform], layout_inputs: Di
 func _update_ue58_time_ubo(ctx: FRPPassContext, snapshot: Dictionary,
 		state: Dictionary, rd: RenderingDevice, scene_data: RenderSceneData, view: int) -> RID:
 	var capture := ctx.is_cloud_capture()
+	var capture_batch_id := ctx.get_cloud_capture_batch_id() if capture else 0
 	var seconds := 0.0
 	var camera_world_m := Vector3.ZERO
-	if capture:
+	if capture and capture_batch_id != 0:
 		var capture_origin := ctx.get_cloud_capture_origin_world_m()
 		if not capture_origin.is_finite():
 			_report("UE 5.8 cloud capture camera origin is invalid.")
 			return RID()
 		var material: Dictionary = snapshot.get("material", {})
-		var cache_key := [
-			int(snapshot.get("provider_id", 0)), int(snapshot.get("world_id", 0)),
-			int(snapshot.get("planet_source_id", 0)), int(snapshot.get("atmosphere_revision", -1)),
-			snapshot.get("atmosphere_snapshot", {}), int(material.get("revision", -1)),
-			str(material.get("kernel_source", "")),
-			ctx.get_cloud_capture_batch_id(),
-		]
-		if bool(state.get("ue58_time_valid", false)) and state.get("ue58_time_key", []) == cache_key:
+		var batch_key := [int(snapshot.get("provider_id", 0)),
+			int(snapshot.get("world_id", 0)), capture_batch_id]
+		# Freeze the first effective TIME for the whole six-face batch. If material
+		# controls change mid-capture, history resets immediately but the new phase
+		# starts on the next native batch so its faces cannot mix phases.
+		if bool(state.get("ue58_time_valid", false)) \
+				and state.get("ue58_time_batch_key", []) == batch_key:
 			seconds = float(state.get("ue58_time_seconds", 0.0))
 			camera_world_m = state.get("ue58_camera_world_m", capture_origin)
 		else:
-			seconds = float(ctx.get_cloud_time_seconds())
+			seconds = CloudMaterialScript.resolve_ue58_time_seconds(
+				float(ctx.get_cloud_time_seconds()), material)
 			camera_world_m = capture_origin
-			state.ue58_time_key = cache_key
+			state.ue58_time_batch_key = batch_key
 			state.ue58_time_seconds = seconds
 			state.ue58_camera_world_m = camera_world_m
 			state.ue58_time_valid = true
 	else:
-		seconds = float(ctx.get_cloud_time_seconds())
+		var material: Dictionary = snapshot.get("material", {})
+		seconds = CloudMaterialScript.resolve_ue58_time_seconds(
+			float(ctx.get_cloud_time_seconds()), material)
 		var camera := scene_data.get_cam_transform().orthonormalized()
 		camera.origin += camera.basis * scene_data.get_view_eye_offset(view)
 		camera_world_m = camera.origin
@@ -1340,6 +1344,7 @@ func _source_signature(snapshot: Dictionary, material: PackedFloat32Array, textu
 		history_atmosphere[0] = 0.0
 		history_atmosphere[1] = 0.0
 		history_atmosphere[2] = 0.0
+	var material_snapshot: Dictionary = snapshot.get("material", {})
 	return hash([
 		int(snapshot.get("provider_id", 0)), int(snapshot.get("world_id", 0)),
 		int(snapshot.get("planet_source_id", 0)), int(snapshot.get("atmosphere_revision", -1)),
@@ -1354,6 +1359,8 @@ func _source_signature(snapshot: Dictionary, material: PackedFloat32Array, textu
 		lighting, history_atmosphere, appearance, ids, _rid_id(blue_noise), mode,
 		layout_ids, str(snapshot.get("material", {}).get("kernel_layout", snapshot.get("kernel_layout", "builtin"))),
 		str(snapshot.get("material", {}).get("kernel_source", "")),
+		float(material_snapshot.get("ue58_time_scale", 1.0)),
+		float(material_snapshot.get("ue58_time_offset_seconds", 0.0)),
 	])
 
 

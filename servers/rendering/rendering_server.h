@@ -334,6 +334,10 @@ public:
 	// Directional light
 
 	virtual void light_directional_set_shadow_mode(RID p_light, RSE::LightDirectionalShadowMode p_mode) = 0;
+	virtual void light_directional_set_shadow_object_shadow_enabled(RID p_light, bool p_enabled) = 0;
+	virtual bool light_directional_get_shadow_object_shadow_enabled(RID p_light) const = 0;
+	virtual void light_directional_set_shadow_object_shadow_instances(RID p_light, const Vector<RID> &p_instances) = 0;
+	virtual Vector<RID> light_directional_get_shadow_object_shadow_instances(RID p_light) const = 0;
 	virtual void light_directional_set_blend_splits(RID p_light, bool p_enable) = 0;
 	virtual void light_directional_set_sky_mode(RID p_light, RSE::LightDirectionalSkyMode p_mode) = 0;
 

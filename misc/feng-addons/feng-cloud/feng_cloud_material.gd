@@ -168,6 +168,22 @@ var _watched_textures: Dictionary = {} # texture instance id -> number of materi
 	set(value):
 		wind_offset_km = _finite_vector(value, Vector3.ZERO)
 		_touch()
+
+@export_group("UE 5.8 Animation")
+## Multiplies the render time supplied to the packaged UE 5.8 layout-wind graph.
+## Zero freezes the density pattern at ue58_time_offset_seconds. One with a zero
+## offset preserves the renderer's raw time value exactly.
+@export_range(0.0, 16.0, 0.01, "or_greater") var ue58_time_scale := 1.0:
+	set(value):
+		ue58_time_scale = maxf(_finite(value, 1.0), 0.0)
+		_touch()
+## Seconds added after ue58_time_scale is applied. With scale zero this is the
+## fixed phase used by the existing UE 5.8 animation graph.
+@export_range(0.0, 9999999.0, 0.01, "or_greater", "suffix:s") var ue58_time_offset_seconds := 0.0:
+	set(value):
+		ue58_time_offset_seconds = maxf(_finite(value, 0.0), 0.0)
+		_touch()
+
 @export var detail_enabled := true:
 	set(value):
 		detail_enabled = value
@@ -302,6 +318,8 @@ func rendering_snapshot() -> Dictionary:
 		"weather_strength": weather_strength,
 		"conservative_density": conservative_density,
 		"wind_offset_km": wind_offset_km,
+		"ue58_time_scale": ue58_time_scale,
+		"ue58_time_offset_seconds": ue58_time_offset_seconds,
 		"detail_enabled": detail_enabled,
 		"kernel_source": resolved_kernel_source,
 		"extinction_per_km": extinction_per_km,
@@ -327,11 +345,14 @@ func rendering_snapshot() -> Dictionary:
 
 
 func _validate_property(property: Dictionary) -> void:
+	var property_name := str(property.get("name", ""))
 	if kernel_layout != "UE 5.8 Default":
+		if property_name in ["ue58_time_scale", "ue58_time_offset_seconds"]:
+			property["usage"] = int(property.get("usage", 0)) & ~PROPERTY_USAGE_EDITOR
 		return
 	# These generic inputs have no consumer in the specialized UE graph kernel.
 	# Keep their stored values intact so switching back to Built-in restores them.
-	if str(property.get("name", "")) in BUILTIN_ONLY_PROPERTIES:
+	if property_name in BUILTIN_ONLY_PROPERTIES:
 		property["usage"] = int(property.get("usage", 0)) & ~PROPERTY_USAGE_EDITOR
 
 
@@ -387,6 +408,17 @@ func _touch() -> void:
 
 static func _finite(value: float, fallback: float) -> float:
 	return value if is_finite(value) else fallback
+
+
+static func resolve_ue58_time_seconds(scene_time_seconds: float,
+		material_snapshot: Dictionary) -> float:
+	var safe_scene_time := _finite(scene_time_seconds, 0.0)
+	var time_scale := maxf(_finite(float(material_snapshot.get("ue58_time_scale", 1.0)), 1.0), 0.0)
+	var time_offset := _finite(float(material_snapshot.get("ue58_time_offset_seconds", 0.0)), 0.0)
+	if time_scale == 1.0 and time_offset == 0.0:
+		return safe_scene_time
+	var resolved := safe_scene_time * time_scale + time_offset
+	return _finite(resolved, 0.0)
 
 
 static func _finite_vector(value: Vector3, fallback: Vector3) -> Vector3:

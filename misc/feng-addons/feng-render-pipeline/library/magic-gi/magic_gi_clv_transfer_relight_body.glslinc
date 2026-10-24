@@ -1,0 +1,57 @@
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Operators { float values[]; } operators;
+layout(set = 0, binding = 1, std430) readonly buffer Indices { int values[]; } indices;
+layout(set = 0, binding = 2, std430) readonly buffer Emitters { float values[]; } emitters;
+layout(set = 0, binding = 3, std140) uniform GIParams {
+	mat4 inverse_projection; mat4 world_to_grid; mat4 view_to_world;
+	vec4 grid; vec4 control; vec4 lighting_sh[7]; vec4 sky_lighting_sh[7];
+} params;
+#ifdef CLV_HALF_OUTPUT
+#define CLV_OUTPUT_FORMAT rgba16f
+#else
+#define CLV_OUTPUT_FORMAT rgba32f
+#endif
+layout(CLV_OUTPUT_FORMAT, set = 0, binding = 4) uniform writeonly image3D output_field;
+layout(push_constant, std430) uniform Config {
+	int cell_count; int source_count; int emitter_count; int columns;
+	int dim_x; int dim_y; int dim_z; float output_scale;
+} config;
+
+vec3 coefficient(vec4 blocks[7], int index) {
+	int k = index * 3;
+	return vec3(blocks[k / 4][k % 4], blocks[(k + 1) / 4][(k + 1) % 4], blocks[(k + 2) / 4][(k + 2) % 4]);
+}
+
+void main() {
+	int cell = int(gl_GlobalInvocationID.x);
+	if (cell >= config.cell_count) return;
+	int source = indices.values[cell];
+	bool valid = source >= 0 && source < config.source_count;
+	vec3 sh[9];
+	for (int outgoing = 0; outgoing < 9; outgoing++) {
+		vec3 value = vec3(0.0);
+		if (valid) {
+			int row = (source * 9 + outgoing) * config.columns;
+			for (int incoming = 0; incoming < 9; incoming++) {
+				int k = row + incoming * 3;
+				value += vec3(operators.values[k], operators.values[k + 1], operators.values[k + 2]) * (coefficient(params.lighting_sh, incoming) * config.output_scale);
+				value += operators.values[row + 27 + incoming] * (coefficient(params.sky_lighting_sh, incoming) * config.output_scale);
+			}
+			for (int e = 0; e < config.emitter_count; e++) {
+				int k = row + 36 + e * 6;
+				for (int c = 0; c < 3; c++) {
+					value[c] += operators.values[k + c] * (emitters.values[e * 6 + c] * config.output_scale)
+						+ operators.values[k + 3 + c] * (emitters.values[e * 6 + 3 + c] * config.output_scale);
+				}
+			}
+		}
+		sh[outgoing] = value;
+		valid = valid && magic_gi_sh9_tensor_finite_vec3(value);
+	}
+	vec4 packed[7];
+	magic_gi_sh9_tensor_pack_e_over_pi(sh, valid ? 1.0 : 0.0, packed);
+	ivec3 position = ivec3(cell % config.dim_x, (cell / config.dim_x) % config.dim_y, cell / (config.dim_x * config.dim_y));
+	for (int field = 0; field < 7; field++) {
+		imageStore(output_field, position + ivec3(0, 0, field * config.dim_z), valid ? packed[field] : vec4(0.0));
+	}
+}

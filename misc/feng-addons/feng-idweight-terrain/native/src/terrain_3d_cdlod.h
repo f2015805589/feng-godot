@@ -10,7 +10,7 @@
 class Terrain3D;
 
 // One regular grid, selected quadtree leaves, two instance lists: visible and
-// offscreen shadow casters. Material/page ownership stays with Terrain3D.
+// offscreen capture/shadow geometry. Material/page ownership stays with Terrain3D.
 class Terrain3DCDLOD {
 	struct Batch {
 		RID multimesh;
@@ -32,6 +32,7 @@ class Terrain3DCDLOD {
 	std::array<Batch, 2> _batches;
 	int _grid = 32;
 	bool _adaptive = true;
+	int _capture_only_flag = -1;
 	int _selected = 0;
 	int _visible = 0;
 	struct Patch {

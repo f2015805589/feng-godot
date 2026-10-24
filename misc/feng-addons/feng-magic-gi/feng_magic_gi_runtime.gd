@@ -6,7 +6,9 @@ extends RefCounted
 const RuntimeState = preload("feng_magic_gi_runtime_state.gd")
 const PageStreamer = preload("feng_magic_gi_page_streamer.gd")
 const Data = preload("feng_magic_gi_data.gd")
+const VolumeSourceChunk = preload("feng_magic_gi_volume_source_chunk.gd")
 const PreviewExposure = preload("../feng-render-pipeline/passes/editor_preview_exposure_cache.gd")
+const VolumePreview = preload("feng_magic_gi_volume_preview.gd")
 const VIEWPORT_SCAN_MSEC := 1000
 ## Optional render-target registry shared by the FRP snapshot consumers.
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
@@ -76,11 +78,12 @@ static func unregister_viewport(viewport: Viewport, owner: Object = null) -> voi
 ## Registers an actual editor 3D viewport for exposure-aware debug materials.
 ## This stays separate from the world snapshot registry, which also includes
 ## ordinary scene and subviewports.
-static func register_editor_preview_viewport(viewport: Viewport, owner: Object) -> void:
+static func register_editor_preview_viewport(viewport: Viewport, owner: Object, viewport_index := 0) -> void:
 	if viewport == null or not is_instance_valid(viewport) or owner == null or not is_instance_valid(owner):
 		return
 	var viewport_id := viewport.get_instance_id()
-	_editor_preview_viewports[viewport_id] = {"viewport_ref": weakref(viewport), "owner_ref": weakref(owner)}
+	_editor_preview_viewports[viewport_id] = {"viewport_ref": weakref(viewport), "owner_ref": weakref(owner),
+		"viewport_index": viewport_index}
 	_preview_view_frame = -1
 	PreviewExposure.register_editor_viewport(viewport, owner)
 
@@ -99,6 +102,7 @@ static func set_preview_requested(volume: FMagicGIVolume, requested: bool) -> vo
 	if volume == null or not is_instance_valid(volume):
 		return
 	PreviewExposure.set_preview_requested(volume.get_instance_id(), requested)
+	VolumePreview.set_requested(volume.get_instance_id(), requested)
 	_preview_view_frame = -1
 
 static func publish(volume: FMagicGIVolume) -> void:
@@ -129,14 +133,14 @@ static func publish(volume: FMagicGIVolume) -> void:
 ## types cross this boundary; Resource loading and page publication stay on the
 ## main thread in tick().
 static func request_streaming_view(target: RID, view_id: int, camera: Vector3,
-		visible_bounds: AABB = AABB()) -> void:
+		visible_bounds: AABB = AABB(), resolution := 16) -> void:
 	if not target.is_valid() or view_id < 0 or not camera.is_finite():
 		return
 	var target_id := int(target.get_id())
 	var key := "%d:%d" % [target_id, view_id]
 	_streaming_request_mutex.lock()
 	_streaming_requests[key] = {"target_id": target_id, "view_id": view_id,
-		"camera": camera, "bounds": visible_bounds}
+		"camera": camera, "bounds": visible_bounds, "resolution": resolution}
 	_streaming_request_mutex.unlock()
 
 static func tick() -> void:
@@ -200,6 +204,11 @@ static func preview_snapshot(volume: FMagicGIVolume) -> Dictionary:
 			streaming_status.get("budget_blocked_pages", 0)]
 		var revision := hash(revision_values)
 		var editor_views := _editor_preview_view_snapshots()
+		var volume_preview: Dictionary = {}
+		if volume.has_free_space_source_generation():
+			volume_preview = VolumePreview.snapshot(volume, pages, lighting, sky_lighting, editor_views)
+			revision = hash([revision, volume_preview.get("revision", 0),
+				volume.display_probes_by_clv, volume.probe_clv_level, volume.probe_clv_view])
 		var view_revision_values: Array = []
 		for view in editor_views:
 			view_revision_values.append_array([
@@ -235,6 +244,11 @@ static func preview_snapshot(volume: FMagicGIVolume) -> Dictionary:
 			"editor_views": editor_views,
 			"view_revision": view_revision,
 		}
+		if not volume_preview.is_empty():
+			# Source-only pages deliberately have data=null. Their layout and live
+			# SH come from the volume source or the selected view's resident CLV.
+			result.merge(volume_preview, true)
+			result["revision"] = revision
 		_preview_cache[id] = result
 		return result
 	var data := volume.bake_data
@@ -327,6 +341,7 @@ static func _editor_preview_view_snapshots() -> Array[Dictionary]:
 		var exposure: Dictionary = PreviewExposure.get_snapshot(target_id, 0)
 		result.append({
 			"target_id": target_id,
+			"viewport_index": int(entry.get("viewport_index", 0)),
 			"view": 0,
 			"origin": transform.origin,
 			"right": basis.x,
@@ -476,7 +491,7 @@ static func _publish() -> void:
 		if volume == null or volume.is_surfel_mode() or volume.bake_manifest == null:
 			continue
 		state.streamer.request_view(int(request.target_id), int(request.view_id),
-				request.camera, request.bounds, now)
+				request.camera, request.bounds, now, int(request.get("resolution", 16)))
 	for id in _registry.keys():
 		var state: RuntimeState = _registry[id]
 		var volume := state.get_volume()
@@ -538,12 +553,59 @@ static func _publish() -> void:
 		var lighting_sets: Dictionary = state.lighting.coefficient_sets(volume)
 		if volume.bake_manifest != null:
 			var manifest := volume.bake_manifest
+			var baked_indirect_ready := volume.has_baked_indirect_sh() # Legacy SH diagnostic only.
 			var streamed_pages := state.streamer.ready_pages(
 				lighting_sets.get("lighting", PackedFloat32Array()),
 				lighting_sets.get("sky_lighting", PackedFloat32Array()))
+			var directional_transfer_status: Dictionary = state.streamer.directional_transfer_status()
+			var directional_transfer_ready := bool(directional_transfer_status.get("ready", false))
+			var magicdawn_selected := int(volume.clv_cache_backend) == 1 \
+					and volume.use_clv and directional_transfer_ready
+			var free_space_pages: Array[Dictionary] = []
+			for streamed_page in streamed_pages:
+				if streamed_page.get("free_space_volume_source", null) is VolumeSourceChunk:
+					free_space_pages.append(streamed_page)
+			var free_space_status := "no_source_only_page"
+			var free_space_page: Dictionary = {}
+			var free_space_chunk: VolumeSourceChunk
+			var free_space_cache_key := ""
+			var free_space_emission := PackedFloat32Array()
+			if free_space_pages.size() > 1 or (not free_space_pages.is_empty() \
+					and streamed_pages.size() != 1):
+				free_space_status = "unsupported_multiple_or_mixed_source_pages"
+			elif free_space_pages.size() == 1:
+				free_space_page = free_space_pages[0]
+				free_space_chunk = free_space_page.get("free_space_volume_source")
+				var source_page_key := String(free_space_page.get("page_key", ""))
+				var source_page_data: Variant = free_space_page.get("data", null)
+				var source_emission_value: Variant = free_space_page.get("emission_sources", PackedFloat32Array())
+				var source_signature := String(free_space_page.get("free_space_source_signature", ""))
+				var source_instance_id := int(free_space_page.get("free_space_source_instance_id", -1))
+				free_space_cache_key = String(free_space_page.get("cache_key", ""))
+				if source_page_key.is_empty() or source_page_data != null \
+						or not bool(free_space_page.get("free_space_source_validated", false)) \
+						or source_instance_id != free_space_chunk.get_instance_id() \
+						or source_signature != free_space_chunk.directional_source_signature \
+						or int(free_space_page.get("geometry_signature", 0)) != free_space_chunk.geometry_signature \
+						or not free_space_chunk.source_transform_world.is_equal_approx(volume.global_transform) \
+						or not free_space_chunk.source_size_m.is_equal_approx(volume.size) \
+						or not String(free_space_page.get("emission_warning", "")).is_empty() \
+						or free_space_chunk.probe_count <= 0 \
+						or free_space_cache_key.is_empty() \
+						or not source_emission_value is PackedFloat32Array \
+						or source_emission_value.size() != free_space_chunk.emitter_count * 6:
+					free_space_status = "source_page_descriptor_mismatch"
+				else:
+					free_space_status = "ready"
+					free_space_emission = source_emission_value
+			if not free_space_pages.is_empty() and free_space_status != "ready":
+				# A source-only bake is a single regular grid in the current runtime
+				# contract. Do not let another page's legacy TransferMatrix make an
+				# ambiguous/mixed source set appear ready to backend 1.
+				magicdawn_selected = false
 			var pending_pages := state.streamer.pending_pages()
 			var cache_key := "%d:stream:%s:%s" % [id, manifest.manifest_key, manifest.generation]
-			result.append({
+			var streamed_snapshot := {
 				"mode": int(volume.gi_mode),
 				"streamed": true,
 				"manifest": manifest,
@@ -565,13 +627,22 @@ static func _publish() -> void:
 				"data": null,
 				"version": hash([manifest.manifest_key, manifest.generation]),
 				"cache_key": cache_key,
+				"stream_cache_key": cache_key,
 				"strength": volume.gi_strength,
 				"use_clv": volume.use_clv,
+				"clv_cache_backend": int(volume.clv_cache_backend),
 				"clv_cell_size": clampf(volume.clv_cell_size, 0.1, 2.0),
 				"clv_cells_per_frame": clampi(volume.clv_cells_per_frame, 32, 512),
 				"lighting": lighting_sets.get("lighting", PackedFloat32Array()),
 				"sky_lighting": lighting_sets.get("sky_lighting", PackedFloat32Array()),
-				"replacement_enabled": manifest.is_valid() and state.streamer.has_active_pages(),
+				"replacement_enabled": manifest.is_valid() and state.streamer.has_active_pages() \
+						and (int(volume.clv_cache_backend) != 1 or magicdawn_selected),
+				"magicdawn_selected": magicdawn_selected,
+				"directional_transfer_ready": directional_transfer_ready,
+				"directional_transfer_status": directional_transfer_status,
+				"baked_indirect_sh_ready": baked_indirect_ready,
+				"baked_indirect_sh_revision": manifest.baked_indirect_sh_revision,
+				"baked_indirect_sh_status": volume.baked_indirect_status(),
 				"emission_payload": PackedFloat32Array(),
 				"emission_sources": PackedFloat32Array(),
 				"emission_revision": state.streamer.revision(),
@@ -581,7 +652,60 @@ static func _publish() -> void:
 				"owner_transform": volume.global_transform,
 				"owner_size": volume.size,
 				"render_targets": _render_targets(world),
-			})
+				"free_space_source_status": free_space_status,
+				"free_space_source_ready": free_space_status == "ready",
+				"emission_warning": "",
+			}
+			streamed_snapshot["replacement_requested"] = bool(streamed_snapshot.get("replacement_enabled", false))
+			if free_space_status == "ready":
+				# The source-only volume baker currently emits one full-volume chunk.
+				# Publish that exact validated page at the root for the native volume
+				# cache while retaining the original streamed-page list for legacy users.
+				streamed_snapshot["free_space_volume_source"] = free_space_chunk
+				streamed_snapshot["free_space_source_validated"] = true
+				streamed_snapshot["free_space_source_instance_id"] = free_space_chunk.get_instance_id()
+				streamed_snapshot["free_space_source_signature"] = free_space_chunk.directional_source_signature
+				streamed_snapshot["free_space_source_page_key"] = String(free_space_page.get("page_key", ""))
+				streamed_snapshot["free_space_source_cache_key"] = free_space_cache_key
+				streamed_snapshot["free_space_source_version"] = int(free_space_page.get("version", 0))
+				streamed_snapshot["free_space_source_core_bounds"] = free_space_page.get("core_bounds", AABB())
+				streamed_snapshot["free_space_source_support_bounds"] = free_space_page.get("support_bounds", AABB())
+				streamed_snapshot["free_space_source_emission_sources"] = free_space_emission
+				streamed_snapshot["free_space_source_emission_revision"] = int(free_space_page.get("emission_revision", 0))
+				# The native source-cache route consumes the immutable page identity;
+				# keep the stream namespace separately for legacy multi-page residency.
+				streamed_snapshot["cache_key"] = free_space_cache_key
+				streamed_snapshot["version"] = int(free_space_page.get("version", 0))
+				streamed_snapshot["page_key"] = String(free_space_page.get("page_key", ""))
+				streamed_snapshot["geometry_signature"] = free_space_chunk.geometry_signature
+				streamed_snapshot["core_bounds"] = free_space_page.get("core_bounds", AABB())
+				streamed_snapshot["support_bounds"] = free_space_page.get("support_bounds", AABB())
+				streamed_snapshot["emission_sources"] = free_space_emission
+				streamed_snapshot["emission_revision"] = int(free_space_page.get("emission_revision", 0))
+				streamed_snapshot["emission_warning"] = String(free_space_page.get("emission_warning", ""))
+			var prepared_header: Resource = state.streamer.prepared_source_header
+			if prepared_header != null:
+				var prepared_pages: Array[Dictionary] = []
+				for page in streamed_pages:
+					if page.get("brick", null) != null and bool(page.get("prepared_transfer_validated", false)):
+						prepared_pages.append(page)
+				var header_matches: bool = prepared_header.source_transform_world.is_equal_approx(volume.global_transform) \
+					and prepared_header.source_size_m.is_equal_approx(volume.size)
+				var emission_warning := state.streamer.emission_warning()
+				var prepared_ready := header_matches and emission_warning.is_empty() and not prepared_pages.is_empty()
+				streamed_snapshot["prepared_source_header"] = prepared_header
+				streamed_snapshot["prepared_transfer_pages"] = prepared_pages if header_matches else []
+				streamed_snapshot["prepared_pages_revision"] = state.streamer.layout_revision()
+				streamed_snapshot["gi_radius_m"] = volume.gi_radius_m
+				streamed_snapshot["gpu_budget_bytes"] = volume.gpu_resident_budget_bytes
+				streamed_snapshot["emission_sources"] = state.streamer.prepared_emission_sources()
+				streamed_snapshot["emission_warning"] = emission_warning
+				streamed_snapshot["replacement_enabled"] = prepared_ready
+				streamed_snapshot["replacement_requested"] = prepared_ready
+				streamed_snapshot["magicdawn_selected"] = prepared_ready and volume.use_clv and volume.clv_cache_backend == 1
+				streamed_snapshot["free_space_source_status"] = "ready_paged_prepared" if prepared_ready else "loading_prepared_bricks"
+				streamed_snapshot["free_space_source_ready"] = prepared_ready
+			result.append(streamed_snapshot)
 			continue
 		if data == null:
 			continue
@@ -592,8 +716,15 @@ static func _publish() -> void:
 		var cache_key := "%d:%d:%d:%d" % [id, data_id, bake_version, data_revision]
 		# A usable preview still owns indirect diffuse. Making a stale bake additive
 		# restores unoccluded SkyLight under it, brightening interiors and hiding shadows.
-		# Staleness remains reported by the volume; it does not change composition.
-		var replacement_enabled := data.format_version == Data.FORMAT_VERSION
+		# Backend 1 uses dynamic directional transfer; stored total-radiance SH remains
+		# a legacy diagnostic and never controls dynamic selection.
+		var baked_indirect_ready := data.has_baked_indirect_sh() # Legacy SH diagnostic only.
+		var directional_transfer_status: Dictionary = volume.directional_transfer_status()
+		var directional_transfer_ready := volume.has_valid_directional_transfer()
+		var magicdawn_selected := int(volume.clv_cache_backend) == 1 \
+				and volume.use_clv and directional_transfer_ready
+		var replacement_enabled := data.format_version == Data.FORMAT_VERSION \
+				and (int(volume.clv_cache_backend) != 1 or magicdawn_selected)
 		if state.emission.update_snapshot(volume, data):
 			_emission_revision_sequence += 1
 			state.emission.revision = _emission_revision_sequence
@@ -604,17 +735,27 @@ static func _publish() -> void:
 			"cache_key": cache_key,
 			"strength": volume.gi_strength,
 			"use_clv": volume.use_clv,
+			"clv_cache_backend": int(volume.clv_cache_backend),
 			"clv_cell_size": clampf(volume.clv_cell_size, 0.1, 2.0),
 			"clv_cells_per_frame": clampi(volume.clv_cells_per_frame, 32, 512),
 			"lighting": lighting_sets.get("lighting", PackedFloat32Array()),
 			"sky_lighting": lighting_sets.get("sky_lighting", PackedFloat32Array()),
 			"replacement_enabled": replacement_enabled,
+			"magicdawn_selected": magicdawn_selected,
+			"directional_transfer_ready": directional_transfer_ready,
+			"directional_transfer_status": directional_transfer_status,
+			"baked_indirect_sh_ready": baked_indirect_ready,
+			"baked_indirect_sh_revision": data.baked_indirect_sh_revision,
+			"baked_indirect_sh_status": volume.baked_indirect_status(),
 			"emission_payload": state.emission.payload,
 			"emission_sources": state.emission.source_values(),
 			"emission_revision": state.emission.revision,
+			"lighting_revision": state.lighting.revision,
 			"emission_identity": state.emission.identity,
 			"world_id": world_id,
 			"volume_id": id,
+			"owner_transform": volume.global_transform,
+			"owner_size": volume.size,
 			"render_targets": _render_targets(volume.get_world_3d()),
 		})
 	_mutex.lock()

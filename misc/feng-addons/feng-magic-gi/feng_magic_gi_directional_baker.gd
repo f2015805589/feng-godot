@@ -7,9 +7,46 @@ const EmitterBakeSet = preload("feng_magic_gi_emitter_bake_set.gd")
 
 static func bake_probe(output: Resource, geometry: RefCounted, probe: int,
 		rays: int, bounces: int, distance: float, coordinates: Array[PackedFloat64Array],
-		shifts: PackedFloat32Array, emitter_shifts: PackedFloat32Array) -> void:
+		shifts: PackedFloat32Array, emitter_shifts: PackedFloat32Array,
+		directional_sources: Array[Dictionary] = []) -> void:
 	var directional: DirectionalData = output.directional
 	var center: Vector3 = output.positions[probe]
+	var nee_sources: Array[Dictionary] = []
+	if output.bake_exact_directional_secondary.is_empty() and directional_sources.is_empty():
+		# Preserve the direct unit-test/legacy call shape as an explicitly valid
+		# no-directional-source bake. Production BakeJob always supplies its
+		# prepared 27-float result and the immutable capture snapshot.
+		output.bake_exact_directional_secondary.resize(27)
+		output.bake_exact_directional_secondary.fill(0.0)
+	if output.bake_exact_directional_secondary.size() != 27:
+		output.bake_exact_directional_secondary_valid = false
+		return
+	output.bake_exact_directional_secondary.fill(0.0)
+	output.bake_exact_directional_secondary_valid = false
+	for source in directional_sources:
+		var direction_value: Variant = source.get("direction_world", null)
+		var radiance_value: Variant = source.get("radiance_rgb", null)
+		var sky_mode_value: Variant = source.get("sky_mode", null)
+		if typeof(direction_value) != TYPE_VECTOR3 or typeof(radiance_value) != TYPE_VECTOR3 \
+				or typeof(sky_mode_value) != TYPE_INT:
+			output.bake_exact_directional_secondary_valid = false
+			return
+		var direction: Vector3 = direction_value
+		var radiance: Vector3 = radiance_value
+		var sky_mode := int(sky_mode_value)
+		if not direction.is_finite() or direction.length_squared() < 0.999 \
+				or direction.length_squared() > 1.001 or not radiance.is_finite() \
+				or sky_mode < DirectionalLight3D.SKY_MODE_LIGHT_AND_SKY \
+				or sky_mode > DirectionalLight3D.SKY_MODE_SKY_ONLY:
+			output.bake_exact_directional_secondary_valid = false
+			return
+		if sky_mode != DirectionalLight3D.SKY_MODE_SKY_ONLY:
+			nee_sources.append(source)
+	# Empty is a valid immutable snapshot when the bake has no eligible direct
+	# sources. It must remain distinct from a missing/invalid snapshot above.
+	var exact_directional_secondary := PackedFloat64Array()
+	exact_directional_secondary.resize(27)
+	exact_directional_secondary.fill(0.0)
 	# Accumulate locally in float64, then publish once. Updating Resource-backed
 	# packed arrays inside the ray loop incurs repeated property/COW traffic.
 	var angular_transport := PackedFloat64Array()
@@ -72,6 +109,27 @@ static func bake_probe(output: Resource, geometry: RefCounted, probe: int,
 						var weight := throughput[channel] * source_basis[k] * factor
 						angular_emission[base + channel] += weight
 						angular_emission[base + 3 + channel] += weight * texture_rgb[channel]
+			# A probe itself has no surface normal, so direct lighting there remains
+			# the native renderer's responsibility. At later path vertices the
+			# throughput already contains each hit's albedo; evaluate direct
+			# directional light exactly and project the outgoing radiance along the
+			# original probe ray, not along the NEE shadow direction.
+			if bounce > 0 and not nee_sources.is_empty():
+				for light_source in nee_sources:
+					var light_direction: Vector3 = light_source["direction_world"]
+					var cosine := maxf(normal.dot(light_direction), 0.0)
+					if cosine <= 0.0:
+						continue
+					if not geometry.trace_directional_visibility(vertex, light_direction,
+							path_start_face):
+						continue
+					var light_radiance: Vector3 = light_source["radiance_rgb"]
+					var outgoing_radiance := throughput * light_radiance * (cosine / PI)
+					for k in 9:
+						var projection_weight := outgoing[k] * (4.0 * PI / rays)
+						for channel in 3:
+							exact_directional_secondary[k * 3 + channel] += \
+									projection_weight * outgoing_radiance[channel]
 			var hit: Dictionary = geometry.trace_path(vertex, direction, distance, path_start_face)
 			if hit.is_empty():
 				var incoming := outgoing if bounce == 0 else DirectionalData.basis(direction)
@@ -126,6 +184,13 @@ static func bake_probe(output: Resource, geometry: RefCounted, probe: int,
 		directional.transfer[probe * 243 + k] = angular_transport[k]
 	for k in 81:
 		directional.sky[probe * 81 + k] = angular_sky[k]
+	for k in 27:
+		if not is_finite(exact_directional_secondary[k]):
+			output.bake_exact_directional_secondary_valid = false
+			return
+	for k in 27:
+		output.bake_exact_directional_secondary[k] = exact_directional_secondary[k]
+	output.bake_exact_directional_secondary_valid = true
 	for emitter in geometry.emitters.groups.size():
 		for k in 54:
 			directional.emission[(emitter * output.probe_count() + probe) * 54 + k] = angular_emission[emitter * 54 + k]

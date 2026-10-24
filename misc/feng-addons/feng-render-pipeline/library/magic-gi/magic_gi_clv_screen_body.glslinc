@@ -1,0 +1,1214 @@
+struct CLVScreenReceiver {
+	vec3 view_position;
+	vec3 world_position;
+	vec3 shading_normal;
+	vec3 geometric_normal;
+	float linear_depth;
+	bool valid;
+};
+
+#if defined(CLV_SCREEN_STAGE_CLASSIFY)
+// One 8x8 workgroup owns one full-resolution tile. Keep the receiver payload
+// shared once per tile; individual invocations retain their own view position
+// in registers for the exact per-pixel view-Z plane test.
+shared vec4 clv_screen_classify_world_depth[64];
+shared vec4 clv_screen_classify_shading_bounds[64];
+shared uint clv_screen_classify_valid[64];
+shared uint clv_screen_classify_accept[64];
+shared vec4 clv_screen_classify_plane_center;
+shared vec4 clv_screen_classify_plane_normal;
+shared vec4 clv_screen_classify_camera_world;
+shared vec4 clv_screen_classify_summary_world_depth;
+shared vec4 clv_screen_classify_summary_geometric_bounds;
+shared vec4 clv_screen_classify_summary_shading;
+shared uint clv_screen_classify_plane_valid;
+shared uint clv_screen_classify_coherent;
+#endif
+
+bool clv_screen_finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool clv_screen_finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool clv_screen_owner_contains(vec3 world) {
+	vec4 size_enabled = frp_magic_gi_owner_parameters0.owner_size_enabled;
+	if (size_enabled.w <= 0.5) { return true; }
+	vec3 local_position = (frp_magic_gi_owner_parameters0.world_to_local
+			* vec4(world, 1.0)).xyz;
+	return clv_screen_finite_vec3(local_position)
+			&& all(lessThanEqual(abs(local_position), size_enabled.xyz * 0.5));
+}
+
+bool clv_screen_in_bake_bounds(vec3 world) {
+	float spacing = max(frp_magic_gi_bake_parameters.control.y, 0.001);
+	vec3 dimensions = frp_magic_gi_bake_parameters.grid.xyz;
+	vec3 grid_position = (frp_magic_gi_bake_parameters.world_to_grid
+			* vec4(world, 1.0)).xyz;
+	mat3 world_to_grid_basis = mat3(frp_magic_gi_bake_parameters.world_to_grid);
+	float grid_epsilon = max(1e-5, spacing * 0.001 * max(
+			length(world_to_grid_basis[0]),
+			max(length(world_to_grid_basis[1]), length(world_to_grid_basis[2]))));
+	return frp_magic_gi_bake_parameters.grid.w > 0.0
+			&& clv_screen_finite_vec3(grid_position)
+			&& all(greaterThanEqual(grid_position, vec3(-grid_epsilon)))
+			&& all(lessThanEqual(grid_position, dimensions + vec3(grid_epsilon)));
+}
+
+bool clv_screen_reconstruct_position(ivec2 pixel, out vec3 view_position,
+		out vec3 world_position, out float linear_depth) {
+	view_position = vec3(0.0);
+	world_position = vec3(0.0);
+	linear_depth = 0.0;
+	if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, pc.full_size))) {
+		return false;
+	}
+	float device_depth = texelFetch(depth_buffer, pixel, 0).r;
+	if (!(device_depth > 0.0) || !clv_screen_finite_float(device_depth)) { return false; }
+	vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(pc.full_size);
+	vec4 view_h = params.inverse_projection * vec4(uv * 2.0 - 1.0, device_depth, 1.0);
+	if (!(abs(view_h.w) > 1e-8) || !clv_screen_finite_float(view_h.w)) { return false; }
+	view_position = view_h.xyz / view_h.w;
+	world_position = (params.view_to_world * vec4(view_position, 1.0)).xyz;
+	linear_depth = -view_position.z;
+	return clv_screen_finite_vec3(view_position)
+		&& clv_screen_finite_vec3(world_position)
+		&& clv_screen_finite_float(linear_depth) && linear_depth > 0.0;
+}
+
+vec3 clv_screen_view_to_world_normal(vec3 encoded_normal) {
+	vec3 view_normal = encoded_normal * 2.0 - 1.0;
+	float length_squared = dot(view_normal, view_normal);
+	if (!(length_squared > 1e-12) || !clv_screen_finite_float(length_squared)) {
+		return vec3(0.0);
+	}
+	view_normal *= inversesqrt(length_squared);
+	vec3 world_normal = mat3(params.view_to_world) * view_normal;
+	float world_length_squared = dot(world_normal, world_normal);
+	if (!(world_length_squared > 1e-12) || !clv_screen_finite_float(world_length_squared)) {
+		return vec3(0.0);
+	}
+	return world_normal * inversesqrt(world_length_squared);
+}
+
+bool clv_screen_neighbor_position(ivec2 pixel, vec3 center_world, float center_depth,
+		out vec3 neighbor_world, out float neighbor_depth) {
+	vec3 unused_view;
+	if (!clv_screen_reconstruct_position(pixel, unused_view, neighbor_world, neighbor_depth)) {
+		return false;
+	}
+	float tolerance = max(0.025, center_depth * 0.025);
+	return abs(neighbor_depth - center_depth) <= tolerance;
+}
+
+vec3 clv_screen_geometric_normal(ivec2 pixel, vec3 world_position,
+		vec3 view_position, vec3 shading_normal) {
+	vec3 left_world; vec3 right_world; vec3 up_world; vec3 down_world;
+	float left_depth; float right_depth; float up_depth; float down_depth;
+	bool have_left = clv_screen_neighbor_position(pixel - ivec2(1, 0), world_position,
+			-view_position.z, left_world, left_depth);
+	bool have_right = clv_screen_neighbor_position(pixel + ivec2(1, 0), world_position,
+			-view_position.z, right_world, right_depth);
+	bool have_up = clv_screen_neighbor_position(pixel - ivec2(0, 1), world_position,
+			-view_position.z, up_world, up_depth);
+	bool have_down = clv_screen_neighbor_position(pixel + ivec2(0, 1), world_position,
+			-view_position.z, down_world, down_depth);
+	vec3 dx = have_left && have_right ? right_world - left_world
+			: (have_right ? right_world - world_position
+			: (have_left ? world_position - left_world : vec3(0.0)));
+	vec3 dy = have_up && have_down ? down_world - up_world
+			: (have_down ? down_world - world_position
+			: (have_up ? world_position - up_world : vec3(0.0)));
+	vec3 geometric = cross(dx, dy);
+	float length_squared = dot(geometric, geometric);
+	if (!(length_squared > 1e-12) || !clv_screen_finite_float(length_squared)
+			|| !clv_screen_finite_vec3(geometric)) { return shading_normal; }
+	geometric *= inversesqrt(length_squared);
+	vec3 view_to_camera_world = mat3(params.view_to_world) * normalize(-view_position);
+	float camera_length_squared = dot(view_to_camera_world, view_to_camera_world);
+	if (camera_length_squared > 1e-12 && clv_screen_finite_float(camera_length_squared)) {
+		view_to_camera_world *= inversesqrt(camera_length_squared);
+		if (dot(geometric, view_to_camera_world) < 0.0) { geometric = -geometric; }
+	}
+	return geometric;
+}
+
+void clv_screen_load_receiver(ivec2 pixel, out CLVScreenReceiver receiver) {
+	receiver.view_position = vec3(0.0);
+	receiver.world_position = vec3(0.0);
+	receiver.shading_normal = vec3(0.0);
+	receiver.geometric_normal = vec3(0.0);
+	receiver.linear_depth = 0.0;
+	receiver.valid = clv_screen_reconstruct_position(pixel, receiver.view_position,
+			receiver.world_position, receiver.linear_depth);
+	if (!receiver.valid) { return; }
+	vec3 encoded = texelFetch(normal_roughness, pixel, 0).rgb;
+	receiver.shading_normal = clv_screen_view_to_world_normal(encoded);
+	if (!clv_screen_finite_vec3(receiver.shading_normal)
+			|| dot(receiver.shading_normal, receiver.shading_normal) < 0.5) {
+		receiver.valid = false;
+		return;
+	}
+	// The coherent quad derives one geometric normal from its four positions.
+	// Individual depth-neighbor reconstruction is reserved for edge pixels.
+}
+
+#if defined(CLV_SCREEN_STAGE_PARTIAL)
+bool clv_screen_visibility_resources_valid() {
+	int node_values = visibility_bvh.nodes.length();
+	int triangle_values = visibility_geometry.triangles.length();
+	return node_values > 0 && (node_values % 2) == 0
+			&& triangle_values > 0 && (triangle_values % 3) == 0;
+}
+
+bool clv_screen_segment_blocked_profiled(vec3 origin, vec3 target,
+		int source_triangle, int receiver_triangle, int receiver_patch,
+		out int node_visits) {
+	node_visits = 0;
+	vec3 delta = target - origin;
+	float distance = length(delta);
+	if (distance <= 0.00002) { return false; }
+	vec3 direction = delta / distance;
+	vec3 inverse_direction = 1.0 / mix(direction, vec3(1.0),
+		lessThan(abs(direction), vec3(1e-8)));
+	int node_count = visibility_bvh.nodes.length() / 2;
+	int node = 0;
+	for (int visit = 0; visit < 256 && node < node_count; visit++) {
+		node_visits++;
+		vec4 lower = visibility_bvh.nodes[node * 2];
+		vec4 upper = visibility_bvh.nodes[node * 2 + 1];
+		if (!segment_hits_bounds(origin, direction, inverse_direction, distance,
+				lower.xyz, upper.xyz)) {
+			node = int(lower.w);
+			continue;
+		}
+		int leaf_range = int(upper.w);
+		if (leaf_range > 0) {
+			int first = leaf_range / 8 - 1;
+			int count = leaf_range % 8;
+			int triangle_count = visibility_geometry.triangles.length() / 3;
+			if (first < 0 || count <= 0 || first + count > triangle_count) { return true; }
+			for (int leaf = 0; leaf < count; leaf++) {
+				if (first + leaf == source_triangle || first + leaf == receiver_triangle) { continue; }
+				int triangle = (first + leaf) * 3;
+				if (receiver_patch > 0
+						&& int(visibility_geometry.triangles[triangle + 2].w) == receiver_patch) { continue; }
+				vec3 a = visibility_geometry.triangles[triangle].xyz;
+				vec3 edge1 = visibility_geometry.triangles[triangle + 1].xyz;
+				vec3 edge2 = visibility_geometry.triangles[triangle + 2].xyz;
+				vec3 p = cross(direction, edge2);
+				float determinant = dot(edge1, p);
+				if (abs(determinant) < visibility_geometry.triangles[triangle + 1].w) { continue; }
+				vec3 from_a = origin - a;
+				float u = dot(from_a, p) / determinant;
+				vec3 q = cross(from_a, edge1);
+				float v = dot(direction, q) / determinant;
+				float hit_distance = dot(edge2, q) / determinant;
+				if (abs(distance - hit_distance) * abs(determinant)
+						<= 0.00001 * visibility_geometry.triangles[triangle].w) { continue; }
+				if (u >= -1e-6 && v >= -1e-6 && u + v <= 1.000001
+						&& hit_distance > 0.00001 && hit_distance < distance - 0.00001) {
+					return true;
+				}
+			}
+		}
+		node++;
+	}
+	return node < node_count;
+}
+
+bool clv_screen_corner_visible(CLVPartialCorner corner, CLVPartialCandidates candidates,
+		vec3 receiver_geometric_normal, bool diagnostic_roi, out bool traced) {
+	traced = false;
+	if (!clv_screen_visibility_resources_valid()) { return false; }
+	vec3 delta = corner.anchor.xyz - candidates.world;
+	float distance = length(delta);
+	if (!(distance >= 0.0) || !clv_screen_finite_float(distance)) { return false; }
+	if (distance <= 1e-5) { return true; }
+	float bias = min(max(candidates.step_size * 0.005, 1e-5), distance * 0.2);
+	vec3 origin = candidates.world + receiver_geometric_normal * bias;
+	vec3 target = corner.anchor.xyz + corner.normal * bias;
+	if (!clv_screen_finite_vec3(origin) || !clv_screen_finite_vec3(target)) { return false; }
+	traced = true;
+	if (pc.diagnostic_enabled != 0) {
+		int node_visits = 0;
+		bool blocked = clv_screen_segment_blocked_profiled(origin, target,
+				corner.source_triangle, -1, corner.patch_id, node_visits);
+		clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_RAYS, 1u, diagnostic_roi);
+		clv_screen_diagnostic_add(SCREEN_DIAG_BVH_NODE_VISITS, uint(node_visits), diagnostic_roi);
+		if (blocked) { clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_BLOCKED, 1u, diagnostic_roi); }
+		return !blocked;
+	}
+	return !segment_blocked_excluding_triangles(origin, target,
+			corner.source_triangle, -1, corner.patch_id);
+}
+
+bool clv_screen_sample_partial(vec3 world, vec3 geometric_normal, vec3 shading_normal,
+		bool diagnostic_roi, out vec3 secondary, out vec3 primary, out float confidence,
+		out int selected_method, out int selected_level) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	confidence = 0.0;
+	selected_method = 0;
+	selected_level = -1;
+	clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_CALLS, 1u, diagnostic_roi);
+	int locked_patch = 0;
+	int level_count = min(frp_magic_gi_clv_parameters0.control.y, 3);
+	for (int level = 0; level < level_count; level++) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_LOD0 + uint(level), 1u, diagnostic_roi);
+		CLVPartialCandidates candidates;
+		if (!clv_partial_prepare_level(
+				frp_magic_gi_clv_texture0, frp_magic_gi_clv_tags0,
+				frp_magic_gi_clv_support0, SAMPLER_NEAREST_CLAMP,
+				frp_magic_gi_clv_parameters0.origins, frp_magic_gi_clv_parameters0.spacing,
+				frp_magic_gi_clv_parameters0.control, world, geometric_normal,
+				level, locked_patch, candidates)) { continue; }
+		uint candidate_count = uint(bitCount(candidates.eligible_mask));
+		clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_CANDIDATES,
+				candidate_count, diagnostic_roi);
+		uint visible_mask = 0u;
+		for (int corner = 0; corner < 8; corner++) {
+			uint bit = 1u << uint(corner);
+			if ((candidates.eligible_mask & bit) == 0u) { continue; }
+			clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_RAY_VISITS, 1u, diagnostic_roi);
+			bool traced;
+			if (clv_screen_corner_visible(candidates.corners[corner], candidates,
+					geometric_normal, diagnostic_roi, traced)) { visible_mask |= bit; }
+		}
+		float level_confidence;
+		int evaluated_level;
+		int method;
+		int selected_patch;
+		if (clv_partial_evaluate(
+				frp_magic_gi_clv_texture0, SAMPLER_NEAREST_CLAMP,
+				candidates, visible_mask,
+				geometric_normal, shading_normal, locked_patch,
+				secondary, primary, level_confidence, evaluated_level,
+				method, selected_patch)) {
+			locked_patch = selected_patch;
+			confidence = level_confidence;
+			selected_method = method;
+			selected_level = evaluated_level >= 0 ? evaluated_level : level;
+			return true;
+		}
+	}
+	return false;
+}
+#endif
+
+#if defined(CLV_SCREEN_STAGE_FAST) || defined(CLV_SCREEN_STAGE_PARTIAL)
+bool clv_screen_resolve_receiver(vec3 world, vec3 geometric_normal,
+		vec3 shading_normal, bool diagnostic_roi, out vec3 incident,
+		out float confidence, out int route, out int selected_level, out int selected_axis) {
+	incident = vec3(0.0);
+	confidence = 0.0;
+	route = 0;
+	selected_level = -1;
+	selected_axis = -1;
+	if (!clv_screen_finite_vec3(world) || !clv_screen_finite_vec3(geometric_normal)
+			|| !clv_screen_finite_vec3(shading_normal)
+			|| !(frp_magic_gi_owner_parameters0.control.x > 0.0)
+			|| !clv_screen_owner_contains(world)
+			|| !clv_screen_in_bake_bounds(world)) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_OWNER_BOUNDS_MISSES, 1u, diagnostic_roi);
+		clv_screen_diagnostic_route(0, -1, -1, 0.0, diagnostic_roi);
+		return false;
+	}
+	vec3 secondary = vec3(0.0);
+	vec3 primary = vec3(0.0);
+	float sample_confidence = 0.0;
+	bool sampled = false;
+#if defined(CLV_SCREEN_STAGE_FAST)
+	int certified_method = 0;
+	sampled = frp_magic_gi_sample_certified(world, geometric_normal,
+			shading_normal, secondary, primary, selected_level, certified_method);
+	if (sampled) {
+		sample_confidence = 1.0;
+		route = certified_method;
+		selected_axis = frp_magic_gi_clv_dominant_axis(
+				certified_method == 3 ? shading_normal : geometric_normal);
+	} else {
+		sampled = frp_magic_gi_sample_approx(world, shading_normal,
+				secondary, primary, selected_level, sample_confidence);
+		if (sampled) {
+			route = 4;
+			selected_axis = frp_magic_gi_clv_dominant_axis(shading_normal);
+		}
+	}
+#else
+	int partial_method = 0;
+	sampled = clv_screen_sample_partial(world, geometric_normal,
+			shading_normal, diagnostic_roi, secondary, primary, sample_confidence,
+			partial_method, selected_level);
+	if (sampled) {
+		route = partial_method == CLV_PARTIAL_METHOD_DIFFUSE ? 5 : 6;
+		selected_axis = clv_partial_dominant_axis(geometric_normal);
+	}
+#endif
+	if (!sampled || !clv_screen_finite_vec3(secondary)
+			|| !clv_screen_finite_vec3(primary)
+			|| !clv_screen_finite_float(sample_confidence)
+			|| !(sample_confidence > 0.0)) {
+		route = 0;
+		selected_level = -1;
+		selected_axis = -1;
+		clv_screen_diagnostic_route(0, -1, -1, 0.0, diagnostic_roi);
+		return false;
+	}
+	vec3 owner_combined = secondary;
+	if (frp_magic_gi_owner_parameters0.control.y > 0.5) {
+		owner_combined += primary;
+	}
+	if (!clv_screen_finite_vec3(owner_combined)) {
+		route = 0;
+		selected_level = -1;
+		selected_axis = -1;
+		clv_screen_diagnostic_route(0, -1, -1, 0.0, diagnostic_roi);
+		return false;
+	}
+	incident = max(owner_combined, vec3(0.0));
+	confidence = clamp(sample_confidence, 1e-6, 1.0);
+	clv_screen_diagnostic_route(route, selected_level, selected_axis, confidence, diagnostic_roi);
+	return true;
+}
+#endif
+
+bool clv_screen_tile_coherent(ivec2 tile_origin, ivec2 region_size,
+		out vec3 center_world, out vec3 center_view, out vec3 geometric_normal,
+		out vec3 shading_normal, out float linear_depth, out bool in_sampling_bounds) {
+	center_world = vec3(0.0);
+	center_view = vec3(0.0);
+	geometric_normal = vec3(0.0);
+	shading_normal = vec3(0.0);
+	linear_depth = 0.0;
+	in_sampling_bounds = false;
+	float minimum_depth = 3.402823466e+38;
+	float maximum_depth = 0.0;
+	bool verify_full_tile_plane = all(equal(region_size, ivec2(CLV_SCREEN_TILE_SIZE)));
+	vec3 candidate_plane_center = vec3(0.0);
+	vec3 candidate_plane_normal = vec3(0.0);
+	if (verify_full_tile_plane) {
+		vec3 corner_00_view; vec3 corner_70_view; vec3 corner_07_view; vec3 corner_77_view;
+		vec3 candidate_corner_00; vec3 candidate_corner_70;
+		vec3 candidate_corner_07; vec3 candidate_corner_77;
+		float corner_depth;
+		bool corners_valid = clv_screen_reconstruct_position(tile_origin,
+				corner_00_view, candidate_corner_00, corner_depth)
+			&& clv_screen_reconstruct_position(tile_origin + ivec2(region_size.x - 1, 0),
+				corner_70_view, candidate_corner_70, corner_depth)
+			&& clv_screen_reconstruct_position(tile_origin + ivec2(0, region_size.y - 1),
+				corner_07_view, candidate_corner_07, corner_depth)
+			&& clv_screen_reconstruct_position(tile_origin + region_size - ivec2(1),
+				corner_77_view, candidate_corner_77, corner_depth);
+		if (!corners_valid) { return false; }
+		vec3 candidate_dx = ((candidate_corner_70 + candidate_corner_77)
+				- (candidate_corner_00 + candidate_corner_07)) * 0.5;
+		vec3 candidate_dy = ((candidate_corner_07 + candidate_corner_77)
+				- (candidate_corner_00 + candidate_corner_70)) * 0.5;
+		candidate_plane_normal = cross(candidate_dx, candidate_dy);
+		float candidate_normal_length_squared = dot(candidate_plane_normal, candidate_plane_normal);
+		float candidate_footprint = max(max(length(candidate_dx), length(candidate_dy)), 1e-5);
+		if (!(candidate_normal_length_squared > 1e-12)
+				|| !clv_screen_finite_float(candidate_normal_length_squared)
+				|| !clv_screen_finite_float(candidate_footprint)) { return false; }
+		candidate_plane_normal *= inversesqrt(candidate_normal_length_squared);
+		candidate_plane_center = (candidate_corner_00 + candidate_corner_70
+				+ candidate_corner_07 + candidate_corner_77) * 0.25;
+	}
+	vec3 reference_normal = vec3(0.0);
+	vec3 corner_00 = vec3(0.0);
+	vec3 corner_70 = vec3(0.0);
+	vec3 corner_07 = vec3(0.0);
+	vec3 corner_77 = vec3(0.0);
+	bool have_reference = false;
+	int bounds_state = -1;
+	int receiver_count = 0;
+	for (int y = 0; y < region_size.y; y++) {
+		for (int x = 0; x < region_size.x; x++) {
+			ivec2 pixel = tile_origin + ivec2(x, y);
+			if (any(greaterThanEqual(pixel, pc.full_size))) { return false; }
+			CLVScreenReceiver receiver;
+			clv_screen_load_receiver(pixel, receiver);
+			if (!receiver.valid) { return false; }
+			if (!have_reference) {
+				reference_normal = receiver.shading_normal;
+				have_reference = true;
+			} else if (dot(receiver.shading_normal, reference_normal) < 0.75) {
+				return false;
+			}
+			int pixel_in_bounds = clv_screen_owner_contains(receiver.world_position)
+					&& clv_screen_in_bake_bounds(receiver.world_position) ? 1 : 0;
+			if (bounds_state < 0) { bounds_state = pixel_in_bounds; }
+			else if (bounds_state != pixel_in_bounds) { return false; }
+			if (verify_full_tile_plane) {
+				float plane_residual = abs(dot(receiver.world_position - candidate_plane_center,
+						candidate_plane_normal));
+				// Perspective projections have a clip-depth contribution to view W in
+				// the inverse matrix; orthographic rays are parallel to view -Z.
+				vec3 ray_view = abs(params.inverse_projection[2][3]) > 1e-8
+						? normalize(receiver.view_position) : vec3(0.0, 0.0, -1.0);
+				vec3 ray_world = mat3(params.view_to_world) * ray_view;
+				float ray_world_length_squared = dot(ray_world, ray_world);
+				if (!(ray_world_length_squared > 1e-12)
+						|| !clv_screen_finite_float(ray_world_length_squared)) { return false; }
+				ray_world *= inversesqrt(ray_world_length_squared);
+				float plane_ray_cosine = abs(dot(candidate_plane_normal, ray_world));
+				if (!(plane_ray_cosine > 1e-5) || !clv_screen_finite_float(plane_ray_cosine)) {
+					return false;
+				}
+				// Convert world-space plane distance to the equivalent view-Z depth
+				// error along this pixel's camera ray. This retains the prior depth
+				// tolerance without treating the natural depth gradient of a sloped
+				// plane as a discontinuity or accepting a grazing parallel layer.
+				float plane_depth_error = plane_residual * abs(ray_view.z) / plane_ray_cosine;
+				float plane_depth_tolerance = max(0.02, receiver.linear_depth * 0.01);
+				if (!clv_screen_finite_float(plane_residual)
+						|| !clv_screen_finite_float(plane_depth_error)
+						|| plane_depth_error > plane_depth_tolerance) { return false; }
+			}
+			shading_normal += receiver.shading_normal;
+			minimum_depth = min(minimum_depth, receiver.linear_depth);
+			maximum_depth = max(maximum_depth, receiver.linear_depth);
+			if (x == 0 && y == 0) { corner_00 = receiver.world_position; }
+			else if (x == region_size.x - 1 && y == 0) { corner_70 = receiver.world_position; }
+			else if (x == 0 && y == region_size.y - 1) { corner_07 = receiver.world_position; }
+			else if (x == region_size.x - 1 && y == region_size.y - 1) { corner_77 = receiver.world_position; }
+			if (x == region_size.x / 2 && y == region_size.y / 2) {
+				center_world = receiver.world_position;
+				center_view = receiver.view_position;
+				linear_depth = receiver.linear_depth;
+			}
+			receiver_count++;
+	}
+	}
+	if (!have_reference || receiver_count != region_size.x * region_size.y) {
+		return false;
+	}
+	float depth_limit = max(0.02, minimum_depth * 0.01);
+	if (!verify_full_tile_plane && maximum_depth - minimum_depth > depth_limit) { return false; }
+	float shading_length_squared = dot(shading_normal, shading_normal);
+	if (!(shading_length_squared > 1e-12) || !clv_screen_finite_float(shading_length_squared)) {
+		return false;
+	}
+	shading_normal *= inversesqrt(shading_length_squared);
+	vec3 dx = ((corner_70 + corner_77) - (corner_00 + corner_07)) * 0.5;
+	vec3 dy = ((corner_07 + corner_77) - (corner_00 + corner_70)) * 0.5;
+	geometric_normal = cross(dx, dy);
+	float geometric_length_squared = dot(geometric_normal, geometric_normal);
+	if (!(geometric_length_squared > 1e-12) || !clv_screen_finite_float(geometric_length_squared)) {
+		return false;
+	}
+	geometric_normal *= inversesqrt(geometric_length_squared);
+	vec3 view_to_camera_world = mat3(params.view_to_world) * normalize(-center_view);
+	float camera_length_squared = dot(view_to_camera_world, view_to_camera_world);
+	if (!(camera_length_squared > 1e-12) || !clv_screen_finite_float(camera_length_squared)) {
+		return false;
+	}
+	view_to_camera_world *= inversesqrt(camera_length_squared);
+	if (dot(geometric_normal, view_to_camera_world) < 0.0) { geometric_normal = -geometric_normal; }
+	float footprint = max(max(length(dx), length(dy)), 1e-5);
+	float plane_tolerance = max(0.002, footprint * 0.18);
+	// The full tile was checked for a single depth/normal domain above. The
+	// four extreme positions define the cache guide plane; bound the represented
+	// footprint so pathological/degenerate geometry falls back to full resolution.
+	vec3 corner_center = (corner_00 + corner_70 + corner_07 + corner_77) * 0.25;
+	if (!(footprint > 1e-5) || !clv_screen_finite_float(plane_tolerance)
+			|| abs(dot(center_world - corner_center, geometric_normal)) > plane_tolerance) {
+		return false;
+	}
+	if (!(linear_depth > 0.0) || !clv_screen_finite_float(linear_depth)) { return false; }
+	in_sampling_bounds = bounds_state == 1;
+	return clv_screen_finite_vec3(center_world) && clv_screen_finite_vec3(geometric_normal)
+			&& clv_screen_finite_vec3(shading_normal) && linear_depth > 0.0
+			&& clv_screen_finite_float(linear_depth);
+}
+
+#if defined(CLV_SCREEN_STAGE_CLASSIFY)
+void clv_screen_classify_tile() {
+	uint lane = gl_LocalInvocationIndex;
+	ivec2 tile_id = ivec2(gl_WorkGroupID.xy);
+	ivec2 tile_count = (pc.full_size + ivec2(CLV_SCREEN_TILE_SIZE - 1))
+			/ CLV_SCREEN_TILE_SIZE;
+	if (tile_id.x >= tile_count.x || tile_id.y >= tile_count.y) { return; }
+	ivec2 full_edge_size = imageSize(full_edge_output);
+	ivec2 half_incident_size = imageSize(half_incident_output);
+	ivec2 half_guide_size = imageSize(half_guide_output);
+	ivec2 depth_size = textureSize(depth_buffer, 0);
+	ivec2 normal_size = textureSize(normal_roughness, 0);
+	ivec2 expected_half_size = (pc.full_size + ivec2(CLV_SCREEN_TILE_SIZE - 1))
+			/ CLV_SCREEN_TILE_SIZE;
+	// Uniform group-wide validation. Every lane takes this branch together, so
+	// no workgroup member can bypass a later barrier independently.
+	if (pc.full_size.x <= 0 || pc.full_size.y <= 0
+			|| pc.half_size.x <= 0 || pc.half_size.y <= 0
+			|| pc.half_size.x != expected_half_size.x
+			|| pc.half_size.y != expected_half_size.y
+			|| depth_size.x != pc.full_size.x || depth_size.y != pc.full_size.y
+			|| normal_size.x != pc.full_size.x || normal_size.y != pc.full_size.y
+			|| full_edge_size.x != pc.full_size.x || full_edge_size.y != pc.full_size.y
+			|| half_incident_size.x != pc.half_size.x
+			|| half_incident_size.y != pc.half_size.y
+			|| half_guide_size.x != pc.half_size.x
+			|| half_guide_size.y != pc.half_size.y) { return; }
+
+	ivec2 tile_origin = tile_id * CLV_SCREEN_TILE_SIZE;
+	ivec2 local_pixel = ivec2(gl_LocalInvocationID.xy);
+	ivec2 pixel = tile_origin + local_pixel;
+	if (lane == 0u) {
+		clv_screen_classify_plane_center = vec4(0.0);
+		clv_screen_classify_plane_normal = vec4(0.0);
+		clv_screen_classify_camera_world = vec4(0.0);
+		clv_screen_classify_summary_world_depth = vec4(0.0);
+		clv_screen_classify_summary_geometric_bounds = vec4(0.0);
+		clv_screen_classify_summary_shading = vec4(0.0);
+		clv_screen_classify_plane_valid = 0u;
+		clv_screen_classify_coherent = 0u;
+	}
+	barrier();
+
+	CLVScreenReceiver receiver;
+	clv_screen_load_receiver(pixel, receiver);
+	bool pixel_in_image = pixel.x >= 0 && pixel.y >= 0
+			&& pixel.x < pc.full_size.x && pixel.y < pc.full_size.y;
+	bool pixel_valid = pixel_in_image && receiver.valid;
+	uint bounds = 0u;
+	if (pixel_valid) {
+		bounds = clv_screen_owner_contains(receiver.world_position)
+				&& clv_screen_in_bake_bounds(receiver.world_position) ? 1u : 0u;
+		clv_screen_classify_world_depth[lane] = vec4(receiver.world_position,
+				receiver.linear_depth);
+		clv_screen_classify_shading_bounds[lane] = vec4(receiver.shading_normal,
+				float(bounds));
+	} else {
+		clv_screen_classify_world_depth[lane] = vec4(0.0);
+		clv_screen_classify_shading_bounds[lane] = vec4(0.0);
+	}
+	clv_screen_classify_valid[lane] = pixel_valid ? 1u : 0u;
+	if (lane == 36u && pixel_valid) {
+		vec3 camera_world = mat3(params.view_to_world) * normalize(-receiver.view_position);
+		float camera_length_squared = dot(camera_world, camera_world);
+		if (camera_length_squared > 1e-12 && clv_screen_finite_float(camera_length_squared)) {
+			clv_screen_classify_camera_world = vec4(camera_world * inversesqrt(camera_length_squared), 1.0);
+		}
+	}
+	barrier();
+
+	if (lane == 0u) {
+		bool corners_valid = clv_screen_classify_valid[0] != 0u
+				&& clv_screen_classify_valid[7] != 0u
+				&& clv_screen_classify_valid[56] != 0u
+				&& clv_screen_classify_valid[63] != 0u;
+		if (corners_valid) {
+			vec3 corner_00 = clv_screen_classify_world_depth[0].xyz;
+			vec3 corner_70 = clv_screen_classify_world_depth[7].xyz;
+			vec3 corner_07 = clv_screen_classify_world_depth[56].xyz;
+			vec3 corner_77 = clv_screen_classify_world_depth[63].xyz;
+			vec3 dx = ((corner_70 + corner_77) - (corner_00 + corner_07)) * 0.5;
+			vec3 dy = ((corner_07 + corner_77) - (corner_00 + corner_70)) * 0.5;
+			vec3 normal = cross(dx, dy);
+			float normal_length_squared = dot(normal, normal);
+			vec3 center = (corner_00 + corner_70 + corner_07 + corner_77) * 0.25;
+			if (normal_length_squared > 1e-12
+					&& clv_screen_finite_float(normal_length_squared)
+					&& clv_screen_finite_vec3(center)) {
+				clv_screen_classify_plane_center = vec4(center, 1.0);
+				clv_screen_classify_plane_normal = vec4(normal * inversesqrt(normal_length_squared), 0.0);
+				clv_screen_classify_plane_valid = 1u;
+			}
+		}
+	}
+	barrier();
+
+	bool accepted = pixel_valid && clv_screen_classify_plane_valid != 0u
+			&& clv_screen_classify_camera_world.w > 0.5;
+	if (accepted) {
+		vec3 reference_normal = clv_screen_classify_shading_bounds[0].xyz;
+		accepted = dot(receiver.shading_normal, reference_normal) >= 0.75
+				&& bounds == uint(clv_screen_classify_shading_bounds[0].w + 0.5);
+	}
+	if (accepted) {
+		vec3 plane_center = clv_screen_classify_plane_center.xyz;
+		vec3 plane_normal = clv_screen_classify_plane_normal.xyz;
+		float plane_residual = abs(dot(receiver.world_position - plane_center, plane_normal));
+		vec3 ray_view = abs(params.inverse_projection[2][3]) > 1e-8
+				? normalize(receiver.view_position) : vec3(0.0, 0.0, -1.0);
+		vec3 ray_world = mat3(params.view_to_world) * ray_view;
+		float ray_world_length_squared = dot(ray_world, ray_world);
+		float plane_ray_cosine = abs(dot(plane_normal,
+				ray_world_length_squared > 1e-12 ? ray_world * inversesqrt(ray_world_length_squared)
+				: vec3(0.0)));
+		float plane_depth_error = plane_residual * abs(ray_view.z)
+				/ max(plane_ray_cosine, 1e-8);
+		float plane_depth_tolerance = max(0.02, receiver.linear_depth * 0.01);
+		accepted = ray_world_length_squared > 1e-12
+				&& clv_screen_finite_float(ray_world_length_squared)
+				&& plane_ray_cosine > 1e-5 && clv_screen_finite_float(plane_ray_cosine)
+				&& clv_screen_finite_float(plane_residual)
+				&& clv_screen_finite_float(plane_depth_error)
+				&& plane_depth_error <= plane_depth_tolerance;
+	}
+	clv_screen_classify_accept[lane] = accepted ? 1u : 0u;
+	barrier();
+
+	if (lane == 0u && clv_screen_classify_plane_valid != 0u
+			&& clv_screen_classify_camera_world.w > 0.5) {
+		bool tile_is_coherent = true;
+		vec3 shading_sum = vec3(0.0);
+		for (uint index = 0u; index < 64u; index++) {
+			tile_is_coherent = tile_is_coherent && clv_screen_classify_accept[index] != 0u;
+			shading_sum += clv_screen_classify_shading_bounds[index].xyz;
+		}
+		vec3 corner_00 = clv_screen_classify_world_depth[0].xyz;
+		vec3 corner_70 = clv_screen_classify_world_depth[7].xyz;
+		vec3 corner_07 = clv_screen_classify_world_depth[56].xyz;
+		vec3 corner_77 = clv_screen_classify_world_depth[63].xyz;
+		vec3 dx = ((corner_70 + corner_77) - (corner_00 + corner_07)) * 0.5;
+		vec3 dy = ((corner_07 + corner_77) - (corner_00 + corner_70)) * 0.5;
+		float footprint = max(max(length(dx), length(dy)), 1e-5);
+		vec3 geometric = clv_screen_classify_plane_normal.xyz;
+		if (dot(geometric, clv_screen_classify_camera_world.xyz) < 0.0) { geometric = -geometric; }
+		float shading_length_squared = dot(shading_sum, shading_sum);
+		vec3 center_world = clv_screen_classify_world_depth[36].xyz;
+		float center_depth = clv_screen_classify_world_depth[36].w;
+		vec3 corner_center = (corner_00 + corner_70 + corner_07 + corner_77) * 0.25;
+		float plane_tolerance = max(0.002, footprint * 0.18);
+		tile_is_coherent = tile_is_coherent && footprint > 1e-5
+				&& clv_screen_finite_float(plane_tolerance)
+				&& abs(dot(center_world - corner_center, geometric)) <= plane_tolerance
+				&& shading_length_squared > 1e-12
+				&& clv_screen_finite_float(shading_length_squared)
+				&& center_depth > 0.0 && clv_screen_finite_float(center_depth)
+				&& clv_screen_finite_vec3(center_world)
+				&& clv_screen_finite_vec3(geometric);
+		if (tile_is_coherent) {
+			float bounds_value = clv_screen_classify_shading_bounds[0].w;
+			clv_screen_classify_summary_world_depth = vec4(center_world, center_depth);
+			clv_screen_classify_summary_geometric_bounds = vec4(geometric, bounds_value);
+			clv_screen_classify_summary_shading = vec4(shading_sum * inversesqrt(shading_length_squared), 0.0);
+			clv_screen_classify_coherent = 1u;
+		}
+	}
+	barrier();
+
+	bool tile_coherent = clv_screen_classify_coherent != 0u;
+	ivec2 cache_pixel = tile_id;
+	ivec2 tile_probe = min(tile_origin + ivec2(CLV_SCREEN_TILE_SIZE / 2), pc.full_size - 1);
+	bool diagnostic_roi = clv_screen_diagnostic_pixel(tile_probe);
+	if (lane == 0u) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_TILE_COUNT, 1u, diagnostic_roi);
+		if (tile_coherent) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_COHERENT_TILES, 1u, diagnostic_roi);
+			clv_screen_diagnostic_add(SCREEN_DIAG_VALID_RECEIVERS, 64u, diagnostic_roi);
+		} else {
+			clv_screen_diagnostic_add(SCREEN_DIAG_EDGE_TILES, 1u, diagnostic_roi);
+		}
+		bool in_sampling_bounds = tile_coherent
+				&& clv_screen_classify_summary_geometric_bounds.w > 0.5;
+		if (tile_coherent) {
+			imageStore(half_guide_output, cache_pixel,
+					vec4(clv_screen_classify_summary_world_depth.w,
+						clv_screen_classify_summary_geometric_bounds.xyz));
+			if (in_sampling_bounds) {
+				imageStore(half_incident_output, cache_pixel,
+						vec4(clv_screen_classify_summary_shading.xyz,
+							CLV_SCREEN_PENDING_FAST_CENTER));
+			} else {
+				imageStore(half_incident_output, cache_pixel, vec4(0.0));
+			}
+		} else {
+			imageStore(half_incident_output, cache_pixel, vec4(0.0));
+			imageStore(half_guide_output, cache_pixel, vec4(0.0));
+		}
+	}
+	if (pixel_in_image) {
+		imageStore(full_edge_output, pixel, tile_coherent ? vec4(0.0)
+				: vec4(0.0, 0.0, 0.0, CLV_SCREEN_PENDING_FAST));
+	}
+}
+#endif
+
+void main() {
+#if defined(CLV_SCREEN_STAGE_CLASSIFY)
+	clv_screen_classify_tile();
+#else
+#if defined(CLV_SCREEN_STAGE_PARTIAL)
+	ivec2 stage_entry_id = ivec2(gl_GlobalInvocationID.xy);
+	if (all(equal(stage_entry_id, ivec2(0)))) {
+		clv_screen_diagnostic_stage_marker(pc.stage_mode == CLV_SCREEN_PARTIAL_COARSE
+				? SCREEN_DIAG_SPLIT_ENTRY_COARSE : SCREEN_DIAG_SPLIT_ENTRY_LOCAL);
+	}
+#endif
+#if defined(CLV_SCREEN_STAGE_FAST)
+	ivec2 stage_id = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 cache_image_size = imageSize(half_incident_output);
+	ivec2 guide_image_size = imageSize(half_guide_output);
+	ivec2 edge_image_size = imageSize(full_edge_output);
+	ivec2 depth_size = textureSize(depth_buffer, 0);
+	ivec2 normal_size = textureSize(normal_roughness, 0);
+	ivec2 expected_cache_size = (pc.full_size + ivec2(CLV_SCREEN_TILE_SIZE - 1))
+			/ CLV_SCREEN_TILE_SIZE;
+	ivec2 expected_local_size = (pc.full_size + ivec2(1)) / 2;
+	bool size_packet_valid = pc.full_size.x > 0 && pc.full_size.y > 0
+			&& pc.half_size.x > 0 && pc.half_size.y > 0;
+	if (pc.stage_mode == CLV_SCREEN_FAST_COARSE) {
+		ivec2 cache_pixel = stage_id;
+		if (cache_pixel.x >= pc.half_size.x || cache_pixel.y >= pc.half_size.y) { return; }
+		if (!size_packet_valid) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_EXTENTS, 1u, false);
+			return;
+		}
+		if (pc.half_size.x != expected_cache_size.x
+				|| pc.half_size.y != expected_cache_size.y) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_CACHE, 1u, false);
+			return;
+		}
+		if (depth_size.x != pc.full_size.x || depth_size.y != pc.full_size.y) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_DEPTH, 1u, false);
+			return;
+		}
+		if (normal_size.x != pc.full_size.x || normal_size.y != pc.full_size.y) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_NORMAL, 1u, false);
+			return;
+		}
+		if (edge_image_size.x != pc.full_size.x || edge_image_size.y != pc.full_size.y) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_EDGE, 1u, false);
+			return;
+		}
+		if (cache_image_size.x != pc.half_size.x || cache_image_size.y != pc.half_size.y) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_HALF_INCIDENT, 1u, false);
+			return;
+		}
+		if (guide_image_size.x != pc.half_size.x || guide_image_size.y != pc.half_size.y) {
+			clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_HALF_GUIDE, 1u, false);
+			return;
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_FAST_COARSE_INVOCATIONS, 1u, false);
+		vec4 guide = imageLoad(half_guide_output, cache_pixel);
+		vec4 classified = imageLoad(half_incident_output, cache_pixel);
+		if (!(guide.r > 0.0) || !clv_screen_finite_float(guide.r)
+				|| !clv_screen_finite_vec3(guide.gba)
+				|| dot(guide.gba, guide.gba) < 0.5
+				|| classified.a != CLV_SCREEN_PENDING_FAST_CENTER) { return; }
+		ivec2 tile_origin = cache_pixel * CLV_SCREEN_TILE_SIZE;
+		ivec2 tile_probe = min(tile_origin + ivec2(CLV_SCREEN_TILE_SIZE / 2), pc.full_size - 1);
+		bool diagnostic_roi = clv_screen_diagnostic_pixel(tile_probe);
+		ivec2 center_pixel = min(tile_origin + ivec2(CLV_SCREEN_TILE_SIZE / 2),
+				pc.full_size - 1);
+		vec3 center_view; vec3 center_world; float center_depth;
+		vec3 geometric = guide.gba;
+		vec3 shading = classified.rgb;
+		float geometric_length_squared = dot(geometric, geometric);
+		float shading_length_squared = dot(shading, shading);
+		bool center_valid = clv_screen_reconstruct_position(center_pixel, center_view,
+				center_world, center_depth)
+			&& clv_screen_finite_vec3(geometric) && geometric_length_squared > 0.5
+			&& clv_screen_finite_vec3(shading) && shading_length_squared > 0.5
+			&& clv_screen_owner_contains(center_world) && clv_screen_in_bake_bounds(center_world);
+		if (!center_valid) {
+			imageStore(half_incident_output, cache_pixel, vec4(0.0));
+			imageStore(half_guide_output, cache_pixel, vec4(0.0));
+			for (int y = 0; y < CLV_SCREEN_TILE_SIZE; y++) {
+				for (int x = 0; x < CLV_SCREEN_TILE_SIZE; x++) {
+					ivec2 pixel = tile_origin + ivec2(x, y);
+					if (pixel.x < pc.full_size.x && pixel.y < pc.full_size.y) {
+						imageStore(full_edge_output, pixel,
+								vec4(0.0, 0.0, 0.0, CLV_SCREEN_PENDING_FAST));
+					}
+				}
+			}
+			return;
+		}
+		geometric *= inversesqrt(geometric_length_squared);
+		shading *= inversesqrt(shading_length_squared);
+		vec3 incident; float confidence; int route; int level; int axis;
+		if (clv_screen_resolve_receiver(center_world, geometric, shading,
+				diagnostic_roi, incident, confidence, route, level, axis)) {
+			imageStore(half_incident_output, cache_pixel, vec4(incident, confidence));
+		} else {
+			imageStore(half_incident_output, cache_pixel,
+					vec4(shading, CLV_SCREEN_PENDING_PARTIAL));
+		}
+		return;
+	}
+	if (pc.stage_mode != CLV_SCREEN_FAST_LOCAL_EDGES) { return; }
+	ivec2 group_size = expected_local_size;
+	ivec2 group_id = stage_id;
+	if (group_id.x >= group_size.x || group_id.y >= group_size.y) { return; }
+	ivec2 sub_origin = group_id * 2;
+	ivec2 sub_size = min(ivec2(2), pc.full_size - sub_origin);
+	if (sub_size.x <= 0 || sub_size.y <= 0) { return; }
+	if (!size_packet_valid) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_EXTENTS, 1u, false);
+		return;
+	}
+	if (pc.half_size.x != expected_cache_size.x || pc.half_size.y != expected_cache_size.y) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_CACHE, 1u, false);
+		return;
+	}
+	if (depth_size.x != pc.full_size.x || depth_size.y != pc.full_size.y) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_DEPTH, 1u, false);
+		return;
+	}
+	if (normal_size.x != pc.full_size.x || normal_size.y != pc.full_size.y) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_NORMAL, 1u, false);
+		return;
+	}
+	if (edge_image_size.x != pc.full_size.x || edge_image_size.y != pc.full_size.y) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_EDGE, 1u, false);
+		return;
+	}
+	if (cache_image_size.x != pc.half_size.x || cache_image_size.y != pc.half_size.y) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_HALF_INCIDENT, 1u, false);
+		return;
+	}
+	if (guide_image_size.x != pc.half_size.x || guide_image_size.y != pc.half_size.y) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_HALF_GUIDE, 1u, false);
+		return;
+	}
+	ivec2 tile_probe = sub_origin;
+	bool diagnostic_roi = clv_screen_diagnostic_pixel(tile_probe);
+	bool has_fast_pending = false;
+	uint fast_pending_count = 0u;
+	for (int y = 0; y < sub_size.y; y++) {
+		for (int x = 0; x < sub_size.x; x++) {
+			vec4 previous = imageLoad(full_edge_output, sub_origin + ivec2(x, y));
+			if (previous.a == CLV_SCREEN_PENDING_FAST) {
+				has_fast_pending = true;
+				fast_pending_count++;
+				clv_screen_diagnostic_add(SCREEN_DIAG_FAST_LOCAL_PENDING_PIXELS,
+						1u, clv_screen_diagnostic_pixel(sub_origin + ivec2(x, y)));
+			}
+		}
+	}
+	if (!has_fast_pending) { return; }
+	vec3 sub_world; vec3 sub_view; vec3 sub_geometric; vec3 sub_shading;
+	float sub_depth; bool sub_in_bounds;
+	bool sub_coherent = clv_screen_tile_coherent(sub_origin, sub_size,
+			sub_world, sub_view, sub_geometric, sub_shading, sub_depth, sub_in_bounds);
+	if (sub_coherent) {
+		vec3 incident; float confidence; int route; int level; int axis;
+		bool resolved = sub_in_bounds && clv_screen_resolve_receiver(sub_world,
+				sub_geometric, sub_shading, diagnostic_roi,
+				incident, confidence, route, level, axis);
+		for (int y = 0; y < sub_size.y; y++) {
+			for (int x = 0; x < sub_size.x; x++) {
+				ivec2 pixel = sub_origin + ivec2(x, y);
+				vec4 previous = imageLoad(full_edge_output, pixel);
+				if (previous.a != CLV_SCREEN_PENDING_FAST) { continue; }
+				if (!sub_in_bounds) {
+					imageStore(full_edge_output, pixel, vec4(0.0));
+				} else if (resolved) {
+					imageStore(full_edge_output, pixel, vec4(incident, confidence));
+				} else {
+					imageStore(full_edge_output, pixel, vec4(0.0, 0.0, 0.0,
+							CLV_SCREEN_PENDING_PARTIAL));
+				}
+			}
+		}
+		return;
+	}
+	clv_screen_diagnostic_add(SCREEN_DIAG_VALID_RECEIVERS, fast_pending_count, diagnostic_roi);
+	for (int y = 0; y < sub_size.y; y++) {
+		for (int x = 0; x < sub_size.x; x++) {
+			ivec2 pixel = sub_origin + ivec2(x, y);
+			if (imageLoad(full_edge_output, pixel).a != CLV_SCREEN_PENDING_FAST) { continue; }
+			bool pixel_diagnostic_roi = clv_screen_diagnostic_pixel(pixel);
+			CLVScreenReceiver receiver;
+			clv_screen_load_receiver(pixel, receiver);
+			if (!receiver.valid || !clv_screen_owner_contains(receiver.world_position)
+					|| !clv_screen_in_bake_bounds(receiver.world_position)) {
+				imageStore(full_edge_output, pixel, vec4(0.0));
+				continue;
+			}
+			vec3 geometric = clv_screen_geometric_normal(pixel,
+					receiver.world_position, receiver.view_position, receiver.shading_normal);
+			vec3 incident; float confidence; int route; int level; int axis;
+			if (clv_screen_resolve_receiver(receiver.world_position, geometric,
+					receiver.shading_normal, pixel_diagnostic_roi, incident, confidence,
+					route, level, axis)) {
+				imageStore(full_edge_output, pixel, vec4(incident, confidence));
+			} else {
+				imageStore(full_edge_output, pixel, vec4(0.0, 0.0, 0.0,
+						CLV_SCREEN_PENDING_PARTIAL));
+			}
+		}
+	}
+#else
+	ivec2 cache_image_size = imageSize(half_incident_output);
+	ivec2 guide_image_size = imageSize(half_guide_output);
+	ivec2 edge_image_size = imageSize(full_edge_output);
+	ivec2 depth_size = textureSize(depth_buffer, 0);
+	ivec2 normal_size = textureSize(normal_roughness, 0);
+	ivec2 expected_cache_size = (pc.full_size + ivec2(CLV_SCREEN_TILE_SIZE - 1))
+			/ CLV_SCREEN_TILE_SIZE;
+	ivec2 stage_id = ivec2(gl_GlobalInvocationID.xy);
+	bool coarse_stage = pc.stage_mode == CLV_SCREEN_PARTIAL_COARSE;
+	if (all(equal(stage_id, ivec2(0)))) {
+		clv_screen_diagnostic_stage_marker(coarse_stage
+				? SCREEN_DIAG_SPLIT_AFTER_SIZE_QUERIES_COARSE
+				: SCREEN_DIAG_SPLIT_AFTER_SIZE_QUERIES_LOCAL);
+	}
+	// Keep the resource guard as explicit ordered checks. Besides preserving the
+	// exact accepted size set, this makes the first failing RD resource unambiguous
+	// in the reserved diagnostic word.
+	if (pc.full_size.x <= 0 || pc.full_size.y <= 0
+			|| pc.half_size.x <= 0 || pc.half_size.y <= 0) {
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker((coarse_stage
+					? SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE | SCREEN_DIAG_SPLIT_EXTENTS_FAIL_COARSE
+					: SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL | SCREEN_DIAG_SPLIT_EXTENTS_FAIL_LOCAL));
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_EXTENTS, 1u, false);
+		return;
+	}
+	if (pc.half_size.x != expected_cache_size.x
+			|| pc.half_size.y != expected_cache_size.y) {
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker((coarse_stage
+					? SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE | SCREEN_DIAG_SPLIT_CACHE_FAIL_COARSE
+					: SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL | SCREEN_DIAG_SPLIT_CACHE_FAIL_LOCAL));
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_CACHE, 1u, false);
+		return;
+	}
+	if (depth_size.x != pc.full_size.x || depth_size.y != pc.full_size.y) {
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker((coarse_stage
+					? SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE | SCREEN_DIAG_SPLIT_DEPTH_FAIL_COARSE
+					: SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL | SCREEN_DIAG_SPLIT_DEPTH_FAIL_LOCAL));
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_DEPTH, 1u, false);
+		return;
+	}
+	if (normal_size.x != pc.full_size.x || normal_size.y != pc.full_size.y) {
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker((coarse_stage
+					? SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE | SCREEN_DIAG_SPLIT_NORMAL_FAIL_COARSE
+					: SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL | SCREEN_DIAG_SPLIT_NORMAL_FAIL_LOCAL));
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_NORMAL, 1u, false);
+		return;
+	}
+	if (edge_image_size.x != pc.full_size.x || edge_image_size.y != pc.full_size.y) {
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker((coarse_stage
+					? SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE | SCREEN_DIAG_SPLIT_EDGE_FAIL_COARSE
+					: SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL | SCREEN_DIAG_SPLIT_EDGE_FAIL_LOCAL));
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_EDGE, 1u, false);
+		return;
+	}
+	if (cache_image_size.x != pc.half_size.x || cache_image_size.y != pc.half_size.y) {
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker((coarse_stage
+					? SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE | SCREEN_DIAG_SPLIT_HALF_INCIDENT_FAIL_COARSE
+					: SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL | SCREEN_DIAG_SPLIT_HALF_INCIDENT_FAIL_LOCAL));
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_HALF_INCIDENT, 1u, false);
+		return;
+	}
+	if (guide_image_size.x != pc.half_size.x || guide_image_size.y != pc.half_size.y) {
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker((coarse_stage
+					? SCREEN_DIAG_SPLIT_SIZE_FAIL_COARSE | SCREEN_DIAG_SPLIT_HALF_GUIDE_FAIL_COARSE
+					: SCREEN_DIAG_SPLIT_SIZE_FAIL_LOCAL | SCREEN_DIAG_SPLIT_HALF_GUIDE_FAIL_LOCAL));
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_SIZE_FAIL_HALF_GUIDE, 1u, false);
+		return;
+	}
+	clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_POST_SIZE_ENTRIES, 1u,
+			clv_screen_diagnostic_pixel(stage_id));
+	if (all(equal(stage_id, ivec2(0)))) {
+		clv_screen_diagnostic_stage_marker(pc.stage_mode == CLV_SCREEN_PARTIAL_COARSE
+				? SCREEN_DIAG_SPLIT_POST_SIZE_COARSE : SCREEN_DIAG_SPLIT_POST_SIZE_LOCAL);
+	}
+	// Count entries only after the runtime resource-size guard. This makes these
+	// stage counters prove the same invocation passed validation and proceeded.
+	if (pc.stage_mode == CLV_SCREEN_PARTIAL_COARSE) {
+		if (all(lessThan(stage_id, pc.half_size))) {
+			ivec2 probe = min(stage_id * CLV_SCREEN_TILE_SIZE
+					+ ivec2(CLV_SCREEN_TILE_SIZE / 2), pc.full_size - 1);
+			clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_COARSE_INVOCATIONS,
+					1u, clv_screen_diagnostic_pixel(probe));
+		}
+	} else {
+		ivec2 stage_group_size = (pc.full_size + ivec2(1)) / 2;
+		if (all(lessThan(stage_id, stage_group_size))) {
+			ivec2 probe = stage_id * 2;
+			clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_LOCAL_INVOCATIONS,
+					1u, clv_screen_diagnostic_pixel(probe));
+		}
+	}
+	if (pc.stage_mode == CLV_SCREEN_PARTIAL_COARSE) {
+		ivec2 cache_pixel = ivec2(gl_GlobalInvocationID.xy);
+		if (any(greaterThanEqual(cache_pixel, pc.half_size))) { return; }
+		ivec2 tile_origin = cache_pixel * CLV_SCREEN_TILE_SIZE;
+		ivec2 tile_probe = min(tile_origin + ivec2(CLV_SCREEN_TILE_SIZE / 2), pc.full_size - 1);
+		bool diagnostic_roi = clv_screen_diagnostic_pixel(tile_probe);
+		if (all(equal(stage_id, ivec2(0)))) {
+			clv_screen_diagnostic_stage_marker(SCREEN_DIAG_SPLIT_FIRST_LOAD_COARSE);
+		}
+		clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_BEFORE_FIRST_IMAGE_LOAD,
+				1u, diagnostic_roi);
+		vec4 guide = imageLoad(half_guide_output, cache_pixel);
+		bool guide_valid = guide.r > 0.0 && clv_screen_finite_float(guide.r)
+				&& clv_screen_finite_vec3(guide.gba) && dot(guide.gba, guide.gba) > 0.5;
+		clv_screen_diagnostic_add(guide_valid ? SCREEN_DIAG_PARTIAL_COARSE_GUIDE_VALID
+				: SCREEN_DIAG_PARTIAL_COARSE_GUIDE_INVALID, 1u, diagnostic_roi);
+		if (!guide_valid) {
+			return;
+		}
+		vec4 previous_incident = imageLoad(half_incident_output, cache_pixel);
+		clv_screen_diagnostic_add(previous_incident.a < 0.0
+				? SCREEN_DIAG_PARTIAL_COARSE_ALPHA_NEGATIVE
+				: SCREEN_DIAG_PARTIAL_COARSE_ALPHA_NONNEGATIVE, 1u, diagnostic_roi);
+		if (!(previous_incident.a < 0.0)) { return; }
+		clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_COARSE_PENDING, 1u, diagnostic_roi);
+		// FAST proved this tile coherent, so reuse its same center and guide. The
+		// coarse partial query is performed once here; local edge work is a separate
+		// dispatch with one invocation per 2x2 group.
+		ivec2 center_pixel = min(tile_origin + ivec2(CLV_SCREEN_TILE_SIZE / 2),
+				pc.full_size - 1);
+		vec3 center_view; vec3 center_world; float center_depth;
+		vec3 geometric = guide.gba;
+		vec3 shading = previous_incident.rgb;
+		float geometric_length_squared = dot(geometric, geometric);
+		float shading_length_squared = dot(shading, shading);
+		bool center_valid = clv_screen_reconstruct_position(center_pixel, center_view,
+				center_world, center_depth)
+			&& clv_screen_finite_vec3(geometric) && geometric_length_squared > 0.5
+			&& clv_screen_finite_vec3(shading) && shading_length_squared > 0.5
+			&& clv_screen_owner_contains(center_world) && clv_screen_in_bake_bounds(center_world);
+		if (!center_valid) {
+			imageStore(half_incident_output, cache_pixel, vec4(0.0));
+			for (int y = 0; y < CLV_SCREEN_TILE_SIZE; y++) {
+				for (int x = 0; x < CLV_SCREEN_TILE_SIZE; x++) {
+					ivec2 pixel = tile_origin + ivec2(x, y);
+					if (pixel.x < pc.full_size.x && pixel.y < pc.full_size.y) {
+						imageStore(full_edge_output, pixel, vec4(0.0, 0.0, 0.0,
+								CLV_SCREEN_PENDING_PARTIAL));
+					}
+				}
+			}
+			return;
+		}
+		geometric *= inversesqrt(geometric_length_squared);
+		shading *= inversesqrt(shading_length_squared);
+		vec3 incident; float confidence; int route; int level; int axis;
+		bool resolved = clv_screen_resolve_receiver(center_world, geometric, shading,
+				diagnostic_roi, incident, confidence,
+				route, level, axis);
+		if (resolved) {
+			imageStore(half_incident_output, cache_pixel, vec4(incident, confidence));
+			return;
+		}
+		imageStore(half_incident_output, cache_pixel, vec4(0.0));
+		for (int y = 0; y < CLV_SCREEN_TILE_SIZE; y++) {
+			for (int x = 0; x < CLV_SCREEN_TILE_SIZE; x++) {
+				ivec2 pixel = tile_origin + ivec2(x, y);
+				if (all(lessThan(pixel, pc.full_size))) {
+					imageStore(full_edge_output, pixel, vec4(0.0, 0.0, 0.0, -1.0));
+				}
+			}
+		}
+		return;
+	}
+
+	// This invocation owns exactly one 2x2 receiver group. FAST/coarse writers
+	// finish in the preceding compute list, so only negative edge sentinels are
+	// eligible; completed cache samples and valid-black samples are untouched.
+	ivec2 group_size = (pc.full_size + ivec2(1)) / 2;
+	ivec2 group_id = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(group_id, group_size))) { return; }
+	ivec2 sub_origin = group_id * 2;
+	ivec2 sub_size = min(ivec2(2), pc.full_size - sub_origin);
+	if (any(lessThanEqual(sub_size, ivec2(0)))) { return; }
+	bool diagnostic_roi = clv_screen_diagnostic_pixel(sub_origin);
+	if (all(equal(stage_id, ivec2(0)))) {
+		clv_screen_diagnostic_stage_marker(SCREEN_DIAG_SPLIT_FIRST_LOAD_LOCAL);
+	}
+	clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_BEFORE_FIRST_IMAGE_LOAD,
+			1u, diagnostic_roi);
+	bool has_miss = false;
+	uint negative_edge_pixels = 0u;
+	uint nonnegative_edge_pixels = 0u;
+	for (int y = 0; y < sub_size.y; y++) {
+		for (int x = 0; x < sub_size.x; x++) {
+			ivec2 pixel = sub_origin + ivec2(x, y);
+			if (imageLoad(full_edge_output, pixel).a < 0.0) {
+				has_miss = true;
+				negative_edge_pixels++;
+			} else {
+				nonnegative_edge_pixels++;
+			}
+		}
+	}
+	clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_LOCAL_NEGATIVE_PIXELS,
+			negative_edge_pixels, diagnostic_roi);
+	clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_LOCAL_NONNEGATIVE_PIXELS,
+			nonnegative_edge_pixels, diagnostic_roi);
+	if (!has_miss) { return; }
+	clv_screen_diagnostic_add(SCREEN_DIAG_PARTIAL_LOCAL_PENDING, 1u, diagnostic_roi);
+	vec3 sub_world; vec3 sub_view; vec3 sub_geometric; vec3 sub_shading;
+	float sub_depth; bool sub_in_bounds;
+	bool sub_coherent = clv_screen_tile_coherent(sub_origin, sub_size,
+			sub_world, sub_view, sub_geometric, sub_shading, sub_depth, sub_in_bounds);
+	if (sub_coherent) {
+		clv_screen_diagnostic_add(SCREEN_DIAG_VALID_RECEIVERS,
+				uint(sub_size.x * sub_size.y), diagnostic_roi);
+		if (!sub_in_bounds) {
+			for (int y = 0; y < sub_size.y; y++) {
+				for (int x = 0; x < sub_size.x; x++) {
+					ivec2 pixel = sub_origin + ivec2(x, y);
+					if (imageLoad(full_edge_output, pixel).a < 0.0) {
+						imageStore(full_edge_output, pixel, vec4(0.0));
+					}
+				}
+			}
+			return;
+		}
+		vec3 incident; float confidence; int route; int level; int axis;
+		bool resolved = clv_screen_resolve_receiver(sub_world, sub_geometric,
+				sub_shading, clv_screen_diagnostic_pixel(sub_origin), incident,
+				confidence, route, level, axis);
+		if (resolved) {
+			for (int y = 0; y < sub_size.y; y++) {
+				for (int x = 0; x < sub_size.x; x++) {
+					ivec2 pixel = sub_origin + ivec2(x, y);
+					if (imageLoad(full_edge_output, pixel).a < 0.0) {
+						imageStore(full_edge_output, pixel, vec4(incident, confidence));
+					}
+				}
+			}
+			return;
+		}
+		// A coherent center miss is not conclusive for every receiver. Fall through
+		// to the same per-pixel partial query used for incoherent groups.
+	}
+	for (int y = 0; y < sub_size.y; y++) {
+		for (int x = 0; x < sub_size.x; x++) {
+			ivec2 pixel = sub_origin + ivec2(x, y);
+			if (imageLoad(full_edge_output, pixel).a >= 0.0) { continue; }
+			bool diagnostic_roi = clv_screen_diagnostic_pixel(pixel);
+			CLVScreenReceiver receiver;
+			clv_screen_load_receiver(pixel, receiver);
+			if (!receiver.valid || !clv_screen_owner_contains(receiver.world_position)
+					|| !clv_screen_in_bake_bounds(receiver.world_position)) {
+				imageStore(full_edge_output, pixel, vec4(0.0));
+				continue;
+			}
+			vec3 geometric = clv_screen_geometric_normal(pixel,
+					receiver.world_position, receiver.view_position, receiver.shading_normal);
+			vec3 incident; float confidence; int route; int level; int axis;
+			if (clv_screen_resolve_receiver(receiver.world_position, geometric,
+					receiver.shading_normal, diagnostic_roi, incident, confidence,
+					route, level, axis)) {
+				imageStore(full_edge_output, pixel, vec4(incident, confidence));
+			}
+		}
+	}
+	#endif
+#endif
+}

@@ -149,6 +149,13 @@ static func resolve() -> Compositor:
 				push_warning("FengProjectPipeline: '%s' is a UID this session cannot resolve (the editor's UID cache does not know it yet); pick the file again or restart the editor." % path)
 			return null
 		path = resolved
+	# ResourceLoader.exists() may accept a directory URL such as `res://`, but
+	# there is no resource to load from it. Treat directory-valued settings as
+	# unconfigured; actual file resources still pass through the existing load
+	# path so their load errors remain visible.
+	if path.ends_with("/") or DirAccess.dir_exists_absolute(ProjectSettings.globalize_path(path)):
+		_clear_cache()
+		return null
 	if path == _cached_path and _cached_compositor_ref != null:
 		var cached := _cached_compositor_ref.get_ref() as Compositor
 		if is_instance_valid(cached):

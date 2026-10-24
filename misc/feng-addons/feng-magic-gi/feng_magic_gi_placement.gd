@@ -23,9 +23,15 @@ const MAX_OCCLUSION_TRIANGLES := 250000
 const OCCLUSION_MAX_CROSSINGS := 256
 const OCCLUSION_WELD_EPSILON := 0.00001
 const FLOAT32_EPSILON := 0.00000011920928955078125
+const TRIANGLE_SEGMENT_DETERMINANT_EPSILON := 0.00001
+const REVERSE_VERIFY_DETERMINANT_SAFETY := 4.0
+const REVERSE_VERIFY_MAX_SPACING_RATIO := 0.25
 const MIN_PROBE_OFFSET_SPACING_RATIO := 0.002
 const BASE_PROBE_OFFSET_SPACING_RATIO := 0.025
-const MAX_PROBE_OFFSET_SPACING_RATIO := 0.08
+# Probe centers may be offset at most half a base cell from their surface anchors.
+# Actual offsets are further reduced or rejected by BVH, owner-side,
+# volume-boundary, and solid checks.
+const MAX_PROBE_OFFSET_SPACING_RATIO := 0.5
 const OCCLUSION_GRID_AXIS := 8
 const BROADPHASE_EPSILON := SceneTracker.BROADPHASE_EPSILON
 const REFRESH_MAIN_SLICE_USEC := 2500
@@ -712,16 +718,22 @@ func _mesh_faces_are_watertight_async(local_faces: PackedVector3Array,
 			if not vertex_ids.has(vertex_key):
 				vertex_ids[vertex_key] = vertex_ids.size()
 			triangle_ids.append(int(vertex_ids[vertex_key]))
-		if triangle_ids[0] == triangle_ids[1] or triangle_ids[1] == triangle_ids[2] \
-				or triangle_ids[2] == triangle_ids[0]:
-			return false
-		for edge_index in 3:
-			var first := triangle_ids[edge_index]
-			var second := triangle_ids[(edge_index + 1) % 3]
-			var low := mini(first, second)
-			var high := maxi(first, second)
-			var edge_key: int = (low << 32) | high
-			edge_counts[edge_key] = int(edge_counts.get(edge_key, 0)) + 1
+		var skip_face := triangle_ids[0] == triangle_ids[1] \
+				or triangle_ids[1] == triangle_ids[2] or triangle_ids[2] == triangle_ids[0]
+		if not skip_face:
+			var a: Vector3 = local_faces[face_offset]
+			var b: Vector3 = local_faces[face_offset + 1]
+			var c: Vector3 = local_faces[face_offset + 2]
+			var face_normal := (c - a).cross(b - a).normalized()
+			skip_face = face_normal.length_squared() < 0.5
+		if not skip_face:
+			for edge_index in 3:
+				var first := triangle_ids[edge_index]
+				var second := triangle_ids[(edge_index + 1) % 3]
+				var low := mini(first, second)
+				var high := maxi(first, second)
+				var edge_key: int = (low << 32) | high
+				edge_counts[edge_key] = int(edge_counts.get(edge_key, 0)) + 1
 		if face_offset % 192 == 0:
 			slice_started = await _yield_refresh_slice(volume, tree, is_current,
 					progress, "Checking closed-mesh edges", face_offset / 3,
@@ -1391,16 +1403,22 @@ func _mesh_faces_are_watertight(local_faces: PackedVector3Array) -> bool:
 			if not vertex_ids.has(vertex_key):
 				vertex_ids[vertex_key] = vertex_ids.size()
 			triangle_ids.append(int(vertex_ids[vertex_key]))
-		if triangle_ids[0] == triangle_ids[1] or triangle_ids[1] == triangle_ids[2] \
-				or triangle_ids[2] == triangle_ids[0]:
-			return false
-		for edge_index in 3:
-			var first := triangle_ids[edge_index]
-			var second := triangle_ids[(edge_index + 1) % 3]
-			var low := mini(first, second)
-			var high := maxi(first, second)
-			var edge_key: int = (low << 32) | high
-			edge_counts[edge_key] = int(edge_counts.get(edge_key, 0)) + 1
+		var skip_face := triangle_ids[0] == triangle_ids[1] \
+				or triangle_ids[1] == triangle_ids[2] or triangle_ids[2] == triangle_ids[0]
+		if not skip_face:
+			var a: Vector3 = local_faces[face_offset]
+			var b: Vector3 = local_faces[face_offset + 1]
+			var c: Vector3 = local_faces[face_offset + 2]
+			var face_normal := (c - a).cross(b - a).normalized()
+			skip_face = face_normal.length_squared() < 0.5
+		if not skip_face:
+			for edge_index in 3:
+				var first := triangle_ids[edge_index]
+				var second := triangle_ids[(edge_index + 1) % 3]
+				var low := mini(first, second)
+				var high := maxi(first, second)
+				var edge_key: int = (low << 32) | high
+				edge_counts[edge_key] = int(edge_counts.get(edge_key, 0)) + 1
 	if edge_counts.is_empty():
 		return false
 	for count in edge_counts.values():
@@ -2433,7 +2451,14 @@ func _candidate_records_conflict(a: Dictionary, b: Dictionary) -> bool:
 			maxf(0.000001, average_spacing * 0.000001))
 	var center_a: Vector3 = candidate_a["center"]
 	var center_b: Vector3 = candidate_b["center"]
-	return center_a.distance_squared_to(center_b) < minimum_distance * minimum_distance
+	if center_a.distance_squared_to(center_b) >= minimum_distance * minimum_distance:
+		return false
+	# Separation is a free-space coverage rule. A probe behind a solid wall or
+	# floor cannot cover this sample and must not evict it merely by proximity.
+	# Keep the same per-cell budget and spacing for mutually visible candidates.
+	if bvh_ready and not bvh.intersect_segment(center_a, center_b).is_empty():
+		return false
+	return true
 
 func _local_priority_survivors(winners: Array[Dictionary],
 		fixed_winners: Array[Dictionary],
@@ -2821,10 +2846,54 @@ func _ray_crossing_count(origin: Vector3, direction: Vector3, ray_length: float,
 			advance_distance *= 2.0
 		if not crossed_hit_plane:
 			return -1
-		# Confirm that the tiny interval around the crossing resolves to the same
-		# face or an exactly coplanar continuation. A nearby distinct shell makes
-		# this ray ambiguous instead of being skipped by the ULP advance.
-		var verify_span := maxf(advance_distance, _probe_spacing * 0.0001)
+		# Geometry3D compares the unnormalised segment determinant against the
+		# absolute CMP_EPSILON=1e-5. A fixed tiny interval falls below that threshold
+		# on small curved facets, so size this local confirmation segment from the
+		# hit triangle's projected area while keeping it bounded.
+		if hit_face < 0 or hit_face * 3 + 2 >= mesh_faces.size():
+			return -1
+		var face_a: Vector3 = mesh_faces[hit_face * 3]
+		var face_b: Vector3 = mesh_faces[hit_face * 3 + 1]
+		var face_c: Vector3 = mesh_faces[hit_face * 3 + 2]
+		var projected_cross := absf((face_b - face_a).cross(face_c - face_a).dot(direction))
+		if not is_finite(projected_cross) or projected_cross <= 0.0:
+			return -1
+		var required_segment_length := REVERSE_VERIFY_DETERMINANT_SAFETY \
+				* TRIANGLE_SEGMENT_DETERMINANT_EPSILON / projected_cross
+		var max_reverse_span := maxf(_probe_spacing * REVERSE_VERIFY_MAX_SPACING_RATIO,
+				_probe_spacing * 0.0001)
+		if not is_finite(required_segment_length) \
+				or required_segment_length > max_reverse_span + max_advance:
+			return -1
+		# Ensure the crossing parameter t=advance/segment_length stays above
+		# segment_intersects_triangle's CMP_EPSILON as the adaptive segment grows.
+		var verify_advance := maxf(advance_distance,
+				required_segment_length * TRIANGLE_SEGMENT_DETERMINANT_EPSILON * 2.0)
+		var verify_crossed_plane := false
+		while verify_advance <= max_advance:
+			var verify_start := hit_position + direction * verify_advance
+			var verify_movement := verify_start - hit_position
+			var verify_plane_step := verify_movement.dot(hit_normal)
+			if verify_movement.dot(direction) > 0.0 \
+					and absf(verify_plane_step) >= boundary_epsilon \
+					and verify_plane_step * hit_normal.dot(direction) > 0.0:
+				ray_start = verify_start
+				verify_crossed_plane = true
+				break
+			verify_advance *= 2.0
+		if not verify_crossed_plane:
+			return -1
+		var verify_span := maxf(_probe_spacing * 0.0001,
+				required_segment_length - verify_advance)
+		if verify_span > max_reverse_span:
+			return -1
+		var verify_total_length := verify_advance + verify_span
+		var reverse_hit_parameter := verify_advance / verify_total_length
+		if not is_finite(verify_total_length) or verify_total_length <= 0.0 \
+				or not is_finite(reverse_hit_parameter) \
+				or reverse_hit_parameter <= TRIANGLE_SEGMENT_DETERMINANT_EPSILON \
+				or reverse_hit_parameter >= 1.0:
+			return -1
 		var reverse_end := hit_position - direction * verify_span
 		var reverse_hit := mesh_bvh.intersect_segment(ray_start, reverse_end)
 		if reverse_hit.is_empty():
@@ -2834,7 +2903,7 @@ func _ray_crossing_count(origin: Vector3, direction: Vector3, ray_length: float,
 				mesh_faces, hit_face, reverse_face, hit_position):
 			return -1
 		crossings += 1
-		if ray_start.distance_squared_to(ray_end) <= advance_distance * advance_distance:
+		if ray_start.distance_squared_to(ray_end) <= verify_advance * verify_advance:
 			return crossings
 	return -1 # Avoid pathological work on malformed/intersecting topology.
 
@@ -2933,3 +3002,8 @@ func trace_emitter_connection(origin: Vector3, direction: Vector3, max_distance:
 
 func safe_surface_offset(surface: Vector3, normal: Vector3) -> float:
 	return trace_scene.safe_surface_offset(surface, normal) if trace_scene != null else 0.0
+
+## Conservative free-space bake classification. A true result includes both a
+## proven closed-mesh interior and an ambiguous boundary/containment query.
+func point_is_inside_or_ambiguous_solid(point: Vector3) -> bool:
+	return _probe_center_is_inside_solid(point)

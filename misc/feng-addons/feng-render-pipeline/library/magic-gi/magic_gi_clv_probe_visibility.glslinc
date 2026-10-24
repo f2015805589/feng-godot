@@ -1,0 +1,112 @@
+// One authoritative implementation for baked-visibility CLV probe lighting.
+// Both the compute sampler and the native deferred sampler provide these names:
+// geometry_atlas, visibility_moment_atlas, and params.control.y.
+float sign_not_zero(float value) {
+	return value < 0.0 ? -1.0 : 1.0;
+}
+
+vec2 octahedral_encode(vec3 direction) {
+	vec3 unit_direction = normalize(direction);
+	float denominator = abs(unit_direction.x) + abs(unit_direction.y) + abs(unit_direction.z);
+	vec2 p = unit_direction.xy / max(denominator, 1e-7);
+	if (unit_direction.z < 0.0) {
+		p = (1.0 - abs(p.yx)) * vec2(sign_not_zero(p.x), sign_not_zero(p.y));
+	}
+	return p * 0.5 + 0.5;
+}
+
+ivec2 fold_visibility_texel(ivec2 texel) {
+	const int tile_size = 8;
+	for (int iteration = 0; iteration < 4; iteration++) {
+		if (texel.x < 0) {
+			texel = ivec2(-texel.x - 1, tile_size - 1 - texel.y);
+		} else if (texel.x >= tile_size) {
+			texel = ivec2(tile_size * 2 - 1 - texel.x, tile_size - 1 - texel.y);
+		}
+		if (texel.y < 0) {
+			texel = ivec2(tile_size - 1 - texel.x, -texel.y - 1);
+		} else if (texel.y >= tile_size) {
+			texel = ivec2(tile_size - 1 - texel.x, tile_size * 2 - 1 - texel.y);
+		}
+		if (all(greaterThanEqual(texel, ivec2(0)))
+				&& all(lessThan(texel, ivec2(tile_size)))) {
+			return texel;
+		}
+	}
+	return clamp(texel, ivec2(0), ivec2(tile_size - 1));
+}
+
+vec2 fetch_visibility_moments(int probe, ivec2 tile_texel) {
+	ivec2 folded = fold_visibility_texel(tile_texel);
+	ivec2 tile_origin = ivec2((probe % 32) * 8, (probe / 32) * 8);
+	return texelFetch(visibility_moment_atlas, tile_origin + folded, 0).rg;
+}
+
+vec2 sample_visibility_moments(int probe, vec3 direction) {
+	vec2 texel_position = octahedral_encode(direction) * 8.0 - 0.5;
+	ivec2 base = ivec2(floor(texel_position));
+	vec2 fraction = texel_position - vec2(base);
+	vec2 moments = vec2(0.0);
+	// A 2x2 gather has the same raw texels as the manual bilinear loop only
+	// when all four taps remain inside this probe's 8x8 octahedral tile.
+	// GLSL 4.00+ provides core textureGather; older shader versions retain the
+	// folding path below.
+#if __VERSION__ >= 400
+	if (all(greaterThanEqual(base, ivec2(0)))
+			&& all(lessThanEqual(base, ivec2(6)))) {
+		ivec2 tile_origin = ivec2((probe % 32) * 8, (probe / 32) * 8);
+		// Place the gather at the center of the base/base+1 footprint. The
+		// original fraction still drives the manual interpolation weights below.
+		vec2 gather_uv = vec2(tile_origin + base + ivec2(1))
+				/ vec2(textureSize(visibility_moment_atlas, 0));
+		// textureGather order is (i0j1, i1j1, i1j0, i0j0). Pair the R/G
+		// channel gathers and preserve the original 00, 10, 01, 11 accumulation order.
+		vec4 red_taps = textureGather(visibility_moment_atlas, gather_uv, 0);
+		vec4 green_taps = textureGather(visibility_moment_atlas, gather_uv, 1);
+		moments += vec2(red_taps.w, green_taps.w)
+				* ((1.0 - fraction.x) * (1.0 - fraction.y));
+		moments += vec2(red_taps.z, green_taps.z)
+				* (fraction.x * (1.0 - fraction.y));
+		moments += vec2(red_taps.x, green_taps.x)
+				* ((1.0 - fraction.x) * fraction.y);
+		moments += vec2(red_taps.y, green_taps.y)
+				* (fraction.x * fraction.y);
+		return moments;
+	}
+#endif
+	for (int y = 0; y < 2; y++) {
+		for (int x = 0; x < 2; x++) {
+			float weight = (x == 1 ? fraction.x : 1.0 - fraction.x)
+					* (y == 1 ? fraction.y : 1.0 - fraction.y);
+			moments += fetch_visibility_moments(probe, base + ivec2(x, y)) * weight;
+		}
+	}
+	return moments;
+}
+
+float chebyshev_visibility(vec2 moments, float receiver_distance, float variance_floor) {
+	float mean_distance = max(moments.x, 0.0);
+	float delta = receiver_distance - mean_distance;
+	if (delta <= 0.0) {
+		return 1.0;
+	}
+	float variance = max(max(moments.y - mean_distance * mean_distance, 0.0), variance_floor);
+	float delta_squared = delta * delta;
+	float denominator = variance + delta_squared;
+	if (isnan(denominator) || isinf(denominator) || denominator <= 0.0) {
+		return 0.0;
+	}
+	float bound = clamp(variance / denominator, 0.0, 1.0);
+	return bound * bound;
+}
+
+float clv_probe_visibility(int probe, vec3 receiver) {
+	ivec2 xy = ivec2((probe % 32) * 3 + 1, probe / 32);
+	vec3 delta = receiver - texelFetch(geometry_atlas, xy, 0).xyz;
+	float distance = length(delta);
+	if (distance <= 1e-6) { return 1.0; }
+	float spacing = max(params.control.y, 0.001);
+	float visibility = chebyshev_visibility(sample_visibility_moments(probe, delta / distance),
+			distance, max(0.0001, spacing * spacing * 0.0001));
+	return visibility * visibility * visibility;
+}

@@ -17,8 +17,11 @@ layout(set = 0, binding = 4, std140) uniform GIParams {
 layout(set = 0, binding = 5, std430) writeonly buffer Lighting { vec4 values[]; } lighting;
 layout(set = 0, binding = 6, std430) readonly buffer Normals { vec4 values[]; } normals;
 layout(set = 0, binding = 7, std430) readonly buffer SurfaceReference { vec4 values[]; } reference;
+// Optional normal-independent SH sidecar for layout14. Binding 5 remains the
+// calibrated 20-vec4 production buffer and is byte-for-byte unchanged.
+layout(set = 0, binding = 8, std430) writeonly buffer RawDirectional { vec4 values[]; } raw_directional;
 #include "magic_gi_sh.glslinc"
-layout(push_constant, std430) uniform Configuration { int probes; int emitters; } config;
+layout(push_constant, std430) uniform Configuration { int probes; int emitters; int write_raw_sidecar; } config;
 
 vec3 coefficient(vec4 blocks[7], int k) {
 	int i = k * 3;
@@ -48,6 +51,12 @@ void main() {
 				secondary[c] += emission.values[base + c] * sources.values[emitter * 6 + c]
 						+ emission.values[base + 3 + c] * sources.values[emitter * 6 + 3 + c];
 			}
+		}
+		if (config.write_raw_sidecar != 0) {
+			// Capture the raw normal-independent outgoing SH before the exact
+			// surface-reference calibration below rewrites coefficient zero.
+			raw_directional.values[probe * 18 + outgoing] = vec4(secondary, 0.0);
+			raw_directional.values[probe * 18 + 9 + outgoing] = vec4(primary, 0.0);
 		}
 		if (outgoing == 0) { constant_secondary = secondary; constant_primary = primary; }
 		// Signed SH coefficients are retained. Clamp only after cosine convolution.

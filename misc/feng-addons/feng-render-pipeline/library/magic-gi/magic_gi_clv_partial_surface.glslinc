@@ -1,0 +1,421 @@
+#ifndef FENG_MAGIC_GI_CLV_PARTIAL_SURFACE_GLSLINC
+#define FENG_MAGIC_GI_CLV_PARTIAL_SURFACE_GLSLINC
+
+// Layout-9 mixed/partial receiver reconstruction for the half-resolution
+// post-GBuffer path. This include owns no descriptor declarations and does not
+// depend on BVH globals. The caller supplies the three cache textures and the
+// existing 80-byte clipmap parameter fields, traces only eligible anchors, then
+// passes a per-corner visibility mask to the evaluator.
+//
+// ABI: layout-9 cache is [3 * 24 * resolution, resolution, levels * resolution].
+// For each axis, columns 0..8 and 9..17 are secondary/primary SH9; 18 is
+// receiver metadata (normal.xyz, patch id.w), 19 is anchor (position.xyz,
+// signed 1-based source triangle id.w), 20/21 are diffuse secondary/primary,
+// and 22/23 are approximate geometry and patch-plane moments. Diffuse columns
+// carry a transfer-valid alpha; a valid black result therefore remains eligible.
+// Relight column 0.w carries visibility-proxy ID + 1 only for an axis-supported
+// transfer. Tag.xyz is logical cell identity and tag.w is the geometry epoch.
+struct CLVPartialCorner {
+	ivec3 slot;               // wrapped physical voxel, with LOD in slot.z
+	ivec3 logical_cell;      // required for caller-side epoch/debug checks
+	int patch_id;             // positive geometry patch identifier
+	int source_triangle;      // zero-based source triangle for the caller's BVH ray
+	float weight;             // trilinear corner weight before visibility
+	vec4 anchor;              // anchor position.xyz and signed source triangle id.w
+	vec3 normal;              // normalized receiver-anchor normal from metadata
+	bool diffuse_valid;       // cols 20/21 alpha >= 0.55; valid black is allowed
+	bool raw_sh_valid;        // col 0.w is a positive visibility-proxy ID + 1
+};
+
+struct CLVPartialCandidates {
+	ivec3 logical_base;
+	ivec3 wrapped_base;
+	vec3 fraction;
+	vec3 world;
+	float step_size;
+	int resolution;
+	int epoch;
+	int level;
+	int axis;
+	uint eligible_mask;      // bits use the exact x + 2*y + 4*z corner order
+	CLVPartialCorner corners[8];
+};
+
+const uint CLV_PARTIAL_NEIGHBOR_TAGS_READY = 1u << 7u;
+const int CLV_PARTIAL_LAYOUT_VERSION = 9;
+const int CLV_PARTIAL_LEVEL_COUNT_MAX = 3;
+const int CLV_PARTIAL_FACE_SLOT_COUNT = 3;
+const int CLV_PARTIAL_FACE_COLUMNS = 24;
+const int CLV_PARTIAL_FACE_RADIANCE_COLUMNS = 18;
+const int CLV_PARTIAL_FACE_METADATA_COLUMN = 18;
+const int CLV_PARTIAL_FACE_ANCHOR_COLUMN = 19;
+const int CLV_PARTIAL_FACE_DIFFUSE_COLUMN = 20;
+const float CLV_PARTIAL_MIN_TRANSFER_ALPHA = 0.55;
+const float CLV_PARTIAL_MIN_VISIBLE_MASS = 1e-4;
+const float CLV_PARTIAL_LOCAL_DISTANCE_STEPS = 1.5;
+const int CLV_PARTIAL_METHOD_NONE = 0;
+const int CLV_PARTIAL_METHOD_DIFFUSE = 1;
+const int CLV_PARTIAL_METHOD_CURVED_SH = 2;
+
+bool clv_partial_finite_float(float value) {
+	return !isnan(value) && !isinf(value);
+}
+
+bool clv_partial_finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool clv_partial_finite_vec4(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+ivec3 clv_partial_wrap_logical_index(ivec3 logical_index, int resolution) {
+	return ((logical_index % resolution) + resolution) % resolution;
+}
+
+vec4 clv_partial_fetch(texture3D cache_texture, sampler cache_sampler,
+		ivec3 slot, int axis,
+		int column, int resolution) {
+	return texelFetch(sampler3D(cache_texture, cache_sampler), slot + ivec3(
+			(axis * CLV_PARTIAL_FACE_COLUMNS + column) * resolution, 0, 0), 0);
+}
+
+int clv_partial_dominant_axis(vec3 normal) {
+	vec3 absolute_normal = abs(normal);
+	if (absolute_normal.x >= absolute_normal.y && absolute_normal.x >= absolute_normal.z) { return 0; }
+	if (absolute_normal.y >= absolute_normal.z) { return 1; }
+	return 2;
+}
+
+void clv_partial_initialize(out CLVPartialCandidates candidates) {
+	candidates.logical_base = ivec3(0);
+	candidates.wrapped_base = ivec3(0);
+	candidates.fraction = vec3(0.0);
+	candidates.world = vec3(0.0);
+	candidates.step_size = 0.0;
+	candidates.resolution = 0;
+	candidates.epoch = 0;
+	candidates.level = -1;
+	candidates.axis = -1;
+	candidates.eligible_mask = 0u;
+	for (int i = 0; i < 8; i++) {
+		candidates.corners[i].slot = ivec3(0);
+		candidates.corners[i].logical_cell = ivec3(0);
+		candidates.corners[i].patch_id = 0;
+		candidates.corners[i].source_triangle = -1;
+		candidates.corners[i].weight = 0.0;
+		candidates.corners[i].anchor = vec4(0.0);
+		candidates.corners[i].normal = vec3(0.0);
+		candidates.corners[i].diffuse_valid = false;
+		candidates.corners[i].raw_sh_valid = false;
+	}
+}
+
+// Prepare one LOD's eligible corner set. `locked_patch_id <= 0` allows the
+// evaluator to select the nearest visible local patch; a positive value locks
+// this LOD to the exact patch chosen by the finest successful LOD.
+//
+// A parent may be mixed: stale, invalid, zero-weight, distant, or back-facing
+// corners are omitted. No all-eight-same-patch/normal certificate is required.
+// The receiver-side plane allowance includes the local chord sagitta bound
+// 0.5 * distance * |N_receiver - N_anchor|, so a curved surface is not rejected
+// merely because it lies behind a neighboring tangent plane. A parallel floor
+// or wall on the wrong side still fails the signed-plane bound.
+bool clv_partial_prepare_level(texture3D cache_texture,
+		itexture3D cache_tags, utexture3D cache_support, sampler cache_sampler,
+		ivec4 origins[3], vec4 spacing, ivec4 control,
+		vec3 world, vec3 geometric_normal, int level, int locked_patch_id,
+		out CLVPartialCandidates candidates) {
+	clv_partial_initialize(candidates);
+	if (control.w != CLV_PARTIAL_LAYOUT_VERSION || control.x < 2
+			|| control.y <= 0 || control.y > CLV_PARTIAL_LEVEL_COUNT_MAX
+			|| level < 0 || level >= control.y || control.z <= 0
+			|| !clv_partial_finite_float(spacing.x) || !(spacing.x > 0.0)
+			|| !clv_partial_finite_vec3(world)
+			|| !clv_partial_finite_vec3(geometric_normal)) { return false; }
+	int resolution = control.x;
+	int level_count = control.y;
+	ivec3 expected_cache_size = ivec3(CLV_PARTIAL_FACE_SLOT_COUNT * CLV_PARTIAL_FACE_COLUMNS * resolution,
+		resolution, level_count * resolution);
+	ivec3 expected_tag_size = ivec3(resolution, resolution, level_count * resolution);
+	if (any(notEqual(textureSize(sampler3D(cache_texture, cache_sampler), 0), expected_cache_size))
+			|| any(notEqual(textureSize(isampler3D(cache_tags, cache_sampler), 0), expected_tag_size))
+			|| any(notEqual(textureSize(usampler3D(cache_support, cache_sampler), 0), expected_tag_size))) { return false; }
+	float normal_length_squared = dot(geometric_normal, geometric_normal);
+	if (!(normal_length_squared > 1e-12) || !clv_partial_finite_float(normal_length_squared)) { return false; }
+	vec3 receiver_normal = geometric_normal * inversesqrt(normal_length_squared);
+	float step_size = spacing.x * float(1 << level);
+	if (!clv_partial_finite_float(step_size) || !(step_size > 0.0)) { return false; }
+	vec3 position = (world + receiver_normal * (0.75 * step_size)) / step_size - 0.5;
+	if (!clv_partial_finite_vec3(position)) { return false; }
+	ivec3 base = ivec3(floor(position));
+	ivec3 relative_base = base - origins[level].xyz;
+	if (any(lessThan(relative_base, ivec3(0)))
+			|| any(greaterThanEqual(relative_base, ivec3(resolution - 1)))) { return false; }
+	ivec3 wrapped_base = clv_partial_wrap_logical_index(base, resolution);
+	ivec3 base_slot = wrapped_base + ivec3(0, 0, level * resolution);
+	ivec4 base_tag = texelFetch(isampler3D(cache_tags, cache_sampler), base_slot, 0);
+	uint base_support = texelFetch(usampler3D(cache_support, cache_sampler), base_slot, 0).r;
+	bool base_tag_matches = all(equal(base_tag.xyz, base)) && base_tag.w == control.z;
+	// READY is only a safe tag-read optimization for a current base slot. If it
+	// is absent or the base slot itself is stale, verify each positive-weight
+	// corner independently instead of rejecting the whole parent cube.
+	bool base_neighbor_tags_ready = base_tag_matches
+			&& (base_support & CLV_PARTIAL_NEIGHBOR_TAGS_READY) != 0u;
+	vec3 fraction = fract(position);
+	int axis = clv_partial_dominant_axis(receiver_normal);
+	float local_distance_limit = CLV_PARTIAL_LOCAL_DISTANCE_STEPS * step_size;
+	float coordinate_scale = max(max(abs(world.x), abs(world.y)), abs(world.z)) + 2.0 * step_size;
+	float numeric_margin = max(1e-5, coordinate_scale * 1.9073486328125e-6);
+	for (int corner = 0; corner < 8; corner++) {
+		ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+		float weight = (offset.x == 0 ? 1.0 - fraction.x : fraction.x)
+				* (offset.y == 0 ? 1.0 - fraction.y : fraction.y)
+				* (offset.z == 0 ? 1.0 - fraction.z : fraction.z);
+		if (!(weight > 0.0)) { continue; }
+		ivec3 logical_corner = base + offset;
+		ivec3 wrapped_corner = clv_partial_wrap_logical_index(logical_corner, resolution);
+		ivec3 slot = wrapped_corner + ivec3(0, 0, level * resolution);
+		if (!base_neighbor_tags_ready) {
+			ivec4 tag = texelFetch(isampler3D(cache_tags, cache_sampler), slot, 0);
+			if (any(notEqual(tag.xyz, logical_corner)) || tag.w != control.z) { continue; }
+		}
+		vec4 metadata = clv_partial_fetch(cache_texture, cache_sampler, slot, axis,
+				CLV_PARTIAL_FACE_METADATA_COLUMN, resolution);
+		vec4 anchor = clv_partial_fetch(cache_texture, cache_sampler, slot, axis,
+				CLV_PARTIAL_FACE_ANCHOR_COLUMN, resolution);
+		vec4 secondary_diffuse = clv_partial_fetch(cache_texture, cache_sampler, slot, axis,
+				CLV_PARTIAL_FACE_DIFFUSE_COLUMN, resolution);
+		vec4 primary_diffuse = clv_partial_fetch(cache_texture, cache_sampler, slot, axis,
+				CLV_PARTIAL_FACE_DIFFUSE_COLUMN + 1, resolution);
+		if (!clv_partial_finite_vec4(metadata) || !clv_partial_finite_vec4(anchor)
+				|| !clv_partial_finite_vec4(secondary_diffuse)
+				|| !clv_partial_finite_vec4(primary_diffuse)
+				|| metadata.w <= 0.0 || metadata.w > 2147480000.0
+				|| floor(metadata.w) != metadata.w) { continue; }
+		int patch_id = int(metadata.w);
+		if (locked_patch_id > 0 && patch_id != locked_patch_id) { continue; }
+		float anchor_id = abs(anchor.w);
+		if (!(anchor_id >= 1.0) || anchor_id > 2147480000.0
+				|| floor(anchor_id) != anchor_id) { continue; }
+		float corner_normal_length_squared = dot(metadata.xyz, metadata.xyz);
+		if (!(corner_normal_length_squared > 1e-12)
+				|| !clv_partial_finite_float(corner_normal_length_squared)) { continue; }
+		vec3 corner_normal = metadata.xyz * inversesqrt(corner_normal_length_squared);
+		if (dot(receiver_normal, corner_normal) <= 0.0) { continue; }
+		vec3 anchor_delta = world - anchor.xyz;
+		float anchor_distance_squared = dot(anchor_delta, anchor_delta);
+		float signed_plane_distance = dot(anchor_delta, corner_normal);
+		float normal_delta_length = length(receiver_normal - corner_normal);
+		if (!clv_partial_finite_vec3(anchor_delta)
+				|| !clv_partial_finite_float(anchor_distance_squared)
+				|| !clv_partial_finite_float(signed_plane_distance)
+				|| !clv_partial_finite_float(normal_delta_length)
+				|| anchor_distance_squared > local_distance_limit * local_distance_limit) { continue; }
+		float curvature_allowance = 0.5 * sqrt(anchor_distance_squared) * normal_delta_length;
+		float local_grid_margin = 0.05 * step_size;
+		float plane_back_tolerance = curvature_allowance + local_grid_margin + numeric_margin;
+		float plane_front_tolerance = 0.35 * step_size + curvature_allowance
+				+ local_grid_margin + numeric_margin;
+		if (signed_plane_distance < -plane_back_tolerance
+				|| signed_plane_distance > plane_front_tolerance) { continue; }
+		float secondary_alpha = secondary_diffuse.a;
+		float primary_alpha = primary_diffuse.a;
+		bool diffuse_valid = secondary_alpha >= CLV_PARTIAL_MIN_TRANSFER_ALPHA
+				&& primary_alpha >= CLV_PARTIAL_MIN_TRANSFER_ALPHA
+				&& clv_partial_finite_vec3(secondary_diffuse.rgb)
+				&& clv_partial_finite_vec3(primary_diffuse.rgb);
+		vec4 first_radiance = clv_partial_fetch(cache_texture, cache_sampler, slot, axis, 0, resolution);
+		bool raw_sh_valid = clv_partial_finite_float(first_radiance.w)
+				&& first_radiance.w >= 1.0 && floor(first_radiance.w) == first_radiance.w;
+		if (!diffuse_valid && !raw_sh_valid) { continue; }
+		candidates.corners[corner].slot = slot;
+		candidates.corners[corner].logical_cell = logical_corner;
+		candidates.corners[corner].patch_id = patch_id;
+		candidates.corners[corner].source_triangle = int(anchor_id) - 1;
+		candidates.corners[corner].weight = weight;
+		candidates.corners[corner].anchor = anchor;
+		candidates.corners[corner].normal = corner_normal;
+		candidates.corners[corner].diffuse_valid = diffuse_valid;
+		candidates.corners[corner].raw_sh_valid = raw_sh_valid;
+		candidates.eligible_mask |= 1u << uint(corner);
+	}
+	if (candidates.eligible_mask == 0u) { return false; }
+	candidates.logical_base = base;
+	candidates.wrapped_base = wrapped_base;
+	candidates.fraction = fraction;
+	candidates.world = world;
+	candidates.step_size = step_size;
+	candidates.resolution = resolution;
+	candidates.epoch = control.z;
+	candidates.level = level;
+	candidates.axis = axis;
+	return true;
+}
+
+void clv_partial_diffuse_basis(vec3 normal, out float basis[9]) {
+	basis[0] = 0.2820947918;
+	basis[1] = 0.4886025119 * normal.y * (2.0 / 3.0);
+	basis[2] = 0.4886025119 * normal.z * (2.0 / 3.0);
+	basis[3] = 0.4886025119 * normal.x * (2.0 / 3.0);
+	basis[4] = 1.0925484306 * normal.x * normal.y * 0.25;
+	basis[5] = 1.0925484306 * normal.y * normal.z * 0.25;
+	basis[6] = 0.3153915653 * (3.0 * normal.z * normal.z - 1.0) * 0.25;
+	basis[7] = 1.0925484306 * normal.x * normal.z * 0.25;
+	basis[8] = 0.5462742153 * (normal.x * normal.x - normal.y * normal.y) * 0.25;
+}
+
+// Evaluate only the caller-visible subset. The same patch with the lowest
+// weighted anchor distance wins; visible trilinear mass breaks near-equal ties.
+// At coarser LODs pass the finest successful patch id in `locked_patch_id`.
+// Confidence is the post-visibility, pre-normalization mass, not an all-or-none
+// cutoff. The caller can use it for bilateral upsampling/coarse-level blending.
+bool clv_partial_evaluate(texture3D cache_texture, sampler cache_sampler,
+		CLVPartialCandidates candidates, uint visible_mask,
+		vec3 geometric_normal, vec3 shading_normal, int locked_patch_id,
+		out vec3 secondary, out vec3 primary, out float confidence,
+		out int selected_level, out int method, out int selected_patch) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	confidence = 0.0;
+	selected_level = -1;
+	method = CLV_PARTIAL_METHOD_NONE;
+	selected_patch = 0;
+	if (candidates.level < 0 || candidates.level >= CLV_PARTIAL_LEVEL_COUNT_MAX
+			|| candidates.axis < 0 || candidates.axis >= 3
+			|| candidates.resolution < 2 || candidates.eligible_mask == 0u
+			|| !clv_partial_finite_vec3(geometric_normal)
+			|| !clv_partial_finite_vec3(shading_normal)) { return false; }
+	float geometric_length_squared = dot(geometric_normal, geometric_normal);
+	float shading_length_squared = dot(shading_normal, shading_normal);
+	if (!(geometric_length_squared > 1e-12) || !(shading_length_squared > 1e-12)
+			|| !clv_partial_finite_float(geometric_length_squared)
+			|| !clv_partial_finite_float(shading_length_squared)) { return false; }
+	vec3 receiver_geometric_normal = geometric_normal * inversesqrt(geometric_length_squared);
+	vec3 receiver_shading_normal = shading_normal * inversesqrt(shading_length_squared);
+	uint visible_candidates = candidates.eligible_mask & visible_mask;
+	if (visible_candidates == 0u) { return false; }
+	float best_distance = 3.402823466e+38;
+	float best_mass = 0.0;
+	int best_patch = 0;
+	for (int i = 0; i < 8; i++) {
+		if ((visible_candidates & (1u << uint(i))) == 0u) { continue; }
+		int patch_id = candidates.corners[i].patch_id;
+		if (patch_id <= 0 || (locked_patch_id > 0 && patch_id != locked_patch_id)) { continue; }
+		bool seen_before = false;
+		for (int prior = 0; prior < i; prior++) {
+			if ((visible_candidates & (1u << uint(prior))) != 0u
+					&& candidates.corners[prior].patch_id == patch_id) { seen_before = true; break; }
+		}
+		if (seen_before) { continue; }
+		float mass = 0.0;
+		float weighted_distance = 0.0;
+		for (int j = 0; j < 8; j++) {
+			if ((visible_candidates & (1u << uint(j))) == 0u
+					|| candidates.corners[j].patch_id != patch_id) { continue; }
+			float weight = candidates.corners[j].weight;
+			float distance = length(candidates.world - candidates.corners[j].anchor.xyz);
+			mass += weight;
+			weighted_distance += weight * distance;
+		}
+		if (!(mass > 0.0)) { continue; }
+		float mean_distance = weighted_distance / mass;
+		float tie_tolerance = max(1e-5, candidates.step_size * 1e-3);
+		if (mean_distance < best_distance - tie_tolerance
+				|| (abs(mean_distance - best_distance) <= tie_tolerance
+					&& (mass > best_mass + 1e-6
+						|| (abs(mass - best_mass) <= 1e-6
+							&& (best_patch == 0 || patch_id < best_patch))))) {
+			best_distance = mean_distance;
+			best_mass = mass;
+			best_patch = patch_id;
+		}
+	}
+	if (best_patch <= 0 || !(best_mass > CLV_PARTIAL_MIN_VISIBLE_MASS)) { return false; }
+	float basis[9];
+	clv_partial_diffuse_basis(receiver_shading_normal, basis);
+	bool flat_group = dot(receiver_geometric_normal, receiver_shading_normal) >= 0.99995;
+	float minimum_plane_distance = 3.402823466e+38;
+	float maximum_plane_distance = -3.402823466e+38;
+	float diffuse_mass = 0.0;
+	float raw_sh_mass = 0.0;
+	for (int i = 0; i < 8; i++) {
+		if ((visible_candidates & (1u << uint(i))) == 0u
+				|| candidates.corners[i].patch_id != best_patch) { continue; }
+		vec3 normal = candidates.corners[i].normal;
+		float plane_distance = dot(candidates.world - candidates.corners[i].anchor.xyz, normal);
+		minimum_plane_distance = min(minimum_plane_distance, plane_distance);
+		maximum_plane_distance = max(maximum_plane_distance, plane_distance);
+		flat_group = flat_group && dot(normal, receiver_geometric_normal) >= 0.99995
+				&& dot(normal, receiver_shading_normal) >= 0.99995;
+		if (candidates.corners[i].diffuse_valid) { diffuse_mass += candidates.corners[i].weight; }
+		if (candidates.corners[i].raw_sh_valid) { raw_sh_mass += candidates.corners[i].weight; }
+	}
+	flat_group = flat_group && maximum_plane_distance - minimum_plane_distance
+			<= max(0.05 * candidates.step_size, 1e-5);
+	bool use_diffuse = flat_group && diffuse_mass > CLV_PARTIAL_MIN_VISIBLE_MASS;
+	bool use_curved_sh = !use_diffuse && raw_sh_mass > CLV_PARTIAL_MIN_VISIBLE_MASS;
+	if (!use_diffuse && !use_curved_sh) { return false; }
+	float accepted_mass = 0.0;
+	for (int i = 0; i < 8; i++) {
+		if ((visible_candidates & (1u << uint(i))) == 0u
+				|| candidates.corners[i].patch_id != best_patch) { continue; }
+		if (use_diffuse && !candidates.corners[i].diffuse_valid) { continue; }
+		if (use_curved_sh && !candidates.corners[i].raw_sh_valid) { continue; }
+		float weight = candidates.corners[i].weight;
+		ivec3 slot = candidates.corners[i].slot;
+		vec3 secondary_corner = vec3(0.0);
+		vec3 primary_corner = vec3(0.0);
+		bool finite_corner = true;
+		if (use_diffuse) {
+			vec4 secondary_value = clv_partial_fetch(cache_texture, cache_sampler, slot, candidates.axis,
+					CLV_PARTIAL_FACE_DIFFUSE_COLUMN, candidates.resolution);
+			vec4 primary_value = clv_partial_fetch(cache_texture, cache_sampler, slot, candidates.axis,
+					CLV_PARTIAL_FACE_DIFFUSE_COLUMN + 1, candidates.resolution);
+			finite_corner = clv_partial_finite_vec3(secondary_value.rgb)
+					&& clv_partial_finite_vec3(primary_value.rgb)
+					&& clv_partial_finite_float(secondary_value.a)
+					&& clv_partial_finite_float(primary_value.a)
+					&& secondary_value.a >= CLV_PARTIAL_MIN_TRANSFER_ALPHA
+					&& primary_value.a >= CLV_PARTIAL_MIN_TRANSFER_ALPHA;
+			if (finite_corner) {
+				secondary_corner = secondary_value.rgb;
+				primary_corner = primary_value.rgb;
+			}
+		} else {
+			for (int coefficient = 0; coefficient < 9; coefficient++) {
+				vec4 secondary_value = clv_partial_fetch(cache_texture, cache_sampler, slot, candidates.axis,
+						coefficient, candidates.resolution);
+				vec4 primary_value = clv_partial_fetch(cache_texture, cache_sampler, slot, candidates.axis,
+						coefficient + 9, candidates.resolution);
+				if (!clv_partial_finite_vec3(secondary_value.rgb)
+						|| !clv_partial_finite_vec3(primary_value.rgb)) { finite_corner = false; break; }
+				secondary_corner += secondary_value.rgb * basis[coefficient];
+				primary_corner += primary_value.rgb * basis[coefficient];
+			}
+		}
+		if (!finite_corner || !clv_partial_finite_vec3(secondary_corner)
+				|| !clv_partial_finite_vec3(primary_corner)) { continue; }
+		secondary += secondary_corner * weight;
+		primary += primary_corner * weight;
+		accepted_mass += weight;
+	}
+	if (!(accepted_mass > CLV_PARTIAL_MIN_VISIBLE_MASS)
+			|| !clv_partial_finite_float(accepted_mass)
+			|| !clv_partial_finite_vec3(secondary)
+			|| !clv_partial_finite_vec3(primary)) {
+		secondary = vec3(0.0); primary = vec3(0.0); confidence = 0.0;
+		return false;
+	}
+	// Keep signed SH reconstruction intact. The caller applies the final clamp
+	// only after secondary and primary have been combined with their ownership.
+	secondary /= accepted_mass;
+	primary /= accepted_mass;
+	confidence = clamp(accepted_mass, 0.0, 1.0);
+	selected_level = candidates.level;
+	method = use_diffuse ? CLV_PARTIAL_METHOD_DIFFUSE : CLV_PARTIAL_METHOD_CURVED_SH;
+	selected_patch = best_patch;
+	return true;
+}
+
+#endif

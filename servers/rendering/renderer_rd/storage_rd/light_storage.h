@@ -78,6 +78,8 @@ private:
 		real_t distance_fade_length = 10.0;
 		RSE::LightOmniShadowMode omni_shadow_mode = RSE::LIGHT_OMNI_SHADOW_DUAL_PARABOLOID;
 		RSE::LightDirectionalShadowMode directional_shadow_mode = RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL;
+		bool directional_object_shadow_enabled = false;
+		Vector<RID> directional_object_shadow_instances;
 		bool directional_blend_splits = false;
 		RSE::LightDirectionalSkyMode directional_sky_mode = RSE::LIGHT_DIRECTIONAL_SKY_MODE_LIGHT_AND_SKY;
 		Vector2 area_size = Vector2(1, 1);
@@ -124,6 +126,10 @@ private:
 		uint64_t last_pass = 0;
 		uint32_t cull_mask = 0;
 		uint32_t light_directional_index = 0;
+		uint32_t directional_shadow_cascade_count = 1;
+		bool directional_object_shadow_active = false;
+		bool directional_object_shadow_reserved = false;
+		uint32_t directional_shadow_base_slot = 0;
 
 		Rect2 directional_rect;
 
@@ -482,9 +488,31 @@ private:
 
 		int light_count = 0;
 		int size = 0;
+		int width = 0;
+		int height = 0;
+		int frp_layer_size = 0;
+		int atlas_columns = 0;
+		int total_slots = 0;
+		bool frp_per_layer = false;
+		bool allocation_supported = true;
+		bool resource_failed = false;
+	uint32_t allocation_retry_frames = 0;
+		String allocation_error;
+		String layout_signature;
+		Vector<RID> light_instances;
 		bool use_16_bits = true;
 		int current_light = 0;
 	} directional_shadow;
+
+	FRPShadowSettings frp_shadow_settings;
+	int frp_shadow_default_resolution = 4096;
+	struct FRPShadowViewState {
+		FRPShadowSettings settings;
+		int cascade_resolution = 4096;
+		RSE::ShadowQuality filter_quality = RSE::SHADOW_QUALITY_SOFT_LOW;
+	};
+	Vector<FRPShadowViewState> frp_shadow_view_stack;
+	void _set_frp_shadow_resolution(int p_resolution);
 
 	/* SHADOW CUBEMAPS */
 
@@ -553,6 +581,10 @@ public:
 	virtual void light_omni_set_shadow_mode(RID p_light, RSE::LightOmniShadowMode p_mode) override;
 
 	virtual void light_directional_set_shadow_mode(RID p_light, RSE::LightDirectionalShadowMode p_mode) override;
+	virtual void light_directional_set_shadow_object_shadow_enabled(RID p_light, bool p_enabled) override;
+	virtual bool light_directional_get_shadow_object_shadow_enabled(RID p_light) const override;
+	virtual void light_directional_set_shadow_object_shadow_instances(RID p_light, const Vector<RID> &p_instances) override;
+	virtual Vector<RID> light_directional_get_shadow_object_shadow_instances(RID p_light) const override;
 	virtual void light_directional_set_blend_splits(RID p_light, bool p_enable) override;
 	virtual bool light_directional_get_blend_splits(RID p_light) const override;
 	virtual void light_directional_set_sky_mode(RID p_light, RSE::LightDirectionalSkyMode p_mode) override;
@@ -579,8 +611,12 @@ public:
 		const Light *light = light_owner.get_or_null(p_light);
 		ERR_FAIL_NULL_V(light, 0);
 
-		return light->param[p_param];
+		return light->type == RSE::LIGHT_DIRECTIONAL ? frp_shadow_settings.get_light_param(p_param, light->param[p_param]) : light->param[p_param];
 	}
+
+	virtual void begin_frp_shadow_view(const FRPShadowSettings &p_settings) override;
+	virtual void end_frp_shadow_view() override;
+	virtual const FRPShadowSettings *get_frp_shadow_settings() const override { return frp_shadow_settings.enabled ? &frp_shadow_settings : nullptr; }
 
 	_FORCE_INLINE_ RID light_get_projector(RID p_light) {
 		const Light *light = light_owner.get_or_null(p_light);
@@ -859,6 +895,32 @@ public:
 	_FORCE_INLINE_ Rect2 light_instance_get_directional_rect(RID p_light_instance) {
 		LightInstance *li = light_instance_owner.get_or_null(p_light_instance);
 		return li->directional_rect;
+	}
+
+	_FORCE_INLINE_ void light_instance_set_directional_shadow_object_state(RID p_light_instance, uint32_t p_cascade_count, bool p_object_reserved, bool p_object_active) override {
+		LightInstance *li = light_instance_owner.get_or_null(p_light_instance);
+		ERR_FAIL_NULL(li);
+		li->directional_shadow_cascade_count = p_cascade_count;
+		li->directional_object_shadow_reserved = p_object_reserved;
+		li->directional_object_shadow_active = p_object_active;
+	}
+
+	_FORCE_INLINE_ uint32_t light_instance_get_directional_shadow_cascade_count(RID p_light_instance) const {
+		const LightInstance *li = light_instance_owner.get_or_null(p_light_instance);
+		ERR_FAIL_NULL_V(li, 1);
+		return li->directional_shadow_cascade_count;
+	}
+
+	_FORCE_INLINE_ bool light_instance_get_directional_object_shadow_active(RID p_light_instance) const {
+		const LightInstance *li = light_instance_owner.get_or_null(p_light_instance);
+		ERR_FAIL_NULL_V(li, false);
+		return li->directional_object_shadow_active;
+	}
+
+	_FORCE_INLINE_ bool light_instance_get_directional_object_shadow_reserved(RID p_light_instance) const {
+		const LightInstance *li = light_instance_owner.get_or_null(p_light_instance);
+		ERR_FAIL_NULL_V(li, false);
+		return li->directional_object_shadow_reserved;
 	}
 
 	/* LIGHT DATA */
@@ -1238,16 +1300,21 @@ public:
 	virtual void directional_shadow_atlas_set_size(int p_size, bool p_16_bits = true) override;
 	virtual int get_directional_light_shadow_size(RID p_light_instance) override;
 	virtual void set_directional_shadow_count(int p_count) override;
+	virtual bool set_directional_shadow_lights(const Vector<RID> &p_light_instances) override;
 
 	Rect2i get_directional_shadow_rect();
+	Rect2i get_directional_shadow_slot_rect(RID p_light_instance, int p_pass) const;
 	void update_directional_shadow_atlas();
+	bool directional_shadow_uses_per_layer_resolution() const { return directional_shadow.frp_per_layer; }
+	bool directional_shadow_allocation_supported() const { return directional_shadow.allocation_supported; }
+	Size2i directional_shadow_get_dimensions() const { return Size2i(directional_shadow.width, directional_shadow.height); }
 
 	_FORCE_INLINE_ RID directional_shadow_get_texture() {
 		return directional_shadow.depth;
 	}
 
 	_FORCE_INLINE_ int directional_shadow_get_size() {
-		return directional_shadow.size;
+		return directional_shadow.width;
 	}
 
 	_FORCE_INLINE_ RID direction_shadow_get_fb() {

@@ -749,10 +749,10 @@ func _install_test_shader(rd: RenderingDevice, cache: RefCounted, variant: Strin
 		check(shader_text.contains(fallback_condition), "Fallback control shader must locate the production branch.")
 		shader_text = shader_text.replace(fallback_condition, "|| true) {")
 	elif variant == "nondirectional":
-		var directional_call := "triangle, true, true, coefficients,"
+		var directional_call := "triangle, true, true, true, coefficients,"
 		check(shader_text.contains(directional_call), "Legacy-path shader must locate the directional source flag.")
 		shader_text = shader_text.replace(directional_call,
-				"triangle, true, false, coefficients,")
+				"triangle, true, false, false, coefficients,")
 	var candidate_only_variants := ["instrumented", "fallback_disabled", "nondirectional",
 			"all_blocked", "candidate_unblocked"]
 	if variant in candidate_only_variants:
@@ -763,13 +763,13 @@ func _install_test_shader(rd: RenderingDevice, cache: RefCounted, variant: Strin
 				"float candidate_only_weight = 0.0;\n\t\t" + declaration_anchor)
 		var directional_literal := "false" if variant == "nondirectional" else "true"
 		var gather_call := "gather_probe_field(surface, normal, triangle, true, " \
-				+ directional_literal + ", coefficients,\n\t\t\t\t\t\tcandidate_weight, visible_support_weight, false);"
+				+ directional_literal + ", " + directional_literal + ", coefficients,\n\t\t\t\t\t\tcandidate_weight, visible_support_weight, false);"
 		check(shader_text.contains(gather_call),
 				"Candidate-only shader must locate the unchanged full gather call.")
 		var candidate_only_call := "\n\t\t\tvec4 candidate_only_coefficients[18];" \
 				+ "\n\t\t\tfloat candidate_only_visible_support_weight = 0.0;" \
 				+ "\n\t\t\tgather_probe_field(surface, normal, triangle, true, " \
-				+ directional_literal + ", candidate_only_coefficients,\n" \
+				+ directional_literal + ", " + directional_literal + ", candidate_only_coefficients,\n" \
 				+ "\t\t\t\t\tcandidate_only_weight, candidate_only_visible_support_weight, true);"
 		shader_text = shader_text.replace(gather_call, gather_call + candidate_only_call)
 		var metadata_write := "vec4(normal, visible_support_weight > 1e-10 ? float(surface_patch) : -1.0));"

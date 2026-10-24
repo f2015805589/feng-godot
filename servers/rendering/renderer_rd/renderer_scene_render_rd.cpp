@@ -1341,6 +1341,12 @@ void RendererSceneRenderRD::positional_soft_shadow_filter_set_quality(RSE::Shado
 
 void RendererSceneRenderRD::directional_soft_shadow_filter_set_quality(RSE::ShadowQuality p_quality) {
 	ERR_FAIL_INDEX_MSG(p_quality, RSE::SHADOW_QUALITY_MAX, "Shadow quality too high, please see RenderingServer's ShadowQuality enum");
+	directional_soft_shadow_filter_set_quality_for_view(p_quality);
+	_update_shader_quality_settings();
+}
+
+void RendererSceneRenderRD::directional_soft_shadow_filter_set_quality_for_view(RSE::ShadowQuality p_quality) {
+	ERR_FAIL_INDEX_MSG(p_quality, RSE::SHADOW_QUALITY_MAX, "Shadow quality too high, please see RenderingServer's ShadowQuality enum");
 
 	if (directional_shadow_quality != p_quality) {
 		directional_shadow_quality = p_quality;
@@ -1382,8 +1388,6 @@ void RendererSceneRenderRD::directional_soft_shadow_filter_set_quality(RSE::Shad
 		get_vogel_disk(directional_penumbra_shadow_kernel, directional_penumbra_shadow_samples);
 		get_vogel_disk(directional_soft_shadow_kernel, directional_soft_shadow_samples);
 	}
-
-	_update_shader_quality_settings();
 }
 
 void RendererSceneRenderRD::decals_set_filter(RSE::DecalFilter p_filter) {
@@ -1538,9 +1542,9 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 			scene_data.shadow_atlas_pixel_size.y = 1.0 / shadow_atlas_size;
 		}
 		{
-			int directional_shadow_size = light_storage->directional_shadow_get_size();
-			scene_data.directional_shadow_pixel_size.x = 1.0 / directional_shadow_size;
-			scene_data.directional_shadow_pixel_size.y = 1.0 / directional_shadow_size;
+			const Size2i directional_shadow_dimensions = light_storage->directional_shadow_get_dimensions();
+			scene_data.directional_shadow_pixel_size.x = 1.0 / MAX(directional_shadow_dimensions.width, 1);
+			scene_data.directional_shadow_pixel_size.y = 1.0 / MAX(directional_shadow_dimensions.height, 1);
 		}
 
 		if (p_environment.is_valid()) {

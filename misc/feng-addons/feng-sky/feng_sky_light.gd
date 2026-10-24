@@ -173,6 +173,7 @@ var _capture_native_config_dirty := true
 var _capture_request_pending := true
 var _capture_in_flight := false
 var _capture_submitted_revision := -1
+var _capture_input_revision := 0
 var _capture_snapshot_after_inflight := false
 var _capture_native_signature: Array = []
 var _capture_fog_effect: CompositorEffect
@@ -245,6 +246,7 @@ func _process(_delta: float) -> void:
 	var current_world_id := _world_id()
 	if current_world_id != _current_world_id:
 		_current_world_id = current_world_id
+		_capture_input_revision += 1
 		_reset_capture_in_flight()
 		_capture_environment_dirty = true
 		_capture_native_config_dirty = true
@@ -516,6 +518,7 @@ func _refresh_provider() -> void:
 
 func _mark_capture_dirty(request_capture: bool = true,
 		native_configuration: bool = true, environment_changed: bool = false) -> void:
+	_capture_input_revision += 1
 	if _capture_in_flight and request_capture and (realtime_capture or _explicit_capture_authorized):
 		_capture_snapshot_after_inflight = true
 	elif not _capture_in_flight:
@@ -603,6 +606,31 @@ func _feng_sky_light_runtime_snapshot() -> Dictionary:
 		"energy": radiance_energy,
 		"rotation": _radiance_rotation(),
 		"radiance_sh": _radiance_sh,
+	}
+
+
+## Read-only bake handshake. The MagicGI baker uses this to distinguish a newly
+## completed capture from an older ready projection without exposing Sky internals
+## as a public refresh API or requesting any GPU readback.
+func _feng_sky_light_bake_capture_state() -> Dictionary:
+	var dirty := _capture_environment_dirty or _capture_native_config_dirty or _cubemap_dirty
+	var pending := _capture_request_pending or _capture_environment_snapshot_pending
+	var projection_signature: Array = [_last_projected_revision, radiance_energy, _radiance_rotation()]
+	var projection_current := _last_projected_revision >= 0 \
+			and _radiance_sh.size() == 27 and _last_projected_signature == projection_signature
+	return {
+		"provider_id": get_instance_id(),
+		"ready": _provider_active and projection_current,
+		"bake_loaded": _bake_loaded,
+		"source_mode": int(_output_source_mode),
+		"capture_position": _effective_capture_position(),
+		"source_revision": maxi(_native_radiance_revision, _last_projected_revision),
+		"input_revision": _capture_input_revision,
+		"source_identity": _output_source_identity.duplicate(true),
+		"projection_current": projection_current,
+		"dirty": dirty,
+		"pending": pending,
+		"in_flight": _capture_in_flight,
 	}
 
 

@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 #include "scene/main/scene_tree.h"
@@ -532,11 +533,116 @@ Light3D::~Light3D() {
 void DirectionalLight3D::set_shadow_mode(ShadowMode p_mode) {
 	shadow_mode = p_mode;
 	RS::get_singleton()->light_directional_set_shadow_mode(light, RSE::LightDirectionalShadowMode(p_mode));
+	if (p_mode == SHADOW_ORTHOGONAL && object_shadow_enabled) {
+		object_shadow_enabled = false;
+		RS::get_singleton()->light_directional_set_shadow_object_shadow_enabled(light, false);
+	}
 	notify_property_list_changed();
+	update_configuration_warnings();
 }
 
 DirectionalLight3D::ShadowMode DirectionalLight3D::get_shadow_mode() const {
 	return shadow_mode;
+}
+
+void DirectionalLight3D::set_object_shadow_enabled(bool p_enabled) {
+	if (p_enabled && shadow_mode == SHADOW_ORTHOGONAL) {
+		WARN_PRINT("Reserved object shadows require PSSM with at least two total shadow slots.");
+		p_enabled = false;
+	}
+	if (object_shadow_enabled == p_enabled) {
+		return;
+	}
+	object_shadow_enabled = p_enabled;
+	RS::get_singleton()->light_directional_set_shadow_object_shadow_enabled(light, object_shadow_enabled);
+	notify_property_list_changed();
+	update_configuration_warnings();
+}
+
+bool DirectionalLight3D::is_object_shadow_enabled() const {
+	return object_shadow_enabled;
+}
+
+void DirectionalLight3D::_collect_object_shadow_instances(Node *p_node, Vector<RID> &r_instances) const {
+	if (VisualInstance3D *visual_instance = Object::cast_to<VisualInstance3D>(p_node)) {
+		RID visual_instance_rid = visual_instance->get_instance();
+		if (visual_instance_rid.is_valid()) {
+			r_instances.push_back(visual_instance_rid);
+		}
+	}
+
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		_collect_object_shadow_instances(p_node->get_child(i), r_instances);
+	}
+}
+
+void DirectionalLight3D::_update_object_shadow_target_instances() {
+	Vector<RID> instances;
+	// Publish the target independently of the light's own reservation switch:
+	// an FRP Shadow Pass may reserve a slot for this view without editing the node.
+	if (!object_shadow_target.is_empty() && is_inside_tree()) {
+		Node *target = get_node_or_null(object_shadow_target);
+		if (target && target->get_tree() == get_tree()) {
+			_collect_object_shadow_instances(target, instances);
+		}
+	}
+	RS::get_singleton()->light_directional_set_shadow_object_shadow_instances(light, instances);
+}
+
+void DirectionalLight3D::set_object_shadow_target(const NodePath &p_target) {
+	if (object_shadow_target == p_target) {
+		return;
+	}
+	object_shadow_target = p_target;
+	_update_object_shadow_target_instances();
+	update_configuration_warnings();
+}
+
+NodePath DirectionalLight3D::get_object_shadow_target() const {
+	return object_shadow_target;
+}
+
+void DirectionalLight3D::_notification(int p_what) {
+	Light3D::_notification(p_what);
+	if (p_what == NOTIFICATION_ENTER_TREE) {
+		SceneTree *tree = get_tree();
+		if (tree && !tree->is_connected(SNAME("tree_changed"), callable_mp(this, &DirectionalLight3D::_update_object_shadow_target_instances))) {
+			tree->connect(SNAME("tree_changed"), callable_mp(this, &DirectionalLight3D::_update_object_shadow_target_instances));
+		}
+		_update_object_shadow_target_instances();
+	} else if (p_what == NOTIFICATION_EXIT_TREE) {
+		SceneTree *tree = get_tree();
+		if (tree && tree->is_connected(SNAME("tree_changed"), callable_mp(this, &DirectionalLight3D::_update_object_shadow_target_instances))) {
+			tree->disconnect(SNAME("tree_changed"), callable_mp(this, &DirectionalLight3D::_update_object_shadow_target_instances));
+		}
+		RS::get_singleton()->light_directional_set_shadow_object_shadow_instances(light, Vector<RID>());
+	}
+}
+
+PackedStringArray DirectionalLight3D::get_configuration_warnings() const {
+	PackedStringArray warnings = Light3D::get_configuration_warnings();
+	if (!object_shadow_enabled) {
+		return warnings;
+	}
+	if (shadow_mode == SHADOW_ORTHOGONAL) {
+		warnings.push_back(RTR("Reserved object shadows require PSSM with at least two total shadow slots."));
+		return warnings;
+	}
+	if (object_shadow_target.is_empty()) {
+		warnings.push_back(RTR("Reserved object shadows are enabled, but no target subtree is assigned."));
+		return warnings;
+	}
+	Node *target = get_node_or_null(object_shadow_target);
+	if (!target || target->get_tree() != get_tree()) {
+		warnings.push_back(RTR("Reserved object shadow target could not be resolved in this scene tree."));
+		return warnings;
+	}
+	Vector<RID> instances;
+	_collect_object_shadow_instances(target, instances);
+	if (instances.is_empty()) {
+		warnings.push_back(RTR("Reserved object shadow target has no VisualInstance3D children to cast shadows."));
+	}
+	return warnings;
 }
 
 void DirectionalLight3D::set_blend_splits(bool p_enable) {
@@ -559,13 +665,25 @@ DirectionalLight3D::SkyMode DirectionalLight3D::get_sky_mode() const {
 
 void DirectionalLight3D::_validate_property(PropertyInfo &p_property) const {
 	if (Engine::get_singleton()->is_editor_hint()) {
+		const bool frp_shadow_pass = OS::get_singleton()->get_current_rendering_method() == "frp";
 		if (shadow_mode == SHADOW_ORTHOGONAL && (p_property.name == "directional_shadow_split_1" || p_property.name == "directional_shadow_blend_splits")) {
 			// Split 2 and split blending are only used with the PSSM 2 Splits and PSSM 4 Splits shadow modes.
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
 
-		if ((shadow_mode == SHADOW_ORTHOGONAL || shadow_mode == SHADOW_PARALLEL_2_SPLITS) && (p_property.name == "directional_shadow_split_2" || p_property.name == "directional_shadow_split_3")) {
-			// Splits 3 and 4 are only used with the PSSM 4 Splits shadow mode.
+		if ((shadow_mode == SHADOW_ORTHOGONAL || shadow_mode == SHADOW_PARALLEL_2_SPLITS) && p_property.name == "directional_shadow_split_2") {
+			// The second split offset is only used with the PSSM 3 or PSSM 4 shadow modes.
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+		if (shadow_mode != SHADOW_PARALLEL_4_SPLITS && p_property.name == "directional_shadow_split_3") {
+			// The third split offset is only used with the PSSM 4 shadow mode.
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+
+		if (shadow_mode == SHADOW_ORTHOGONAL && (p_property.name == "directional_shadow_object_shadow_enabled" || (!frp_shadow_pass && p_property.name == "directional_shadow_object_shadow_target"))) {
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+		if (!frp_shadow_pass && !object_shadow_enabled && p_property.name == "directional_shadow_object_shadow_target") {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
 	}
@@ -582,6 +700,10 @@ void DirectionalLight3D::_validate_property(PropertyInfo &p_property) const {
 void DirectionalLight3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_shadow_mode", "mode"), &DirectionalLight3D::set_shadow_mode);
 	ClassDB::bind_method(D_METHOD("get_shadow_mode"), &DirectionalLight3D::get_shadow_mode);
+	ClassDB::bind_method(D_METHOD("set_object_shadow_enabled", "enabled"), &DirectionalLight3D::set_object_shadow_enabled);
+	ClassDB::bind_method(D_METHOD("is_object_shadow_enabled"), &DirectionalLight3D::is_object_shadow_enabled);
+	ClassDB::bind_method(D_METHOD("set_object_shadow_target", "target"), &DirectionalLight3D::set_object_shadow_target);
+	ClassDB::bind_method(D_METHOD("get_object_shadow_target"), &DirectionalLight3D::get_object_shadow_target);
 
 	ClassDB::bind_method(D_METHOD("set_blend_splits", "enabled"), &DirectionalLight3D::set_blend_splits);
 	ClassDB::bind_method(D_METHOD("is_blend_splits_enabled"), &DirectionalLight3D::is_blend_splits_enabled);
@@ -590,7 +712,9 @@ void DirectionalLight3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_sky_mode"), &DirectionalLight3D::get_sky_mode);
 
 	ADD_GROUP("Directional Shadow", "directional_shadow_");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "directional_shadow_mode", PROPERTY_HINT_ENUM, "Orthogonal (Fast),PSSM 2 Splits (Average),PSSM 4 Splits (Slow)"), "set_shadow_mode", "get_shadow_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "directional_shadow_mode", PROPERTY_HINT_ENUM, "Orthogonal (Fast):0,PSSM 2 Splits (Average):1,PSSM 4 Splits (Slow):2,PSSM 3 Splits:3"), "set_shadow_mode", "get_shadow_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "directional_shadow_object_shadow_enabled"), "set_object_shadow_enabled", "is_object_shadow_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "directional_shadow_object_shadow_target", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "Node3D"), "set_object_shadow_target", "get_object_shadow_target");
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "directional_shadow_split_1", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_param", "get_param", PARAM_SHADOW_SPLIT_1_OFFSET);
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "directional_shadow_split_2", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_param", "get_param", PARAM_SHADOW_SPLIT_2_OFFSET);
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "directional_shadow_split_3", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_param", "get_param", PARAM_SHADOW_SPLIT_3_OFFSET);
@@ -603,6 +727,7 @@ void DirectionalLight3D::_bind_methods() {
 
 	BIND_ENUM_CONSTANT(SHADOW_ORTHOGONAL);
 	BIND_ENUM_CONSTANT(SHADOW_PARALLEL_2_SPLITS);
+	BIND_ENUM_CONSTANT(SHADOW_PARALLEL_3_SPLITS);
 	BIND_ENUM_CONSTANT(SHADOW_PARALLEL_4_SPLITS);
 
 	BIND_ENUM_CONSTANT(SKY_MODE_LIGHT_AND_SKY);

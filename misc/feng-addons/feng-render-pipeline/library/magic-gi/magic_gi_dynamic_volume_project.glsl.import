@@ -1,0 +1,13 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://d0sy08256y6ml"
+path="res://.godot/imported/magic_gi_dynamic_volume_project.glsl-080809f77d14b5b4c609420942f6ac6b.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_project.glsl"
+dest_files=["res://.godot/imported/magic_gi_dynamic_volume_project.glsl-080809f77d14b5b4c609420942f6ac6b.res"]
+
+[params]

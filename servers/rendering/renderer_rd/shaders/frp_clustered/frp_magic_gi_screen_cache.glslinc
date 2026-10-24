@@ -1,0 +1,134 @@
+#ifndef FRP_MAGIC_GI_SCREEN_CACHE_GLSLINC
+#define FRP_MAGIC_GI_SCREEN_CACHE_GLSLINC
+
+// Independent screen-space receiver cache path. This specialization deliberately
+// does not include the per-pixel CLV sampler, so the full-resolution PBR shader
+// reads at most four 1/8-resolution cache taps plus one full-resolution edge
+// override.
+layout(set = 1, binding = 50) uniform texture2D frp_magic_gi_screen_incident;
+layout(set = 1, binding = 51) uniform texture2D frp_magic_gi_screen_guide;
+layout(set = 1, binding = 52) uniform texture2D frp_magic_gi_screen_edge;
+layout(set = 1, binding = 53, std140) uniform FRPMagicGIScreenOwnerParameters {
+	mat4 world_to_local;
+	vec4 owner_size_enabled;
+	vec4 control;
+} frp_magic_gi_screen_owner;
+layout(set = 1, binding = 54, std140) uniform FRPMagicGIScreenBakeParameters {
+	mat4 world_to_grid;
+	vec4 grid;
+	vec4 control;
+} frp_magic_gi_screen_bake;
+
+bool frp_magic_gi_screen_finite(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool frp_magic_gi_screen_owner_contains(vec3 world) {
+	vec4 owner_size_enabled = frp_magic_gi_screen_owner.owner_size_enabled;
+	if (owner_size_enabled.w <= 0.5) {
+		return true;
+	}
+	vec3 local_position = (frp_magic_gi_screen_owner.world_to_local * vec4(world, 1.0)).xyz;
+	return frp_magic_gi_screen_finite(local_position) &&
+			all(lessThanEqual(abs(local_position), owner_size_enabled.xyz * 0.5));
+}
+
+bool frp_magic_gi_screen_in_bake_bounds(vec3 world) {
+	float spacing = max(frp_magic_gi_screen_bake.control.y, 0.001);
+	vec3 dimensions = frp_magic_gi_screen_bake.grid.xyz;
+	vec3 grid_position = (frp_magic_gi_screen_bake.world_to_grid * vec4(world, 1.0)).xyz;
+	mat3 world_to_grid_basis = mat3(frp_magic_gi_screen_bake.world_to_grid);
+	float grid_epsilon = max(1e-5, spacing * 0.001 * max(
+			length(world_to_grid_basis[0]),
+			max(length(world_to_grid_basis[1]), length(world_to_grid_basis[2]))));
+	return frp_magic_gi_screen_bake.grid.w > 0.0 &&
+			frp_magic_gi_screen_finite(grid_position) &&
+			all(greaterThanEqual(grid_position, vec3(-grid_epsilon))) &&
+			all(lessThanEqual(grid_position, dimensions + vec3(grid_epsilon)));
+}
+
+bool frp_magic_gi_screen_sample(vec3 world, vec2 screen_uv, vec2 fragment_position,
+		float receiver_depth, vec3 geometric_normal, vec3 albedo, float ao,
+		float diffuse_ao, int view, inout vec3 ambient_light,
+		vec3 global_sky_light_diffuse) {
+	vec4 control = frp_magic_gi_screen_owner.control;
+	float strength = max(control.x, 0.0);
+	if (!(strength > 0.0) || ao <= 0.0 || diffuse_ao <= 0.0 ||
+			all(equal(albedo, vec3(0.0))) ||
+			!frp_magic_gi_screen_owner_contains(world) ||
+			!frp_magic_gi_screen_in_bake_bounds(world)) {
+		return false;
+	}
+	// Same-owner, zero-contribution profiling mode. It keeps sky replacement and
+	// producer state unchanged while avoiding every screen-cache texture read.
+	if (abs(control.w - 4.0) < 0.01) {
+		if (control.y > 0.5) {
+			ambient_light -= global_sky_light_diffuse * clamp(strength, 0.0, 1.0);
+		}
+		return true;
+	}
+	ivec2 full_size = textureSize(sampler2D(frp_magic_gi_screen_edge,
+			SAMPLER_NEAREST_CLAMP), 0);
+	ivec2 pixel = clamp(ivec2(fragment_position), ivec2(0), full_size - 1);
+	vec4 incident = texelFetch(sampler2D(frp_magic_gi_screen_edge,
+			SAMPLER_NEAREST_CLAMP), pixel, 0);
+	float confidence = incident.a;
+	// Negative alpha marks a full-resolution discontinuity pixel whose own
+	// receiver had no safe CLV sample. Do not borrow a half-resolution value
+	// across that edge.
+	if (confidence < 0.0) {
+		return false;
+	}
+	if (!(confidence > 0.0) || !frp_magic_gi_screen_finite(incident.rgb)) {
+		ivec2 low_size = textureSize(sampler2D(frp_magic_gi_screen_incident,
+				SAMPLER_NEAREST_CLAMP), 0);
+		vec2 low_position = gl_FragCoord.xy * 0.125 - 0.5;
+		ivec2 base = ivec2(floor(low_position));
+		vec2 fraction = fract(low_position);
+		float view_sigma = max(receiver_depth * 0.015, 0.025);
+		float weight_sum = 0.0;
+		float confidence_sum = 0.0;
+		float confidence_weight_sum = 0.0;
+		vec3 incident_sum = vec3(0.0);
+		for (int corner = 0; corner < 4; corner++) {
+			ivec2 offset = ivec2(corner & 1, (corner >> 1) & 1);
+			ivec2 sample_pixel = clamp(base + offset, ivec2(0), low_size - 1);
+			vec4 guide = texelFetch(sampler2D(frp_magic_gi_screen_guide,
+					SAMPLER_NEAREST_CLAMP), sample_pixel, 0);
+			vec4 sample_value = texelFetch(sampler2D(frp_magic_gi_screen_incident,
+					SAMPLER_NEAREST_CLAMP), sample_pixel, 0);
+			float guide_normal_length_squared = dot(guide.yzw, guide.yzw);
+			if (!(guide.x > 0.0) || !frp_magic_gi_screen_finite(guide.rgb) ||
+					!(guide_normal_length_squared > 1e-12) || isnan(guide_normal_length_squared) ||
+					isinf(guide_normal_length_squared) || !(sample_value.a > 0.0) ||
+					!frp_magic_gi_screen_finite(sample_value.rgb) ||
+					!frp_magic_gi_screen_finite(guide.yzw)) { continue; }
+			float bilinear = (offset.x == 0 ? 1.0 - fraction.x : fraction.x) *
+					(offset.y == 0 ? 1.0 - fraction.y : fraction.y);
+			float depth_weight = exp(-abs(receiver_depth - guide.x) / view_sigma);
+			float normal_weight = pow(max(dot(normalize(geometric_normal),
+					normalize(guide.yzw)), 0.0), 24.0);
+			float guide_weight = bilinear * depth_weight * normal_weight;
+			float weight = guide_weight * sample_value.a;
+			incident_sum += sample_value.rgb * weight;
+			weight_sum += weight;
+			confidence_sum += sample_value.a * guide_weight;
+			confidence_weight_sum += guide_weight;
+		}
+		if (!(weight_sum > 1e-5) || isnan(weight_sum) || isinf(weight_sum)) {
+			return false;
+		}
+		incident.rgb = incident_sum / weight_sum;
+		confidence = confidence_weight_sum > 1e-5
+				? confidence_sum / confidence_weight_sum : 0.0;
+	}
+	if (!frp_magic_gi_screen_finite(incident.rgb)) { return false; }
+	if (control.y > 0.5) {
+		ambient_light -= global_sky_light_diffuse * clamp(strength, 0.0, 1.0);
+	}
+	ambient_light += max(incident.rgb, vec3(0.0)) * albedo * ao * diffuse_ao *
+			strength * max(control.z, 0.0);
+	return true;
+}
+
+#endif // FRP_MAGIC_GI_SCREEN_CACHE_GLSLINC

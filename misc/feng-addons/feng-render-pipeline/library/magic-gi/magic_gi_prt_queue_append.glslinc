@@ -1,0 +1,40 @@
+// Optional-only include. Compile this code only from the compact queue root, which
+// requires GL_KHR_shader_subgroup_basic and GL_KHR_shader_subgroup_ballot. The
+// extension must not be enabled by the legacy root.
+layout(set = 0, binding = 31, std430) restrict buffer PrtMissPixelQueue {
+	uint values[];
+} prt_miss_pixel_queue;
+
+layout(set = 0, binding = 32, std430) buffer PrtMissQueueControl {
+	uint count;
+	uint overflow;
+} prt_miss_queue_control;
+
+// `dispatch_pixel` is the exact coordinate used by the legacy apply shader.
+// Producer mode is full-view only; the queued id is local to PageParams' rect.
+void prt_compact_append_cert_miss(ivec2 dispatch_pixel) {
+	uvec4 mask = subgroupBallot(true);
+	uint subgroup_miss_count = subgroupBallotBitCount(mask);
+	uint miss_rank = subgroupBallotExclusiveBitCount(mask);
+	uint queue_base = 0u;
+	if (subgroupElect()) {
+		queue_base = atomicAdd(prt_miss_queue_control.count, subgroup_miss_count);
+	}
+	// Every invocation in this dynamic instance is a cert miss. Elect and
+	// BroadcastFirst therefore use the same active set, including early-return subsets.
+	queue_base = subgroupBroadcastFirst(queue_base);
+
+	uint rect_width = uint(page.dispatch_rect.z);
+	uint rect_height = uint(page.dispatch_rect.w);
+	uint capacity = rect_width * rect_height;
+	if (queue_base >= capacity || subgroup_miss_count > capacity - queue_base) {
+		if (subgroupElect()) {
+			atomicOr(prt_miss_queue_control.overflow, 1u);
+		}
+		return; // Never write past the full-view queue. Consumer will scan marker fallback.
+	}
+
+	ivec2 local_pixel = dispatch_pixel - page.dispatch_rect.xy;
+	uint pixel_id = uint(local_pixel.y) * rect_width + uint(local_pixel.x);
+	prt_miss_pixel_queue.values[queue_base + miss_rank] = pixel_id;
+}

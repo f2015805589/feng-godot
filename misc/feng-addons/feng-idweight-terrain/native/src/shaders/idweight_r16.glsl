@@ -251,6 +251,12 @@ vec3 idweight_decode_normal(vec4 packedNormal, float scale) {
 	// neutral map exactly (0, 1, 0) at any normal_depth; scaling the height and
 	// re-deriving the V tilt instead invents a tilt that was never authored.
 	normalPS.xz *= scale;
+	// Godot's mesh tangent frame reconstructs its bitangent as
+	// cross(N, T) * tangent.w. SurfaceTool's MikkTSpace callback stores the
+	// negated UV bitangent, so that frame points along -dP/dV on every canonical
+	// projection face. These projection charts use +dP/dV for nV; invert only
+	// the green-channel tilt here to match Godot StandardMaterial normal maps.
+	normalPS.z = -normalPS.z;
 	normalPS.y = sqrt(idweight_saturate(1.0 - dot(normalPS.xz, normalPS.xz)));
 	return normalPS;
 }

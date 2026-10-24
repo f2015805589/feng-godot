@@ -37,6 +37,7 @@
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
+#include "servers/rendering/rendering_server_default.h"
 
 namespace {
 Mutex sky_lighting_sources_mutex;
@@ -83,6 +84,7 @@ bool FRPPassContext::get_sky_lighting_source(RID p_render_target, SkyLightingSou
 
 void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void(int)> &p_operation_runner, const std::function<void(int)> &p_stage_runner, const Dictionary &p_pass_parameters, const std::function<void(const StringName &)> &p_present_runner, const std::function<float(int)> &p_pre_exposure_reader, const std::function<void(int, float)> &p_pre_exposure_writer, const std::function<void(RID)> &p_eye_exposure_texture_writer, float p_scene_exposure_normalization, const std::function<bool(int)> &p_operation_is_scheduled, const Dictionary &p_camera_exposure_data) {
 	render_data = p_render_data;
+	frame_token = RSG::rasterizer != nullptr ? RSG::rasterizer->get_frame_number() : 0;
 	operation_runner = p_operation_runner;
 	operation_is_scheduled = p_operation_is_scheduled;
 	stage_runner = p_stage_runner;
@@ -109,6 +111,13 @@ void FRPPassContext::setup(RenderDataRD *p_render_data, const std::function<void
 	clear_cloud_native_inputs();
 	clear_cloud_projection_parameters();
 	clear_cloud_outputs();
+	clear_magic_gi_clv_inputs();
+	clear_magic_gi_screen_cache_inputs();
+	clear_magic_gi_dynamic_screen_cache_inputs();
+	clear_magic_gi_baked_sh_inputs();
+	clear_magic_gi_dynamic_volume_inputs();
+	magic_gi_profile_enabled = false;
+	magic_gi_clv_lighting_active = false;
 	set_reflection_capture_context(false, 0, -1, 0, Vector3(), 1.0f);
 	sky_light_diffuse_requested = false;
 	indirect_specular_requested = false;
@@ -842,9 +851,437 @@ void FRPPassContext::clear_after_operation_callbacks() {
 	after_operation_callbacks.clear();
 	dispatching_after_operation_callbacks.clear();
 	completed_operations.clear();
+	clear_magic_gi_clv_inputs();
+	clear_magic_gi_screen_cache_inputs();
+	clear_magic_gi_baked_sh_inputs();
+	clear_magic_gi_dynamic_volume_inputs();
+	magic_gi_profile_enabled = false;
+	magic_gi_clv_lighting_active = false;
 	operation_is_scheduled = std::function<bool(int)>();
 	indirect_specular_target_provider = std::function<RID(int)>();
 	begin_indirect_specular_callback();
+}
+
+void FRPPassContext::set_magic_gi_clv_input(int p_view, RID p_texture, RID p_tags, RID p_support, RID p_clv_parameters, RID p_owner_parameters, RID p_gi_parameters, int64_t p_screen_cache_revision, int64_t p_screen_cache_dispatch_token) {
+	ERR_FAIL_INDEX(p_view, 2);
+	magic_gi_screen_cache_inputs[p_view] = MagicGIScreenCacheViewInput();
+	magic_gi_inputs[p_view].clv_texture = p_texture;
+	magic_gi_inputs[p_view].clv_tags = p_tags;
+	magic_gi_inputs[p_view].clv_support = p_support;
+	magic_gi_inputs[p_view].clv_parameters = p_clv_parameters;
+	magic_gi_inputs[p_view].owner_parameters = p_owner_parameters;
+	magic_gi_inputs[p_view].gi_parameters = p_gi_parameters;
+	magic_gi_inputs[p_view].screen_cache_revision = p_screen_cache_revision;
+	magic_gi_inputs[p_view].screen_cache_dispatch_token = p_screen_cache_dispatch_token;
+}
+
+void FRPPassContext::set_magic_gi_screen_cache_input(int p_view, RID p_half_incident, RID p_half_guide, RID p_edge_incident, RID p_source_clv_texture, int64_t p_cache_revision, int64_t p_dispatch_token, int64_t p_frame_token) {
+	if (p_view < 0 || p_view >= 2) {
+		clear_magic_gi_screen_cache_inputs();
+		ERR_FAIL_INDEX(p_view, 2);
+	}
+	// Clear first so every failed replacement drops the previous frame's lease.
+	magic_gi_screen_cache_inputs[p_view] = MagicGIScreenCacheViewInput();
+	const MagicGIViewInput &source = magic_gi_inputs[p_view];
+	ERR_FAIL_COND_MSG(!p_half_incident.is_valid() || !p_half_guide.is_valid() || !p_edge_incident.is_valid(), "Magic GI screen cache requires three valid output textures.");
+	ERR_FAIL_COND_MSG(!p_source_clv_texture.is_valid() || p_source_clv_texture != source.clv_texture, "Magic GI screen cache source does not match this view's current CLV lease.");
+	ERR_FAIL_COND_MSG(p_cache_revision < 0 || p_cache_revision != source.screen_cache_revision, "Magic GI screen cache revision does not match this view's prepared CLV revision.");
+	ERR_FAIL_COND_MSG(p_dispatch_token <= 0 || p_dispatch_token != source.screen_cache_dispatch_token, "Magic GI screen cache was not published by the current CLV dispatch.");
+	ERR_FAIL_COND_MSG(frame_token == 0 || p_frame_token < 0 || uint64_t(p_frame_token) != frame_token, "Magic GI screen cache publication is not from the current renderer frame.");
+	MagicGIScreenCacheViewInput &input = magic_gi_screen_cache_inputs[p_view];
+	input.half_incident = p_half_incident;
+	input.half_guide = p_half_guide;
+	input.edge_incident = p_edge_incident;
+	input.source_clv_texture = p_source_clv_texture;
+	input.frame_token = frame_token;
+	input.cache_revision = p_cache_revision;
+	input.dispatch_token = p_dispatch_token;
+}
+
+void FRPPassContext::clear_magic_gi_screen_cache_inputs() {
+	for (int view = 0; view < 2; view++) {
+		magic_gi_screen_cache_inputs[view] = MagicGIScreenCacheViewInput();
+	}
+	magic_gi_screen_cache_lighting_active = false;
+}
+
+bool FRPPassContext::has_magic_gi_screen_cache_input(int p_view) const {
+	if (p_view < 0 || p_view >= 2) {
+		return false;
+	}
+	const MagicGIScreenCacheViewInput &input = magic_gi_screen_cache_inputs[p_view];
+	const MagicGIViewInput &source = magic_gi_inputs[p_view];
+	return input.half_incident.is_valid() && input.half_guide.is_valid() && input.edge_incident.is_valid() &&
+			input.frame_token != 0 && input.frame_token == frame_token &&
+			input.source_clv_texture.is_valid() && input.source_clv_texture == source.clv_texture &&
+			input.cache_revision >= 0 && input.cache_revision == source.screen_cache_revision &&
+			input.dispatch_token > 0 && input.dispatch_token == source.screen_cache_dispatch_token;
+}
+
+FRPPassContext::MagicGIScreenCacheViewInput FRPPassContext::get_magic_gi_screen_cache_input(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, 2, MagicGIScreenCacheViewInput());
+	return magic_gi_screen_cache_inputs[p_view];
+}
+
+void FRPPassContext::set_magic_gi_dynamic_screen_cache_input(int p_view,
+		RID p_half_incident, RID p_half_guide, RID p_edge_incident,
+		int64_t p_source_publication_token, int64_t p_cache_revision,
+		int64_t p_dispatch_token, uint64_t p_frame_token) {
+	if (p_view < 0 || p_view >= 2) {
+		clear_magic_gi_dynamic_screen_cache_inputs();
+		ERR_FAIL_INDEX(p_view, 2);
+	}
+	magic_gi_dynamic_screen_cache_inputs[p_view] = MagicGIDynamicScreenCacheViewInput();
+	ERR_FAIL_COND_MSG(!p_half_incident.is_valid() || !p_half_guide.is_valid() ||
+			!p_edge_incident.is_valid(), "Dynamic screen cache requires three valid output textures.");
+	ERR_FAIL_COND_MSG(!has_magic_gi_dynamic_volume_input(p_view),
+			"Dynamic screen cache requires the current dynamic-volume lease.");
+	const MagicGIDynamicVolumeViewInput &source = magic_gi_dynamic_volume_inputs[p_view];
+	ERR_FAIL_COND_MSG(p_source_publication_token <= 0 ||
+			p_source_publication_token != source.publication_token,
+			"Dynamic screen cache source publication does not match the current volume lease.");
+	ERR_FAIL_COND_MSG(p_frame_token == 0 || p_frame_token != frame_token ||
+			p_frame_token != source.frame_token,
+			"Dynamic screen cache publication is not from the current volume frame.");
+	ERR_FAIL_COND_MSG(p_cache_revision < 0 || p_dispatch_token <= 0,
+			"Dynamic screen cache requires a completed relight revision and dispatch token.");
+	MagicGIDynamicScreenCacheViewInput &input = magic_gi_dynamic_screen_cache_inputs[p_view];
+	input.half_incident = p_half_incident;
+	input.half_guide = p_half_guide;
+	input.edge_incident = p_edge_incident;
+	input.source_volume_parameters = source.volume_parameters;
+	input.source_owner_parameters = source.owner_parameters;
+	input.source_response = source.fields[0];
+	input.source_moment_atlas = source.receiver_moment_atlas;
+	input.source_relocation = source.relocation_offsets;
+	input.source_validity = source.source_validity;
+	input.frame_token = p_frame_token;
+	input.source_publication_token = p_source_publication_token;
+	input.cache_revision = p_cache_revision;
+	input.dispatch_token = p_dispatch_token;
+}
+
+void FRPPassContext::clear_magic_gi_dynamic_screen_cache_inputs() {
+	for (int view = 0; view < 2; view++) {
+		magic_gi_dynamic_screen_cache_inputs[view] = MagicGIDynamicScreenCacheViewInput();
+	}
+	magic_gi_dynamic_screen_cache_lighting_active = false;
+}
+
+bool FRPPassContext::has_magic_gi_dynamic_screen_cache_input(int p_view) const {
+	if (p_view < 0 || p_view >= 2 || !has_magic_gi_dynamic_volume_input(p_view)) {
+		return false;
+	}
+	const MagicGIDynamicScreenCacheViewInput &input = magic_gi_dynamic_screen_cache_inputs[p_view];
+	const MagicGIDynamicVolumeViewInput &source = magic_gi_dynamic_volume_inputs[p_view];
+	return input.half_incident.is_valid() && input.half_guide.is_valid() && input.edge_incident.is_valid() &&
+			input.frame_token != 0 && input.frame_token == frame_token && input.frame_token == source.frame_token &&
+			input.source_publication_token > 0 && input.source_publication_token == source.publication_token &&
+			input.source_volume_parameters == source.volume_parameters &&
+			input.source_owner_parameters == source.owner_parameters &&
+			input.source_response == source.fields[0] &&
+			input.source_moment_atlas == source.receiver_moment_atlas &&
+			input.source_relocation == source.relocation_offsets &&
+			input.source_validity == source.source_validity &&
+			input.cache_revision >= 0 && input.dispatch_token > 0;
+}
+
+FRPPassContext::MagicGIDynamicScreenCacheViewInput FRPPassContext::get_magic_gi_dynamic_screen_cache_input(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, 2, MagicGIDynamicScreenCacheViewInput());
+	return magic_gi_dynamic_screen_cache_inputs[p_view];
+}
+
+void FRPPassContext::set_magic_gi_baked_sh_input(int p_view, const Array &p_fields, RID p_clipmap_parameters, RID p_owner_parameters, Vector4 p_codec, int64_t p_publication_token) {
+	magic_gi_baked_sh_lighting_active = false;
+	magic_gi_baked_sh_consumed_token = 0;
+	if (p_view < 0 || p_view >= 2) {
+		clear_magic_gi_baked_sh_inputs();
+		ERR_FAIL_INDEX(p_view, 2);
+	}
+	magic_gi_baked_sh_inputs[p_view] = MagicGIBakedSHViewInput();
+	ERR_FAIL_COND_MSG(p_fields.size() != MAGIC_GI_BAKED_SH_FIELD_COUNT, "Magic GI baked SH input requires exactly seven field RIDs.");
+	ERR_FAIL_COND_MSG(!p_clipmap_parameters.is_valid(), "Magic GI baked SH input requires valid clipmap parameters.");
+	ERR_FAIL_COND_MSG(!p_owner_parameters.is_valid(), "Magic GI baked SH input requires valid owner parameters.");
+	const bool codec_parameters_valid = Math::is_finite(p_codec.x) && p_codec.x > 0.0f &&
+			Math::is_finite(p_codec.y) && p_codec.y > 0.0f && Math::is_finite(p_codec.z) &&
+			Math::is_finite(p_codec.w) && (p_codec.z == 16.0f || p_codec.z == 32.0f) &&
+			p_codec.w == 1.0f && Math::is_finite(p_codec.x * p_codec.y) &&
+			Math::abs(p_codec.x * p_codec.y - 1.0f) <= 2e-6f &&
+			(p_codec.z != 32.0f || (p_codec.x == 1.0f && p_codec.y == 1.0f));
+	ERR_FAIL_COND_MSG(!codec_parameters_valid, "Magic GI baked SH codec must contain a finite reciprocal scale, format tag 16 or 32, and revision 1.");
+	ERR_FAIL_COND_MSG(p_publication_token == 0, "Magic GI baked SH publication token must be nonzero.");
+
+	MagicGIBakedSHViewInput input;
+	for (int field_index = 0; field_index < MAGIC_GI_BAKED_SH_FIELD_COUNT; field_index++) {
+		const Variant field = p_fields[field_index];
+		ERR_FAIL_COND_MSG(field.get_type() != Variant::RID, "Magic GI baked SH field entries must be RIDs.");
+		input.fields[field_index] = field;
+		ERR_FAIL_COND_MSG(!input.fields[field_index].is_valid(), "Magic GI baked SH field entries must be valid RIDs.");
+	}
+	input.clipmap_parameters = p_clipmap_parameters;
+	input.owner_parameters = p_owner_parameters;
+	input.codec_parameters = p_codec;
+	input.expected_clipmap_parameters_size_bytes = MAGIC_GI_BAKED_SH_CLIPMAP_PARAMETERS_SIZE_BYTES;
+	input.publication_token = p_publication_token;
+	magic_gi_baked_sh_inputs[p_view] = input;
+}
+
+bool FRPPassContext::has_magic_gi_baked_sh_input(int p_view) const {
+	if (p_view < 0 || p_view >= 2) {
+		return false;
+	}
+	const MagicGIBakedSHViewInput &input = magic_gi_baked_sh_inputs[p_view];
+	if (input.publication_token == 0 || !input.clipmap_parameters.is_valid() || !input.owner_parameters.is_valid() ||
+			input.expected_clipmap_parameters_size_bytes != MAGIC_GI_BAKED_SH_CLIPMAP_PARAMETERS_SIZE_BYTES) {
+		return false;
+	}
+	const Vector4 &codec = input.codec_parameters;
+	if (!Math::is_finite(codec.x) || codec.x <= 0.0f || !Math::is_finite(codec.y) || codec.y <= 0.0f ||
+			!Math::is_finite(codec.z) || !Math::is_finite(codec.w) ||
+			(codec.z != 16.0f && codec.z != 32.0f) || codec.w != 1.0f ||
+			!Math::is_finite(codec.x * codec.y) || Math::abs(codec.x * codec.y - 1.0f) > 2e-6f ||
+			(codec.z == 32.0f && (codec.x != 1.0f || codec.y != 1.0f))) {
+		return false;
+	}
+	for (int field_index = 0; field_index < MAGIC_GI_BAKED_SH_FIELD_COUNT; field_index++) {
+		if (!input.fields[field_index].is_valid()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+FRPPassContext::MagicGIBakedSHViewInput FRPPassContext::get_magic_gi_baked_sh_input(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, 2, MagicGIBakedSHViewInput());
+	return magic_gi_baked_sh_inputs[p_view];
+}
+
+void FRPPassContext::clear_magic_gi_baked_sh_inputs() {
+	for (int view = 0; view < 2; view++) {
+		magic_gi_baked_sh_inputs[view] = MagicGIBakedSHViewInput();
+	}
+	magic_gi_baked_sh_lighting_active = false;
+	magic_gi_baked_sh_consumed_token = 0;
+}
+
+void FRPPassContext::set_magic_gi_baked_sh_lighting_consumed_token(int64_t p_publication_token) {
+	const int view_count = get_view_count();
+	bool valid = p_publication_token != 0 && view_count > 0 && view_count <= 2;
+	for (int view = 0; valid && view < view_count; view++) {
+		const MagicGIBakedSHViewInput &input = magic_gi_baked_sh_inputs[view];
+		if (!has_magic_gi_baked_sh_input(view) || input.publication_token != p_publication_token) {
+			valid = false;
+		}
+	}
+	for (int view = view_count; valid && view < 2; view++) {
+		if (magic_gi_baked_sh_inputs[view].publication_token != 0) {
+			valid = false;
+		}
+	}
+	magic_gi_baked_sh_lighting_active = valid;
+	magic_gi_baked_sh_consumed_token = magic_gi_baked_sh_lighting_active ? p_publication_token : 0;
+}
+
+void FRPPassContext::set_magic_gi_dynamic_volume_input(int p_view, const Array &p_fields,
+		RID p_volume_parameters, RID p_owner_parameters, Vector3i p_dimensions,
+		RID p_receiver_moment_atlas, RID p_relocation_offsets, RID p_source_validity,
+		Vector3 p_origin_world, float p_spacing_m, int p_response_resolution,
+		int p_layout_version,
+		int64_t p_publication_token, uint64_t p_frame_token) {
+	magic_gi_dynamic_volume_lighting_active = false;
+	magic_gi_dynamic_volume_consumed_token = 0;
+	if (p_view < 0 || p_view >= 2) {
+		clear_magic_gi_dynamic_volume_inputs();
+		ERR_FAIL_INDEX(p_view, 2);
+	}
+	magic_gi_dynamic_volume_inputs[p_view] = MagicGIDynamicVolumeViewInput();
+	ERR_FAIL_COND_MSG(p_fields.size() != MAGIC_GI_DYNAMIC_VOLUME_FIELD_COUNT,
+			"Magic GI dynamic volume requires exactly one response atlas.");
+	ERR_FAIL_COND_MSG(!p_volume_parameters.is_valid() || !p_owner_parameters.is_valid(),
+			"Magic GI dynamic volume requires valid volume and owner parameter buffers.");
+	ERR_FAIL_COND_MSG(!p_receiver_moment_atlas.is_valid() || !p_relocation_offsets.is_valid() ||
+			!p_source_validity.is_valid(),
+			"Magic GI dynamic volume requires a valid receiver moment atlas, relocation, and validity resources.");
+	ERR_FAIL_COND_MSG(p_dimensions.x <= 0 || p_dimensions.y <= 0 || p_dimensions.z <= 0,
+			"Magic GI dynamic volume dimensions must be positive.");
+	ERR_FAIL_COND_MSG(!Math::is_finite(p_origin_world.x) || !Math::is_finite(p_origin_world.y) ||
+			!Math::is_finite(p_origin_world.z) || !Math::is_finite(p_spacing_m) || p_spacing_m <= 0.0f,
+			"Magic GI dynamic volume geometry must be finite with positive spacing.");
+	ERR_FAIL_COND_MSG(p_response_resolution != 8 && p_response_resolution != 12 &&
+			p_response_resolution != 16,
+			"Magic GI dynamic volume response resolution must be 8, 12, or 16.");
+	ERR_FAIL_COND_MSG(p_layout_version != MAGIC_GI_DYNAMIC_VOLUME_LAYOUT_VERSION &&
+			p_layout_version != MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION &&
+			p_layout_version != MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION,
+			"Magic GI dynamic volume layout version mismatch.");
+	ERR_FAIL_COND_MSG(p_publication_token <= 0,
+			"Magic GI dynamic volume publication token must be positive.");
+	ERR_FAIL_COND_MSG(frame_token == 0 || p_frame_token != frame_token,
+			"Magic GI dynamic volume publication must belong to the current frame.");
+
+	MagicGIDynamicVolumeViewInput input;
+	for (int field_index = 0; field_index < MAGIC_GI_DYNAMIC_VOLUME_FIELD_COUNT; field_index++) {
+		const Variant field = p_fields[field_index];
+		ERR_FAIL_COND_MSG(field.get_type() != Variant::RID,
+				"Magic GI dynamic volume field entries must be RIDs.");
+		input.fields[field_index] = field;
+		ERR_FAIL_COND_MSG(!input.fields[field_index].is_valid(),
+				"Magic GI dynamic volume field entries must be valid RIDs.");
+	}
+	input.volume_parameters = p_volume_parameters;
+	input.owner_parameters = p_owner_parameters;
+	input.receiver_moment_atlas = p_receiver_moment_atlas;
+	input.relocation_offsets = p_relocation_offsets;
+	input.source_validity = p_source_validity;
+	input.dimensions = p_dimensions;
+	input.origin_world = p_origin_world;
+	input.spacing_m = p_spacing_m;
+	input.response_resolution = p_response_resolution;
+	input.expected_volume_parameters_size_bytes = p_layout_version == MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION ?
+			MAGIC_GI_PAGED_PREPARED_VOLUME_PARAMETERS_SIZE_BYTES : MAGIC_GI_DYNAMIC_VOLUME_PARAMETERS_SIZE_BYTES;
+	input.layout_version = p_layout_version;
+	input.frame_token = p_frame_token;
+	input.publication_token = p_publication_token;
+	magic_gi_dynamic_volume_inputs[p_view] = input;
+}
+
+bool FRPPassContext::has_magic_gi_dynamic_volume_input(int p_view) const {
+	if (p_view < 0 || p_view >= 2) {
+		return false;
+	}
+	const MagicGIDynamicVolumeViewInput &input = magic_gi_dynamic_volume_inputs[p_view];
+	const uint32_t expected_parameters_size = input.layout_version == MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION ?
+			MAGIC_GI_PAGED_PREPARED_VOLUME_PARAMETERS_SIZE_BYTES : MAGIC_GI_DYNAMIC_VOLUME_PARAMETERS_SIZE_BYTES;
+	if (input.publication_token <= 0 || input.frame_token == 0 || input.frame_token != frame_token ||
+			!input.volume_parameters.is_valid() || !input.owner_parameters.is_valid() ||
+			!input.receiver_moment_atlas.is_valid() || !input.relocation_offsets.is_valid() ||
+			!input.source_validity.is_valid() ||
+			input.expected_volume_parameters_size_bytes != expected_parameters_size ||
+			(input.layout_version != MAGIC_GI_DYNAMIC_VOLUME_LAYOUT_VERSION &&
+					input.layout_version != MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION &&
+					input.layout_version != MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) ||
+			input.dimensions.x <= 0 || input.dimensions.y <= 0 || input.dimensions.z <= 0 ||
+			(input.response_resolution != 8 && input.response_resolution != 12 &&
+					input.response_resolution != 16) ||
+			!Math::is_finite(input.spacing_m) || input.spacing_m <= 0.0f) {
+		return false;
+	}
+	for (int field_index = 0; field_index < MAGIC_GI_DYNAMIC_VOLUME_FIELD_COUNT; field_index++) {
+		if (!input.fields[field_index].is_valid()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+FRPPassContext::MagicGIDynamicVolumeViewInput FRPPassContext::get_magic_gi_dynamic_volume_input(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, 2, MagicGIDynamicVolumeViewInput());
+	return magic_gi_dynamic_volume_inputs[p_view];
+}
+
+void FRPPassContext::clear_magic_gi_dynamic_volume_inputs() {
+	clear_magic_gi_dynamic_screen_cache_inputs();
+	for (int view = 0; view < 2; view++) {
+		magic_gi_dynamic_volume_inputs[view] = MagicGIDynamicVolumeViewInput();
+	}
+	magic_gi_dynamic_volume_lighting_active = false;
+	magic_gi_dynamic_volume_consumed_token = 0;
+}
+
+void FRPPassContext::set_magic_gi_dynamic_volume_lighting_consumed_token(int64_t p_publication_token) {
+	const int view_count = get_view_count();
+	bool valid = p_publication_token > 0 && view_count > 0 && view_count <= 2;
+	for (int view = 0; valid && view < view_count; view++) {
+		const MagicGIDynamicVolumeViewInput &input = magic_gi_dynamic_volume_inputs[view];
+		if (!has_magic_gi_dynamic_volume_input(view) || input.publication_token != p_publication_token) {
+			valid = false;
+		}
+	}
+	for (int view = view_count; valid && view < 2; view++) {
+		if (magic_gi_dynamic_volume_inputs[view].publication_token != 0) {
+			valid = false;
+		}
+	}
+	magic_gi_dynamic_volume_lighting_active = valid;
+	magic_gi_dynamic_volume_consumed_token = valid ? p_publication_token : 0;
+}
+
+int FRPPassContext::get_magic_gi_clv_layout_version() const {
+	return MAGIC_GI_CLV_LAYOUT_VERSION;
+}
+
+bool FRPPassContext::supports_magic_gi_clv_resolution(int p_resolution) const {
+	return p_resolution >= MAGIC_GI_CLV_MIN_RESOLUTION && p_resolution <= MAGIC_GI_CLV_MAX_RESOLUTION &&
+			(p_resolution - MAGIC_GI_CLV_MIN_RESOLUTION) % MAGIC_GI_CLV_RESOLUTION_STEP == 0;
+}
+
+void FRPPassContext::clear_magic_gi_clv_inputs() {
+	for (int view = 0; view < 2; view++) {
+		magic_gi_inputs[view] = MagicGIViewInput();
+	}
+	clear_magic_gi_screen_cache_inputs();
+	clear_magic_gi_general_queue_inputs();
+}
+
+bool FRPPassContext::has_magic_gi_clv_input(int p_view) const {
+	if (p_view < 0 || p_view >= 2) {
+		return false;
+	}
+	const MagicGIViewInput &input = magic_gi_inputs[p_view];
+	return input.clv_texture.is_valid() && input.clv_tags.is_valid() && input.clv_support.is_valid()
+			&& input.clv_parameters.is_valid() && input.owner_parameters.is_valid() && input.gi_parameters.is_valid();
+}
+
+FRPPassContext::MagicGIViewInput FRPPassContext::get_magic_gi_clv_input(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, 2, MagicGIViewInput());
+	return magic_gi_inputs[p_view];
+}
+
+void FRPPassContext::set_magic_gi_general_queue_input(int p_view, RID p_geometry_atlas,
+		RID p_visibility_moments, RID p_visibility_nodes, RID p_visibility_triangles,
+		RID p_directional_lighting, RID p_miss_queue, RID p_queue_control, RID p_source_pending) {
+	ERR_FAIL_INDEX(p_view, 2);
+	MagicGIGeneralQueueInput &input = magic_gi_general_queue_inputs[p_view];
+	input.geometry_atlas = p_geometry_atlas;
+	input.visibility_moments = p_visibility_moments;
+	input.visibility_nodes = p_visibility_nodes;
+	input.visibility_triangles = p_visibility_triangles;
+	input.directional_lighting = p_directional_lighting;
+	input.miss_queue = p_miss_queue;
+	input.queue_control = p_queue_control;
+	input.source_pending = p_source_pending;
+	magic_gi_general_queue_active = false;
+}
+
+void FRPPassContext::clear_magic_gi_general_queue_inputs() {
+	for (int view = 0; view < 2; view++) {
+		magic_gi_general_queue_inputs[view] = MagicGIGeneralQueueInput();
+	}
+	magic_gi_general_queue_active = false;
+	magic_gi_general_queue_runtime_msaa = -1;
+	magic_gi_general_queue_runtime_view_count = 0;
+}
+
+bool FRPPassContext::has_magic_gi_general_queue_input(int p_view) const {
+	if (p_view < 0 || p_view >= 2) {
+		return false;
+	}
+	const MagicGIGeneralQueueInput &input = magic_gi_general_queue_inputs[p_view];
+	return input.geometry_atlas.is_valid() && input.visibility_moments.is_valid()
+			&& input.visibility_nodes.is_valid() && input.visibility_triangles.is_valid()
+			&& input.directional_lighting.is_valid() && input.miss_queue.is_valid()
+			&& input.queue_control.is_valid() && input.source_pending.is_valid();
+}
+
+FRPPassContext::MagicGIGeneralQueueInput FRPPassContext::get_magic_gi_general_queue_input(int p_view) const {
+	ERR_FAIL_INDEX_V(p_view, 2, MagicGIGeneralQueueInput());
+	return magic_gi_general_queue_inputs[p_view];
+}
+
+void FRPPassContext::set_magic_gi_general_queue_active(bool p_active, int p_msaa_mode, int p_view_count) {
+	magic_gi_general_queue_active = p_active;
+	magic_gi_general_queue_runtime_msaa = p_msaa_mode;
+	magic_gi_general_queue_runtime_view_count = p_view_count;
 }
 
 bool FRPPassContext::is_operation_completed(int p_operation) const {
@@ -877,6 +1314,45 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_volume_deferred_composition"), &FRPPassContext::is_volume_deferred_composition);
 	ClassDB::bind_method(D_METHOD("set_diffuse_ambient_occlusion_texture", "texture"), &FRPPassContext::set_diffuse_ambient_occlusion_texture);
 	ClassDB::bind_method(D_METHOD("get_diffuse_ambient_occlusion_texture"), &FRPPassContext::get_diffuse_ambient_occlusion_texture);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_clv_input", "view", "texture", "tags", "support", "clv_parameters", "owner_parameters", "gi_parameters", "screen_cache_revision", "screen_cache_dispatch_token"), &FRPPassContext::set_magic_gi_clv_input, DEFVAL(-1), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_magic_gi_screen_cache_input", "view", "half_incident", "half_guide", "edge_incident", "source_clv_texture", "cache_revision", "dispatch_token", "frame_token"), &FRPPassContext::set_magic_gi_screen_cache_input);
+	ClassDB::bind_method(D_METHOD("clear_magic_gi_screen_cache_inputs"), &FRPPassContext::clear_magic_gi_screen_cache_inputs);
+	ClassDB::bind_method(D_METHOD("has_magic_gi_screen_cache_input", "view"), &FRPPassContext::has_magic_gi_screen_cache_input);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_dynamic_screen_cache_input", "view", "half_incident", "half_guide", "edge_incident", "source_publication_token", "cache_revision", "dispatch_token", "frame_token"), &FRPPassContext::set_magic_gi_dynamic_screen_cache_input);
+	ClassDB::bind_method(D_METHOD("clear_magic_gi_dynamic_screen_cache_inputs"), &FRPPassContext::clear_magic_gi_dynamic_screen_cache_inputs);
+	ClassDB::bind_method(D_METHOD("has_magic_gi_dynamic_screen_cache_input", "view"), &FRPPassContext::has_magic_gi_dynamic_screen_cache_input);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_dynamic_screen_cache_lighting_active"), &FRPPassContext::is_magic_gi_dynamic_screen_cache_lighting_active);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_screen_cache_lighting_active"), &FRPPassContext::is_magic_gi_screen_cache_lighting_active);
+	ClassDB::bind_method(D_METHOD("get_frame_token"), &FRPPassContext::get_frame_token);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_baked_sh_input", "view", "fields", "clipmap_parameters", "owner_parameters", "codec", "publication_token"), &FRPPassContext::set_magic_gi_baked_sh_input);
+	ClassDB::bind_method(D_METHOD("has_magic_gi_baked_sh_input", "view"), &FRPPassContext::has_magic_gi_baked_sh_input);
+	ClassDB::bind_method(D_METHOD("clear_magic_gi_baked_sh_inputs"), &FRPPassContext::clear_magic_gi_baked_sh_inputs);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_baked_sh_layout_version"), &FRPPassContext::get_magic_gi_baked_sh_layout_version);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_baked_sh_lighting_active"), &FRPPassContext::is_magic_gi_baked_sh_lighting_active);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_baked_sh_consumed_token"), &FRPPassContext::get_magic_gi_baked_sh_consumed_token);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_dynamic_volume_input", "view", "fields", "volume_parameters", "owner_parameters", "dimensions", "receiver_moment_atlas", "relocation_offsets", "source_validity", "origin_world", "spacing_m", "response_resolution", "layout_version", "publication_token", "frame_token"), &FRPPassContext::set_magic_gi_dynamic_volume_input);
+	ClassDB::bind_method(D_METHOD("has_magic_gi_dynamic_volume_input", "view"), &FRPPassContext::has_magic_gi_dynamic_volume_input);
+	ClassDB::bind_method(D_METHOD("clear_magic_gi_dynamic_volume_inputs"), &FRPPassContext::clear_magic_gi_dynamic_volume_inputs);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_dynamic_volume_lighting_active"), &FRPPassContext::is_magic_gi_dynamic_volume_lighting_active);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_dynamic_volume_consumed_token"), &FRPPassContext::get_magic_gi_dynamic_volume_consumed_token);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_layout_version"), &FRPPassContext::get_magic_gi_paged_prepared_layout_version);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_parameters_size"), &FRPPassContext::get_magic_gi_paged_prepared_parameters_size);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_max_lods"), &FRPPassContext::get_magic_gi_paged_prepared_max_lods);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_abi_version"), &FRPPassContext::get_magic_gi_paged_prepared_abi_version);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_clv_layout_version"), &FRPPassContext::get_magic_gi_clv_layout_version);
+	ClassDB::bind_method(D_METHOD("supports_magic_gi_clv_resolution", "resolution"), &FRPPassContext::supports_magic_gi_clv_resolution);
+	ClassDB::bind_method(D_METHOD("clear_magic_gi_clv_inputs"), &FRPPassContext::clear_magic_gi_clv_inputs);
+	ClassDB::bind_method(D_METHOD("has_magic_gi_clv_input", "view"), &FRPPassContext::has_magic_gi_clv_input);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_general_queue_input", "view", "geometry_atlas", "visibility_moments", "visibility_nodes", "visibility_triangles", "directional_lighting", "miss_queue", "queue_control", "source_pending"), &FRPPassContext::set_magic_gi_general_queue_input);
+	ClassDB::bind_method(D_METHOD("clear_magic_gi_general_queue_inputs"), &FRPPassContext::clear_magic_gi_general_queue_inputs);
+	ClassDB::bind_method(D_METHOD("has_magic_gi_general_queue_input", "view"), &FRPPassContext::has_magic_gi_general_queue_input);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_general_queue_active", "active", "msaa_mode", "view_count"), &FRPPassContext::set_magic_gi_general_queue_active);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_general_queue_active"), &FRPPassContext::is_magic_gi_general_queue_active);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_general_queue_runtime_msaa"), &FRPPassContext::get_magic_gi_general_queue_runtime_msaa);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_general_queue_runtime_view_count"), &FRPPassContext::get_magic_gi_general_queue_runtime_view_count);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_profile_enabled", "enabled"), &FRPPassContext::set_magic_gi_profile_enabled);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_profile_enabled"), &FRPPassContext::is_magic_gi_profile_enabled);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_clv_lighting_active"), &FRPPassContext::is_magic_gi_clv_lighting_active);
 	ClassDB::bind_method(D_METHOD("enqueue_after_operation", "operation", "callback"), &FRPPassContext::enqueue_after_operation);
 	ClassDB::bind_method(D_METHOD("is_operation_completed", "operation"), &FRPPassContext::is_operation_completed);
 	ClassDB::bind_method(D_METHOD("set_next_pre_exposure", "view", "exposure"), &FRPPassContext::set_next_pre_exposure);

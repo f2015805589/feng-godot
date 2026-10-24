@@ -17,16 +17,15 @@ func _parse_begin(object: Object) -> void:
 	var warnings: PackedStringArray = object.call("get_configuration_warnings")
 	if warnings.is_empty():
 		return
-
-	var panel := VBoxContainer.new()
-	panel.name = "FengRendererConfigurationWarnings"
-	var heading := Label.new()
-	heading.text = "FRP schedule warnings"
-	heading.add_theme_color_override("font_color", Color(1.0, 0.76, 0.34))
-	panel.add_child(heading)
+	var warning_panel := VBoxContainer.new()
+	warning_panel.name = "FengRendererConfigurationWarnings"
+	var warning_heading := Label.new()
+	warning_heading.text = "FRP schedule warnings"
+	warning_heading.add_theme_color_override("font_color", Color(1.0, 0.76, 0.34))
+	warning_panel.add_child(warning_heading)
 	for warning in warnings:
 		var label := Label.new()
 		label.text = "• " + warning
 		label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		panel.add_child(label)
-	add_custom_control(panel)
+		warning_panel.add_child(label)
+	add_custom_control(warning_panel)

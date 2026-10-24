@@ -2,35 +2,220 @@
 // tag is published; light changes reuse the same visible probes and weights.
 // Overflow retains the complete gather instead of truncating its contributors.
 layout(set = 0, binding = 12, std430) buffer Stencils { uint words[]; } clv_stencils;
+layout(set = 0, binding = 18, std430) coherent buffer TransferAggregateScratch { vec4 values[]; } clv_transfer_scratch;
 const int CLV_STENCIL_CAPACITY = 16;
 const int CLV_STENCIL_WORDS = 4 + CLV_STENCIL_CAPACITY * 3;
+const int CLV_TRANSFER_MATRIX_COLUMNS = 81;
+const int CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE = 14;
+const int CLV_TRANSFER_MAX_JOBS = 512;
+// The low 31 bits preserve the selected visibility-proxy probe ID (+1). The
+// high bit is independent of the geometry certificate bits in the support
+// image: it says that this face owns a complete interpolated TransferMatrix.
+const uint CLV_STENCIL_TRANSFER_VALID_BIT = 0x80000000u;
 uint clv_stencil_base;
 int clv_stencil_count;
 int clv_stencil_begin;
 int clv_stencil_narrow_count;
 int clv_stencil_neighborhood;
+uint clv_transfer_job_index;
+int clv_transfer_axis;
+int clv_transfer_stage;
+bool clv_transfer_aggregate_valid;
+
+uint clv_stencil_compute_base(ivec3 slot, int axis);
 
 void clv_stencil_reset(ivec3 slot, int axis) {
 	clv_stencil_base = uint(((slot.z * config.resolution + slot.y)
 			* config.resolution + slot.x) * CLV_FACE_SLOT_COUNT + axis) * uint(CLV_STENCIL_WORDS);
+	// A recycled face must not inherit an old proxy or dynamic-transfer-valid
+	// marker while its new geometry/stencil is being gathered.
+	clv_stencils.words[clv_stencil_base] = 0u;
+	clv_stencils.words[clv_stencil_base + 1u] = 0u;
+	clv_stencils.words[clv_stencil_base + 2u] = 0u;
+	clv_stencils.words[clv_stencil_base + 3u] = 0u;
 	clv_stencil_count = 0;
 	clv_stencil_neighborhood = 0;
+	clv_transfer_axis = axis;
+	clv_transfer_stage = 0;
+	clv_transfer_aggregate_valid = true;
+}
+
+uint clv_transfer_scratch_base(int stage) {
+	uint columns = uint(CLV_TRANSFER_MATRIX_COLUMNS
+			+ max(config.emitters, 0) * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE);
+	return ((clv_transfer_job_index * uint(CLV_FACE_SLOT_COUNT)
+			+ uint(clv_transfer_axis)) * 2u + uint(stage)) * columns;
 }
 
 void clv_stencil_begin_neighborhood() {
 	clv_stencil_begin = clv_stencil_count;
-	if (clv_stencil_neighborhood++ == 1) { clv_stencil_narrow_count = clv_stencil_count; }
+	int stage = clv_stencil_neighborhood++;
+	if (stage == 1) { clv_stencil_narrow_count = clv_stencil_count; }
+	if (config.dynamic_transfer == 0) { return; }
+	clv_transfer_stage = stage;
+	int columns = CLV_TRANSFER_MATRIX_COLUMNS
+			+ max(config.emitters, 0) * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE;
+	if (stage < 0 || stage >= 2 || config.emitters < 0
+			|| clv_transfer_job_index >= uint(CLV_TRANSFER_MAX_JOBS)) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	uint base = clv_transfer_scratch_base(stage);
+	if (base + uint(columns) > uint(clv_transfer_scratch.values.length())) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	for (int column = 0; column < columns; column++) {
+		clv_transfer_scratch.values[base + uint(column)] = vec4(0.0);
+	}
+	memoryBarrierBuffer();
 }
 
 void clv_stencil_record(int probe, float secondary_weight, float sky_weight) {
-	if (clv_stencil_count >= CLV_STENCIL_CAPACITY) {
+	int entry_index = clv_stencil_count;
+	if (config.dynamic_transfer == 0 && entry_index >= CLV_STENCIL_CAPACITY) {
 		clv_stencil_count = CLV_STENCIL_CAPACITY + 1;
 		return;
 	}
-	uint entry = clv_stencil_base + 4u + uint(clv_stencil_count++ * 3);
+	clv_stencil_count++;
+	if (entry_index >= CLV_STENCIL_CAPACITY) { return; }
+	uint entry = clv_stencil_base + 4u + uint(entry_index * 3);
 	clv_stencils.words[entry] = uint(probe);
 	clv_stencils.words[entry + 1u] = floatBitsToUint(secondary_weight);
 	clv_stencils.words[entry + 2u] = floatBitsToUint(sky_weight);
+}
+
+void clv_transfer_aggregate_record(int probe, float secondary_weight, float sky_weight) {
+	if (config.dynamic_transfer == 0) { return; }
+	uint probe_count = uint(max(config.probe_count, 0));
+	int columns = CLV_TRANSFER_MATRIX_COLUMNS
+			+ max(config.emitters, 0) * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE;
+	if (clv_transfer_stage < 0 || clv_transfer_stage >= 2 || probe < 0
+			|| uint(probe) >= probe_count || config.emitters < 0
+			|| isnan(secondary_weight) || isinf(secondary_weight) || secondary_weight < 0.0
+			|| isnan(sky_weight) || isinf(sky_weight) || sky_weight < 0.0
+			|| clv_probe_transfer.values.length() < config.probe_count * 243
+			|| clv_probe_sky_transfer.values.length() < config.probe_count * 81
+			|| clv_probe_emission_transfer.values.length()
+				< config.probe_count * config.emitters * 54) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	uint base = clv_transfer_scratch_base(clv_transfer_stage);
+	if (base + uint(columns) > uint(clv_transfer_scratch.values.length())) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	for (int column = 0; column < CLV_TRANSFER_MATRIX_COLUMNS; column++) {
+		vec4 aggregate = clv_transfer_scratch.values[base + uint(column)];
+		for (int component = 0; component < 4; component++) {
+			int scalar_index = column * 4 + component;
+			if (scalar_index < 243) {
+				float value = clv_probe_transfer.values[probe * 243 + scalar_index];
+				if (isnan(value) || isinf(value)) {
+					clv_transfer_aggregate_valid = false;
+					return;
+				}
+				aggregate[component] += value * secondary_weight;
+			} else {
+				float value = clv_probe_sky_transfer.values[probe * 81 + scalar_index - 243];
+				if (isnan(value) || isinf(value)) {
+					clv_transfer_aggregate_valid = false;
+					return;
+				}
+				aggregate[component] += value * sky_weight;
+			}
+		}
+		clv_transfer_scratch.values[base + uint(column)] = aggregate;
+	}
+	for (int emitter = 0; emitter < config.emitters; emitter++) {
+		for (int column = 0; column < CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE; column++) {
+			vec4 aggregate = clv_transfer_scratch.values[base + uint(
+					CLV_TRANSFER_MATRIX_COLUMNS + emitter * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE + column)];
+			for (int component = 0; component < 4; component++) {
+				int scalar_index = column * 4 + component;
+				if (scalar_index < 54) {
+					int input_index = (emitter * config.probe_count + probe) * 54 + scalar_index;
+					float value = clv_probe_emission_transfer.values[input_index];
+					if (isnan(value) || isinf(value)) {
+						clv_transfer_aggregate_valid = false;
+						return;
+					}
+					aggregate[component] += value * secondary_weight;
+				}
+			}
+			clv_transfer_scratch.values[base + uint(
+					CLV_TRANSFER_MATRIX_COLUMNS + emitter * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE + column)] = aggregate;
+		}
+	}
+	memoryBarrierBuffer();
+}
+
+void clv_transfer_aggregate_normalize(float secondary_total, float sky_total) {
+	if (config.dynamic_transfer == 0) { return; }
+	if (!clv_transfer_aggregate_valid || clv_transfer_stage < 0 || clv_transfer_stage >= 2
+			|| isnan(secondary_total) || isinf(secondary_total)
+			|| isnan(sky_total) || isinf(sky_total)) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	uint base = clv_transfer_scratch_base(clv_transfer_stage);
+	int columns = CLV_TRANSFER_MATRIX_COLUMNS
+			+ config.emitters * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE;
+	if (columns < CLV_TRANSFER_MATRIX_COLUMNS
+			|| base + uint(columns) > uint(clv_transfer_scratch.values.length())) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	for (int column = 0; column < CLV_TRANSFER_MATRIX_COLUMNS; column++) {
+		vec4 aggregate = clv_transfer_scratch.values[base + uint(column)];
+		for (int component = 0; component < 4; component++) {
+			int scalar_index = column * 4 + component;
+			float divisor = scalar_index < 243 ? max(secondary_total, 1e-7)
+					: max(sky_total, 1e-7);
+			aggregate[component] /= divisor;
+		}
+		clv_transfer_scratch.values[base + uint(column)] = aggregate;
+	}
+	for (int emitter = 0; emitter < config.emitters; emitter++) {
+		for (int column = 0; column < CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE; column++) {
+			vec4 aggregate = clv_transfer_scratch.values[base + uint(
+					CLV_TRANSFER_MATRIX_COLUMNS + emitter * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE + column)];
+			for (int component = 0; component < 4; component++) {
+				int scalar_index = column * 4 + component;
+				if (scalar_index < 54) { aggregate[component] /= max(secondary_total, 1e-7); }
+				else { aggregate[component] = 0.0; }
+			}
+			clv_transfer_scratch.values[base + uint(
+					CLV_TRANSFER_MATRIX_COLUMNS + emitter * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE + column)] = aggregate;
+		}
+	}
+	memoryBarrierBuffer();
+}
+
+void clv_transfer_aggregate_blend(float narrow_mix) {
+	if (config.dynamic_transfer == 0) { return; }
+	if (!clv_transfer_aggregate_valid || clv_stencil_neighborhood != 2
+			|| isnan(narrow_mix) || isinf(narrow_mix)) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	uint narrow_base = clv_transfer_scratch_base(0);
+	uint wide_base = clv_transfer_scratch_base(1);
+	int columns = CLV_TRANSFER_MATRIX_COLUMNS
+			+ config.emitters * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE;
+	if (config.emitters < 0 || columns < CLV_TRANSFER_MATRIX_COLUMNS
+			|| wide_base + uint(columns) > uint(clv_transfer_scratch.values.length())) {
+		clv_transfer_aggregate_valid = false;
+		return;
+	}
+	for (int column = 0; column < columns; column++) {
+		vec4 narrow = clv_transfer_scratch.values[narrow_base + uint(column)];
+		vec4 wide = clv_transfer_scratch.values[wide_base + uint(column)];
+		clv_transfer_scratch.values[narrow_base + uint(column)] =
+				narrow * narrow_mix + wide * (1.0 - narrow_mix);
+	}
+	memoryBarrierBuffer();
 }
 
 void clv_stencil_normalize(float secondary_total, float sky_total) {
@@ -58,9 +243,146 @@ void clv_stencil_blend(float narrow_mix) {
 
 void clv_stencil_publish(float proxy, float candidate, float visible) {
 	clv_stencils.words[clv_stencil_base] = uint(clv_stencil_count);
-	clv_stencils.words[clv_stencil_base + 1u] = uint(proxy);
+	clv_stencils.words[clv_stencil_base + 1u] = uint(proxy) & ~CLV_STENCIL_TRANSFER_VALID_BIT;
 	clv_stencils.words[clv_stencil_base + 2u] = floatBitsToUint(candidate);
 	clv_stencils.words[clv_stencil_base + 3u] = floatBitsToUint(visible);
+}
+
+void clv_stencil_mark_transfer_valid(ivec3 slot, int axis) {
+	uint base = clv_stencil_compute_base(slot, axis);
+	clv_stencils.words[base + 1u] |= CLV_STENCIL_TRANSFER_VALID_BIT;
+}
+
+void clv_stencil_clear_transfer_valid(ivec3 slot, int axis) {
+	uint base = clv_stencil_compute_base(slot, axis);
+	clv_stencils.words[base + 1u] &= ~CLV_STENCIL_TRANSFER_VALID_BIT;
+}
+
+bool clv_stencil_transfer_valid(ivec3 slot, int axis) {
+	uint base = clv_stencil_compute_base(slot, axis);
+	return (clv_stencils.words[base + 1u] & CLV_STENCIL_TRANSFER_VALID_BIT) != 0u;
+}
+
+uint clv_stencil_proxy_probe(ivec3 slot, int axis) {
+	uint base = clv_stencil_compute_base(slot, axis);
+	return clv_stencils.words[base + 1u] & ~CLV_STENCIL_TRANSFER_VALID_BIT;
+}
+
+ivec3 clv_transfer_matrix_position(ivec3 slot, int axis, int column) {
+	int level = slot.z / config.resolution;
+	int local_z = slot.z - level * config.resolution;
+	return ivec3(column * config.resolution + slot.x, slot.y,
+			(level * CLV_FACE_SLOT_COUNT + axis) * config.resolution + local_z);
+}
+
+float clv_transfer_matrix_scalar(ivec3 slot, int axis, int scalar_index) {
+	vec4 packed_value = imageLoad(clv_transfer_matrix_image,
+			clv_transfer_matrix_position(slot, axis, scalar_index / 4));
+	return packed_value[scalar_index & 3];
+}
+
+void clv_transfer_matrix_clear(ivec3 slot, int axis) {
+	int columns = CLV_TRANSFER_MATRIX_COLUMNS
+			+ config.emitters * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE;
+	for (int column = 0; column < columns; column++) {
+		imageStore(clv_transfer_matrix_image,
+				clv_transfer_matrix_position(slot, axis, column), vec4(0.0));
+	}
+	// Clearing matrix data also withdraws its validity marker, so a recycled or
+	// failed face can never publish a stale matrix to the next resident relight.
+	memoryBarrierImage();
+	clv_stencil_clear_transfer_valid(slot, axis);
+	memoryBarrierBuffer();
+}
+
+// Geometry/visibility stencil weights are applied once when the cell's receiver
+// geometry changes. The resulting aggregate matrix remains cached across every
+// lighting revision; later dispatches only multiply this matrix by live SH.
+bool clv_transfer_matrix_build(ivec3 slot, int axis) {
+	uint base = clv_stencil_compute_base(slot, axis);
+	uint count = clv_stencils.words[base];
+	float visible_support = uintBitsToFloat(clv_stencils.words[base + 3u]);
+	int columns = CLV_TRANSFER_MATRIX_COLUMNS
+			+ max(config.emitters, 0) * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE;
+	if (count == 0u || !clv_transfer_aggregate_valid
+			|| clv_stencil_neighborhood < 1 || clv_stencil_neighborhood > 2
+			|| config.probe_count <= 0 || config.emitters < 0
+			|| clv_probe_transfer.values.length() < config.probe_count * 243
+			|| isnan(visible_support) || isinf(visible_support) || visible_support <= 1e-10
+			|| clv_probe_sky_transfer.values.length() < config.probe_count * 81
+			|| clv_probe_emission_transfer.values.length() < config.probe_count
+				* config.emitters * 54
+			|| clv_emission_sources.values.length() < config.emitters * 6) {
+		return false;
+	}
+	memoryBarrierBuffer();
+	uint aggregate_base = clv_transfer_scratch_base(0);
+	if (aggregate_base + uint(columns) > uint(clv_transfer_scratch.values.length())) { return false; }
+	for (int column = 0; column < columns; column++) {
+		vec4 aggregate = clv_transfer_scratch.values[aggregate_base + uint(column)];
+		if (any(isnan(aggregate)) || any(isinf(aggregate))) { return false; }
+		imageStore(clv_transfer_matrix_image,
+				clv_transfer_matrix_position(slot, axis, column), aggregate);
+	}
+	// Publish only after every directional, sky, and emission coefficient has
+	// been written. The fresh-fill path consumes this matrix again in the same
+	// invocation, so make both the matrix and stencil visible before publishing
+	// its validity marker. Certification remains a separate geometry-only decision.
+	memoryBarrierImage();
+	memoryBarrierBuffer();
+	clv_stencil_mark_transfer_valid(slot, axis);
+	memoryBarrierBuffer();
+	return true;
+}
+
+vec3 clv_live_sh_coefficient(vec4 blocks[7], int index) {
+	int scalar_index = index * 3;
+	return vec3(blocks[scalar_index / 4][scalar_index & 3],
+			blocks[(scalar_index + 1) / 4][(scalar_index + 1) & 3],
+			blocks[(scalar_index + 2) / 4][(scalar_index + 2) & 3]);
+}
+
+bool clv_transfer_matrix_relight_column(ivec3 slot, int axis, int column,
+		out vec4 coefficient) {
+	uint base = clv_stencil_compute_base(slot, axis);
+	uint count = clv_stencils.words[base];
+	if (count == 0u || column < 0 || column >= 18
+			|| config.emitters < 0 || clv_emission_sources.values.length() < config.emitters * 6) {
+		return false;
+	}
+	if (!clv_stencil_transfer_valid(slot, axis)) { return false; }
+	int outgoing = column < 9 ? column : column - 9;
+	vec3 result = vec3(0.0);
+	if (column < 9) {
+		for (int incoming = 0; incoming < 9; incoming++) {
+			vec3 live = clv_live_sh_coefficient(params.lighting_sh, incoming);
+			for (int channel = 0; channel < 3; channel++) {
+				int transfer_index = outgoing * 27 + incoming * 3 + channel;
+				result[channel] += clv_transfer_matrix_scalar(slot, axis, transfer_index)
+						* live[channel];
+			}
+		}
+		for (int emitter = 0; emitter < config.emitters; emitter++) {
+			int emission_base = CLV_TRANSFER_MATRIX_COLUMNS * 4
+					+ emitter * CLV_EMISSION_MATRIX_COLUMNS_PER_SOURCE * 4 + outgoing * 6;
+				for (int channel = 0; channel < 3; channel++) {
+					float first = clv_transfer_matrix_scalar(slot, axis, emission_base + channel);
+					float second = clv_transfer_matrix_scalar(slot, axis, emission_base + 3 + channel);
+					result[channel] += first * clv_emission_sources.values[emitter * 6 + channel]
+							+ second * clv_emission_sources.values[emitter * 6 + 3 + channel];
+				}
+		}
+	} else {
+		for (int incoming = 0; incoming < 9; incoming++) {
+			vec3 live = clv_live_sh_coefficient(params.sky_lighting_sh, incoming);
+			float transfer = clv_transfer_matrix_scalar(slot, axis,
+					243 + outgoing * 9 + incoming);
+				result += live * transfer;
+		}
+	}
+	coefficient = vec4(result, 0.0);
+	if (column == 0) { coefficient.w = float(clv_stencil_proxy_probe(slot, axis)); }
+	return all(not(isnan(coefficient))) && all(not(isinf(coefficient)));
 }
 
 bool clv_stencil_relight(out vec4 coefficients[18], out float candidate, out float visible) {
@@ -78,13 +400,50 @@ bool clv_stencil_relight(out vec4 coefficients[18], out float candidate, out flo
 			coefficients[k + 9] += directional_lighting.values[probe * 20u + uint(k + 9)] * sky_weight;
 		}
 	}
-	coefficients[0].w = float(clv_stencils.words[clv_stencil_base + 1u]);
+	coefficients[0].w = float(clv_stencils.words[clv_stencil_base + 1u]
+			& ~CLV_STENCIL_TRANSFER_VALID_BIT);
 	candidate = uintBitsToFloat(clv_stencils.words[clv_stencil_base + 2u]);
 	visible = uintBitsToFloat(clv_stencils.words[clv_stencil_base + 3u]);
 	return true;
 }
 
+uint clv_stencil_compute_base(ivec3 slot, int axis) {
+	return uint(((slot.z * config.resolution + slot.y) * config.resolution + slot.x)
+			* CLV_FACE_SLOT_COUNT + axis) * uint(CLV_STENCIL_WORDS);
+}
+
+// Cooperative fill variant: one lane owns one axis/SH column. Its i loop and
+// multiply-add order match clv_stencil_relight() for that individual column.
+bool clv_stencil_relight_column(ivec3 slot, int axis, int column, out vec4 coefficient) {
+	if (config.dynamic_transfer != 0) {
+		return clv_transfer_matrix_relight_column(slot, axis, column, coefficient);
+	}
+	uint base = clv_stencil_compute_base(slot, axis);
+	uint count = clv_stencils.words[base];
+	if (count > uint(CLV_STENCIL_CAPACITY) || column < 0 || column >= 18) { return false; }
+	coefficient = vec4(0.0);
+	uint probe_count = uint(directional_lighting.values.length() / 20);
+	for (uint i = 0u; i < count; i++) {
+		uint entry = base + 4u + i * 3u;
+		uint probe = clv_stencils.words[entry];
+		if (probe >= probe_count) { return false; }
+		float weight = column < 9
+				? uintBitsToFloat(clv_stencils.words[entry + 1u])
+				: uintBitsToFloat(clv_stencils.words[entry + 2u]);
+		coefficient += directional_lighting.values[probe * 20u + uint(column)] * weight;
+	}
+	if (column == 0) { coefficient.w = float(clv_stencils.words[base + 1u]
+			& ~CLV_STENCIL_TRANSFER_VALID_BIT); }
+	return true;
+}
+
 #define MAGIC_GI_GATHER_BEGIN() clv_stencil_begin_neighborhood()
-#define MAGIC_GI_GATHER_RECORD(probe, secondary, sky) clv_stencil_record(probe, secondary, sky)
-#define MAGIC_GI_GATHER_NORMALIZE(secondary, sky) clv_stencil_normalize(secondary, sky)
-#define MAGIC_GI_GATHER_BLEND(narrow_mix) clv_stencil_blend(narrow_mix)
+#define MAGIC_GI_GATHER_RECORD(probe, secondary, sky) \
+	clv_stencil_record(probe, secondary, sky); \
+	clv_transfer_aggregate_record(probe, secondary, sky)
+#define MAGIC_GI_GATHER_NORMALIZE(secondary, sky) \
+	clv_stencil_normalize(secondary, sky); \
+	clv_transfer_aggregate_normalize(secondary, sky)
+#define MAGIC_GI_GATHER_BLEND(narrow_mix) \
+	clv_stencil_blend(narrow_mix); \
+	clv_transfer_aggregate_blend(narrow_mix)

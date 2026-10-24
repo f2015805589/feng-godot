@@ -1,0 +1,9 @@
+#ifndef FRP_MAGIC_GI_DYNAMIC_VOLUME_GLSLINC
+#define FRP_MAGIC_GI_DYNAMIC_VOLUME_GLSLINC
+
+// Keep this native wrapper deliberately thin. The runtime compute resolve
+// includes the same sampler body from the add-on resource tree.
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh9_tensor.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_sample.glslinc"
+
+#endif // FRP_MAGIC_GI_DYNAMIC_VOLUME_GLSLINC

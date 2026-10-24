@@ -30,6 +30,9 @@ const INTERNAL_METERING_CAMERA_MANUAL := 4
 		pre_exposure = value
 		emit_changed()
 @export_group("Exposure")
+## Automatic (default) always uses FRP Histogram auto metering. Camera Attributes
+## uses the linked camera: its auto toggle selects camera metering or fixed
+## exposure. Pass Settings uses this pass's metering, including Manual.
 @export_enum("Automatic", "Camera Attributes", "Pass Settings") var exposure_source := EXPOSURE_SOURCE_AUTOMATIC:
 	set(value):
 		exposure_source = clampi(value, EXPOSURE_SOURCE_AUTOMATIC, EXPOSURE_SOURCE_PASS_SETTINGS)
@@ -129,16 +132,22 @@ var _state: Dictionary = {}
 var _frame_parameters: Variant = null
 var _frame_context: FRPPassContext
 
-static func resolve_exposure_route(source: int, has_volume_override: bool,
+static func resolve_exposure_route(source: int, _has_volume_override: bool,
 		has_camera_attributes: bool) -> int:
 	var selected := clampi(source, EXPOSURE_SOURCE_AUTOMATIC, EXPOSURE_SOURCE_PASS_SETTINGS)
-	if selected == EXPOSURE_SOURCE_PASS_SETTINGS:
-		return EXPOSURE_ROUTE_PASS_SETTINGS
 	if selected == EXPOSURE_SOURCE_CAMERA_ATTRIBUTES:
 		return EXPOSURE_ROUTE_CAMERA_ATTRIBUTES if has_camera_attributes else EXPOSURE_ROUTE_PASS_SETTINGS
-	if has_volume_override or not has_camera_attributes:
-		return EXPOSURE_ROUTE_PASS_SETTINGS
-	return EXPOSURE_ROUTE_CAMERA_ATTRIBUTES
+	# Automatic is the FRP histogram route. CameraAttributes are opt-in so a
+	# linked resource with auto exposure disabled cannot silently freeze metering.
+	return EXPOSURE_ROUTE_PASS_SETTINGS
+
+static func resolve_exposure_method(source: int, route: int, camera_auto_enabled: bool,
+		pass_metering_mode: int) -> int:
+	if route == EXPOSURE_ROUTE_CAMERA_ATTRIBUTES:
+		return INTERNAL_METERING_CAMERA_AUTO if camera_auto_enabled else INTERNAL_METERING_CAMERA_MANUAL
+	if clampi(source, EXPOSURE_SOURCE_AUTOMATIC, EXPOSURE_SOURCE_PASS_SETTINGS) == EXPOSURE_SOURCE_AUTOMATIC:
+		return 0 # Histogram
+	return clampi(pass_metering_mode, 0, 2)
 
 func _init() -> void:
 	var color := TextureInput.new()
@@ -264,13 +273,11 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var values: Dictionary = _frame_parameters if _frame_parameters is Dictionary else {}
 	var camera_data: Dictionary = _frame_context.get_camera_exposure_data() if _frame_context != null else {}
 	var camera_available := bool(camera_data.get("available", false))
+	var source := int(values.get("exposure_source", exposure_source))
 	var route := resolve_exposure_route(
-		int(values.get("exposure_source", exposure_source)),
+		source,
 		bool(values.get("_frp_volume_eye_exposure_override", false)),
 		camera_available)
-	var camera_auto := route == EXPOSURE_ROUTE_CAMERA_ATTRIBUTES \
-			and bool(camera_data.get("auto_enabled", false))
-	var camera_manual := route == EXPOSURE_ROUTE_CAMERA_ATTRIBUTES and not camera_auto
 	var camera_auto_min_luminance := float(camera_data.get("auto_min_luminance", 1.0e-12))
 	var camera_auto_max_luminance := float(camera_data.get("auto_max_luminance", camera_auto_min_luminance))
 	if not is_finite(camera_auto_min_luminance) or camera_auto_min_luminance <= 0.0:
@@ -285,8 +292,14 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var previous_pre_exposure := 1.0
 	if use_pre_exposure and _frame_context != null:
 		previous_pre_exposure = maxf(_frame_context.get_pre_exposure(view), 1e-12)
-	var method := clampi(int(values.get("metering_mode", metering_mode)), 0, 2)
-	var internal_method := method
+	var pass_metering_mode := clampi(int(values.get("metering_mode", metering_mode)), 0, 2)
+	var internal_method := resolve_exposure_method(source, route,
+		bool(camera_data.get("auto_enabled", false)), pass_metering_mode)
+	# Camera-specific modes use 3/4 internally; the pass's histogram controls
+	# should only see Histogram/Basic/Manual when Pass Settings is selected.
+	var method := clampi(internal_method, 0, 2)
+	var camera_auto := internal_method == INTERNAL_METERING_CAMERA_AUTO
+	var camera_manual := internal_method == INTERNAL_METERING_CAMERA_MANUAL
 	var low := clampf(float(values.get("low_percent", low_percent)), 1.0, 99.0) * 0.01
 	var high := clampf(float(values.get("high_percent", high_percent)), 1.0, 99.0) * 0.01
 	low = minf(low, high)

@@ -31,6 +31,7 @@ func run() -> void:
 	var native_spec: Script = load("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
 	var native_pass_script: Script = load("res://addons/feng-render-pipeline/passes/builtin_pass.gd")
 	var provider_script: Script = load("res://addons/feng-render-pipeline/tests/indirect_gi_provider_fixture.gd")
+	var availability_script: Script = load("res://addons/feng-raytracing/passes/rtgi_runtime_availability.gd")
 	var rt: Variant = provider_script.new()
 	rt.kind = selection.KIND_RT
 	rt.key = "test:rt"
@@ -46,6 +47,78 @@ func run() -> void:
 			"RTGI must retain its planned diffuse slot when authored diffuse strength is zero")
 	require(owner.get("fallback_kind") == selection.KIND_MAGIC and owner.get("fallback_key") == magic.key,
 			"the unique MagicGI candidate must be retained as a frame-resolved fallback")
+
+	rt.indirect_gi_available = false
+	rt.hardware_rt_supported = false
+	var unavailable_owner: Dictionary = selection.resolve(providers, Callable(self, "_enabled"))
+	require(unavailable_owner.get("kind") == selection.KIND_MAGIC
+			and unavailable_owner.get("key") == magic.key,
+			"an enabled RTGI provider without ray-tracing capability must release the diffuse slot to MagicGI")
+	var unavailable_providers: Array = unavailable_owner.get("unavailable_providers", [])
+	require(not unavailable_providers.is_empty()
+			and unavailable_providers[0].get("reason") == "fixture_raytracing_unavailable",
+			"the fallback plan must retain a readable RTGI-unavailable reason")
+	var unavailable_injected: Dictionary = selection.inject({rt.key: {"strength": 1.0}, magic.key: {}},
+			providers, unavailable_owner)
+	var unavailable_rt_packet: Dictionary = unavailable_injected[rt.key][selection.OWNER_PARAMETER]
+	var available_magic_packet: Dictionary = unavailable_injected[magic.key][selection.OWNER_PARAMETER]
+	require(not selection.is_resolved_owner(unavailable_rt_packet, rt.key, selection.KIND_RT, {"strength": 1.0})
+			and selection.is_resolved_owner(available_magic_packet, magic.key, selection.KIND_MAGIC, {}),
+			"unsupported RTGI must not block MagicGI or leave both diffuse writers active")
+	rt.indirect_gi_available = true
+	rt.hardware_rt_supported = true
+	rt.omit_indirect_gi_availability_flag = true
+	var malformed_owner: Dictionary = selection.resolve(providers, Callable(self, "_enabled"))
+	require(malformed_owner.get("kind") == selection.KIND_MAGIC,
+			"an RTGI provider with a malformed availability packet must fail closed to MagicGI")
+	rt.omit_indirect_gi_availability_flag = false
+
+	# Simulate capability passing but first diffuse dispatch failing. The state keeps
+	# RTGI out of the next plan, then permits a later retry and clears after success.
+	var availability_state: RefCounted = availability_script.new()
+	var initial_status: Dictionary = availability_state.get_status(true, "", "Fixture GPU", 100)
+	require(bool(initial_status.get("available", false))
+			and initial_status.get("state") == "probe_pending",
+			"supported RT hardware must get one initial diffuse attempt")
+	availability_state.report_diffuse_result(false, "fixture_trace_failed", 100)
+	var failed_status: Dictionary = availability_state.get_status(true, "", "Fixture GPU", 101)
+	require(not bool(failed_status.get("available", true))
+			and failed_status.get("reason") == "fixture_trace_failed",
+			"a real diffuse attempt failure must expose its reason for the following frame")
+	rt.indirect_gi_available = bool(failed_status.get("available", false))
+	rt.hardware_rt_supported = bool(failed_status.get("hardware_supported", false))
+	rt.indirect_gi_unavailable_reason = str(failed_status.get("reason", ""))
+	var next_frame_owner: Dictionary = selection.resolve(providers, Callable(self, "_enabled"))
+	var next_frame_packets: Dictionary = selection.inject({rt.key: {"strength": 1.0}, magic.key: {}},
+			providers, next_frame_owner)
+	var failed_rt_owner: Dictionary = next_frame_packets[rt.key][selection.OWNER_PARAMETER]
+	var fallback_magic_owner: Dictionary = next_frame_packets[magic.key][selection.OWNER_PARAMETER]
+	var runtime_unavailable: Array = next_frame_owner.get("unavailable_providers", [])
+	require(next_frame_owner.get("kind") == selection.KIND_MAGIC
+			and not runtime_unavailable.is_empty()
+			and runtime_unavailable[0].get("reason") == "fixture_trace_failed",
+			"the next plan after trace failure must hand diffuse ownership back to MagicGI with the failure reason")
+	require(not selection.is_resolved_owner(failed_rt_owner, rt.key, selection.KIND_RT, {"strength": 1.0})
+			and selection.is_resolved_owner(fallback_magic_owner, magic.key, selection.KIND_MAGIC, {}),
+			"runtime fallback must leave exactly one diffuse writer after an RTGI failure")
+	require(selection.is_resolved_reflection_owner(failed_rt_owner, rt.key),
+			"a diffuse-only runtime failure must keep the hardware-capable RTGI reflection slot independent")
+	var retry_status: Dictionary = availability_state.get_status(true, "", "Fixture GPU", 220)
+	require(bool(retry_status.get("available", false))
+			and retry_status.get("state") == "retry_probe",
+			"a transient failure must be eligible for one later retry after the cooldown")
+	rt.indirect_gi_available = true
+	rt.hardware_rt_supported = true
+	var retry_owner: Dictionary = selection.resolve(providers, Callable(self, "_enabled"))
+	require(retry_owner.get("kind") == selection.KIND_RT,
+			"a recovered RTGI probe must reclaim the diffuse slot on a later frame")
+	availability_state.report_diffuse_result(true, "", 221)
+	var recovered_status: Dictionary = availability_state.get_status(true, "", "Fixture GPU", 222)
+	require(bool(recovered_status.get("available", false))
+			and recovered_status.get("state") == "ready"
+			and recovered_status.get("reason", "").is_empty(),
+			"a successful diffuse composite must clear the runtime failure state")
+	rt.indirect_gi_available = true
 
 	var injected: Dictionary = selection.inject({rt.key: {"strength": 0.0}, magic.key: {}}, providers, owner)
 	var rt_owner: Dictionary = injected[rt.key][selection.OWNER_PARAMETER]

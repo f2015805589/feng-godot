@@ -1,0 +1,13 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://4f80jo28d0c4"
+path="res://.godot/imported/magic_gi_clv_probe_block_field_fill.glsl-c7619240c001d4a08ef9e08339eb73e7.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_probe_block_field_fill.glsl"
+dest_files=["res://.godot/imported/magic_gi_clv_probe_block_field_fill.glsl-c7619240c001d4a08ef9e08339eb73e7.res"]
+
+[params]

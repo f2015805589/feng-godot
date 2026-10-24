@@ -30,12 +30,20 @@
 
 #pragma once
 
+#include "servers/rendering/frp_shadow_settings.h"
 #include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/storage/render_scene_buffers.h"
 
 class RendererLightStorage {
 public:
 	virtual ~RendererLightStorage() {}
+
+	// Render-scoped FRP settings are installed before any shadow culling and
+	// restored after the view has submitted its lighting. Other backends ignore
+	// them, and scene-authored light properties are never mutated.
+	virtual void begin_frp_shadow_view(const FRPShadowSettings &p_settings) {}
+	virtual void end_frp_shadow_view() {}
+	virtual const FRPShadowSettings *get_frp_shadow_settings() const { return nullptr; }
 
 	/* Light API */
 
@@ -69,6 +77,10 @@ public:
 	virtual void light_omni_set_shadow_mode(RID p_light, RSE::LightOmniShadowMode p_mode) = 0;
 
 	virtual void light_directional_set_shadow_mode(RID p_light, RSE::LightDirectionalShadowMode p_mode) = 0;
+	virtual void light_directional_set_shadow_object_shadow_enabled(RID p_light, bool p_enabled) = 0;
+	virtual bool light_directional_get_shadow_object_shadow_enabled(RID p_light) const = 0;
+	virtual void light_directional_set_shadow_object_shadow_instances(RID p_light, const Vector<RID> &p_instances) = 0;
+	virtual Vector<RID> light_directional_get_shadow_object_shadow_instances(RID p_light) const = 0;
 	virtual void light_directional_set_blend_splits(RID p_light, bool p_enable) = 0;
 	virtual bool light_directional_get_blend_splits(RID p_light) const = 0;
 	virtual void light_directional_set_sky_mode(RID p_light, RSE::LightDirectionalSkyMode p_mode) = 0;
@@ -104,6 +116,7 @@ public:
 	virtual void light_instance_free(RID p_light_instance) = 0;
 	virtual void light_instance_set_transform(RID p_light_instance, const Transform3D &p_transform) = 0;
 	virtual void light_instance_set_aabb(RID p_light_instance, const AABB &p_aabb) = 0;
+	virtual void light_instance_set_directional_shadow_object_state(RID p_light_instance, uint32_t p_cascade_count, bool p_object_reserved, bool p_object_active) = 0;
 	virtual void light_instance_set_shadow_transform(RID p_light_instance, const Projection &p_projection, const Transform3D &p_transform, float p_far, float p_split, int p_pass, float p_shadow_texel_size, float p_bias_scale = 1.0, float p_range_begin = 0, const Vector2 &p_uv_scale = Vector2()) = 0;
 	virtual void light_instance_mark_visible(RID p_light_instance) = 0;
 	virtual bool light_instances_can_render_shadow_cube() const {
@@ -228,4 +241,5 @@ public:
 	virtual void directional_shadow_atlas_set_size(int p_size, bool p_16_bits = true) = 0;
 	virtual int get_directional_light_shadow_size(RID p_light_instance) = 0;
 	virtual void set_directional_shadow_count(int p_count) = 0;
+	virtual bool set_directional_shadow_lights(const Vector<RID> &p_light_instances) = 0;
 };

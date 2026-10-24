@@ -286,6 +286,9 @@ public:
 
 	virtual void positional_soft_shadow_filter_set_quality(RSE::ShadowQuality p_quality) override;
 	virtual void directional_soft_shadow_filter_set_quality(RSE::ShadowQuality p_quality) override;
+	// FRP resolves quality per view and includes its samples in that view's shader
+	// specialization. Updating kernels must not flush every material pipeline.
+	void directional_soft_shadow_filter_set_quality_for_view(RSE::ShadowQuality p_quality);
 
 	virtual void decals_set_filter(RSE::DecalFilter p_filter) override;
 	virtual void light_projectors_set_filter(RSE::LightProjectorFilter p_filter) override;

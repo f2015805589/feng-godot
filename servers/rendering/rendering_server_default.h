@@ -498,6 +498,10 @@ public:
 	FUNC2(light_omni_set_shadow_mode, RID, RSE::LightOmniShadowMode)
 
 	FUNC2(light_directional_set_shadow_mode, RID, RSE::LightDirectionalShadowMode)
+	FUNC2(light_directional_set_shadow_object_shadow_enabled, RID, bool)
+	FUNC1RC(bool, light_directional_get_shadow_object_shadow_enabled, RID)
+	FUNC2(light_directional_set_shadow_object_shadow_instances, RID, const Vector<RID> &)
+	FUNC1RC(Vector<RID>, light_directional_get_shadow_object_shadow_instances, RID)
 	FUNC2(light_directional_set_blend_splits, RID, bool)
 	FUNC2(light_directional_set_sky_mode, RID, RSE::LightDirectionalSkyMode)
 

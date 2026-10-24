@@ -1,11 +1,14 @@
 @tool
 class_name FengDebugBuffersPass
 extends FengShaderPass
-## Presents one material/GI channel after Post Process, without tonemapping it.
+## Presents one material/GI channel after Post Process. Magic GI has a display-only
+## tone map so HDR contribution values remain visible; it never changes SceneColor.
 
 enum Buffer { DIFFUSE, NORMAL, AO, ROUGHNESS, METALLIC, MOTION_VECTORS, MAGIC_GI }
+enum GIDisplayMode { ACES_HDR, UNMAPPED }
 const DEBUG_OUTPUT: StringName = &"debug_buffers"
 const GI_OUTPUT: StringName = &"magic_gi"
+const MagicGIDebugRequest = preload("magic_gi_debug_request.gd")
 
 @export_enum("Diffuse (Albedo)", "Normal (View Space)", "AO", "Roughness", "Metallic", "Motion Vectors", "Magic GI") var buffer: int = Buffer.DIFFUSE:
 	set(value):
@@ -13,6 +16,7 @@ const GI_OUTPUT: StringName = &"magic_gi"
 		if buffer == next:
 			return
 		buffer = next
+		MagicGIDebugRequest.register_debug_pass(self)
 		_configure_inputs()
 		emit_changed()
 @export_range(1.0, 256.0, 1.0) var motion_scale := 32.0:
@@ -22,6 +26,13 @@ const GI_OUTPUT: StringName = &"magic_gi"
 @export_range(-8.0, 8.0, 0.1) var gi_exposure := 0.0:
 	set(value):
 		gi_exposure = value
+		emit_changed()
+@export_enum("ACES HDR", "Unmapped (may clip)") var gi_display_mode: int = GIDisplayMode.ACES_HDR:
+	set(value):
+		var next := clampi(value, GIDisplayMode.ACES_HDR, GIDisplayMode.UNMAPPED)
+		if gi_display_mode == next:
+			return
+		gi_display_mode = next
 		emit_changed()
 
 func _init() -> void:
@@ -85,7 +96,8 @@ func _configure_inputs() -> void:
 func get_frp_parameters() -> Dictionary:
 	# Buffer chooses the texture contract and remains an authored property. Runtime
 	# parameter dictionaries only tune values that do not change the bindings.
-	return {"motion_scale": motion_scale, "gi_exposure": gi_exposure}
+	return {"motion_scale": motion_scale, "gi_exposure": gi_exposure,
+		"gi_display_mode": gi_display_mode}
 
 func get_volume_parameter_names() -> PackedStringArray:
 	return PackedStringArray()
@@ -97,6 +109,12 @@ var _buffer_override_warned := false
 func _frp_execute(ctx: FRPPassContext) -> void:
 	if ctx == null:
 		return
+	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
+	var target: RID = buffers.get_render_target() if buffers != null else RID()
+	if target.is_valid():
+		MagicGIDebugRequest.set_target_request(int(target.get_id()), self,
+				enabled and buffer == Buffer.MAGIC_GI)
+	MagicGIDebugRequest.register_debug_pass(self)
 	var resolved := get_resolved_parameters(ctx)
 	_invalid_buffer_override = resolved.has("buffer") and int(resolved["buffer"]) != buffer
 	if _invalid_buffer_override and not _buffer_override_warned:
@@ -106,11 +124,11 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 			float(buffer),
 			float(resolved.get("motion_scale", motion_scale)),
 			pow(2.0, float(resolved.get("gi_exposure", gi_exposure))),
-			0.0
+			float(resolved.get("gi_display_mode", gi_display_mode))
 	)
 	super._frp_execute(ctx)
 	_frame_options = Vector4()
-	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
+	buffers = ctx.get_render_scene_buffers() as RenderSceneBuffersRD
 	if buffers != null and buffers.has_texture(TextureInput.PIPELINE_SCOPE, DEBUG_OUTPUT):
 		ctx.present(DEBUG_OUTPUT)
 

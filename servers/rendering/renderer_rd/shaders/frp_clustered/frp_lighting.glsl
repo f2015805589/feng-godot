@@ -1,5 +1,7 @@
 #[vertex]
 
+// CLV transfer layout 5: hardware interpolation of HDR-scaled current relit SH tensors.
+
 #version 450
 
 #VERSION_DEFINES
@@ -47,6 +49,43 @@ void main() {
 #include "../half_inc.glsl"
 #include "scene_frp_clustered_inc.glsl"
 #include "frp_cloud_inc.glsl"
+#ifdef MODE_MAGIC_GI_BAKED_SH
+// The layout-15 baked-SH mode is disjoint from the legacy layout-9 PRT path.
+#include "frp_magic_gi_baked_sh.glslinc"
+#endif
+#ifdef MODE_MAGIC_GI_SCREEN_CACHE
+// Receiver-cache lighting is a separate, compact specialization; it must not
+// pull the full per-pixel CLV traversal into the PBR variant.
+#include "frp_magic_gi_screen_cache.glslinc"
+#endif
+#ifdef MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE
+// Live TransferMatrix reconstruction is computed after the current GBuffer.
+// This compact specialization samples only the screen cache plus owner UBO;
+// it intentionally excludes the dynamic-volume/CLV query implementation.
+#include "frp_magic_gi_dynamic_screen_cache.glslinc"
+#endif
+#ifdef MODE_MAGIC_GI_DYNAMIC_VOLUME
+// Live free-space TransferMatrix tensor sampling is a small, independent mode.
+// It must remain disjoint from the surface-chart and legacy baked-SH helpers.
+// DYNAMIC_VOLUME_CLIPMAP_ABI4_CAMERA_CENTERED_16_CELLS_THREE_LODS_20261023
+// DYNAMIC_VOLUME_VALID_COVERAGE_WITH_ZERO_VISIBLE_RADIANCE_20261023
+// DYNAMIC_VOLUME_GEOMETRIC_RECEIVER_HEMISPHERE_20261023
+// DYNAMIC_VOLUME_HEMISPHERE_DOES_NOT_SHRINK_SPATIAL_COVERAGE_20261023
+// DYNAMIC_VOLUME_NORMALIZED_SUPPORT_FULL_SKY_OWNERSHIP_20261023
+#include "frp_magic_gi_dynamic_volume.glslinc"
+// Dynamic-volume real-moment no-side QA revision 20261023-6.
+// Dynamic-volume QA revision 6: isolate per-corner receiver-moment visibility.
+#endif
+#ifdef MODE_MAGIC_GI_CLV
+// Compile the certified native PRT CLV sampler into this deferred lighting variant.
+// Keep sampler construction at fetch sites for the separate image/sampler layout.
+#include "frp_magic_gi_clv.glslinc"
+#ifdef MODE_MAGIC_GI_CLV_GENERAL_QUEUE
+// This optional single-view/single-sample variant reuses the add-on's exact
+// general CLV and baked visibility source through repo-relative build includes.
+#include "frp_magic_gi_general.glslinc"
+#endif
+#endif
 
 #ifndef MODE_RENDER_DEPTH
 #define ATMO_PARAMS implementation_data.atmosphere_parameters
@@ -260,6 +299,78 @@ void main() {
 
 	vec3 vertex_ddx = dFdx(vertex);
 	vec3 vertex_ddy = dFdy(vertex);
+#if defined(MODE_MAGIC_GI_BAKED_SH) || defined(MODE_MAGIC_GI_CLV) || defined(MODE_MAGIC_GI_SCREEN_CACHE) || defined(MODE_MAGIC_GI_DYNAMIC_VOLUME) || defined(MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE)
+	// Evaluate position derivatives before AO/owner-dependent lighting branches.
+	// CLV domain certificates are receiver-geometry contracts, so the native
+	// sampler always needs this geometric normal. Baked-SH keeps the derivative
+	// work limited to its explicit QA offset modes.
+	vec3 magic_gi_geometric_normal_world = vec3(0.0);
+	#ifdef MODE_MAGIC_GI_SCREEN_CACHE
+	vec4 magic_gi_early_owner_control = frp_magic_gi_screen_owner.control;
+	#elif defined(MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE)
+	vec4 magic_gi_early_owner_control = frp_magic_gi_dynamic_screen_owner.control;
+	#elif defined(MODE_MAGIC_GI_CLV)
+	vec4 magic_gi_early_owner_control = frp_magic_gi_clv_owner_control(ViewIndex);
+	#elif defined(MODE_MAGIC_GI_DYNAMIC_VOLUME)
+	vec4 magic_gi_early_owner_control = frp_magic_gi_dynamic_volume_owner_control(ViewIndex);
+	#else
+	vec4 magic_gi_early_owner_control = frp_magic_gi_baked_sh_owner_control(ViewIndex);
+	#endif
+	bool magic_gi_need_geometric_normal =
+			abs(magic_gi_early_owner_control.w - 1.0) < 0.01 ||
+			abs(magic_gi_early_owner_control.w - 2.0) < 0.01;
+#ifdef MODE_MAGIC_GI_CLV
+	// QA mode 4 bypasses all sampling and is the matched zero-contribution
+	// baseline, so do not charge it for the receiver-normal derivatives.
+	magic_gi_need_geometric_normal = abs(magic_gi_early_owner_control.w - 4.0) >= 0.01;
+#endif
+#ifdef MODE_MAGIC_GI_SCREEN_CACHE
+	// The compact lighting specialization uses geometry normals to reject cache
+	// taps across depth/normal discontinuities. It still has no CLV descriptors.
+	magic_gi_need_geometric_normal = true;
+#endif
+#ifdef MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE
+	// The screen result was resolved with geometric receiver normals. Keep a
+	// geometric normal here for owner-domain checks and bilateral upsampling.
+	magic_gi_need_geometric_normal = true;
+#endif
+#ifdef MODE_MAGIC_GI_DYNAMIC_VOLUME
+	// The free-space probe visibility gate uses the receiver's geometric
+	// hemisphere. Keep normal maps for SH response evaluation only.
+	#ifdef MAGIC_GI_PREINTERPOLATED_ONLY
+	// Geometry-conditioned linear operators were prepared by the baker.
+	magic_gi_need_geometric_normal = false;
+	#else
+	magic_gi_need_geometric_normal = abs(magic_gi_early_owner_control.w - 4.0) >= 0.01;
+	#endif
+#endif
+	if (magic_gi_need_geometric_normal) {
+		vec3 magic_gi_view_to_camera_world = transpose(mat3(scene_data.inv_view_matrix)) * view;
+		float magic_gi_view_to_camera_length_squared = dot(magic_gi_view_to_camera_world,
+				magic_gi_view_to_camera_world);
+		if (magic_gi_view_to_camera_length_squared > 1e-12
+				&& !isnan(magic_gi_view_to_camera_length_squared)
+				&& !isinf(magic_gi_view_to_camera_length_squared)) {
+			magic_gi_view_to_camera_world *= inversesqrt(magic_gi_view_to_camera_length_squared);
+		} else {
+			magic_gi_view_to_camera_world = vec3(0.0);
+		}
+		vec3 world_ddx = transpose(mat3(scene_data.inv_view_matrix)) * vertex_ddx;
+		vec3 world_ddy = transpose(mat3(scene_data.inv_view_matrix)) * vertex_ddy;
+		vec3 derivative_normal = cross(world_ddx, world_ddy);
+		float derivative_length_squared = dot(derivative_normal, derivative_normal);
+		if (derivative_length_squared > 1e-12 && !isnan(derivative_length_squared) &&
+				!isinf(derivative_length_squared) && !any(isnan(derivative_normal)) &&
+				!any(isinf(derivative_normal))) {
+			magic_gi_geometric_normal_world = derivative_normal * inversesqrt(derivative_length_squared);
+			// Screen-space derivative order can reverse the sign. Orient the geometric
+			// receiver normal toward the visible front face, independent of normal maps.
+			if (dot(magic_gi_geometric_normal_world, magic_gi_view_to_camera_world) < 0.0) {
+				magic_gi_geometric_normal_world = -magic_gi_geometric_normal_world;
+			}
+		}
+	}
+#endif
 
 	// Energy conservation.
 	FRPBRDFData brdf = frp_make_brdf_data(albedo, alpha, ao, roughness, metallic, material_specular, sss_strength, emission, normal, view);
@@ -359,6 +470,81 @@ void main() {
 		ambient_light *= albedo.rgb;
 		global_sky_light_diffuse *= ao * frp_diffuse_ao;
 		global_sky_light_diffuse *= albedo.rgb;
+		// Certified PRT CLV cells are sampled as part of deferred diffuse lighting.
+		// The addon compute pass after lighting remains responsible only for complete
+		// fallback work where the CLV certificate rejects this receiver.
+#ifdef MODE_MAGIC_GI_CLV
+		if (frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
+			vec3 magic_gi_world = frp_cloud_world_position(vertex, scene_data);
+			// SceneData packs inverse view as transposed 3x4 rows. Restore its
+			// rotation just as frp_cloud_world_position does for positions.
+			bool magic_gi_consumer_bypassed =
+					abs(magic_gi_early_owner_control.w - 4.0) < 0.01;
+			vec3 magic_gi_normal = magic_gi_consumer_bypassed ? vec3(0.0)
+					: normalize(transpose(mat3(scene_data.inv_view_matrix)) * normal);
+			vec3 magic_gi_geometric_normal = magic_gi_geometric_normal_world;
+			float magic_gi_geometric_length_squared = dot(magic_gi_geometric_normal,
+					magic_gi_geometric_normal);
+			if (magic_gi_geometric_length_squared > 1e-12
+					&& !isnan(magic_gi_geometric_length_squared)
+					&& !isinf(magic_gi_geometric_length_squared)) {
+				magic_gi_geometric_normal *= inversesqrt(magic_gi_geometric_length_squared);
+			}
+			bool magic_gi_native_hit = frp_magic_gi_apply_certified(magic_gi_world,
+					magic_gi_geometric_normal, magic_gi_normal, albedo.rgb,
+					ao, frp_diffuse_ao, ViewIndex, ambient_light,
+					global_sky_light_diffuse);
+#ifdef MODE_MAGIC_GI_CLV_GENERAL_QUEUE
+			if (!magic_gi_native_hit) {
+				frp_magic_gi_apply_general(magic_gi_world, vertex, depth, magic_gi_normal,
+						albedo.rgb, ao, frp_diffuse_ao, screen_uv, ViewIndex,
+						ambient_light, global_sky_light_diffuse);
+			}
+#endif
+		}
+#endif
+#ifdef MODE_MAGIC_GI_BAKED_SH
+		if (frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
+			vec3 magic_gi_world = frp_cloud_world_position(vertex, scene_data);
+			// Using the packed rows as columns rotates the normal a second time
+			// when the camera turns, selecting the wrong side of boundary tensors.
+			vec3 magic_gi_normal_world = normalize(transpose(mat3(scene_data.inv_view_matrix)) * normal);
+			frp_magic_gi_apply_baked_sh(magic_gi_world, magic_gi_normal_world,
+					albedo.rgb, magic_gi_geometric_normal_world, ao,
+					frp_diffuse_ao, ViewIndex, ambient_light,
+					global_sky_light_diffuse);
+		}
+#endif
+
+#ifdef MODE_MAGIC_GI_SCREEN_CACHE
+		if (frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
+			vec3 magic_gi_screen_world = frp_cloud_world_position(vertex, scene_data);
+			frp_magic_gi_screen_sample(magic_gi_screen_world, screen_uv, gl_FragCoord.xy, -vertex.z,
+					magic_gi_geometric_normal_world, albedo.rgb, ao, frp_diffuse_ao,
+					ViewIndex, ambient_light, global_sky_light_diffuse);
+		}
+#endif
+
+#ifdef MODE_MAGIC_GI_DYNAMIC_VOLUME
+		if (frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
+			vec3 magic_gi_world = frp_cloud_world_position(vertex, scene_data);
+			vec3 magic_gi_normal_world = normalize(transpose(mat3(scene_data.inv_view_matrix)) * normal);
+			frp_magic_gi_dynamic_volume_apply(magic_gi_world,
+					magic_gi_geometric_normal_world, magic_gi_normal_world,
+					albedo.rgb, ao, frp_diffuse_ao, ViewIndex, ambient_light,
+					global_sky_light_diffuse);
+		}
+#endif
+
+#ifdef MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE
+		if (frp_normalize_shading_model(shading_model_id) != FRP_SHADING_MODEL_UNLIT) {
+			vec3 magic_gi_world = frp_cloud_world_position(vertex, scene_data);
+			frp_magic_gi_dynamic_screen_apply(magic_gi_world, gl_FragCoord.xy,
+					-vertex.z, magic_gi_geometric_normal_world,
+					albedo.rgb, ao, frp_diffuse_ao, ambient_light,
+					global_sky_light_diffuse);
+		}
+#endif
 
 		// Apply energy compensation and DFG to the indirect specular. The BxDF
 		// constructor computes the same DFG sample for energy compensation, but it
@@ -385,180 +571,7 @@ void main() {
 			float shadow = 1.0;
 
 			if (directional_lights.data[i].shadow_opacity > 0.001) {
-				float depth_z = -vertex.z;
-				vec3 light_dir = directional_lights.data[i].direction;
-				vec3 base_normal_bias = normal * (1.0 - max(0.0, dot(light_dir, -normal)));
-
-#define BIAS_FUNC(m_var, m_idx) \
-	m_var.xyz += light_dir * directional_lights.data[i].shadow_bias[m_idx]; \
-	vec3 normal_bias = base_normal_bias * directional_lights.data[i].shadow_normal_bias[m_idx]; \
-	normal_bias -= light_dir * dot(light_dir, normal_bias); \
-	m_var.xyz += normal_bias;
-
-				if (sc_use_directional_soft_shadows() && directional_lights.data[i].softshadow_angle > 0) {
-					uint blend_count = 0;
-					const uint blend_max = directional_lights.data[i].blend_splits ? 2 : 1;
-
-					if (depth_z < directional_lights.data[i].shadow_split_offsets.x) {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 0)
-
-						vec4 pssm_coord = (directional_lights.data[i].shadow_matrix1 * v);
-						pssm_coord /= pssm_coord.w;
-
-						float range_pos = dot(directional_lights.data[i].direction, v.xyz);
-						float range_begin = directional_lights.data[i].shadow_range_begin.x;
-						float test_radius = (range_pos - range_begin) * directional_lights.data[i].softshadow_angle;
-						vec2 tex_scale = directional_lights.data[i].uv_scale1 * test_radius;
-						shadow = sample_directional_soft_shadow(directional_shadow_atlas, pssm_coord.xyz, tex_scale * directional_lights.data[i].soft_shadow_scale, scene_data.taa_frame_count);
-						blend_count++;
-					}
-
-					if (blend_count < blend_max && depth_z < directional_lights.data[i].shadow_split_offsets.y) {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 1)
-
-						vec4 pssm_coord = (directional_lights.data[i].shadow_matrix2 * v);
-						pssm_coord /= pssm_coord.w;
-
-						float range_pos = dot(directional_lights.data[i].direction, v.xyz);
-						float range_begin = directional_lights.data[i].shadow_range_begin.y;
-						float test_radius = (range_pos - range_begin) * directional_lights.data[i].softshadow_angle;
-						vec2 tex_scale = directional_lights.data[i].uv_scale2 * test_radius;
-						float s = sample_directional_soft_shadow(directional_shadow_atlas, pssm_coord.xyz, tex_scale * directional_lights.data[i].soft_shadow_scale, scene_data.taa_frame_count);
-
-						if (blend_count == 0) {
-							shadow = s;
-						} else {
-							float blend = smoothstep(0.0, directional_lights.data[i].shadow_split_offsets.x, depth_z);
-							shadow = mix(shadow, s, blend);
-						}
-
-						blend_count++;
-					}
-
-					if (blend_count < blend_max && depth_z < directional_lights.data[i].shadow_split_offsets.z) {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 2)
-
-						vec4 pssm_coord = (directional_lights.data[i].shadow_matrix3 * v);
-						pssm_coord /= pssm_coord.w;
-
-						float range_pos = dot(directional_lights.data[i].direction, v.xyz);
-						float range_begin = directional_lights.data[i].shadow_range_begin.z;
-						float test_radius = (range_pos - range_begin) * directional_lights.data[i].softshadow_angle;
-						vec2 tex_scale = directional_lights.data[i].uv_scale3 * test_radius;
-						float s = sample_directional_soft_shadow(directional_shadow_atlas, pssm_coord.xyz, tex_scale * directional_lights.data[i].soft_shadow_scale, scene_data.taa_frame_count);
-
-						if (blend_count == 0) {
-							shadow = s;
-						} else {
-							float blend = smoothstep(directional_lights.data[i].shadow_split_offsets.x, directional_lights.data[i].shadow_split_offsets.y, depth_z);
-							shadow = mix(shadow, s, blend);
-						}
-
-						blend_count++;
-					}
-
-					if (blend_count < blend_max) {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 3)
-
-						vec4 pssm_coord = (directional_lights.data[i].shadow_matrix4 * v);
-						pssm_coord /= pssm_coord.w;
-
-						float range_pos = dot(directional_lights.data[i].direction, v.xyz);
-						float range_begin = directional_lights.data[i].shadow_range_begin.w;
-						float test_radius = (range_pos - range_begin) * directional_lights.data[i].softshadow_angle;
-						vec2 tex_scale = directional_lights.data[i].uv_scale4 * test_radius;
-						float s = sample_directional_soft_shadow(directional_shadow_atlas, pssm_coord.xyz, tex_scale * directional_lights.data[i].soft_shadow_scale, scene_data.taa_frame_count);
-
-						if (blend_count == 0) {
-							shadow = s;
-						} else {
-							float blend = smoothstep(directional_lights.data[i].shadow_split_offsets.y, directional_lights.data[i].shadow_split_offsets.z, depth_z);
-							shadow = mix(shadow, s, blend);
-						}
-					}
-				} else { //no soft shadows
-					vec4 pssm_coord;
-					float blur_factor;
-
-					if (depth_z < directional_lights.data[i].shadow_split_offsets.x) {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 0)
-
-						pssm_coord = (directional_lights.data[i].shadow_matrix1 * v);
-						blur_factor = 1.0;
-					} else if (depth_z < directional_lights.data[i].shadow_split_offsets.y) {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 1)
-
-						pssm_coord = (directional_lights.data[i].shadow_matrix2 * v);
-						blur_factor = directional_lights.data[i].shadow_split_offsets.x / directional_lights.data[i].shadow_split_offsets.y;
-					} else if (depth_z < directional_lights.data[i].shadow_split_offsets.z) {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 2)
-
-						pssm_coord = (directional_lights.data[i].shadow_matrix3 * v);
-						blur_factor = directional_lights.data[i].shadow_split_offsets.x / directional_lights.data[i].shadow_split_offsets.z;
-					} else {
-						vec4 v = vec4(vertex, 1.0);
-
-						BIAS_FUNC(v, 3)
-
-						pssm_coord = (directional_lights.data[i].shadow_matrix4 * v);
-						blur_factor = directional_lights.data[i].shadow_split_offsets.x / directional_lights.data[i].shadow_split_offsets.w;
-					}
-
-					pssm_coord /= pssm_coord.w;
-
-					shadow = sample_directional_pcf_shadow(directional_shadow_atlas, scene_data.directional_shadow_pixel_size * directional_lights.data[i].soft_shadow_scale * (blur_factor + (1.0 - blur_factor) * float(directional_lights.data[i].blend_splits)), pssm_coord, scene_data.taa_frame_count);
-
-					if (directional_lights.data[i].blend_splits) {
-						float pssm_blend;
-						float blur_factor2;
-
-						if (depth_z < directional_lights.data[i].shadow_split_offsets.x) {
-							vec4 v = vec4(vertex, 1.0);
-							BIAS_FUNC(v, 1)
-							pssm_coord = (directional_lights.data[i].shadow_matrix2 * v);
-							pssm_blend = smoothstep(directional_lights.data[i].shadow_split_offsets.x - directional_lights.data[i].shadow_split_offsets.x * 0.1, directional_lights.data[i].shadow_split_offsets.x, depth_z);
-							blur_factor2 = directional_lights.data[i].shadow_split_offsets.x / directional_lights.data[i].shadow_split_offsets.y;
-						} else if (depth_z < directional_lights.data[i].shadow_split_offsets.y) {
-							vec4 v = vec4(vertex, 1.0);
-							BIAS_FUNC(v, 2)
-							pssm_coord = (directional_lights.data[i].shadow_matrix3 * v);
-							pssm_blend = smoothstep(directional_lights.data[i].shadow_split_offsets.y - directional_lights.data[i].shadow_split_offsets.y * 0.1, directional_lights.data[i].shadow_split_offsets.y, depth_z);
-							blur_factor2 = directional_lights.data[i].shadow_split_offsets.x / directional_lights.data[i].shadow_split_offsets.z;
-						} else if (depth_z < directional_lights.data[i].shadow_split_offsets.z) {
-							vec4 v = vec4(vertex, 1.0);
-							BIAS_FUNC(v, 3)
-							pssm_coord = (directional_lights.data[i].shadow_matrix4 * v);
-							pssm_blend = smoothstep(directional_lights.data[i].shadow_split_offsets.z - directional_lights.data[i].shadow_split_offsets.z * 0.1, directional_lights.data[i].shadow_split_offsets.z, depth_z);
-							blur_factor2 = directional_lights.data[i].shadow_split_offsets.x / directional_lights.data[i].shadow_split_offsets.w;
-						} else {
-							pssm_blend = 0.0;
-							blur_factor2 = 1.0;
-						}
-
-						pssm_coord /= pssm_coord.w;
-
-						float shadow2 = sample_directional_pcf_shadow(directional_shadow_atlas, scene_data.directional_shadow_pixel_size * directional_lights.data[i].soft_shadow_scale * (blur_factor2 + (1.0 - blur_factor2) * float(directional_lights.data[i].blend_splits)), pssm_coord, scene_data.taa_frame_count);
-						shadow = mix(shadow, shadow2, pssm_blend);
-					}
-				}
-
-#undef BIAS_FUNC
-				// Cascades cover only the configured shadow range. Match Forward+
-				// beyond that range instead of sampling unrelated last-cascade texels.
+				shadow = sample_directional_csm_and_object_shadow(directional_shadow_atlas, directional_lights.data[i], vertex, normal, scene_data.directional_shadow_pixel_size, scene_data.taa_frame_count);
 				shadow = mix(shadow, 1.0, smoothstep(directional_lights.data[i].fade_from, directional_lights.data[i].fade_to, vertex.z));
 			}
 

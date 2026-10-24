@@ -15,6 +15,8 @@ const KIND_MAGIC: StringName = &"magic_gi"
 static func resolve(passes: Array, is_entry_enabled_fn: Callable) -> Dictionary:
 	var rt_candidates: Array[Dictionary] = []
 	var magic_candidates: Array[Dictionary] = []
+	var unavailable_rt_candidates: Array[Dictionary] = []
+	var reflection_rt_candidates: Array[Dictionary] = []
 	for entry in passes:
 		if entry == null or not is_entry_enabled_fn.call(entry):
 			continue
@@ -22,6 +24,18 @@ static func resolve(passes: Array, is_entry_enabled_fn: Callable) -> Dictionary:
 		if kind not in [KIND_RT, KIND_MAGIC]:
 			continue
 		var key: Variant = entry.get_parameter_source().get_parameter_key()
+		if kind == KIND_RT:
+			var availability := _provider_availability(entry)
+			if not bool(availability.get("available", true)):
+				var unavailable_candidate := {
+					"kind": kind,
+					"key": str(key) if key != null else "",
+					"reason": str(availability.get("reason", "indirect_gi_provider_unavailable")),
+				}
+				unavailable_rt_candidates.append(unavailable_candidate)
+				if bool(availability.get("hardware_supported", false)) and key != null and not str(key).is_empty():
+					reflection_rt_candidates.append(unavailable_candidate)
+				continue
 		# An active provider that cannot be addressed is still an owner candidate:
 		# silently ignoring it could let MagicGI write while RTGI is active.
 		var candidate := {
@@ -46,8 +60,44 @@ static func resolve(passes: Array, is_entry_enabled_fn: Callable) -> Dictionary:
 			owner["fallback_blocked"] = bool(fallback.get("blocked", false))
 		return owner
 	if not magic_candidates.is_empty():
-		return _single_or_blocked(KIND_MAGIC, magic_candidates)
-	return {"kind": &"", "key": ""}
+		var magic_owner := _single_or_blocked(KIND_MAGIC, magic_candidates)
+		if not unavailable_rt_candidates.is_empty():
+			magic_owner["unavailable_providers"] = unavailable_rt_candidates
+		if reflection_rt_candidates.size() == 1:
+			magic_owner["reflection_kind"] = KIND_RT
+			magic_owner["reflection_key"] = reflection_rt_candidates[0].get("key", "")
+			magic_owner["reflection_blocked"] = false
+		elif reflection_rt_candidates.size() > 1:
+			magic_owner["reflection_kind"] = KIND_RT
+			magic_owner["reflection_key"] = ""
+			magic_owner["reflection_blocked"] = true
+		return magic_owner
+	var no_diffuse_owner := {"kind": &"", "key": ""}
+	if not unavailable_rt_candidates.is_empty():
+		no_diffuse_owner["unavailable_providers"] = unavailable_rt_candidates
+	if reflection_rt_candidates.size() == 1:
+		no_diffuse_owner["reflection_kind"] = KIND_RT
+		no_diffuse_owner["reflection_key"] = reflection_rt_candidates[0].get("key", "")
+		no_diffuse_owner["reflection_blocked"] = false
+	elif reflection_rt_candidates.size() > 1:
+		no_diffuse_owner["reflection_kind"] = KIND_RT
+		no_diffuse_owner["reflection_key"] = ""
+		no_diffuse_owner["reflection_blocked"] = true
+	return no_diffuse_owner
+
+static func _provider_availability(entry: Variant) -> Dictionary:
+	if entry == null or not entry.has_method("get_indirect_gi_availability"):
+		return {"available": true, "reason": ""}
+	var value: Variant = entry.call("get_indirect_gi_availability")
+	if value is Dictionary:
+		var availability: Dictionary = value.duplicate(true)
+		if not availability.has("available"):
+			availability["available"] = false
+			availability["reason"] = str(availability.get("reason", "invalid_availability_status"))
+		return availability
+	# Providers exposing the method must explicitly affirm availability. A malformed
+	# status packet should release diffuse ownership to the fallback, not steal it.
+	return {"available": bool(value), "reason": "indirect_gi_provider_unavailable" if not bool(value) else ""}
 
 
 static func _single_or_blocked(kind: StringName, candidates: Array[Dictionary]) -> Dictionary:
@@ -70,6 +120,9 @@ static func inject(parameters: Dictionary, passes: Array, owner: Dictionary) -> 
 		"fallback_kind": StringName(owner.get("fallback_kind", &"")),
 		"fallback_key": String(owner.get("fallback_key", "")),
 		"fallback_blocked": bool(owner.get("fallback_blocked", true)),
+		"reflection_kind": StringName(owner.get("reflection_kind", &"")),
+		"reflection_key": String(owner.get("reflection_key", "")),
+		"reflection_blocked": bool(owner.get("reflection_blocked", true)),
 	}
 	for entry in ParameterResolver.sources(passes):
 		if entry == null:
@@ -110,8 +163,11 @@ static func is_reflection_owner(ctx: FRPPassContext, pass_key: String) -> bool:
 static func is_resolved_reflection_owner(owner_value: Variant, pass_key: String) -> bool:
 	if owner_value == null or not owner_value is Dictionary or bool(owner_value.get("blocked", false)):
 		return false
-	return StringName(owner_value.get("kind", &"")) == KIND_RT \
-			and String(owner_value.get("key", "")) == pass_key
+	if StringName(owner_value.get("kind", &"")) == KIND_RT:
+		return String(owner_value.get("key", "")) == pass_key
+	return StringName(owner_value.get("reflection_kind", &"")) == KIND_RT \
+			and not bool(owner_value.get("reflection_blocked", true)) \
+			and String(owner_value.get("reflection_key", "")) == pass_key
 
 static func is_resolved_owner(owner_value: Variant, pass_key: String,
 		expected_kind: StringName, resolved_parameters: Dictionary = {}, allow_missing_legacy := false) -> bool:

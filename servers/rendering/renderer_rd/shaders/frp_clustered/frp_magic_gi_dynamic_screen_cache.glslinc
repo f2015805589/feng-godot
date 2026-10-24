@@ -1,0 +1,148 @@
+#ifndef FRP_MAGIC_GI_DYNAMIC_SCREEN_CACHE_GLSLINC
+#define FRP_MAGIC_GI_DYNAMIC_SCREEN_CACHE_GLSLINC
+
+// Compact native consumer for the after-GBuffer dynamic-volume resolve.
+// This variant intentionally has no CLV/TransferMatrix/BVH descriptors: the
+// current-frame screen cache already contains signed live incident irradiance
+// and a geometric guide. The edge texture uses alpha < 0 for a per-pixel miss,
+// alpha == 0 for a coherent half-resolution tile, and alpha > 0 for a valid
+// sample (including valid black).
+layout(set = 1, binding = 50) uniform texture2D frp_magic_gi_dynamic_screen_incident;
+layout(set = 1, binding = 51) uniform texture2D frp_magic_gi_dynamic_screen_guide;
+layout(set = 1, binding = 52) uniform texture2D frp_magic_gi_dynamic_screen_edge;
+layout(set = 1, binding = 53, std140) uniform FRPMagicGIDynamicScreenOwnerParameters {
+	mat4 world_to_local;
+	vec4 owner_size_enabled;
+	vec4 control; // strength, replace native Sky, scene normalization, QA mode.
+} frp_magic_gi_dynamic_screen_owner;
+
+bool frp_magic_gi_dynamic_screen_finite(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool frp_magic_gi_dynamic_screen_owner_contains(vec3 world) {
+	vec4 size_enabled = frp_magic_gi_dynamic_screen_owner.owner_size_enabled;
+	if (!(size_enabled.w > 0.5) || !frp_magic_gi_dynamic_screen_finite(world)) {
+		return false;
+	}
+	vec3 local_position = (frp_magic_gi_dynamic_screen_owner.world_to_local *
+			vec4(world, 1.0)).xyz;
+	return frp_magic_gi_dynamic_screen_finite(local_position) &&
+			all(lessThanEqual(abs(local_position), size_enabled.xyz * 0.5));
+}
+
+bool frp_magic_gi_dynamic_screen_sample(vec3 world, vec2 fragment_position,
+		float receiver_depth, vec3 geometric_normal, out vec3 incident,
+		out float coverage) {
+	incident = vec3(0.0);
+	coverage = 0.0;
+	vec4 control = frp_magic_gi_dynamic_screen_owner.control;
+	if (!(control.x > 0.0) || !(control.z > 0.0) ||
+			!frp_magic_gi_dynamic_screen_finite(control.xyz) ||
+			!frp_magic_gi_dynamic_screen_owner_contains(world) ||
+			!frp_magic_gi_dynamic_screen_finite(geometric_normal) ||
+			!(dot(geometric_normal, geometric_normal) > 0.5)) {
+		return false;
+	}
+	// Same-owner QA mode bypasses screen reads and Sky replacement entirely.
+	if (abs(control.w - 4.0) < 0.01) {
+		return false;
+	}
+	ivec2 full_size = textureSize(sampler2D(frp_magic_gi_dynamic_screen_edge,
+			SAMPLER_NEAREST_CLAMP), 0);
+	ivec2 half_size = textureSize(sampler2D(frp_magic_gi_dynamic_screen_incident,
+			SAMPLER_NEAREST_CLAMP), 0);
+	if (any(lessThanEqual(full_size, ivec2(0))) ||
+			any(lessThanEqual(half_size, ivec2(0)))) {
+		return false;
+	}
+	ivec2 pixel = clamp(ivec2(fragment_position), ivec2(0), full_size - 1);
+	vec4 edge = texelFetch(sampler2D(frp_magic_gi_dynamic_screen_edge,
+			SAMPLER_NEAREST_CLAMP), pixel, 0);
+	if (!frp_magic_gi_dynamic_screen_finite(edge.rgb) || isnan(edge.a) || isinf(edge.a)) {
+		return false;
+	}
+	if (edge.a < 0.0) {
+		// An explicit edge miss must never borrow the coherent half-resolution
+		// sample across a depth/normal discontinuity.
+		return false;
+	}
+	if (edge.a > 0.0) {
+		incident = edge.rgb;
+		coverage = clamp(edge.a, 0.0, 1.0);
+	} else {
+		// The current quad was certified coherent by the compute pass. Bilateral
+		// filtering uses its geometric guide and confidence only as sample weights;
+		// confidence is not multiplied into radiance a second time.
+		vec2 low_position = (fragment_position * 0.5) - 0.5;
+		ivec2 base = ivec2(floor(low_position));
+		vec2 fraction = fract(low_position);
+		float view_sigma = max(receiver_depth * 0.015, 0.025);
+		float weight_sum = 0.0;
+		float confidence_weight_sum = 0.0;
+		float confidence_sum = 0.0;
+		vec3 incident_sum = vec3(0.0);
+		for (int tap = 0; tap < 4; tap++) {
+			ivec2 offset = ivec2(tap & 1, (tap >> 1) & 1);
+			ivec2 sample_pixel = clamp(base + offset, ivec2(0), half_size - 1);
+			vec4 guide = texelFetch(sampler2D(frp_magic_gi_dynamic_screen_guide,
+					SAMPLER_NEAREST_CLAMP), sample_pixel, 0);
+			vec4 sample_value = texelFetch(sampler2D(frp_magic_gi_dynamic_screen_incident,
+					SAMPLER_NEAREST_CLAMP), sample_pixel, 0);
+			float guide_normal_length_squared = dot(guide.yzw, guide.yzw);
+			if (!(guide.x > 0.0) || !frp_magic_gi_dynamic_screen_finite(guide.rgb) ||
+					!(guide_normal_length_squared > 1e-12) ||
+					isnan(guide_normal_length_squared) || isinf(guide_normal_length_squared) ||
+					!(sample_value.a > 0.0) || !frp_magic_gi_dynamic_screen_finite(sample_value.rgb) ||
+					!frp_magic_gi_dynamic_screen_finite(guide.yzw)) {
+				continue;
+			}
+			float bilinear = (offset.x == 0 ? 1.0 - fraction.x : fraction.x) *
+					(offset.y == 0 ? 1.0 - fraction.y : fraction.y);
+			float depth_weight = exp(-abs(receiver_depth - guide.x) / view_sigma);
+			float normal_weight = pow(max(dot(normalize(geometric_normal),
+					normalize(guide.yzw)), 0.0), 24.0);
+			float weight = bilinear * depth_weight * normal_weight * sample_value.a;
+			incident_sum += sample_value.rgb * weight;
+			weight_sum += weight;
+			float guide_weight = bilinear * depth_weight * normal_weight;
+			confidence_sum += sample_value.a * guide_weight;
+			confidence_weight_sum += guide_weight;
+		}
+		if (!(weight_sum > 1e-5) || isnan(weight_sum) || isinf(weight_sum)) {
+			return false;
+		}
+		incident = incident_sum / weight_sum;
+		coverage = clamp(confidence_sum / max(confidence_weight_sum, 1e-5), 0.0, 1.0);
+	}
+	if (!frp_magic_gi_dynamic_screen_finite(incident) || !(coverage > 0.0)) {
+		return false;
+	}
+	return true;
+}
+
+void frp_magic_gi_dynamic_screen_apply(vec3 world, vec2 fragment_position,
+		float receiver_depth, vec3 geometric_normal,
+		vec3 albedo, float ao, float diffuse_ao, inout vec3 ambient_light,
+		vec3 global_sky_light_diffuse) {
+	vec4 control = frp_magic_gi_dynamic_screen_owner.control;
+	float strength = max(control.x, 0.0);
+	if (!(strength > 0.0) || !(control.z > 0.0) || !(ao > 0.0) ||
+			!(diffuse_ao > 0.0) || all(equal(albedo, vec3(0.0)))) {
+		return;
+	}
+	vec3 incident;
+	float coverage;
+	if (!frp_magic_gi_dynamic_screen_sample(world, fragment_position, receiver_depth,
+			geometric_normal, incident, coverage)) {
+		return;
+	}
+	if (control.y > 0.5) {
+		ambient_light -= global_sky_light_diffuse *
+				clamp(strength, 0.0, 1.0) * coverage;
+	}
+	ambient_light += max(incident, vec3(0.0)) * albedo * ao * diffuse_ao *
+			strength * control.z;
+}
+
+#endif // FRP_MAGIC_GI_DYNAMIC_SCREEN_CACHE_GLSLINC

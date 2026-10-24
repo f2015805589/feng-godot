@@ -1,13 +1,17 @@
+#ifndef MAGIC_GI_CLV_EXTERNAL_RESOURCES
 layout(set = 0, binding = 18, std430) readonly buffer DirectionalLighting { vec4 values[]; } directional_lighting;
 layout(set = 0, binding = 19) uniform sampler3D clv_texture;
 layout(set = 0, binding = 20) uniform isampler3D clv_tags;
 layout(set = 0, binding = 25) uniform usampler3D clv_support;
 layout(set = 0, binding = 21, std140) uniform ClipmapParameters {
-	ivec4 origins[3]; vec4 spacing; ivec4 control;
+	ivec4 origins[3]; vec4 spacing; // x = cell size; layout14 uses yzw for actual camera world position; legacy layouts keep their established meanings.
+	ivec4 control;
 } clv;
+#endif
 const int CLV_SAMPLE_EXACT = 0;
 const int CLV_SAMPLE_FULL = 1;
 const int CLV_SAMPLE_FILTERED = 2;
+const int CLV_SAMPLE_APPROX = 3;
 const int CLV_REJECT_NONE = 0;
 const int CLV_REJECT_DISABLED = 1;
 const int CLV_REJECT_OUTSIDE = 2;
@@ -18,10 +22,25 @@ const int CLV_REJECT_NO_EXACT_CANDIDATE = 6;
 const int CLV_REJECT_OUTSIDE_BAKE_GRID = 7;
 const int CLV_REJECT_INCOMPLETE_SUPPORT = 8;
 const int CLV_REJECT_UNCERTIFIED = 9;
+const float CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON = 1e-6;
 
-const float CLV_QUERY_PLANE_EPSILON = 1e-4;
-const float CLV_QUERY_AXIS_EPSILON = 1e-4;
-const int CLV_QUERY_MAX_BOUNDARY_STEPS = 8;
+const float CLV_AXIS_BLEND_BAND = 0.08;
+const float CLV_QUERY_MAX_OFFSET_STEPS = 2.4830508075688772;
+// Specialization ID 3 selects an exact power-of-two modulo shortcut. The default
+// path and non-power-of-two resolutions retain the original Euclidean wrap.
+#ifndef MAGIC_GI_CLV_EXTERNAL_SPECIALIZATIONS
+layout(constant_id = 3) const bool MAGIC_GI_CLV_POWER_OF_TWO_WRAP = false;
+layout(constant_id = 5) const bool MAGIC_GI_CLV_REUSE_CORNER_FLOAT_ARRAY = false;
+#endif
+ivec3 clv_wrap_logical_index(ivec3 logical_index, int resolution) {
+	if (MAGIC_GI_CLV_POWER_OF_TWO_WRAP && resolution > 0) {
+		int mask = resolution - 1;
+		if ((resolution & mask) == 0) {
+			return logical_index & ivec3(mask);
+		}
+	}
+	return ((logical_index % resolution) + resolution) % resolution;
+}
 
 #ifdef MAGIC_GI_BAKED_VISIBILITY
 float clv_probe_visibility(int probe, vec3 receiver);
@@ -30,11 +49,17 @@ float clv_probe_visibility(int probe, vec3 receiver);
 // The producer proves all eight same-plane corners together. A matching receiver
 // only checks the logical owner, plane and certified-box intersection here.
 bool sample_clv_certified(vec3 world, vec3 normal, out vec3 secondary, out vec3 primary,
-		out int selected_level, out vec3 cell_fraction) {
+		out int selected_level, out vec3 cell_fraction, out int diagnostic_reject_reason,
+		bool evaluate_radiance) {
 	secondary = vec3(0.0); primary = vec3(0.0);
-	selected_level = -1; cell_fraction = vec3(0.0);
-	if (clv.control.w != CLV_LAYOUT_VERSION || !visibility_finite_vec3(world)
+	selected_level = -1; cell_fraction = vec3(0.0); diagnostic_reject_reason = 1;
+	if (clv.control.w != CLV_LAYOUT_VERSION
+			|| !visibility_finite_vec3(world)
 			|| !visibility_finite_vec3(normal)) { return false; }
+	bool entered_window = false;
+	bool found_matching_tag = false;
+	bool found_axis_support = false;
+	bool found_matching_normal = false;
 	int axis = clv_dominant_absolute_normal_axis(normal);
 	int resolution = clv.control.x;
 	for (int level = 0; level < min(clv.control.y, 3); level++) {
@@ -43,12 +68,15 @@ bool sample_clv_certified(vec3 world, vec3 normal, out vec3 secondary, out vec3 
 		ivec3 base = ivec3(floor(position));
 		ivec3 relative = base - clv.origins[level].xyz;
 		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
-		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		entered_window = true;
+		ivec3 physical = clv_wrap_logical_index(base, resolution);
 		if (any(equal(physical, ivec3(resolution - 1)))) { continue; }
 		ivec3 slot = physical + ivec3(0, 0, level * resolution);
 		ivec4 tag = texelFetch(clv_tags, slot, 0);
-		if (any(notEqual(tag.xyz, base)) || tag.w != clv.control.z
-				|| (texelFetch(clv_support, slot, 0).r & (1u << uint(axis))) == 0u) { continue; }
+		if (any(notEqual(tag.xyz, base)) || tag.w != clv.control.z) { continue; }
+		found_matching_tag = true;
+		if ((texelFetch(clv_support, slot, 0).r & (1u << uint(axis))) == 0u) { continue; }
+		found_axis_support = true;
 		vec4 metadata = texelFetch(clv_texture,
 				slot + ivec3(clv_face_column(axis, CLV_FACE_METADATA_COLUMN) * resolution, 0, 0), 0);
 		vec4 anchor = texelFetch(clv_texture,
@@ -57,6 +85,7 @@ bool sample_clv_certified(vec3 world, vec3 normal, out vec3 secondary, out vec3 
 		// Accommodate GBuffer normal quantization; curved/normal-mapped surfaces
 		// with a distinct normal continue through the directional SH reconstruction.
 		if (dot(normal_delta, normal_delta) > CLV_DIFFUSE_NORMAL_ERROR_SQUARED) { continue; }
+		found_matching_normal = true;
 		vec3 center = (vec3(base) + 0.5) * step_size;
 		float magnitude = max(step_size, max(max(abs(center.x), abs(center.y)), abs(center.z)));
 		float margin = max(1e-5, magnitude * 1.9073486328125e-6);
@@ -65,14 +94,360 @@ bool sample_clv_certified(vec3 world, vec3 normal, out vec3 secondary, out vec3 
 				|| any(lessThan(world, center - vec3(0.75 * step_size + margin)))
 				|| any(greaterThan(world, center + vec3(1.75 * step_size + margin)))) { continue; }
 		cell_fraction = fract(position);
+		selected_level = level;
+		diagnostic_reject_reason = 0;
+		if (!evaluate_radiance) { return true; }
 		vec3 coordinate = vec3(slot) + cell_fraction + 0.5;
 		vec3 extent = vec3(textureSize(clv_texture, 0));
 		secondary = max(textureLod(clv_texture, (coordinate + vec3(
 				clv_face_column(axis, CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent, 0.0).rgb, vec3(0.0));
 		primary = max(textureLod(clv_texture, (coordinate + vec3(
 				clv_face_column(axis, CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent, 0.0).rgb, vec3(0.0));
-		selected_level = level;
 		return true;
+	}
+	if (!entered_window) {
+		diagnostic_reject_reason = 2;
+	} else if (!found_matching_tag) {
+		diagnostic_reject_reason = 3;
+	} else if (!found_axis_support) {
+		diagnostic_reject_reason = 4;
+	} else if (!found_matching_normal) {
+		diagnostic_reject_reason = 5;
+	} else {
+		diagnostic_reject_reason = 6;
+	}
+	return false;
+}
+
+// Approximate sampled-volume lane. The producer populates its confidence and
+// geometry-guide columns only from real surface anchors with visible PRT support.
+// This is deliberately separate from the exact producer certificate above: it
+// can renormalize a one-sided neighborhood but never changes exact support bits.
+bool clv_approx_fetch_neighborhood(vec3 world, ivec3 base, vec3 fraction,
+		int level, int axis, int resolution, float step_size,
+		out vec4 secondary_sample, out vec4 primary_sample,
+		out vec4 geometry_sample, out vec4 moment_sample,
+		out vec4 plane_moments) {
+	secondary_sample = vec4(0.0);
+	primary_sample = vec4(0.0);
+	geometry_sample = vec4(0.0);
+	moment_sample = vec4(0.0);
+	plane_moments = vec4(0.0);
+	float coordinate_scale = max(max(abs(world.x), abs(world.y)), abs(world.z))
+			+ 2.0 * step_size;
+	plane_moments.w = coordinate_scale * 1.1920928955078125e-7;
+	bool valid_geometry = true;
+	bool have_patch_reference = false;
+	bool patch_ids_match = true;
+	float patch_reference = 0.0;
+	int secondary_column = clv_face_column(axis, CLV_FACE_DIFFUSE_COLUMN);
+	int geometry_column = clv_face_column(axis, CLV_FACE_APPROX_GEOMETRY_COLUMN);
+	int moments_column = clv_face_column(axis, CLV_FACE_APPROX_PATCH_PLANE_MOMENTS_COLUMN);
+	ivec3 physical_base = clv_wrap_logical_index(base, resolution);
+	ivec3 slot_base = physical_base + ivec3(0, 0, level * resolution);
+	bool use_hardware_filter = all(lessThan(physical_base, ivec3(resolution - 1)));
+	for (int corner = 0; corner < 8; corner++) {
+		ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+		float corner_weight = (offset.x == 0 ? 1.0 - fraction.x : fraction.x)
+				* (offset.y == 0 ? 1.0 - fraction.y : fraction.y)
+				* (offset.z == 0 ? 1.0 - fraction.z : fraction.z);
+		if (!(corner_weight > 0.0)) { continue; }
+		ivec3 logical_corner = base + offset;
+		ivec3 slot = clv_wrap_logical_index(logical_corner, resolution);
+		slot.z += level * resolution;
+		vec4 corner_geometry = texelFetch(clv_texture,
+				slot + ivec3(geometry_column * resolution, 0, 0), 0);
+		vec4 corner_moments = texelFetch(clv_texture,
+				slot + ivec3(moments_column * resolution, 0, 0), 0);
+		float corner_valid = corner_moments.a;
+		if (!use_hardware_filter) {
+			vec4 corner_secondary = texelFetch(clv_texture,
+					slot + ivec3(secondary_column * resolution, 0, 0), 0);
+			vec4 corner_primary = texelFetch(clv_texture,
+					slot + ivec3((secondary_column + 1) * resolution, 0, 0), 0);
+			secondary_sample += corner_secondary * corner_weight;
+			primary_sample += corner_primary * corner_weight;
+			corner_valid = min(min(corner_secondary.a, corner_primary.a), corner_moments.a);
+		}
+		geometry_sample.xyz += corner_geometry.xyz * corner_weight;
+		moment_sample.xy += corner_moments.xy * corner_weight;
+		moment_sample.a += corner_moments.a * corner_weight;
+		if (corner_valid > 0.0) {
+			float corner_patch = corner_moments.x;
+			if (!(corner_patch > 0.0) || isnan(corner_patch) || isinf(corner_patch)
+					|| floor(corner_patch) != corner_patch) {
+				patch_ids_match = false;
+			} else if (!have_patch_reference) {
+				patch_reference = corner_patch;
+				have_patch_reference = true;
+			} else if (corner_patch != patch_reference) {
+				patch_ids_match = false;
+			}
+			vec3 corner_normal = corner_geometry.xyz / corner_valid;
+			float normal_length_squared = dot(corner_normal, corner_normal);
+			float corner_offset = corner_geometry.w / corner_valid;
+			if (!visibility_finite_vec3(corner_normal)
+					|| !(normal_length_squared > 1e-12)
+					|| isnan(normal_length_squared) || isinf(normal_length_squared)
+					|| isnan(corner_offset) || isinf(corner_offset)) {
+				valid_geometry = false;
+			} else {
+				vec3 cell_center = (vec3(logical_corner) + 0.5) * step_size;
+				float receiver_plane_delta = dot(world - cell_center, corner_normal)
+						- corner_offset;
+				if (isnan(receiver_plane_delta) || isinf(receiver_plane_delta)) {
+					valid_geometry = false;
+				} else {
+					float weighted_validity = corner_weight * corner_valid;
+					plane_moments.x += receiver_plane_delta * weighted_validity;
+					plane_moments.y += receiver_plane_delta * receiver_plane_delta * weighted_validity;
+					plane_moments.z = max(plane_moments.z, abs(receiver_plane_delta));
+				}
+			}
+		}
+	}
+	if (use_hardware_filter) {
+		vec3 coordinate = vec3(slot_base) + fraction + 0.5;
+		vec3 extent = vec3(textureSize(clv_texture, 0));
+		secondary_sample = textureLod(clv_texture, (coordinate + vec3(
+				secondary_column * resolution, 0, 0)) / extent, 0.0);
+		primary_sample = textureLod(clv_texture, (coordinate + vec3(
+				(secondary_column + 1) * resolution, 0, 0)) / extent, 0.0);
+		// Keep the geometry acceptance weight on the exact manual guide sum;
+		// hardware interpolation is used only for radiance and must not move
+		// receivers across the existing confidence threshold.
+		secondary_sample.a = moment_sample.a;
+		primary_sample.a = moment_sample.a;
+	}
+	// These lanes have query-relative values now; do not expose the legacy
+	// cell-relative plane moments as if they were an interpolable common frame.
+	geometry_sample.w = 0.0;
+	// The source texture's column-23.z remains the plane-offset second moment;
+	// this local accumulator lane instead carries exact patch identity agreement.
+	moment_sample.z = have_patch_reference && patch_ids_match ? 1.0 : 0.0;
+	return valid_geometry;
+}
+
+bool sample_clv_volume_approx(vec3 world, vec3 normal, out vec3 secondary,
+		out vec3 primary, out int selected_level, out float confidence,
+		bool evaluate_radiance) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	selected_level = -1;
+	confidence = 0.0;
+	if (clv.spacing.y < 0.5 || clv.control.w != CLV_LAYOUT_VERSION
+			|| !visibility_finite_vec3(world) || !visibility_finite_vec3(normal)) { return false; }
+	float input_normal_length_squared = dot(normal, normal);
+	if (!(input_normal_length_squared > 1e-12) || isnan(input_normal_length_squared)
+			|| isinf(input_normal_length_squared)) { return false; }
+	normal *= inversesqrt(input_normal_length_squared);
+	int resolution = clv.control.x;
+	int axis = clv_dominant_absolute_normal_axis(normal);
+	for (int level = 0; level < min(clv.control.y, 3); level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) { continue; }
+		vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
+		if (!visibility_finite_vec3(position)) { continue; }
+		ivec3 base = ivec3(floor(position));
+		ivec3 relative = base - clv.origins[level].xyz;
+		if (any(lessThan(relative, ivec3(0)))
+				|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = clv_wrap_logical_index(base, resolution);
+		ivec3 slot = physical + ivec3(0, 0, level * resolution);
+		ivec4 base_tag = texelFetch(clv_tags, slot, 0);
+		if (any(notEqual(base_tag.xyz, base)) || base_tag.w != clv.control.z) { continue; }
+		uint support = texelFetch(clv_support, slot, 0).r;
+		bool ready_tags = (support & CLV_SUPPORT_NEIGHBOR_TAGS_READY) != 0u;
+		if (!ready_tags) {
+			// Layout 9 certifies all eight tags in the READY bit. Old or
+			// uncertified caches retain the original explicit corner validation.
+			bool tags_valid = true;
+			for (int corner = 1; corner < 8; corner++) {
+				ivec3 logical_corner = base + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+				ivec3 corner_slot = clv_wrap_logical_index(logical_corner, resolution);
+				corner_slot.z += level * resolution;
+				ivec4 corner_tag = texelFetch(clv_tags, corner_slot, 0);
+				if (any(notEqual(corner_tag.xyz, logical_corner)) || corner_tag.w != clv.control.z) {
+					tags_valid = false;
+					break;
+				}
+			}
+			if (!tags_valid) { continue; }
+		}
+		vec3 fraction = fract(position);
+		bool boundary_fraction = any(lessThanEqual(fraction,
+				vec3(CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)))
+				|| any(greaterThanEqual(fraction,
+					vec3(1.0 - CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)));
+		uint approx_possible_bit = axis == 0 ? CLV_SUPPORT_APPROX_POSSIBLE_X
+				: (axis == 1 ? CLV_SUPPORT_APPROX_POSSIBLE_Y
+					: CLV_SUPPORT_APPROX_POSSIBLE_Z);
+		if (ready_tags && (support & approx_possible_bit) == 0u && !boundary_fraction) { continue; }
+		vec4 secondary_sample; vec4 primary_sample;
+		vec4 geometry_sample; vec4 moment_sample; vec4 plane_moments;
+		if (!clv_approx_fetch_neighborhood(world, base, fraction, level,
+				axis, resolution, step_size, secondary_sample, primary_sample,
+				geometry_sample, moment_sample, plane_moments)) { continue; }
+		float valid_weight = min(min(secondary_sample.a, primary_sample.a), moment_sample.a);
+		if (!clv_approx_geometry_valid(normal, geometry_sample, moment_sample,
+				plane_moments, valid_weight, step_size, clv.spacing.x)) { continue; }
+		selected_level = level;
+		confidence = clamp(valid_weight, 0.0, 1.0);
+		if (evaluate_radiance) {
+			secondary = max(secondary_sample.rgb / valid_weight, vec3(0.0));
+			primary = max(primary_sample.rgb / valid_weight, vec3(0.0));
+			if (!visibility_finite_vec3(secondary) || !visibility_finite_vec3(primary)) {
+				secondary = vec3(0.0);
+				primary = vec3(0.0);
+				selected_level = -1;
+				confidence = 0.0;
+				continue;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+// Untimed mirror of sample_clv_volume_approx. The original sampler remains the
+// production path; this variant reports one disjoint rejection code per level
+// so coverage profiles can identify the dominant miss without changing gates.
+bool sample_clv_volume_approx_diagnostic(vec3 world, vec3 normal,
+		out vec3 secondary, out vec3 primary, out int selected_level,
+		out float confidence, bool evaluate_radiance,
+		out uvec4 level_reject_reasons, out uint global_reject_reason) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	selected_level = -1;
+	confidence = 0.0;
+	level_reject_reasons = uvec4(255u);
+	global_reject_reason = 0u;
+	if (clv.spacing.y < 0.5) {
+		global_reject_reason = CLV_APPROX_GLOBAL_DISABLED;
+		return false;
+	}
+	if (clv.control.w != CLV_LAYOUT_VERSION) {
+		global_reject_reason = CLV_APPROX_GLOBAL_LAYOUT;
+		return false;
+	}
+	if (!visibility_finite_vec3(world) || !visibility_finite_vec3(normal)) {
+		global_reject_reason = CLV_APPROX_GLOBAL_INVALID_INPUT;
+		return false;
+	}
+	float input_normal_length_squared = dot(normal, normal);
+	if (!(input_normal_length_squared > 1e-12) || isnan(input_normal_length_squared)
+			|| isinf(input_normal_length_squared)) {
+		global_reject_reason = CLV_APPROX_GLOBAL_INVALID_NORMAL;
+		return false;
+	}
+	normal *= inversesqrt(input_normal_length_squared);
+	int resolution = clv.control.x;
+	int level_count = min(clv.control.y, 3);
+	if (level_count <= 0) {
+		global_reject_reason = CLV_APPROX_GLOBAL_NO_LEVELS;
+		return false;
+	}
+	int axis = clv_dominant_absolute_normal_axis(normal);
+	for (int level = 0; level < level_count; level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		uint reject_reason = CLV_APPROX_REJECT_NONE;
+		if (!(step_size > 0.0) || isnan(step_size) || isinf(step_size)) {
+			reject_reason = CLV_APPROX_REJECT_INVALID_STEP;
+		} else {
+			vec3 position = (world + normal * step_size * 0.75) / step_size - 0.5;
+			if (!visibility_finite_vec3(position)) {
+				reject_reason = CLV_APPROX_REJECT_NONFINITE_POSITION;
+			} else {
+				ivec3 base = ivec3(floor(position));
+				ivec3 relative = base - clv.origins[level].xyz;
+				if (any(lessThan(relative, ivec3(0)))
+						|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) {
+					reject_reason = CLV_APPROX_REJECT_OUTSIDE_WINDOW;
+				} else {
+					ivec3 physical = clv_wrap_logical_index(base, resolution);
+					ivec3 slot = physical + ivec3(0, 0, level * resolution);
+					bool tags_valid = true;
+					bool neighbors_ready = true;
+					uint readiness = 0u;
+					ivec4 base_tag = texelFetch(clv_tags, slot, 0);
+					bool base_tag_valid = all(equal(base_tag.xyz, base))
+							&& base_tag.w == clv.control.z;
+					if (!base_tag_valid) {
+						reject_reason = CLV_APPROX_REJECT_BASE_TAG;
+					} else {
+						readiness = texelFetch(clv_support, slot, 0).r;
+						neighbors_ready = (readiness & CLV_SUPPORT_NEIGHBOR_TAGS_READY) != 0u;
+						if (!neighbors_ready && reject_reason == CLV_APPROX_REJECT_NONE) {
+							for (int corner = 1; corner < 8; corner++) {
+								ivec3 logical_corner = base + ivec3(corner & 1,
+										(corner >> 1) & 1, (corner >> 2) & 1);
+								ivec3 corner_slot = clv_wrap_logical_index(logical_corner, resolution);
+								corner_slot.z += level * resolution;
+								ivec4 corner_tag = texelFetch(clv_tags, corner_slot, 0);
+								if (any(notEqual(corner_tag.xyz, logical_corner))
+										|| corner_tag.w != clv.control.z) {
+									tags_valid = false;
+									break;
+								}
+							}
+							if (!tags_valid) { reject_reason = CLV_APPROX_REJECT_NEIGHBOR_TAG; }
+						}
+						vec3 fraction = fract(position);
+						bool boundary_fraction = any(lessThanEqual(fraction,
+								vec3(CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)))
+								|| any(greaterThanEqual(fraction,
+									vec3(1.0 - CLV_APPROX_PATCH_PREFILTER_BOUNDARY_EPSILON)));
+						uint approx_possible_bit = axis == 0 ? CLV_SUPPORT_APPROX_POSSIBLE_X
+								: (axis == 1 ? CLV_SUPPORT_APPROX_POSSIBLE_Y
+									: CLV_SUPPORT_APPROX_POSSIBLE_Z);
+						if (neighbors_ready && (readiness & approx_possible_bit) == 0u
+								&& !boundary_fraction && reject_reason == CLV_APPROX_REJECT_NONE) {
+							reject_reason = CLV_APPROX_REJECT_PATCH_MISMATCH;
+						}
+						if (reject_reason == CLV_APPROX_REJECT_NONE) {
+							vec4 secondary_sample; vec4 primary_sample;
+							vec4 geometry_sample; vec4 moment_sample; vec4 plane_moments;
+							bool sample_valid = clv_approx_fetch_neighborhood(world, base,
+										fraction, level, axis, resolution, step_size,
+									secondary_sample, primary_sample, geometry_sample,
+									moment_sample, plane_moments);
+							if (!sample_valid) {
+								reject_reason = CLV_APPROX_REJECT_NONFINITE_SAMPLES;
+							} else {
+								float valid_weight = min(min(secondary_sample.a, primary_sample.a),
+										moment_sample.a);
+								reject_reason = clv_approx_geometry_reject_reason(normal,
+										geometry_sample, moment_sample, plane_moments,
+										valid_weight, step_size, clv.spacing.x);
+								if (reject_reason == CLV_APPROX_REJECT_NONE) {
+									selected_level = level;
+									confidence = clamp(valid_weight, 0.0, 1.0);
+									if (evaluate_radiance) {
+										secondary = max(secondary_sample.rgb / valid_weight, vec3(0.0));
+										primary = max(primary_sample.rgb / valid_weight, vec3(0.0));
+										if (!visibility_finite_vec3(secondary)
+												|| !visibility_finite_vec3(primary)) {
+											reject_reason = CLV_APPROX_REJECT_NONFINITE_RADIANCE;
+											secondary = vec3(0.0);
+											primary = vec3(0.0);
+											selected_level = -1;
+											confidence = 0.0;
+										} else {
+											level_reject_reasons[level] = CLV_APPROX_REJECT_NONE;
+											return true;
+										}
+									} else {
+										level_reject_reasons[level] = CLV_APPROX_REJECT_NONE;
+										return true;
+									}
+								}
+						}
+					}
+				}
+			}
+		}
+		}
+		level_reject_reasons[level] = reject_reason;
 	}
 	return false;
 }
@@ -80,11 +455,10 @@ bool sample_clv_certified(vec3 world, vec3 normal, out vec3 secondary, out vec3 
 // Geometry identity is supplied by the world cache, never a pixel BVH query.
 // Hints keep the reconstructed GBuffer point; they only select a compatible
 // baked surface family. Uncertified connections still use probe distance moments.
-int clv_receiver_hint(vec3 world, vec3 normal) {
+int clv_receiver_hint_axis(vec3 world, vec3 normal, int axis) {
 	if (clv.control.w != CLV_LAYOUT_VERSION || !visibility_finite_vec3(world)
-			|| !visibility_finite_vec3(normal)) { return -1; }
+			|| !visibility_finite_vec3(normal) || axis < 0 || axis >= CLV_FACE_SLOT_COUNT) { return -1; }
 	int resolution = clv.control.x;
-	int axis = clv_dominant_absolute_normal_axis(normal);
 	for (int level = 0; level < min(clv.control.y, 3); level++) {
 		float step_size = clv.spacing.x * float(1 << level);
 		vec3 logical = floor(world / step_size);
@@ -95,7 +469,7 @@ int clv_receiver_hint(vec3 world, vec3 normal) {
 					: base + ivec3((candidate - 1) & 1, ((candidate - 1) >> 1) & 1, (candidate - 1) >> 2);
 			if (any(lessThan(cell, clv.origins[level].xyz))
 					|| any(greaterThanEqual(cell, clv.origins[level].xyz + resolution))) { continue; }
-			ivec3 slot = ((cell % resolution) + resolution) % resolution;
+			ivec3 slot = clv_wrap_logical_index(cell, resolution);
 			slot.z += level * resolution;
 			ivec4 tag = texelFetch(clv_tags, slot, 0);
 			if (any(notEqual(tag.xyz, cell)) || tag.w != clv.control.z) { continue; }
@@ -113,6 +487,40 @@ int clv_receiver_hint(vec3 world, vec3 normal) {
 		}
 	}
 	return -1;
+}
+
+// Use the same active directional lanes as sample_clv(). At a Y/Z tie, a
+// family found by either lane remains available while that lane has nonzero
+// blend weight; conflicting families are ambiguous and deliberately rejected.
+int clv_receiver_hint(vec3 world, vec3 normal) {
+	float normal_length_squared = dot(normal, normal);
+	if (clv.control.w != CLV_LAYOUT_VERSION || !visibility_finite_vec3(world)
+			|| !visibility_finite_vec3(normal) || !(normal_length_squared > 1e-12)
+			|| isnan(normal_length_squared) || isinf(normal_length_squared)) { return -1; }
+	vec3 abs_normal = abs(normal) * inversesqrt(normal_length_squared);
+	float maximum_component = max(abs_normal.x, max(abs_normal.y, abs_normal.z));
+	int representative_triangle = -1;
+	int representative_patch = -1;
+	float representative_lane_weight = -1.0;
+	for (int axis = 0; axis < CLV_FACE_SLOT_COUNT; axis++) {
+		float lane_weight = max(0.0, abs_normal[axis] - maximum_component + CLV_AXIS_BLEND_BAND);
+		if (!(lane_weight > 0.0)) { continue; }
+		int candidate_triangle = clv_receiver_hint_axis(world, normal, axis);
+		if (candidate_triangle < 0) { continue; }
+		float patch_value = visibility_geometry.triangles[candidate_triangle * 3 + 2].w;
+		if (isnan(patch_value) || isinf(patch_value) || !(patch_value > 0.0)
+				|| floor(patch_value) != patch_value || patch_value > 2147480000.0) { return -1; }
+		int candidate_patch = int(patch_value);
+		if (representative_patch >= 0 && candidate_patch != representative_patch) {
+			return -1;
+		}
+		if (representative_patch < 0 || lane_weight > representative_lane_weight) {
+			representative_triangle = candidate_triangle;
+			representative_patch = candidate_patch;
+			representative_lane_weight = lane_weight;
+		}
+	}
+	return representative_triangle;
 }
 
 // A fill-time box certificate excludes foreign geometry in front of this
@@ -136,7 +544,7 @@ bool clv_cached_receiver(vec3 world, vec3 direction, float radius, vec3 shading_
 		if (any(lessThan(logical, vec3(clv.origins[level].xyz)))
 				|| any(greaterThanEqual(logical, vec3(clv.origins[level].xyz + resolution)))) { continue; }
 		ivec3 cell = ivec3(logical);
-		ivec3 slot = ((cell % resolution) + resolution) % resolution;
+		ivec3 slot = clv_wrap_logical_index(cell, resolution);
 		slot.z += level * resolution;
 		ivec4 tag = texelFetch(clv_tags, slot, 0);
 		if (any(notEqual(tag.xyz, cell)) || tag.w != clv.control.z) { continue; }
@@ -221,21 +629,11 @@ bool clv_finite_vec3(vec3 value) {
 	return !any(isnan(value)) && !any(isinf(value));
 }
 
-float clv_min_corner_plane_distance(ivec3 base, float step_size,
-		vec3 world, vec3 geometric_normal) {
-	vec3 minimum_offset = vec3(
-			geometric_normal.x < 0.0 ? 1.0 : 0.0,
-			geometric_normal.y < 0.0 ? 1.0 : 0.0,
-			geometric_normal.z < 0.0 ? 1.0 : 0.0);
-	vec3 corner = (vec3(base) + minimum_offset + 0.5) * step_size;
-	return dot(corner - world, geometric_normal);
-}
-
-// Move the interpolation cell outward only when its nearest corner falls behind
-// a known receiver plane. The returned grid position remains the query used for
-// cache addressing; all radiance projection still uses the shading normal.
+// Use a continuous normal offset. An exact triangle bounds the offset needed to
+// keep all eight corners of the addressed cell on the receiver's front side.
 bool clv_surface_query_position(vec3 world, vec3 normal, int receiver_triangle,
-		float step_size, out vec3 position, out ivec3 base, out vec3 fraction) {
+		float step_size, bool bounded_layout12_query,
+		out vec3 position, out ivec3 base, out vec3 fraction) {
 	position = vec3(0.0);
 	base = ivec3(0);
 	fraction = vec3(0.0);
@@ -246,7 +644,22 @@ bool clv_surface_query_position(vec3 world, vec3 normal, int receiver_triangle,
 	float shading_length_squared = dot(normal, normal);
 	if (!(shading_length_squared > 1e-12)
 			|| isnan(shading_length_squared) || isinf(shading_length_squared)) { return false; }
-	vec3 query_world = world + normal * step_size * 0.75;
+	vec3 shading_direction = normal * inversesqrt(shading_length_squared);
+	float offset_steps = dot(abs(shading_direction), vec3(1.0)) + 1e-4;
+	if (bounded_layout12_query) {
+		float max_abs_component = max(max(abs(shading_direction.x),
+				abs(shading_direction.y)), abs(shading_direction.z));
+		if (!(max_abs_component > 1e-12) || isnan(max_abs_component)
+				|| isinf(max_abs_component)) { return false; }
+		// Layout12 certifies each cell over a 1.75-step half extent. Any
+		// trilinear corner center is at most 1 step per axis from query_world;
+		// cap each query-offset component at 0.74 step so the receiver stays
+		// within 1.74 steps of every positive corner, with 0.01 step of slack.
+		offset_steps = min(offset_steps, 0.74 / max_abs_component);
+	}
+	// A caller family hint is passed as -1. It never supplies a geometric plane;
+	// the shading plane is the only query fallback in that case.
+	vec3 query_world = world + shading_direction * step_size * offset_steps;
 	if (!clv_finite_vec3(query_world)) { return false; }
 	position = query_world / step_size - 0.5;
 	if (!clv_finite_vec3(position)) { return false; }
@@ -256,81 +669,736 @@ bool clv_surface_query_position(vec3 world, vec3 normal, int receiver_triangle,
 			|| receiver_triangle * 3 + 2 >= visibility_geometry.triangles.length()) {
 		return true;
 	}
+	vec3 triangle_origin = visibility_geometry.triangles[receiver_triangle * 3].xyz;
 	vec3 edge1 = visibility_geometry.triangles[receiver_triangle * 3 + 1].xyz;
 	vec3 edge2 = visibility_geometry.triangles[receiver_triangle * 3 + 2].xyz;
 	vec3 geometric_normal = cross(edge2, edge1);
 	float geometric_length_squared = dot(geometric_normal, geometric_normal);
-	if (!clv_finite_vec3(geometric_normal) || !(geometric_length_squared > 1e-12)
+	if (!clv_finite_vec3(triangle_origin) || !clv_finite_vec3(geometric_normal)
+			|| !(geometric_length_squared > 1e-12)
 			|| isnan(geometric_length_squared) || isinf(geometric_length_squared)) {
 		return true;
 	}
 	geometric_normal *= inversesqrt(geometric_length_squared);
-	float normal_alignment = dot(geometric_normal, normal);
-	if (isnan(normal_alignment) || isinf(normal_alignment) || abs(normal_alignment) < 1e-5) {
-		return true;
+	float normal_alignment = dot(geometric_normal, shading_direction);
+	if (isnan(normal_alignment) || isinf(normal_alignment)) { return false; }
+	if (normal_alignment < 0.0) {
+		geometric_normal = -geometric_normal;
+		normal_alignment = -normal_alignment;
 	}
-	if (normal_alignment < 0.0) { geometric_normal = -geometric_normal; }
-	float plane_epsilon = step_size * CLV_QUERY_PLANE_EPSILON;
-	if (clv_min_corner_plane_distance(base, step_size, world, geometric_normal) >= plane_epsilon) {
-		return true;
-	}
-	float maximum_movement = step_size * (1.7320508075688772 + 0.001);
-	float movement = 0.0;
-	for (int attempt = 0; attempt < CLV_QUERY_MAX_BOUNDARY_STEPS; attempt++) {
-		float nearest_distance = 1e30;
-		int crossing_axis = -1;
-		for (int axis = 0; axis < 3; axis++) {
-			float direction = geometric_normal[axis];
-			if (abs(direction) < 1e-7) { continue; }
-			float boundary = direction > 0.0 ? float(base[axis] + 1) : float(base[axis]);
-			float distance = step_size * (boundary - position[axis]) / direction;
-			if (distance >= 0.0 && distance < nearest_distance) {
-				nearest_distance = distance;
-				crossing_axis = axis;
-			}
-		}
-		if (crossing_axis < 0 || isnan(nearest_distance) || isinf(nearest_distance)) {
+	// Below 0.70 the guaranteed offset can exceed the previous 0.75 + sqrt(3)
+	// step bound. Reject this cache sample instead of querying arbitrarily far.
+	if (normal_alignment < 0.70) { return false; }
+	float plane_distance_steps = dot(world - triangle_origin, geometric_normal) / step_size;
+	if (isnan(plane_distance_steps) || isinf(plane_distance_steps)) { return false; }
+	// Include any small raster reconstruction error behind the exact plane.
+	// This preserves the outside-plane proof instead of assuming world is exact.
+	offset_steps = (dot(abs(geometric_normal), vec3(1.0))
+			+ max(0.0, -plane_distance_steps) + 1e-4)
+			/ normal_alignment;
+	if (isnan(offset_steps) || isinf(offset_steps)
+			|| offset_steps > CLV_QUERY_MAX_OFFSET_STEPS) { return false; }
+	query_world = world + shading_direction * step_size * offset_steps;
+	if (!clv_finite_vec3(query_world)) { return false; }
+	position = query_world / step_size - 0.5;
+	if (!clv_finite_vec3(position)) { return false; }
+	base = ivec3(floor(position));
+	fraction = fract(position);
+	return true;
+}
+
+// Layout 10 stores a single nearest receiver chart per cell. Every positive
+// trilinear corner must have visible gathered data and a producer-side finite
+// box certificate, then pass same-family, normal, triangle, and local-plane
+// checks. An unsupported level falls through to the next clipmap level, then
+// to the original source gather.
+bool sample_clv_block_chart(vec3 world, vec3 normal, int receiver_triangle,
+		int receiver_patch, out vec3 secondary, out vec3 primary,
+		out float cache_weight, out bool complete_support,
+		out float cache_blend_weight) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	cache_weight = 0.0;
+	complete_support = false;
+	cache_blend_weight = 0.0;
+	if (clv.control.w != CLV_BLOCK_LAYOUT_VERSION_LEGACY
+			|| !clv_finite_vec3(world) || !clv_finite_vec3(normal)
+			|| clv.control.x < 2 || clv.control.y <= 0 || clv.control.y > 3) { return false; }
+	float normal_length_squared = dot(normal, normal);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared)) { return false; }
+	vec3 shading_normal = normal * inversesqrt(normal_length_squared);
+	int resolution = clv.control.x;
+	int triangle_count = visibility_geometry.triangles.length() / 3;
+	int exact_triangle_patch = -1;
+	if (receiver_triangle >= 0) {
+		if (receiver_triangle >= triangle_count) { return false; }
+		int tri_base = receiver_triangle * 3;
+		float patch_value = visibility_geometry.triangles[tri_base + 2].w;
+		vec3 edge1 = visibility_geometry.triangles[tri_base + 1].xyz;
+		vec3 edge2 = visibility_geometry.triangles[tri_base + 2].xyz;
+		vec3 geometric = cross(edge2, edge1);
+		float geometric_length_squared = dot(geometric, geometric);
+		if (isnan(patch_value) || isinf(patch_value) || patch_value < 1.0
+				|| floor(patch_value) != patch_value || patch_value > float(triangle_count)
+				|| (receiver_patch > 0 && patch_value != float(receiver_patch))
+				|| !clv_finite_vec3(geometric) || !(geometric_length_squared > 1e-12)
+				|| isnan(geometric_length_squared) || isinf(geometric_length_squared)
+				|| dot(geometric * inversesqrt(geometric_length_squared), shading_normal) < 0.5) {
 			return false;
 		}
-		float axis_epsilon = step_size * CLV_QUERY_AXIS_EPSILON;
-		float step_movement = nearest_distance + axis_epsilon;
-		if (movement + step_movement > maximum_movement) { return false; }
-		ivec3 previous_base = base;
-		position += geometric_normal * (nearest_distance / step_size);
-		position[crossing_axis] += geometric_normal[crossing_axis] > 0.0
-				? CLV_QUERY_AXIS_EPSILON : -CLV_QUERY_AXIS_EPSILON;
-		base = ivec3(floor(position));
-		fraction = fract(position);
-		if (base[crossing_axis] == previous_base[crossing_axis]) { return false; }
-		movement += step_movement;
-		if (clv_min_corner_plane_distance(base, step_size, world, geometric_normal) >= plane_epsilon) {
-			return true;
+		exact_triangle_patch = int(patch_value);
+	}
+	float basis[9];
+	diffuse_basis(normal, basis);
+	for (int level = 0; level < clv.control.y; level++) {
+		// A layout-10 chart is its own bounded family candidate when neither an
+		// exact triangle nor a compatible external hint was supplied. Resolve it
+		// independently for each level from that level's first current, supported
+		// positive-weight chart corner; never treat the candidate as exact geometry.
+		int level_expected_patch = receiver_patch > 0 ? receiver_patch : exact_triangle_patch;
+		bool have_level_expected_patch = level_expected_patch > 0;
+		float step_size = clv.spacing.x * float(1 << level);
+		vec3 query_position;
+		ivec3 base;
+		vec3 fraction;
+		if (!clv_surface_query_position(world, normal, receiver_triangle,
+				step_size, false, query_position, base, fraction)) { continue; }
+		vec3 query_world = (query_position + vec3(0.5)) * step_size;
+		if (!clv_finite_vec3(query_world)) { continue; }
+		ivec3 relative = base - clv.origins[level].xyz;
+		if (any(lessThan(relative, ivec3(0)))
+				|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = clv_wrap_logical_index(base, resolution);
+		// A hardware linear fetch at a toroidal seam would filter into the next
+		// column. The explicit corner path below preserves wrap semantics there.
+		bool seam = any(equal(physical, ivec3(resolution - 1)));
+		bool all_positive_corners_valid = true;
+		bool aligned_normals = true;
+		vec3 first_chart_normal = vec3(0.0);
+		bool have_first_normal = false;
+		for (int z = 0; z < 2 && all_positive_corners_valid; z++)
+		for (int y = 0; y < 2 && all_positive_corners_valid; y++)
+		for (int x = 0; x < 2; x++) {
+			float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+					* (y == 0 ? 1.0 - fraction.y : fraction.y)
+					* (z == 0 ? 1.0 - fraction.z : fraction.z);
+			if (!(weight > 0.0)) { continue; }
+			ivec3 logical_cell = base + ivec3(x, y, z);
+			ivec3 wrapped = clv_wrap_logical_index(logical_cell, resolution);
+			ivec3 slot = wrapped + ivec3(0, 0, level * resolution);
+			ivec4 tag = texelFetch(clv_tags, slot, 0);
+			uint support = texelFetch(clv_support, slot, 0).r;
+			vec4 metadata = texelFetch(clv_texture, slot + ivec3(
+					CLV_BLOCK_RECEIVER_METADATA_COLUMN * resolution, 0, 0), 0);
+			vec4 anchor = texelFetch(clv_texture, slot + ivec3(
+					CLV_BLOCK_RECEIVER_ANCHOR_COLUMN * resolution, 0, 0), 0);
+			bool finite_record = clv_finite_vec3(metadata.xyz)
+					&& !isnan(metadata.w) && !isinf(metadata.w)
+					&& clv_finite_vec3(anchor.xyz) && !isnan(anchor.w) && !isinf(anchor.w);
+			bool tag_current = all(equal(tag.xyz, logical_cell)) && tag.w == clv.control.z;
+			bool payload_supported = (support & (CLV_BLOCK_SUPPORT_VISIBLE | CLV_BLOCK_SUPPORT_BOX_CERTIFIED))
+					== (CLV_BLOCK_SUPPORT_VISIBLE | CLV_BLOCK_SUPPORT_BOX_CERTIFIED);
+			bool chart_patch_valid = finite_record && metadata.w >= 1.0
+					&& floor(metadata.w) == metadata.w && metadata.w <= float(triangle_count);
+			if (!have_level_expected_patch && tag_current && payload_supported && chart_patch_valid) {
+				level_expected_patch = int(metadata.w);
+				have_level_expected_patch = true;
+			}
+			bool patch_matches = chart_patch_valid && have_level_expected_patch
+					&& metadata.w == float(level_expected_patch);
+			float chart_length_squared = dot(metadata.xyz, metadata.xyz);
+			bool chart_normal_valid = patch_matches && chart_length_squared > 1e-12
+					&& !isnan(chart_length_squared) && !isinf(chart_length_squared);
+			vec3 chart_normal = chart_normal_valid
+					? metadata.xyz * inversesqrt(chart_length_squared) : vec3(0.0);
+			float triangle_value = anchor.w;
+			bool anchor_valid = finite_record && triangle_value >= 1.0
+					&& floor(triangle_value) == triangle_value
+					&& triangle_value <= float(triangle_count)
+				&& payload_supported;
+			vec3 certified_cell_center = (vec3(logical_cell) + vec3(0.5)) * step_size;
+			float certified_center_magnitude = max(step_size,
+				max(max(abs(certified_cell_center.x), abs(certified_cell_center.y)),
+					abs(certified_cell_center.z)));
+			float certificate_margin = max(1e-5,
+				certified_center_magnitude * 1.9073486328125e-6);
+		vec3 certificate_half_extent = vec3(1.75 * step_size + certificate_margin);
+		bool inside_certificate_box = clv_finite_vec3(certified_cell_center)
+			&& all(lessThanEqual(abs(world - certified_cell_center), certificate_half_extent))
+			&& all(lessThanEqual(abs(query_world - certified_cell_center), certificate_half_extent));
+			bool geometry_valid = anchor_valid && chart_normal_valid
+				&& dot(chart_normal, shading_normal) >= 0.5
+				&& inside_certificate_box
+				&& length(world - anchor.xyz) <= 2.5 * step_size
+				&& abs(dot(world - anchor.xyz, chart_normal)) <= 0.45 * step_size + 1e-5;
+			if (geometry_valid) {
+				int stored_triangle = int(triangle_value) - 1;
+				float stored_patch = visibility_geometry.triangles[stored_triangle * 3 + 2].w;
+				vec3 stored_normal = cross(visibility_geometry.triangles[stored_triangle * 3 + 2].xyz,
+						visibility_geometry.triangles[stored_triangle * 3 + 1].xyz);
+				float stored_normal_length_squared = dot(stored_normal, stored_normal);
+				geometry_valid = stored_patch == metadata.w && clv_finite_vec3(stored_normal)
+					&& stored_normal_length_squared > 1e-12
+					&& dot(stored_normal * inversesqrt(stored_normal_length_squared), chart_normal) >= 0.999;
+			}
+			if (!tag_current || !geometry_valid) {
+				all_positive_corners_valid = false;
+				break;
+			}
+			aligned_normals = aligned_normals
+					&& dot(metadata.xyz - normal, metadata.xyz - normal)
+						<= CLV_DIFFUSE_NORMAL_ERROR_SQUARED;
+			if (!have_first_normal) { first_chart_normal = chart_normal; have_first_normal = true; }
+			else if (dot(first_chart_normal, chart_normal) < 0.7) {
+				all_positive_corners_valid = false;
+				break;
+			}
 		}
+		if (!all_positive_corners_valid || !have_first_normal) { continue; }
+		vec3 coordinate = vec3(physical) + fraction + 0.5;
+		coordinate.z += float(level * resolution);
+		vec3 extent = vec3(textureSize(clv_texture, 0));
+		if (aligned_normals && !seam) {
+			secondary = textureLod(clv_texture, (coordinate + vec3(
+					CLV_BLOCK_SECONDARY_DIFFUSE_COLUMN * resolution, 0, 0)) / extent, 0.0).rgb;
+			primary = textureLod(clv_texture, (coordinate + vec3(
+					CLV_BLOCK_PRIMARY_DIFFUSE_COLUMN * resolution, 0, 0)) / extent, 0.0).rgb;
+		} else if (seam) {
+			for (int z = 0; z < 2; z++) for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
+				float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+						* (y == 0 ? 1.0 - fraction.y : fraction.y)
+						* (z == 0 ? 1.0 - fraction.z : fraction.z);
+				if (!(weight > 0.0)) { continue; }
+				ivec3 wrapped = clv_wrap_logical_index(base + ivec3(x, y, z), resolution);
+				ivec3 slot = wrapped + ivec3(0, 0, level * resolution);
+				if (aligned_normals) {
+					secondary += texelFetch(clv_texture, slot + ivec3(
+							CLV_BLOCK_SECONDARY_DIFFUSE_COLUMN * resolution, 0, 0), 0).rgb * weight;
+					primary += texelFetch(clv_texture, slot + ivec3(
+							CLV_BLOCK_PRIMARY_DIFFUSE_COLUMN * resolution, 0, 0), 0).rgb * weight;
+				} else {
+					vec3 corner_secondary = vec3(0.0);
+					vec3 corner_primary = vec3(0.0);
+					for (int k = 0; k < 9; k++) {
+						corner_secondary += texelFetch(clv_texture, slot + ivec3(k * resolution, 0, 0), 0).rgb * basis[k];
+						corner_primary += texelFetch(clv_texture, slot + ivec3((k + 9) * resolution, 0, 0), 0).rgb * basis[k];
+					}
+					secondary += corner_secondary * weight;
+					primary += corner_primary * weight;
+				}
+			}
+		} else {
+			for (int k = 0; k < 9; k++) {
+				secondary += textureLod(clv_texture, (coordinate + vec3(k * resolution, 0, 0))
+						/ extent, 0.0).rgb * basis[k];
+				primary += textureLod(clv_texture, (coordinate + vec3((k + 9) * resolution, 0, 0))
+						/ extent, 0.0).rgb * basis[k];
+			}
+		}
+		secondary = max(secondary, vec3(0.0));
+		primary = max(primary, vec3(0.0));
+		cache_weight = 1.0;
+		complete_support = true;
+		cache_blend_weight = 1.0;
+		return true;
 	}
 	return false;
 }
 
+// Layout 12 samples up to three bounded receiver charts. The CPU producer sets the
+// certified bits only after complete D_i overlap enumeration and unique-domain
+// proof; this consumer still verifies tags, chart family, normal and query tube.
+struct ClvBlock12ChartMatch {
+	int slot_index;
+	int patch_id;
+	int component_id;
+	vec3 normal;
+};
+
+bool clv_block12_match_chart(ivec3 slot, ivec3 logical_cell, int level,
+		float step_size, vec3 world, vec3 query_world, vec3 shading_normal,
+		int chart_index, uint support, int required_patch, int required_component,
+		out ClvBlock12ChartMatch match) {
+	match.slot_index = chart_index;
+	match.patch_id = -1;
+	match.component_id = -1;
+	match.normal = vec3(0.0);
+	uint visible_bit = 1u << uint(chart_index * 2);
+	uint certified_bit = 1u << uint(chart_index * 2 + 1);
+	if ((support & (visible_bit | certified_bit)) != (visible_bit | certified_bit)
+			|| (support & ~0x0001ffffu) != 0u) { return false; }
+	int column_base = chart_index * CLV_BLOCK_CHART_COLUMNS;
+	int triangle_count = visibility_geometry.triangles.length() / 3;
+	vec4 metadata = texelFetch(clv_texture, slot + ivec3(
+			(column_base + CLV_BLOCK_RECEIVER_METADATA_COLUMN) * clv.control.x, 0, 0), 0);
+	vec4 anchor = texelFetch(clv_texture, slot + ivec3(
+			(column_base + CLV_BLOCK_RECEIVER_ANCHOR_COLUMN) * clv.control.x, 0, 0), 0);
+	vec4 domain = texelFetch(clv_texture, slot + ivec3(
+			(column_base + CLV_BLOCK_DOMAIN_COLUMN) * clv.control.x, 0, 0), 0);
+	if (!clv_finite_vec3(metadata.xyz) || isnan(metadata.w) || isinf(metadata.w)
+			|| !clv_finite_vec3(anchor.xyz) || isnan(anchor.w) || isinf(anchor.w)
+			|| !clv_finite_vec3(domain.xyz) || isnan(domain.w) || isinf(domain.w)
+			|| !(metadata.w > 0.0) || floor(metadata.w) != metadata.w
+			|| !(anchor.w >= 1.0) || floor(anchor.w) != anchor.w
+			|| !(domain.x > 0.0) || !(domain.y > 0.0)
+			|| abs(domain.z - CLV_BLOCK12_CONSUMER_NORMAL_DOT_MIN) > 1e-5
+			|| !(domain.w > 0.0) || floor(domain.w) != domain.w
+			|| triangle_count <= 0 || metadata.w > float(triangle_count)
+			|| anchor.w > float(triangle_count) || domain.w > float(triangle_count)) { return false; }
+	if (required_patch > 0 && metadata.w != float(required_patch)) { return false; }
+	if (required_component > 0 && domain.w != float(required_component)) { return false; }
+	float normal_length_squared = dot(metadata.xyz, metadata.xyz);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared) || abs(normal_length_squared - 1.0) > 1e-3) { return false; }
+	vec3 chart_normal = metadata.xyz * inversesqrt(normal_length_squared);
+	if (dot(chart_normal, shading_normal) < CLV_BLOCK12_CONSUMER_NORMAL_DOT_MIN) { return false; }
+	vec3 cell_center = (vec3(logical_cell) + vec3(0.5)) * step_size;
+	float magnitude = max(step_size,
+			max(max(abs(cell_center.x), abs(cell_center.y)), abs(cell_center.z)));
+	float margin = max(1e-5, magnitude * 1.9073486328125e-6);
+	vec3 half_extent = vec3(1.75 * step_size + margin);
+	float domain_diameter = 2.0 * length(half_extent);
+	if (!clv_finite_vec3(cell_center) || domain.x > domain_diameter
+			|| domain.y > domain_diameter
+			|| any(greaterThan(abs(anchor.xyz - cell_center), half_extent))
+			|| any(greaterThan(abs(world - cell_center), half_extent))
+			|| any(greaterThan(abs(query_world - cell_center), half_extent))) { return false; }
+	vec3 from_anchor = world - anchor.xyz;
+	float world_plane = dot(from_anchor, chart_normal);
+	vec3 world_tangent = from_anchor - chart_normal * world_plane;
+	float query_margin_normal = dot(query_world - world, chart_normal);
+	vec3 query_delta = query_world - world;
+	vec3 query_margin_tangent = query_delta - chart_normal * query_margin_normal;
+	vec3 query_from_anchor = query_world - anchor.xyz;
+	float query_plane = dot(query_from_anchor, chart_normal);
+	vec3 query_tangent = query_from_anchor - chart_normal * query_plane;
+	float effective_radius = domain.x + length(query_margin_tangent);
+	float effective_half_width = domain.y + abs(query_margin_normal);
+	if (length(world_tangent) > domain.x || abs(world_plane) > domain.y
+			|| length(query_tangent) > effective_radius
+			|| abs(query_plane) > effective_half_width) { return false; }
+	match.patch_id = int(metadata.w);
+	match.component_id = int(domain.w);
+	match.normal = chart_normal;
+	return true;
+}
+
+vec3 clv_block12_filtered_sample(vec3 coordinate, vec3 extent, int chart_index, int local_column) {
+	vec3 texel_column = vec3(float((chart_index * CLV_BLOCK_CHART_COLUMNS + local_column)
+			* clv.control.x), 0.0, 0.0);
+	return textureLod(clv_texture, (coordinate + texel_column) / extent, 0.0).rgb;
+}
+
+bool clv_block12_sample_filtered_chart(vec3 coordinate, int chart_index, bool aligned,
+		vec3 normal, float max_normal_deviation, out vec3 secondary, out vec3 primary) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	vec3 extent = vec3(textureSize(clv_texture, 0));
+	if (aligned) {
+		secondary = clv_block12_filtered_sample(coordinate, extent, chart_index,
+				CLV_BLOCK_SECONDARY_DIFFUSE_COLUMN);
+		primary = clv_block12_filtered_sample(coordinate, extent, chart_index,
+				CLV_BLOCK_PRIMARY_DIFFUSE_COLUMN);
+	} else {
+		float basis[9];
+		diffuse_basis(normal, basis);
+		for (int k = 0; k < 9; k++) {
+			secondary += clv_block12_filtered_sample(coordinate, extent, chart_index, k) * basis[k];
+			primary += clv_block12_filtered_sample(coordinate, extent, chart_index, k + 9) * basis[k];
+		}
+	}
+	secondary = max(secondary, vec3(0.0));
+	primary = max(primary, vec3(0.0));
+	return clv_finite_vec3(secondary) && clv_finite_vec3(primary);
+}
+
+bool clv_block13_finite_vec4(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+// A mixed summary cannot use hardware filtering because each corner can name a
+// different chart. The strict aligned path still reads only the two
+// preconvolved diffuse columns per positive corner; nonaligned queries fall
+// through to the existing bounded slow path rather than rebuilding 18 SHs.
+bool clv_block13_sample_mixed_aligned(ivec3 logical_base, int level, vec3 fraction,
+		uint slot_map, out vec3 secondary, out vec3 primary) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	int resolution = clv.control.x;
+	for (int corner = 0; corner < 8; corner++) {
+		int x = corner & 1;
+		int y = (corner >> 1) & 1;
+		int z = (corner >> 2) & 1;
+		float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+				* (y == 0 ? 1.0 - fraction.y : fraction.y)
+				* (z == 0 ? 1.0 - fraction.z : fraction.z);
+		if (!(weight > 0.0)) { continue; }
+		uint chart_value = clv_block13_slot_for_corner(slot_map, corner);
+		if (chart_value >= 3u) { secondary = vec3(0.0); primary = vec3(0.0); return false; }
+		int chart = int(chart_value);
+		ivec3 logical_corner = logical_base + ivec3(x, y, z);
+		ivec3 physical_corner = clv_wrap_logical_index(logical_corner, resolution);
+		ivec3 secondary_texel = ivec3((chart * CLV_BLOCK_CHART_COLUMNS
+				+ CLV_BLOCK_SECONDARY_DIFFUSE_COLUMN) * resolution + physical_corner.x,
+				physical_corner.y, level * resolution + physical_corner.z);
+		ivec3 primary_texel = ivec3((chart * CLV_BLOCK_CHART_COLUMNS
+				+ CLV_BLOCK_PRIMARY_DIFFUSE_COLUMN) * resolution + physical_corner.x,
+				physical_corner.y, level * resolution + physical_corner.z);
+		vec4 secondary_record = texelFetch(clv_texture, secondary_texel, 0);
+		vec4 primary_record = texelFetch(clv_texture, primary_texel, 0);
+		if (!clv_block13_finite_vec4(secondary_record)
+				|| !clv_block13_finite_vec4(primary_record)
+				|| secondary_record.w < 0.5 || primary_record.w < 0.5) {
+			secondary = vec3(0.0);
+			primary = vec3(0.0);
+			return false;
+		}
+		secondary += secondary_record.rgb * weight;
+		primary += primary_record.rgb * weight;
+	}
+	// Clamp after interpolation, matching the existing filtered chart path.
+	secondary = max(secondary, vec3(0.0));
+	primary = max(primary, vec3(0.0));
+	return clv_finite_vec3(secondary) && clv_finite_vec3(primary);
+}
+
+bool sample_clv_block_chart_v12(vec3 world, vec3 normal, int receiver_triangle,
+		int receiver_patch, out vec3 secondary, out vec3 primary, out float cache_weight,
+		out bool complete_support, out float cache_blend_weight) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	cache_weight = 0.0;
+	complete_support = false;
+	cache_blend_weight = 0.0;
+	bool layout13 = clv.control.w == CLV_BLOCK_LAYOUT_VERSION;
+	if ((!layout13 && clv.control.w != CLV_BLOCK_LAYOUT_VERSION_V12)
+			|| !clv_finite_vec3(world)
+			|| !clv_finite_vec3(normal) || clv.control.x < 2
+			|| clv.control.y <= 0 || clv.control.y > 3) { return false; }
+	float normal_length_squared = dot(normal, normal);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared)) { return false; }
+	vec3 shading_normal = normal * inversesqrt(normal_length_squared);
+	// The normal layout-12 caller's layout-9 snap/hint helpers leave these
+	// values unset. If another caller supplies a valid exact triangle, honor its
+	// verified patch and geometric query; a patch-only value remains a hint.
+	int resolution = clv.control.x;
+	int triangle_count = visibility_geometry.triangles.length() / 3;
+	int exact_receiver_patch = 0;
+	int query_receiver_triangle = -1;
+	if (receiver_triangle < -1 || receiver_patch < -1) { return false; }
+	if (receiver_triangle >= 0) {
+		if (triangle_count <= 0 || receiver_triangle >= triangle_count) { return false; }
+		float exact_patch_value = visibility_geometry.triangles[receiver_triangle * 3 + 2].w;
+		if (isnan(exact_patch_value) || isinf(exact_patch_value)
+				|| !(exact_patch_value > 0.0) || floor(exact_patch_value) != exact_patch_value
+				|| exact_patch_value > float(triangle_count)) { return false; }
+		exact_receiver_patch = int(exact_patch_value);
+		if (receiver_patch > 0 && receiver_patch != exact_receiver_patch) { return false; }
+		query_receiver_triangle = receiver_triangle;
+	}
+	for (int level = 0; level < clv.control.y; level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		vec3 query_position;
+		ivec3 base;
+		vec3 fraction;
+		// When no exact triangle was supplied, use a bounded continuous
+		// shading-normal query; an exact triangle provides the query plane.
+		if (!clv_surface_query_position(world, normal, query_receiver_triangle, step_size,
+				true, query_position, base, fraction)) { continue; }
+		vec3 query_world = (query_position + vec3(0.5)) * step_size;
+		if (!clv_finite_vec3(query_world)) { continue; }
+		ivec3 relative = base - clv.origins[level].xyz;
+		if (any(lessThan(relative, ivec3(0)))
+				|| any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
+		ivec3 physical = clv_wrap_logical_index(base, resolution);
+		bool seam = any(equal(physical, ivec3(resolution - 1)));
+		uint positive_mask = 0u;
+		for (int corner = 0; corner < 8; corner++) {
+			int x = corner & 1;
+			int y = (corner >> 1) & 1;
+			int z = (corner >> 2) & 1;
+			float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+					* (y == 0 ? 1.0 - fraction.y : fraction.y)
+					* (z == 0 ? 1.0 - fraction.z : fraction.z);
+			if (weight > 0.0) { positive_mask |= 1u << uint(corner); }
+		}
+		if (positive_mask == 0u) { continue; }
+
+		// A summary is a CPU-certified common cylinder for all eight corners.
+		// It is attempted only away from toroidal seams; all other queries use
+		// explicit wrapped corner reads.
+		if (!seam) {
+			ivec3 base_slot = physical + ivec3(0, 0, level * resolution);
+			ivec4 base_tag = texelFetch(clv_tags, base_slot, 0);
+			uint base_support = texelFetch(clv_support, base_slot, 0).r;
+			uint stored_mask = (base_support & CLV_BLOCK12_SUPPORT_POSITIVE_CORNER_MASK) >> 9u;
+			uint summary_hint = (base_support & CLV_BLOCK12_SUPPORT_SUMMARY_SLOT_MASK)
+				>> CLV_BLOCK12_SUPPORT_SUMMARY_SLOT_SHIFT;
+			bool summary_slot_valid = layout13 ? summary_hint <= 3u : summary_hint < 3u;
+			int summary_chart = int(min(summary_hint, 2u));
+			uint summary_chart_bits = 3u << uint(summary_chart * 2);
+			bool summary_ready = summary_slot_valid
+					&& (base_support & ~0x0001ffffu) == 0u
+					&& (base_support & CLV_BLOCK12_SUPPORT_SUMMARY_READY) != 0u
+					&& (layout13 ? stored_mask == 0xffu
+							: (base_support & summary_chart_bits) == summary_chart_bits)
+					&& (stored_mask & positive_mask) == positive_mask
+					&& all(equal(base_tag.xyz, base)) && base_tag.w == clv.control.z;
+			if (summary_ready) {
+				vec4 summary_normal_patch = texelFetch(clv_texture, base_slot + ivec3(
+						CLV_BLOCK_SUMMARY_NORMAL_PATCH_COLUMN * resolution, 0, 0), 0);
+				vec4 summary_center_component = texelFetch(clv_texture, base_slot + ivec3(
+						CLV_BLOCK_SUMMARY_CENTER_COMPONENT_COLUMN * resolution, 0, 0), 0);
+				vec4 summary_domain = texelFetch(clv_texture, base_slot + ivec3(
+						CLV_BLOCK_SUMMARY_DOMAIN_COLUMN * resolution, 0, 0), 0);
+				float patch_value = summary_normal_patch.w;
+				float component_value = summary_center_component.w;
+				float summary_slot_value = summary_domain.w;
+				uint summary_slot_map = 0u;
+				int map_uniform_chart = -1;
+				bool slot_map_valid = !layout13
+						|| clv_block13_decode_slot_map(summary_slot_value,
+								summary_slot_map, map_uniform_chart);
+				bool slot_hint_matches = layout13
+						? (slot_map_valid && (map_uniform_chart >= 0
+							? summary_hint == uint(map_uniform_chart) : summary_hint == 3u))
+						: summary_slot_value == float(summary_chart);
+				vec3 nbar = summary_normal_patch.xyz;
+				float nbar_length_squared = dot(nbar, nbar);
+				vec3 common_center = (vec3(base) + vec3(1.0)) * step_size;
+				float common_magnitude = max(step_size,
+						max(max(abs(common_center.x), abs(common_center.y)), abs(common_center.z)));
+				float common_margin = max(1e-5, common_magnitude * 1.9073486328125e-6);
+				vec3 common_half_extent = vec3(1.25 * step_size + common_margin);
+				float summary_domain_limit = 2.0 * length(common_half_extent);
+				bool valid_summary = clv_finite_vec3(nbar)
+						&& clv_finite_vec3(summary_center_component.xyz)
+						&& clv_finite_vec3(summary_domain.xyz)
+						&& !isnan(patch_value) && !isinf(patch_value)
+						&& !isnan(component_value) && !isinf(component_value)
+						&& !isnan(summary_slot_value) && !isinf(summary_slot_value)
+						&& patch_value > 0.0 && floor(patch_value) == patch_value
+						&& component_value > 0.0 && floor(component_value) == component_value
+						&& patch_value <= float(triangle_count)
+						&& component_value <= float(triangle_count)
+						&& slot_hint_matches
+					&& (exact_receiver_patch == 0 || patch_value == float(exact_receiver_patch))
+						&& summary_domain.x > 0.0 && summary_domain.x <= summary_domain_limit
+						&& summary_domain.y > 0.0 && summary_domain.y <= summary_domain_limit
+						&& summary_domain.z >= 0.0 && nbar_length_squared > 1e-12
+						&& !isnan(nbar_length_squared) && !isinf(nbar_length_squared);
+				nbar *= inversesqrt(max(nbar_length_squared, 1e-20));
+				// In mode 12, layout-9-only snap/hint helpers leave caller identity
+				// unavailable. The summary supplies its own candidate family, which
+				// is revalidated against the bounded world/query domain below.
+				if (valid_summary && dot(shading_normal, nbar) >= 0.95) {
+					vec3 from_center = world - summary_center_component.xyz;
+					float signed_height = dot(from_center, nbar);
+					vec3 tangent = from_center - nbar * signed_height;
+					// Keep the original common-box gate, then test the exact producer D_i
+					// predicate against all eight chart cells. A margin derived from the
+					// common center can exceed an inward corner's own margin by a few ULPs.
+					bool in_common_D = all(lessThanEqual(abs(world - common_center), common_half_extent))
+							&& all(lessThanEqual(abs(query_world - common_center), common_half_extent));
+					for (int domain_corner = 0; domain_corner < 8 && in_common_D; domain_corner++) {
+						ivec3 domain_cell = base + ivec3(domain_corner & 1,
+							(domain_corner >> 1) & 1, (domain_corner >> 2) & 1);
+						vec3 domain_center = (vec3(domain_cell) + vec3(0.5)) * step_size;
+						float domain_magnitude = max(step_size,
+							max(max(abs(domain_center.x), abs(domain_center.y)), abs(domain_center.z)));
+						float domain_margin = max(1e-5, domain_magnitude * 1.9073486328125e-6);
+						vec3 domain_half_extent = vec3(1.75 * step_size + domain_margin);
+						in_common_D = all(lessThanEqual(abs(world - domain_center), domain_half_extent))
+							&& all(lessThanEqual(abs(query_world - domain_center), domain_half_extent));
+					}
+					bool in_common_cylinder = length(tangent) <= summary_domain.x
+							&& abs(signed_height) <= summary_domain.y;
+					if (in_common_D && in_common_cylinder) {
+						bool aligned = length(shading_normal - nbar) + summary_domain.z
+								<= CLV_DIFFUSE_NORMAL_ERROR - 1e-6;
+						vec3 coordinate = vec3(physical) + fraction + vec3(0.5);
+						coordinate.z += float(level * resolution);
+						bool summary_sampled = false;
+						if (layout13 && map_uniform_chart < 0) {
+							if (aligned) {
+								summary_sampled = clv_block13_sample_mixed_aligned(base, level,
+										fraction, summary_slot_map, secondary, primary);
+							}
+						} else {
+							int selected_chart = layout13 ? map_uniform_chart : summary_chart;
+							summary_sampled = clv_block12_sample_filtered_chart(coordinate,
+									selected_chart, aligned, shading_normal, summary_domain.z,
+									secondary, primary);
+						}
+						if (summary_sampled) {
+							cache_weight = 1.0;
+							complete_support = true;
+							cache_blend_weight = 1.0;
+							return true;
+						}
+						secondary = vec3(0.0);
+						primary = vec3(0.0);
+					}
+				}
+			}
+		}
+
+		// Slow boundary/curved path: every positive corner must uniquely match
+		// one certified chart, and all chosen charts share patch/component.
+		int selected_chart[8];
+		float selected_weight[8];
+		vec3 selected_normal[8];
+		for (int i = 0; i < 8; i++) {
+			selected_chart[i] = -1;
+			selected_weight[i] = 0.0;
+			selected_normal[i] = vec3(0.0);
+		}
+		// Caller triangle/patch may be legacy hints, not an exact GBuffer ID.
+		// Derive a per-level family only from the first uniquely matched chart.
+		int required_patch = exact_receiver_patch;
+		int required_component = 0;
+		bool aligned = true;
+		bool level_valid = true;
+		vec3 first_normal = vec3(0.0);
+		bool have_first = false;
+		for (int corner = 0; corner < 8 && level_valid; corner++) {
+			int x = corner & 1;
+			int y = (corner >> 1) & 1;
+			int z = (corner >> 2) & 1;
+			float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+					* (y == 0 ? 1.0 - fraction.y : fraction.y)
+					* (z == 0 ? 1.0 - fraction.z : fraction.z);
+			if (!(weight > 0.0)) { continue; }
+			ivec3 logical_cell = base + ivec3(x, y, z);
+			ivec3 wrapped = clv_wrap_logical_index(logical_cell, resolution);
+			ivec3 corner_slot = wrapped + ivec3(0, 0, level * resolution);
+			ivec4 tag = texelFetch(clv_tags, corner_slot, 0);
+			uint support = texelFetch(clv_support, corner_slot, 0).r;
+			if (!all(equal(tag.xyz, logical_cell)) || tag.w != clv.control.z) {
+				level_valid = false;
+				break;
+			}
+			ClvBlock12ChartMatch match0;
+			ClvBlock12ChartMatch match1;
+			ClvBlock12ChartMatch match2;
+			bool valid0 = clv_block12_match_chart(corner_slot, logical_cell, level,
+					step_size, world, query_world, shading_normal, 0, support,
+					required_patch, required_component, match0);
+			bool valid1 = clv_block12_match_chart(corner_slot, logical_cell, level,
+					step_size, world, query_world, shading_normal, 1, support,
+					required_patch, required_component, match1);
+			bool valid2 = clv_block12_match_chart(corner_slot, logical_cell, level,
+					step_size, world, query_world, shading_normal, 2, support,
+					required_patch, required_component, match2);
+			int valid_chart_count = int(valid0) + int(valid1) + int(valid2);
+			if (valid_chart_count != 1) {
+				level_valid = false;
+				break;
+			}
+			ClvBlock12ChartMatch chosen = valid0 ? match0 : (valid1 ? match1 : match2);
+			if (!have_first) {
+				required_patch = chosen.patch_id;
+				required_component = chosen.component_id;
+				first_normal = chosen.normal;
+				have_first = true;
+			} else {
+				if (chosen.patch_id != required_patch || chosen.component_id != required_component) {
+					level_valid = false;
+					break;
+				}
+				for (int prior = 0; prior < corner; prior++) {
+					if (selected_chart[prior] >= 0
+							&& dot(selected_normal[prior], chosen.normal) < 0.7) {
+						level_valid = false;
+						break;
+					}
+				}
+				if (!level_valid) { break; }
+			}
+			aligned = aligned && dot(chosen.normal - shading_normal, chosen.normal - shading_normal)
+					<= CLV_DIFFUSE_NORMAL_ERROR_SQUARED;
+			selected_chart[corner] = chosen.slot_index;
+			selected_weight[corner] = weight;
+			selected_normal[corner] = chosen.normal;
+		}
+		if (!level_valid || !have_first) { continue; }
+		float sh_basis[9];
+		if (!aligned) { diffuse_basis(shading_normal, sh_basis); }
+		secondary = vec3(0.0);
+		primary = vec3(0.0);
+		for (int corner = 0; corner < 8; corner++) {
+			if (selected_chart[corner] < 0 || !(selected_weight[corner] > 0.0)) { continue; }
+			int x = corner & 1;
+			int y = (corner >> 1) & 1;
+			int z = (corner >> 2) & 1;
+			ivec3 wrapped = clv_wrap_logical_index(base + ivec3(x, y, z), resolution);
+			ivec3 corner_slot = wrapped + ivec3(0, 0, level * resolution);
+			int chart = selected_chart[corner];
+			if (aligned) {
+				secondary += texelFetch(clv_texture, corner_slot + ivec3(
+						(chart * CLV_BLOCK_CHART_COLUMNS + CLV_BLOCK_SECONDARY_DIFFUSE_COLUMN)
+								* resolution, 0, 0), 0).rgb * selected_weight[corner];
+				primary += texelFetch(clv_texture, corner_slot + ivec3(
+						(chart * CLV_BLOCK_CHART_COLUMNS + CLV_BLOCK_PRIMARY_DIFFUSE_COLUMN)
+								* resolution, 0, 0), 0).rgb * selected_weight[corner];
+			} else {
+				for (int k = 0; k < 9; k++) {
+					secondary += texelFetch(clv_texture, corner_slot + ivec3(
+							(chart * CLV_BLOCK_CHART_COLUMNS + k) * resolution, 0, 0), 0).rgb
+							* sh_basis[k] * selected_weight[corner];
+					primary += texelFetch(clv_texture, corner_slot + ivec3(
+							(chart * CLV_BLOCK_CHART_COLUMNS + k + 9) * resolution, 0, 0), 0).rgb
+							* sh_basis[k] * selected_weight[corner];
+				}
+			}
+		}
+		secondary = max(secondary, vec3(0.0));
+		primary = max(primary, vec3(0.0));
+		if (!clv_finite_vec3(secondary) || !clv_finite_vec3(primary)) {
+			secondary = vec3(0.0);
+			primary = vec3(0.0);
+			continue;
+		}
+		cache_weight = 1.0;
+		complete_support = true;
+		cache_blend_weight = 1.0;
+		return true;
+	}
+	return false;
+}
+
+
 bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
-		bool collect_diagnostics,
+		int requested_axis, bool collect_diagnostics,
 		out vec3 secondary, out vec3 primary, out float cache_weight,
-		out bool complete_support, out int selected_level, out int sample_status,
-		out int reject_reason, out vec3 cell_fraction) {
+		out bool complete_support, out float cache_blend_weight, out int selected_level, out int sample_status,
+		out int reject_reason, out vec3 cell_fraction,
+		out uvec4 diagnostic_level_corner_box_work,
+		out uvec4 diagnostic_visibility_radiance_work,
+		out uint diagnostic_exact_visibility_source_side_rejects) {
 	secondary = vec3(0.0); primary = vec3(0.0);
-	cache_weight = 0.0; complete_support = false;
+	cache_weight = 0.0; complete_support = false; cache_blend_weight = 0.0;
 	selected_level = -1; sample_status = CLV_SAMPLE_EXACT;
 	reject_reason = CLV_REJECT_NONE; cell_fraction = vec3(0.0);
+	diagnostic_level_corner_box_work = uvec4(0u);
+	diagnostic_visibility_radiance_work = uvec4(0u);
+	diagnostic_exact_visibility_source_side_rejects = 0u;
 	if (clv.control.w != CLV_LAYOUT_VERSION) {
-		if (collect_diagnostics) { reject_reason = CLV_REJECT_DISABLED; }
+		if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { reject_reason = CLV_REJECT_DISABLED; }
 		return false;
 	}
-	int receiver_axis = -1;
-	if (!clv_receiver_geometric_axis(receiver_triangle, receiver_patch, receiver_axis)) {
+	int receiver_axis = requested_axis;
+	if (receiver_axis < 0 || receiver_axis >= CLV_FACE_SLOT_COUNT) {
+		if (!clv_receiver_geometric_axis(receiver_triangle, receiver_patch, receiver_axis)) {
 #ifdef MAGIC_GI_BAKED_VISIBILITY
-		receiver_axis = clv_dominant_absolute_normal_axis(normal);
+			receiver_axis = clv_dominant_absolute_normal_axis(normal);
 #else
-		if (collect_diagnostics) { reject_reason = CLV_REJECT_NO_VALID_CORNERS; }
-		return false;
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { reject_reason = CLV_REJECT_NO_VALID_CORNERS; }
+			return false;
 #endif
+		}
 	}
 	int resolution = clv.control.x;
 	float y[9]; diffuse_basis(normal, y);
@@ -338,59 +1406,96 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 	bool found_valid_corner = false;
 	bool found_blocked_geometry = false;
 	for (int level = 0; level < clv.control.y; level++) {
+		if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { diagnostic_level_corner_box_work.x++; }
 		float step_size = clv.spacing.x * float(1 << level);
 		// Address the sample from the receiving side before validating this level.
 		vec3 position;
 		ivec3 base;
 		vec3 fraction;
 		if (!clv_surface_query_position(world, normal, receiver_triangle,
-				step_size, position, base, fraction)) {
-			if (collect_diagnostics) { found_blocked_geometry = true; }
+				step_size, false, position, base, fraction)) {
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { found_blocked_geometry = true; }
 			continue;
 		}
 		ivec3 relative = base - clv.origins[level].xyz;
 		if (any(lessThan(relative, ivec3(0))) || any(greaterThanEqual(relative, ivec3(resolution - 1)))) { continue; }
-		if (collect_diagnostics) { found_in_bounds = true; }
-		ivec3 physical = ((base % resolution) + resolution) % resolution;
+		if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { found_in_bounds = true; }
+		ivec3 physical = clv_wrap_logical_index(base, resolution);
 		bool seam = any(equal(physical, ivec3(resolution - 1)));
 		int valid_mask = 0;
 		bool all_metadata_valid = true;
 		bool all_positive_metadata_valid = true;
+		bool all_positive_data_support_valid = true;
 		bool aligned_normals = true;
 		float coverage = 0.0;
+		float corner_normal_compatibility[8];
+		vec4 corner_metadata_cache[8];
 #ifdef MAGIC_GI_BAKED_VISIBILITY
 		float filtered_weights[8];
 		float visible_coverage = 0.0;
 		float maximum_visibility = 0.0;
 #endif
 		for (int z = 0; z < 2; z++) for (int yy = 0; yy < 2; yy++) for (int x = 0; x < 2; x++) {
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { diagnostic_level_corner_box_work.y++; }
 			ivec3 offset = ivec3(x, yy, z);
 			ivec3 logical_cell = base + offset;
-			ivec3 wrapped = ((logical_cell % resolution) + resolution) % resolution;
+			ivec3 wrapped = clv_wrap_logical_index(logical_cell, resolution);
 			ivec3 slot = wrapped + ivec3(0, 0, level * resolution);
 			ivec4 tag = texelFetch(clv_tags, slot, 0);
 			int metadata_column = clv_face_column(receiver_axis, CLV_FACE_METADATA_COLUMN);
 			vec4 metadata = texelFetch(clv_texture,
 					slot + ivec3(metadata_column * resolution, 0, 0), 0);
 			int surface_patch = int(metadata.w);
+			int corner_index = x | (yy << 1) | (z << 2);
+			if (MAGIC_GI_CLV_METADATA_REUSE) {
+				corner_metadata_cache[corner_index] = metadata;
+			}
+			float normal_compatibility = 1.0;
+			if (surface_patch > 0) {
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+				// Curved, same-patch receivers blend neighboring directional SH samples
+				// smoothly. Patch identity and the later per-corner visibility test remain
+				// hard safety gates; the planar certified path keeps its stricter test.
+				normal_compatibility = smoothstep(0.5, 0.9, dot(metadata.xyz, normal));
+#else
+				normal_compatibility = dot(metadata.xyz, normal) < 0.9 ? 0.0 : 1.0;
+#endif
+			}
+		#ifdef MAGIC_GI_BAKED_VISIBILITY
+			if (MAGIC_GI_CLV_REUSE_CORNER_FLOAT_ARRAY) {
+				filtered_weights[corner_index] = normal_compatibility;
+			} else {
+				corner_normal_compatibility[corner_index] = normal_compatibility;
+			}
+#else
+			corner_normal_compatibility[corner_index] = normal_compatibility;
+#endif
 			bool corner_valid;
 			// Keep every validity term explicit: a positive valid weight contributes to
 			// coverage, while missing metadata never aliases a radiance coefficient.
 			corner_valid = !any(notEqual(tag.xyz, logical_cell)) && tag.w == clv.control.z
 					&& surface_patch >= 0
 					&& !(receiver_patch > 0 && surface_patch != receiver_patch)
-					&& !(surface_patch > 0 && dot(metadata.xyz, normal) < 0.9);
-			float corner_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+					&& normal_compatibility > 0.0;
+			float trilinear_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
 					* (yy == 0 ? 1.0 - fraction.y : fraction.y)
 					* (z == 0 ? 1.0 - fraction.z : fraction.z);
-			all_metadata_valid = all_metadata_valid && corner_valid;
+			float corner_weight = trilinear_weight * normal_compatibility;
+			if (trilinear_weight > 0.0 && (!corner_valid || normal_compatibility < 1.0)) {
+				all_positive_data_support_valid = false;
+			}
+			all_metadata_valid = all_metadata_valid && corner_valid && normal_compatibility >= 1.0;
 			if (corner_weight > 0.0 && !corner_valid) {
+				all_positive_metadata_valid = false;
+			}
+			if (corner_weight > 0.0 && normal_compatibility < 1.0) {
 				all_positive_metadata_valid = false;
 			}
 			if (corner_valid) {
 				valid_mask |= 1 << (x | (yy << 1) | (z << 2));
 				coverage += corner_weight;
 				if (corner_weight > 0.0) {
+					if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { diagnostic_level_corner_box_work.z++; }
 					vec3 normal_delta = metadata.xyz - normal;
 					aligned_normals = aligned_normals
 							&& dot(normal_delta, normal_delta) <= CLV_DIFFUSE_NORMAL_ERROR_SQUARED;
@@ -398,13 +1503,13 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 			}
 		}
 		if (coverage <= 0.0) { continue; }
-		if (collect_diagnostics) { found_valid_corner = true; }
+		if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { found_valid_corner = true; }
 		// Incomplete positive-weight support cannot be consumed by interpolation.
 		// Return exact before launching LOS work for corners that cannot affect output.
 		if (!all_positive_metadata_valid) {
 #ifndef MAGIC_GI_BAKED_VISIBILITY
 			cache_weight = clamp(coverage, 0.0, 1.0);
-			if (collect_diagnostics) {
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) {
 				selected_level = level;
 				cell_fraction = fraction;
 				sample_status = CLV_SAMPLE_EXACT;
@@ -421,22 +1526,37 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 		for (int x = 0; x < 2; x++) {
 			int corner_index = x | (yy << 1) | (z << 2);
 #ifdef MAGIC_GI_BAKED_VISIBILITY
+			float corner_normal_compatibility_value;
+			if (MAGIC_GI_CLV_REUSE_CORNER_FLOAT_ARRAY) {
+				corner_normal_compatibility_value = filtered_weights[corner_index];
+			} else {
+				corner_normal_compatibility_value = corner_normal_compatibility[corner_index];
+			}
 			filtered_weights[corner_index] = 0.0;
+#else
+			float corner_normal_compatibility_value = corner_normal_compatibility[corner_index];
 #endif
-			float corner_weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+			float corner_weight = ((x == 0 ? 1.0 - fraction.x : fraction.x)
 					* (yy == 0 ? 1.0 - fraction.y : fraction.y)
-					* (z == 0 ? 1.0 - fraction.z : fraction.z);
+					* (z == 0 ? 1.0 - fraction.z : fraction.z))
+					* corner_normal_compatibility_value;
 			if ((valid_mask & (1 << corner_index)) == 0 || !(corner_weight > 0.0)) { continue; }
 			ivec3 corner_cell = base + ivec3(x, yy, z);
 			vec3 corner = (vec3(corner_cell) + 0.5) * step_size;
-			ivec3 wrapped_corner = ((corner_cell % resolution) + resolution) % resolution;
+			ivec3 wrapped_corner = clv_wrap_logical_index(corner_cell, resolution);
 			ivec3 corner_slot = wrapped_corner + ivec3(0, 0, level * resolution);
 			int metadata_column = clv_face_column(receiver_axis, CLV_FACE_METADATA_COLUMN);
 			int anchor_column = clv_face_column(receiver_axis, CLV_FACE_ANCHOR_COLUMN);
-			vec4 corner_metadata = texelFetch(clv_texture,
-					corner_slot + ivec3(metadata_column * resolution, 0, 0), 0);
+			vec4 corner_metadata;
+			if (MAGIC_GI_CLV_METADATA_REUSE) {
+				corner_metadata = corner_metadata_cache[corner_index];
+			} else {
+				corner_metadata = texelFetch(clv_texture,
+						corner_slot + ivec3(metadata_column * resolution, 0, 0), 0);
+			}
 			vec4 surface_anchor = texelFetch(clv_texture,
 					corner_slot + ivec3(anchor_column * resolution, 0, 0), 0);
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { diagnostic_level_corner_box_work.w++; }
 			bool corner_patch_valid = !isnan(corner_metadata.w) && !isinf(corner_metadata.w)
 					&& abs(corner_metadata.w) <= 2147480000.0
 					&& floor(corner_metadata.w) == corner_metadata.w;
@@ -451,10 +1571,58 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 				continue;
 			}
 #ifdef MAGIC_GI_BAKED_VISIBILITY
+			if (MAGIC_GI_FULL_FEATURES && clv.spacing.z > 0.5 && params.control.w > 0.5) {
+				// The box certificate already rejected this corner because another
+				// surface or a patch boundary lies nearby. Moments may include the
+				// neighbor, but the stored radiance was gathered at surface_anchor,
+				// not at this cell center. Exclude only its source triangle; keep real
+				// blockers from every other triangle in the static BVH.
+				float source_triangle_id = abs(surface_anchor.w);
+				int triangle_count = visibility_geometry.triangles.length() / 3;
+				bool anchor_valid = !isnan(surface_anchor.w) && !isinf(surface_anchor.w)
+						&& source_triangle_id >= 1.0
+						&& source_triangle_id <= float(triangle_count)
+						&& floor(source_triangle_id) == source_triangle_id
+						&& visibility_finite_vec3(surface_anchor.xyz)
+						&& visibility_finite_vec3(corner_metadata.xyz);
+				float source_normal_length_squared = dot(corner_metadata.xyz, corner_metadata.xyz);
+				anchor_valid = anchor_valid && source_normal_length_squared > 1e-8
+						&& !isnan(source_normal_length_squared) && !isinf(source_normal_length_squared);
+				if (anchor_valid) {
+					vec3 source_normal = corner_metadata.xyz * inversesqrt(source_normal_length_squared);
+					float receiver_side = dot(world - surface_anchor.xyz, source_normal);
+					// Since the source triangle is excluded at the start point, reject
+					// receivers behind its oriented face before tracing the segment.
+					bool exact_blocked = receiver_side < -1e-5;
+					if (exact_blocked) {
+						if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) {
+							diagnostic_exact_visibility_source_side_rejects++;
+							diagnostic_visibility_radiance_work.w++;
+						}
+					} else {
+						exact_blocked = segment_blocked_excluding_triangles(
+								surface_anchor.xyz, world, int(source_triangle_id) - 1,
+								receiver_triangle, 0);
+						if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) {
+							diagnostic_visibility_radiance_work.z++;
+							if (exact_blocked) { diagnostic_visibility_radiance_work.w++; }
+						}
+					}
+					if (!exact_blocked) {
+						filtered_weights[corner_index] = corner_weight;
+						visible_coverage += corner_weight;
+						maximum_visibility = 1.0;
+					}
+					continue;
+				}
+			}
+			// Keep the previous moment-based query as the default and as a safe
+			// fallback when a valid surface anchor was not stored for this corner.
 			float proxy = texelFetch(clv_texture,
 					corner_slot + ivec3(clv_face_column(receiver_axis, 0) * resolution, 0, 0), 0).w;
 			if (isnan(proxy) || isinf(proxy) || proxy < 1.0 || floor(proxy) != proxy
 					|| proxy > float(directional_lighting.values.length() / 20)) { continue; }
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { diagnostic_visibility_radiance_work.x++; }
 			float visibility = clv_probe_visibility(int(proxy) - 1, world);
 			if (isnan(visibility) || isinf(visibility)) { continue; }
 			filtered_weights[corner_index] = corner_weight * clamp(visibility, 0.0, 1.0);
@@ -472,10 +1640,10 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 		all_metadata_valid = all_metadata_valid && visible_coverage > 0.999999;
 #endif
 		if (!geometry_clear) {
-			if (collect_diagnostics) { found_blocked_geometry = true; }
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { found_blocked_geometry = true; }
 			continue;
 		}
-		if (collect_diagnostics) {
+		if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) {
 			selected_level = level;
 			cell_fraction = fraction;
 		}
@@ -488,6 +1656,7 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 						clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0)) / extent, 0.0).rgb;
 				primary = textureLod(clv_texture, (coordinate + vec3(
 						clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0)) / extent, 0.0).rgb;
+				if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { diagnostic_visibility_radiance_work.y += 2u; }
 			} else for (int k = 0; k < 9; k++) {
 				int secondary_column = clv_face_column(receiver_axis, k);
 				int primary_column = clv_face_column(receiver_axis, k + 9);
@@ -498,6 +1667,9 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 						(coordinate + vec3(primary_column * resolution, 0, 0))
 						/ extent, 0.0).rgb * y[k];
 			}
+			if (MAGIC_GI_FULL_FEATURES && collect_diagnostics && !aligned_normals) {
+				diagnostic_visibility_radiance_work.y += 18u;
+			}
 			cache_weight = 1.0;
 			complete_support = true;
 		} else {
@@ -506,7 +1678,7 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 				if ((valid_mask & (1 << corner_index)) == 0) { continue; }
 				ivec3 offset = ivec3(x, yy, z);
 				ivec3 logical_cell = base + offset;
-				ivec3 wrapped = ((logical_cell % resolution) + resolution) % resolution;
+				ivec3 wrapped = clv_wrap_logical_index(logical_cell, resolution);
 				ivec3 slot = wrapped + ivec3(0, 0, level * resolution);
 				float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
 						* (yy == 0 ? 1.0 - fraction.y : fraction.y)
@@ -522,6 +1694,7 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 							clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN) * resolution, 0, 0), 0).rgb;
 					corner_primary = texelFetch(clv_texture, slot + ivec3(
 							clv_face_column(receiver_axis, CLV_FACE_DIFFUSE_COLUMN + 1) * resolution, 0, 0), 0).rgb;
+					if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) { diagnostic_visibility_radiance_work.y += 2u; }
 				} else for (int k = 0; k < 9; k++) {
 					int secondary_column = clv_face_column(receiver_axis, k);
 					int primary_column = clv_face_column(receiver_axis, k + 9);
@@ -529,6 +1702,9 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 							slot + ivec3(secondary_column * resolution, 0, 0), 0).rgb * y[k];
 					corner_primary += texelFetch(clv_texture,
 							slot + ivec3(primary_column * resolution, 0, 0), 0).rgb * y[k];
+				}
+				if (MAGIC_GI_FULL_FEATURES && collect_diagnostics && !aligned_normals) {
+					diagnostic_visibility_radiance_work.y += 18u;
 				}
 				secondary += corner_secondary * weight;
 				primary += corner_primary * weight;
@@ -539,14 +1715,22 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 #ifdef MAGIC_GI_BAKED_VISIBILITY
 		cache_weight = clamp(visible_coverage, 0.0, 1.0);
 		complete_support = all_positive_metadata_valid && visible_coverage > 0.999999;
+		float data_support = all_positive_data_support_valid
+				? 1.0 : min(clamp(coverage, 0.0, 1.0), 0.99999994);
+		float visible_mass_confidence = smoothstep(1e-6, 2e-6, visible_coverage);
+		float peak_visibility_confidence = smoothstep(0.1, 0.11, maximum_visibility);
+		cache_blend_weight = data_support * visible_mass_confidence * peak_visibility_confidence;
+#else
+		cache_blend_weight = all_positive_data_support_valid
+				? 1.0 : min(clamp(coverage, 0.0, 1.0), 0.99999994);
 #endif
-		if (collect_diagnostics) {
+		if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) {
 			sample_status = complete_support ? CLV_SAMPLE_FULL : CLV_SAMPLE_FILTERED;
 		}
 		secondary = max(secondary, vec3(0.0)); primary = max(primary, vec3(0.0));
 		return cache_weight > 0.0;
 	}
-	if (collect_diagnostics) {
+	if (MAGIC_GI_FULL_FEATURES && collect_diagnostics) {
 		if (found_blocked_geometry) {
 			reject_reason = CLV_REJECT_GEOMETRY_BLOCKED;
 		} else if (found_in_bounds && !found_valid_corner) {
@@ -560,22 +1744,289 @@ bool sample_clv_core(vec3 world, vec3 normal, int receiver_triangle, int receive
 	return false;
 }
 
+// One V0 field-level lookup. Every positive trilinear corner needs a current
+// logical tag and both finite streams; a missing corner rejects this level.
+bool sample_clv_block_field_level_v14(vec3 world, vec3 shading_normal,
+		int receiver_triangle, int level, int resolution, int padded_stride,
+		ivec3 field_extent, in float basis[9], out vec3 secondary,
+		out vec3 primary) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	float step_size = clv.spacing.x * float(1 << level);
+	vec3 query_position;
+	ivec3 base;
+	vec3 fraction;
+	if (!clv_surface_query_position(world, shading_normal, receiver_triangle,
+			step_size, true, query_position, base, fraction)) { return false; }
+	for (int z = 0; z <= 1; z++) {
+		for (int y = 0; y <= 1; y++) {
+			for (int x = 0; x <= 1; x++) {
+				float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+						* (y == 0 ? 1.0 - fraction.y : fraction.y)
+						* (z == 0 ? 1.0 - fraction.z : fraction.z);
+				if (!(weight > 0.0)) { continue; }
+				ivec3 logical_corner = base + ivec3(x, y, z);
+				ivec3 relative = logical_corner - clv.origins[level].xyz;
+				if (any(lessThan(relative, ivec3(0)))
+						|| any(greaterThanEqual(relative, ivec3(resolution)))) { return false; }
+				ivec3 wrapped = clv_wrap_logical_index(logical_corner, resolution);
+				ivec3 tag_slot = wrapped + ivec3(0, 0, level * resolution);
+				ivec4 tag = texelFetch(clv_tags, tag_slot, 0);
+				uint support = texelFetch(clv_support, tag_slot, 0).r;
+				if (any(notEqual(tag.xyz, logical_corner)) || tag.w != clv.control.z
+						|| (support & CLV_FIELD_SUPPORT_REQUIRED) != CLV_FIELD_SUPPORT_REQUIRED) {
+					return false;
+				}
+			}
+		}
+	}
+	vec3 wrapped_base = vec3(clv_wrap_logical_index(base, resolution));
+	vec3 secondary_sum = vec3(0.0);
+	vec3 primary_sum = vec3(0.0);
+	bool finite_field = true;
+	for (int k = 0; k < 9; k++) {
+		vec3 secondary_coordinate = vec3(
+				float(k * padded_stride) + wrapped_base.x + fraction.x + 0.5,
+				wrapped_base.y + fraction.y + 0.5,
+				float(level * padded_stride) + wrapped_base.z + fraction.z + 0.5)
+				/ vec3(field_extent);
+		vec3 primary_coordinate = secondary_coordinate;
+		primary_coordinate.x += float(9 * padded_stride) / float(field_extent.x);
+		vec4 secondary_coefficient = textureLod(clv_texture, secondary_coordinate, 0.0);
+		vec4 primary_coefficient = textureLod(clv_texture, primary_coordinate, 0.0);
+		finite_field = finite_field && clv_finite_vec3(secondary_coefficient.rgb)
+				&& clv_finite_vec3(primary_coefficient.rgb)
+				&& !isnan(secondary_coefficient.w) && !isinf(secondary_coefficient.w)
+				&& !isnan(primary_coefficient.w) && !isinf(primary_coefficient.w);
+		secondary_sum += secondary_coefficient.rgb * basis[k];
+		primary_sum += primary_coefficient.rgb * basis[k];
+	}
+	if (!finite_field || !clv_finite_vec3(secondary_sum)
+			|| !clv_finite_vec3(primary_sum)) { return false; }
+	secondary = secondary_sum;
+	primary = primary_sum;
+	return true;
+}
+
+// Layout14 V0 stores a normal-independent block-center radiance SH field. It
+// fails closed on missing tags/support, but does not claim pixel-to-corner LOS.
+bool sample_clv_block_field_v14(vec3 world, vec3 normal, int receiver_triangle,
+		out vec3 secondary, out vec3 primary, out float cache_weight,
+		out bool complete_support, out float cache_blend_weight) {
+	secondary = vec3(0.0);
+	primary = vec3(0.0);
+	cache_weight = 0.0;
+	complete_support = false;
+	cache_blend_weight = 0.0;
+	if (clv.control.w != CLV_FIELD_LAYOUT_VERSION
+			|| clv.control.x < 2 || clv.control.y <= 0 || clv.control.y > 3
+			|| !clv_finite_vec3(world) || !clv_finite_vec3(normal)) { return false; }
+	float normal_length_squared = dot(normal, normal);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared)) { return false; }
+	vec3 shading_normal = normal * inversesqrt(normal_length_squared);
+	int resolution = clv.control.x;
+	int level_count = min(clv.control.y, 3);
+	ivec3 tag_extent = textureSize(clv_tags, 0);
+	ivec3 support_extent = textureSize(clv_support, 0);
+	if (any(notEqual(tag_extent, ivec3(resolution, resolution, level_count * resolution)))
+			|| any(notEqual(support_extent, tag_extent))) { return false; }
+	ivec3 field_extent = textureSize(clv_texture, 0);
+	int padded_stride = resolution + 1;
+	if (field_extent.x != 18 * padded_stride || field_extent.y != padded_stride
+			|| field_extent.z != level_count * padded_stride) { return false; }
+	float basis[9];
+	diffuse_basis(shading_normal, basis);
+	vec3 camera_position = clv.spacing.yzw;
+	if (!clv_finite_vec3(camera_position)) { return false; }
+	float view_distance = max(max(abs(world.x - camera_position.x),
+			abs(world.y - camera_position.y)), abs(world.z - camera_position.z));
+	int fine_level = level_count - 1;
+	int coarse_level = fine_level;
+	float coarse_weight = 0.0;
+	for (int level = 0; level < level_count - 1; level++) {
+		float step_size = clv.spacing.x * float(1 << level);
+		float half_extent = 0.5 * float(resolution) * step_size;
+		float fade_width = max(2.0 * step_size, 0.15 * half_extent);
+		float fade_start = max(0.0, half_extent - fade_width);
+		float fade_end = half_extent + fade_width;
+		if (view_distance <= fade_start) {
+			fine_level = level;
+			coarse_level = level;
+			coarse_weight = 0.0;
+			break;
+		}
+		if (view_distance < fade_end) {
+			fine_level = level;
+			coarse_level = level + 1;
+			coarse_weight = smoothstep(fade_start, fade_end, view_distance);
+			break;
+		}
+		fine_level = level + 1;
+		coarse_level = level + 1;
+		coarse_weight = 0.0;
+	}
+	vec3 fine_secondary;
+	vec3 fine_primary;
+	bool fine_valid = sample_clv_block_field_level_v14(world, shading_normal,
+			receiver_triangle, fine_level, resolution, padded_stride, field_extent, basis,
+			fine_secondary, fine_primary);
+	vec3 coarse_secondary = vec3(0.0);
+	vec3 coarse_primary = vec3(0.0);
+	bool coarse_valid = false;
+	if (coarse_level != fine_level) {
+		coarse_valid = sample_clv_block_field_level_v14(world, shading_normal,
+				receiver_triangle, coarse_level, resolution, padded_stride, field_extent, basis,
+				coarse_secondary, coarse_primary);
+	}
+	if (fine_valid && coarse_valid) {
+		secondary = mix(fine_secondary, coarse_secondary, coarse_weight);
+		primary = mix(fine_primary, coarse_primary, coarse_weight);
+	} else if (fine_valid) {
+		secondary = fine_secondary;
+		primary = fine_primary;
+	} else if (coarse_valid) {
+		secondary = coarse_secondary;
+		primary = coarse_primary;
+	} else {
+		for (int level = 0; level < level_count; level++) {
+			if (level == fine_level || level == coarse_level) { continue; }
+			if (sample_clv_block_field_level_v14(world, shading_normal,
+					receiver_triangle, level, resolution, padded_stride, field_extent, basis,
+					secondary, primary)) {
+				fine_valid = true;
+				break;
+			}
+		}
+		if (!fine_valid) { return false; }
+	}
+	// Keep signed SH evaluations through cross-level blending; clamp once after
+	// the selected LOD result is complete so negative lobes can cancel correctly.
+	if (!clv_finite_vec3(secondary) || !clv_finite_vec3(primary)) { return false; }
+	secondary = max(secondary, vec3(0.0));
+	primary = max(primary, vec3(0.0));
+	cache_weight = 1.0;
+	complete_support = true;
+	cache_blend_weight = 1.0;
+	return true;
+}
+
 bool sample_clv_diagnostic(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
 		out vec3 secondary, out vec3 primary, out float cache_weight,
 		out bool complete_support, out int selected_level, out int sample_status,
-		out int reject_reason, out vec3 cell_fraction) {
-	return sample_clv_core(world, normal, receiver_triangle, receiver_patch, true,
-			secondary, primary, cache_weight, complete_support, selected_level,
-			sample_status, reject_reason, cell_fraction);
+		out int reject_reason, out vec3 cell_fraction,
+		out uvec4 diagnostic_level_corner_box_work,
+		out uvec4 diagnostic_visibility_radiance_work,
+		out uint diagnostic_exact_visibility_source_side_rejects) {
+	float cache_blend_weight = 0.0;
+	return sample_clv_core(world, normal, receiver_triangle, receiver_patch, -1, true,
+			secondary, primary, cache_weight, complete_support, cache_blend_weight, selected_level,
+			sample_status, reject_reason, cell_fraction,
+			diagnostic_level_corner_box_work, diagnostic_visibility_radiance_work,
+			diagnostic_exact_visibility_source_side_rejects);
 }
 
 // Keep the established production/test call shape; optimized shaders discard
 // the diagnostic outputs when the caller does not request them.
 bool sample_clv(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
 		out vec3 secondary, out vec3 primary, out float cache_weight,
+		out bool complete_support, out float cache_blend_weight) {
+	secondary = vec3(0.0); primary = vec3(0.0);
+	cache_weight = 0.0; complete_support = false; cache_blend_weight = 0.0;
+	if (clv.control.w == CLV_FIELD_LAYOUT_VERSION) {
+		return sample_clv_block_field_v14(world, normal, receiver_triangle,
+				secondary, primary, cache_weight, complete_support, cache_blend_weight);
+	}
+	if (clv.control.w == CLV_BLOCK_LAYOUT_VERSION
+			|| clv.control.w == CLV_BLOCK_LAYOUT_VERSION_V12) {
+		return sample_clv_block_chart_v12(world, normal, receiver_triangle, receiver_patch,
+				secondary, primary, cache_weight, complete_support, cache_blend_weight);
+	}
+	if (clv.control.w == CLV_BLOCK_LAYOUT_VERSION_LEGACY) {
+		return sample_clv_block_chart(world, normal, receiver_triangle, receiver_patch,
+				secondary, primary, cache_weight, complete_support, cache_blend_weight);
+	}
+#ifdef MAGIC_GI_BAKED_VISIBILITY
+	// No family is an unresolved receiver, not permission to mix unrelated faces.
+	// The caller keeps the original GBuffer point and uses exact source fallback.
+	if (receiver_patch <= 0) { return false; }
+#endif
+	float normal_length_squared = dot(normal, normal);
+	if (receiver_patch <= 0 || !(normal_length_squared > 1e-12)
+			|| isnan(normal_length_squared) || isinf(normal_length_squared)
+			|| !clv_finite_vec3(normal)) {
+		int selected_level; int sample_status; int reject_reason; vec3 cell_fraction;
+		uvec4 diagnostic_level_corner_box_work; uvec4 diagnostic_visibility_radiance_work;
+		uint diagnostic_exact_visibility_source_side_rejects;
+		return sample_clv_core(world, normal, receiver_triangle, receiver_patch, -1, false,
+				secondary, primary, cache_weight, complete_support, cache_blend_weight, selected_level,
+				sample_status, reject_reason, cell_fraction,
+				diagnostic_level_corner_box_work, diagnostic_visibility_radiance_work,
+				diagnostic_exact_visibility_source_side_rejects);
+	}
+	vec3 abs_normal = abs(normal) * inversesqrt(normal_length_squared);
+	float maximum_component = max(abs_normal.x, max(abs_normal.y, abs_normal.z));
+	vec3 lane_weight = vec3(0.0);
+	float lane_weight_sum = 0.0;
+	int active_lanes = 0;
+	for (int axis = 0; axis < 3; axis++) {
+		lane_weight[axis] = max(0.0, abs_normal[axis] - maximum_component + CLV_AXIS_BLEND_BAND);
+		lane_weight_sum += lane_weight[axis];
+		if (lane_weight[axis] > 0.0) { active_lanes++; }
+	}
+	int dominant_axis = clv_dominant_absolute_normal_axis(normal);
+	if (active_lanes < 2 || !(lane_weight_sum > 0.0)) {
+		int selected_level; int sample_status; int reject_reason; vec3 cell_fraction;
+		uvec4 diagnostic_level_corner_box_work; uvec4 diagnostic_visibility_radiance_work;
+		uint diagnostic_exact_visibility_source_side_rejects;
+		return sample_clv_core(world, normal, receiver_triangle, receiver_patch,
+				dominant_axis, false, secondary, primary, cache_weight, complete_support, cache_blend_weight,
+				selected_level, sample_status, reject_reason, cell_fraction,
+				diagnostic_level_corner_box_work, diagnostic_visibility_radiance_work,
+				diagnostic_exact_visibility_source_side_rejects);
+	}
+	float supported_lane_weight = 0.0;
+	bool all_lanes_complete = true;
+	bool all_lanes_blend_full = true;
+	for (int axis = 0; axis < 3; axis++) {
+		if (!(lane_weight[axis] > 0.0)) { continue; }
+		vec3 lane_secondary; vec3 lane_primary;
+		float lane_coverage; bool lane_complete; float lane_blend_weight;
+		int selected_level; int sample_status; int reject_reason; vec3 cell_fraction;
+		uvec4 diagnostic_level_corner_box_work; uvec4 diagnostic_visibility_radiance_work;
+		uint diagnostic_exact_visibility_source_side_rejects;
+		bool lane_found = sample_clv_core(world, normal, receiver_triangle, receiver_patch,
+				axis, false, lane_secondary, lane_primary, lane_coverage, lane_complete, lane_blend_weight,
+				selected_level, sample_status, reject_reason, cell_fraction,
+				diagnostic_level_corner_box_work, diagnostic_visibility_radiance_work,
+				diagnostic_exact_visibility_source_side_rejects);
+		float lane_axis_weight = lane_weight[axis] / lane_weight_sum;
+		float effective_weight = lane_found ? lane_axis_weight * clamp(lane_coverage, 0.0, 1.0) : 0.0;
+		cache_blend_weight += lane_axis_weight * (lane_found ? lane_blend_weight : 0.0);
+		all_lanes_blend_full = all_lanes_blend_full && lane_found && lane_blend_weight >= 1.0;
+		all_lanes_complete = all_lanes_complete && lane_found && lane_complete;
+		if (!(effective_weight > 0.0)) { continue; }
+		secondary += lane_secondary * effective_weight;
+		primary += lane_primary * effective_weight;
+		supported_lane_weight += effective_weight;
+	}
+	if (!(supported_lane_weight > 0.0)) { cache_blend_weight = 0.0; return false; }
+	secondary /= supported_lane_weight;
+	primary /= supported_lane_weight;
+	cache_weight = clamp(supported_lane_weight, 0.0, 1.0);
+	cache_blend_weight = clamp(cache_blend_weight, 0.0, 1.0);
+	cache_blend_weight = all_lanes_blend_full ? 1.0 : min(cache_blend_weight, 0.99999994);
+	complete_support = all_lanes_complete;
+	return true;
+}
+
+// Keep the original eight-argument interface for native and staged callers.
+// Those paths retain cache_weight/complete_support semantics and intentionally
+// discard the ordinary-compute-only blend control.
+bool sample_clv(vec3 world, vec3 normal, int receiver_triangle, int receiver_patch,
+		out vec3 secondary, out vec3 primary, out float cache_weight,
 		out bool complete_support) {
-	int selected_level; int sample_status; int reject_reason; vec3 cell_fraction;
-	return sample_clv_core(world, normal, receiver_triangle, receiver_patch, false,
-			secondary, primary, cache_weight, complete_support, selected_level,
-			sample_status, reject_reason, cell_fraction);
+	float ignored_cache_blend_weight;
+	return sample_clv(world, normal, receiver_triangle, receiver_patch,
+			secondary, primary, cache_weight, complete_support, ignored_cache_blend_weight);
 }

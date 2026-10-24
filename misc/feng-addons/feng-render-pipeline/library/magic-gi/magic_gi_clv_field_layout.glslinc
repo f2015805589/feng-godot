@@ -1,0 +1,14 @@
+#ifndef MAGIC_GI_CLV_FIELD_LAYOUT_GLSLINC
+#define MAGIC_GI_CLV_FIELD_LAYOUT_GLSLINC
+
+// Experimental V0 layout. The 18 columns are two independent SH9 streams:
+// secondary indirect (0..8), primary/sky (9..17).
+const int CLV_FIELD_LAYOUT_VERSION = 14;
+const int CLV_FIELD_COEFFICIENT_COLUMNS = 18;
+const int CLV_FIELD_LEVEL_COUNT = 3;
+const int CLV_FIELD_GUARD = 1;
+const uint CLV_FIELD_SUPPORT_SECONDARY = 1u;
+const uint CLV_FIELD_SUPPORT_PRIMARY = 2u;
+const uint CLV_FIELD_SUPPORT_REQUIRED = 3u;
+
+#endif

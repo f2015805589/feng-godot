@@ -20,12 +20,15 @@ func run() -> void:
 	check(RenderingServer.get_rendering_device() == null,
 		"exposure source routing can be checked without a RenderingDevice")
 	var eye_pass := EyeAdaptation.new()
+	check(eye_pass.exposure_source == EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC
+		and eye_pass.metering_mode == 0,
+		"new Eye Adaptation passes default to Automatic plus Histogram metering")
 	check(eye_pass.get_volume_parameter_names().has("exposure_source"),
 		"Volume schema exposes the Eye Adaptation source selector")
 	check(EyeAdaptation.resolve_exposure_route(
 		EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC, false, true)
-		== EyeAdaptation.EXPOSURE_ROUTE_CAMERA_ATTRIBUTES,
-		"Automatic uses camera attributes when no scene Volume explicitly overrides Eye Adaptation")
+		== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
+		"Automatic meters through pass settings even when a default camera resource is present")
 	check(EyeAdaptation.resolve_exposure_route(
 		EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC, true, true)
 		== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
@@ -38,6 +41,13 @@ func run() -> void:
 		EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC, false, false)
 		== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
 		"Automatic retains pass settings when no camera attributes exist")
+	var automatic_route := EyeAdaptation.resolve_exposure_route(
+		EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC, false, true)
+	check(EyeAdaptation.resolve_exposure_method(EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC,
+		automatic_route, false, eye_pass.metering_mode) == 0
+		and EyeAdaptation.resolve_exposure_method(EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC,
+			automatic_route, true, 2) == 0,
+		"Automatic always uses FRP Histogram despite camera attributes or the pass metering selector")
 	check(EyeAdaptation.resolve_exposure_route(
 		EyeAdaptation.EXPOSURE_SOURCE_CAMERA_ATTRIBUTES, false, true)
 		== EyeAdaptation.EXPOSURE_ROUTE_CAMERA_ATTRIBUTES
@@ -45,10 +55,22 @@ func run() -> void:
 			EyeAdaptation.EXPOSURE_SOURCE_CAMERA_ATTRIBUTES, false, false)
 			== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
 		"explicit Camera Attributes falls back safely when a camera source is unavailable")
+	var camera_route := EyeAdaptation.resolve_exposure_route(
+		EyeAdaptation.EXPOSURE_SOURCE_CAMERA_ATTRIBUTES, false, true)
+	check(EyeAdaptation.resolve_exposure_method(EyeAdaptation.EXPOSURE_SOURCE_CAMERA_ATTRIBUTES,
+		camera_route, false, eye_pass.metering_mode)
+		== EyeAdaptation.INTERNAL_METERING_CAMERA_MANUAL
+		and EyeAdaptation.resolve_exposure_method(EyeAdaptation.EXPOSURE_SOURCE_CAMERA_ATTRIBUTES,
+			camera_route, true, eye_pass.metering_mode)
+		== EyeAdaptation.INTERNAL_METERING_CAMERA_AUTO,
+		"explicit Camera Attributes follows its auto-enabled flag for camera manual/automatic modes")
 	check(EyeAdaptation.resolve_exposure_route(
 		EyeAdaptation.EXPOSURE_SOURCE_PASS_SETTINGS, false, true)
 		== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
 		"explicit Pass Settings ignores camera attributes")
+	check(EyeAdaptation.resolve_exposure_method(EyeAdaptation.EXPOSURE_SOURCE_PASS_SETTINGS,
+		EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS, true, 2) == 2,
+		"explicit Pass Settings preserves manual metering")
 
 	var base := {"library:eye_adaptation": {"exposure_source": 0, "metering_mode": 0}}
 	var schema := {"library:eye_adaptation": {
@@ -97,8 +119,26 @@ func run() -> void:
 	check(not bool(explicit_auto_eye.get("_frp_volume_eye_exposure_override", false))
 		and EyeAdaptation.resolve_exposure_route(
 			int(explicit_auto_eye["exposure_source"]), false, true)
-			== EyeAdaptation.EXPOSURE_ROUTE_CAMERA_ATTRIBUTES,
-		"selecting Automatic alone does not count as a pass-settings override")
+			== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
+		"selecting Automatic alone uses pass metering rather than the linked camera")
+	var volume_auto_manual := ParameterResolver.resolve_context([], {
+		"library:eye_adaptation": {"exposure_source": EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC,
+			"metering_mode": 2}}, context)
+	var volume_auto_manual_eye: Dictionary = volume_auto_manual["library:eye_adaptation"]
+	check(EyeAdaptation.resolve_exposure_method(
+		int(volume_auto_manual_eye["exposure_source"]),
+		EyeAdaptation.resolve_exposure_route(int(volume_auto_manual_eye["exposure_source"]), true, true),
+		false, int(volume_auto_manual_eye["metering_mode"])) == 0,
+		"a Volume selecting Automatic still uses Histogram even when its metering override says Manual")
+	var volume_pass_manual := ParameterResolver.resolve_context([], {
+		"library:eye_adaptation": {"exposure_source": EyeAdaptation.EXPOSURE_SOURCE_PASS_SETTINGS,
+			"metering_mode": 2}}, context)
+	var volume_pass_manual_eye: Dictionary = volume_pass_manual["library:eye_adaptation"]
+	check(EyeAdaptation.resolve_exposure_method(
+		int(volume_pass_manual_eye["exposure_source"]),
+		EyeAdaptation.resolve_exposure_route(int(volume_pass_manual_eye["exposure_source"]), true, true),
+		false, int(volume_pass_manual_eye["metering_mode"])) == 2,
+		"a Volume explicitly selecting Pass Settings retains Manual metering")
 	var unknown_only := ParameterResolver.resolve_context([], {
 		"library:eye_adaptation": {"not_a_volume_field": 1}}, context)
 	var unknown_eye: Dictionary = unknown_only["library:eye_adaptation"]

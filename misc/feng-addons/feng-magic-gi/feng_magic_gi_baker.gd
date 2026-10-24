@@ -13,6 +13,9 @@ const PageContext = preload("feng_magic_gi_page_context.gd")
 const PagePlanner = preload("feng_magic_gi_page_planner.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
+const Lighting = preload("feng_magic_gi_lighting.gd")
+const Emission = preload("feng_magic_gi_emission.gd")
+const BoundaryTensorBuilder = preload("feng_magic_gi_boundary_tensor_builder.gd")
 const MAX_BAKE_PATHS := 100000000
 const SAMPLER_REVISION := Data.SAMPLER_REVISION
 const QMC_PRIME_BASES := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59]
@@ -58,6 +61,18 @@ static func _build_visibility_geometry(data: Data, faces: PackedVector3Array) ->
 func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if not volume.is_inside_tree():
 		return null
+	var lighting := Lighting.new()
+	var sky_capture: Dictionary = await lighting._capture_bake_coefficient_sets(volume,
+			Callable(self, "_bake_request_cancelled").bind(volume, generation))
+	if not bool(sky_capture.get("ready", false)):
+		push_warning("FMagicGI: " + String(sky_capture.get("error", "Bake-time Sky capture failed.")))
+		return null
+	if not _bake_request_current(volume, generation):
+		return null
+	var bake_lighting_sets: Dictionary = sky_capture.get("coefficient_sets", {})
+	if bake_lighting_sets.is_empty():
+		push_warning("FMagicGI: bake-time Sky capture returned no frozen lighting snapshot.")
+		return null
 	var bake_input_signature := SceneTracker.bake_content_signature(volume)
 	var scene_watch_signature := SceneTracker.stable_scene_signature(volume)
 	var geometry := Placement.new()
@@ -75,7 +90,17 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if rays < 1 or rays > 65536 or bounces < 1 or bounces > 8 or volume.bake_distance <= 0.0:
 		push_warning("FMagicGI: invalid bake sample, bounce, or distance settings.")
 		return null
-	var work_per_probe_sample := (bounces + 1) * (1 + geometry.emitters.groups.size())
+	var directional_sources: Array[Dictionary] = bake_lighting_sets.get("directional_sources", [])
+	var directional_source_signature := String(bake_lighting_sets.get(
+			"directional_source_signature", ""))
+	if directional_source_signature.is_empty() or not Data.is_valid_baked_indirect_directional_provenance(
+			Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE,
+			directional_source_signature, _baked_directional_provenance(bake_lighting_sets)):
+		push_warning("FMagicGI: exact directional-light bake snapshot is missing or invalid.")
+		return null
+	var eligible_directional_sources := _eligible_directional_source_count(directional_sources)
+	var work_per_probe_sample := (bounces + 1) * (1 + geometry.emitters.groups.size()) \
+			+ bounces * eligible_directional_sources
 	var visibility_rays := maxi(rays,
 			Data.VISIBILITY_TEXELS_PER_PROBE * MIN_VISIBILITY_RAYS_PER_TEXEL)
 	var total_work := geometry.positions.size() * (rays * work_per_probe_sample + visibility_rays)
@@ -118,6 +143,8 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	data.emitter_transport.resize(data.probe_count() * geometry.emitters.groups.size() * 6)
 	data.directional = Data.DirectionalData.new()
 	data.directional.allocate(data.probe_count(), geometry.emitters.groups.size())
+	data.prepare_bake_exact_directional_secondary()
+	var bake_emission_sources: PackedFloat32Array = Emission.new().read_source_values(volume, data)
 	var qmc_dimension_count := (bounces + 1) * 2
 	var qmc_base_coordinates := _build_qmc_base_coordinates(rays, qmc_dimension_count)
 	var minimum_visibility_rays := Data.VISIBILITY_TEXELS_PER_PROBE * MIN_VISIBILITY_RAYS_PER_TEXEL
@@ -127,14 +154,38 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	var trace_scene: RefCounted = geometry.trace_scene
 	var jobs_completed: bool = await _run_probe_jobs(data, volume, generation, trace_scene, geometry_signature,
 			qmc_base_coordinates, minimum_visibility_qmc_coordinates,
-			extra_visibility_qmc_coordinates, visibility_rays)
+			extra_visibility_qmc_coordinates, visibility_rays, directional_sources)
 	if not jobs_completed:
 		return null
+	if not _build_baked_indirect_sh(data, bake_lighting_sets, bake_emission_sources):
+		push_warning("FMagicGI: failed to produce the persistent indirect-radiance SH field.")
+		return null
+	data.clear_bake_exact_directional_secondary()
 	# Material, Mesh, Terrain, texture, and source inputs are fingerprinted at the
 	# boundary. This rejects edits made during worker yields without paying for a
 	# second Placement traversal, material decode, and BVH build.
 	if SceneTracker.bake_content_signature(volume) != bake_input_signature:
 		push_warning("FMagicGI: scene geometry, material, Terrain, texture, or source inputs changed during baking; discarded stale transfer.")
+		return null
+	# The total SH is frozen from one lighting/emission snapshot. Reject the bake
+	# if either dynamic input changed while worker jobs were running.
+	var lighting_validation: Dictionary = lighting._validate_bake_coefficient_capture(
+			volume, bake_lighting_sets)
+	if not bool(lighting_validation.get("ready", false)):
+		push_warning("FMagicGI: " + String(lighting_validation.get("error",
+				"Sky input changed during bake; discarded the mixed-snapshot SH field.")))
+		return null
+	var current_lighting_sets: Dictionary = lighting_validation.get("coefficient_sets", {})
+	var current_lighting_signature := hash([
+		current_lighting_sets.get("lighting", PackedFloat32Array()),
+		current_lighting_sets.get("sky_lighting", PackedFloat32Array()),
+		ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)])
+	var current_emission_sources: PackedFloat32Array = Emission.new().read_source_values(volume, data)
+	if current_lighting_signature != data.baked_indirect_lighting_signature \
+			or String(current_lighting_sets.get("directional_source_signature", "")) \
+			!= data.baked_indirect_directional_source_signature \
+			or hash(current_emission_sources) != data.baked_indirect_emission_signature:
+		push_warning("FMagicGI: lighting or emissive sources changed during baking; discarded the mixed-snapshot SH field.")
 		return null
 	if not is_instance_valid(volume) or not volume.is_bake_request_current(generation) \
 			or not data.matches_layout(
@@ -146,8 +197,19 @@ func bake_volume(volume: FMagicGIVolume, generation: int) -> Data:
 	if not data.build_cell_indices():
 		push_warning("FMagicGI: probe lookup construction failed; discarded incomplete transport.")
 		return null
+	if int(volume.clv_cache_backend) == 1 and not volume.is_surfel_mode() \
+			and not volume.chunked_baking:
+		var boundary_payload: Dictionary = BoundaryTensorBuilder.build_records(
+				volume, data, geometry)
+		if bool(boundary_payload.get("valid", false)):
+			if not data.set_baked_boundary_tensor_records(boundary_payload):
+				data.invalidate_baked_boundary_tensor_records()
+				push_warning("FMagicGI: optional boundary tensor correction was rejected by Data validation; the complete ordinary SH bake is retained.")
+		else:
+			data.invalidate_baked_boundary_tensor_records()
+			push_warning("FMagicGI: optional boundary tensor correction was not generated (%s); the complete ordinary SH bake is retained." % String(boundary_payload.get("reason", "unknown_builder_failure")))
 	data.bake_version = Time.get_ticks_usec()
-	if not data.is_valid():
+	if not data.is_valid() or not data.has_baked_indirect_sh():
 		push_warning("FMagicGI: generated PRT payload failed validation.")
 		return null
 	if not data.has_nonzero_transfer():
@@ -161,12 +223,39 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 		selected_chunk: Vector2i = Vector2i(2147483647, 2147483647)) -> Dictionary:
 	if not _bake_request_current(volume, request_generation):
 		return {"error": "Bake was cancelled before page planning."}
+	var lighting := Lighting.new()
+	var sky_capture: Dictionary = await lighting._capture_bake_coefficient_sets(volume,
+			Callable(self, "_bake_request_cancelled").bind(volume, request_generation))
+	if not bool(sky_capture.get("ready", false)):
+		return {"error": String(sky_capture.get("error", "Bake-time Sky capture failed."))}
+	if not _bake_request_current(volume, request_generation):
+		return {"error": "Bake was cancelled while waiting for the Sky snapshot."}
+	var generation_lighting_sets: Dictionary = sky_capture.get("coefficient_sets", {})
+	if generation_lighting_sets.is_empty():
+		return {"error": "Bake-time Sky capture returned no frozen lighting snapshot."}
+	var generation_directional_sources: Array[Dictionary] = generation_lighting_sets.get(
+			"directional_sources", [])
+	var generation_directional_signature := String(generation_lighting_sets.get(
+			"directional_source_signature", ""))
+	var generation_directional_provenance := _baked_directional_provenance(generation_lighting_sets)
+	if generation_directional_signature.is_empty() \
+			or not Data.is_valid_baked_indirect_directional_provenance(
+			Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE,
+			generation_directional_signature, generation_directional_provenance):
+		return {"error": "Bake-time exact DirectionalLight snapshot is missing or invalid."}
+	var generation_sky_provenance := _baked_sky_provenance(generation_lighting_sets)
+	if not Data.is_valid_baked_indirect_sky_provenance(generation_sky_provenance):
+		return {"error": "Bake-time Sky provenance failed validation; the active generation was kept."}
 	var world_bounds: AABB = volume.global_transform * AABB(-volume.size * 0.5, volume.size)
 	var planned := PagePlanner.core_pages(world_bounds, volume.management_block_size,
 		volume.core_page_size)
 	if planned.is_empty():
 		return {"error": "The Volume does not intersect a finite set of managed pages."}
 	var selected_only := selected_chunk.x != 2147483647
+	var generation_lighting_signature := hash([
+		generation_lighting_sets.get("lighting", PackedFloat32Array()),
+		generation_lighting_sets.get("sky_lighting", PackedFloat32Array()),
+		ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)])
 	var settings_signature := _streamed_settings_signature(volume)
 	var scene_signature_before := SceneTracker.stable_scene_signature(volume)
 	var bake_input_signature := SceneTracker.bake_content_signature(volume)
@@ -216,6 +305,21 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 	if selected_only and volume.bake_manifest != null:
 		if volume.bake_manifest.bake_settings_signature != settings_signature:
 			return {"error": "Chunk rebake requires the same global bake settings as the current manifest; run a full Bake after changing bake settings."}
+		if volume.bake_manifest.baked_indirect_sh_revision != Data.BAKED_INDIRECT_SH_REVISION:
+			return {"error": "A full Bake is required to add the persistent indirect-radiance SH field to this older generation."}
+		if not volume.bake_manifest.has_baked_indirect_sh():
+			return {"error": "A full Bake is required because the current generation has no verified bake-time Sky provenance."}
+		if volume.bake_manifest.baked_indirect_sh_algorithm \
+				!= Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE \
+				or volume.bake_manifest.baked_indirect_directional_source_signature \
+				!= generation_directional_signature:
+			return {"error": "A full Bake is required after directional source algorithm/input changes; partial rebake would mix frozen indirect lighting."}
+		if volume.bake_manifest.baked_indirect_sky_provenance != generation_sky_provenance:
+			return {"error": "A full Bake is required because streamed pages must share one exact Sky provenance snapshot."}
+		if volume.bake_manifest.baked_indirect_lighting_signature != generation_lighting_signature:
+			return {"error": "A full Bake is required after Sky or indirect DirectionalLight changes; partial rebake would mix frozen indirect lighting."}
+		if not _streamed_emission_snapshot_matches(volume, volume.bake_manifest):
+			return {"error": "A full Bake is required after emissive-source changes; partial rebake would mix frozen indirect lighting."}
 	var generation_id := "%d_%d" % [Time.get_ticks_usec(), volume.get_instance_id()]
 	var output_root := volume.resolved_bake_directory()
 	if output_root.is_empty() or not output_root.begins_with("res://"):
@@ -304,10 +408,12 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 						return {"error": "Page-local geometry collection failed for %s in batch %s: %s" % [page_key, batch_key, page_geometry.error_message]}
 				else:
 					page_result = await _bake_streamed_page(volume, request_generation,
-							generation_id, page_key, core, support, page_geometry)
+							generation_id, page_key, core, support, page_geometry,
+							generation_lighting_sets, generation_directional_sources)
 			else:
 				page_result = await _bake_streamed_page(volume, request_generation,
-						generation_id, page_key, core, support, page_geometry)
+						generation_id, page_key, core, support, page_geometry,
+						generation_lighting_sets, generation_directional_sources)
 			if bool(page_result.get("split", false)):
 				var minimum_extent := maxf(0.125, minf(volume.probe_spacing,
 						volume.minimum_probe_spacing) * 0.5)
@@ -326,6 +432,10 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 				geometry_context.free()
 				return {"error": String(page_result.error)}
 			var page_entry: Dictionary = page_result.entry
+			page_entry["baked_indirect_sh_revision"] = Data.BAKED_INDIRECT_SH_REVISION
+			page_entry["baked_indirect_sky_provenance"] = generation_sky_provenance.duplicate(true)
+			page_entry["baked_indirect_sh_algorithm"] = Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE
+			page_entry["baked_indirect_directional_source_signature"] = generation_directional_signature
 			if not bool(page_result.get("empty", false)):
 				var page_resource: Page = page_result.page
 				var page_path := generation_root.path_join("page_" + _safe_page_filename(page_key) + ".res")
@@ -340,7 +450,17 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 					geometry_context.free()
 					return {"error": "Streamed bake was canceled after writing an unreferenced page; the active generation was kept."}
 				var reloaded := ResourceLoader.load(page_path, "", ResourceLoader.CACHE_MODE_IGNORE) as Page
-				if reloaded == null or not reloaded.is_valid(generation_id, page_key):
+				if reloaded == null or not reloaded.is_valid(generation_id, page_key) \
+						or not reloaded.has_baked_indirect_sh() \
+						or reloaded.data.baked_indirect_lighting_signature \
+							!= generation_lighting_signature \
+						or reloaded.baked_indirect_sh_algorithm \
+							!= Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE \
+						or reloaded.baked_indirect_directional_source_signature \
+							!= generation_directional_signature \
+						or reloaded.baked_indirect_directional_source_provenance \
+							!= generation_directional_provenance \
+						or reloaded.baked_indirect_sky_provenance != generation_sky_provenance:
 					geometry_context.free()
 					return {"error": "Saved page %s failed reload validation." % page_key}
 				page_entry["resource_path"] = page_path
@@ -357,10 +477,27 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 			volume.set_streamed_bake_progress(completed_pages, total_pages)
 		geometry_context.free()
 	var bake_input_signature_after := SceneTracker.bake_content_signature(volume)
+	var lighting_validation: Dictionary = lighting._validate_bake_coefficient_capture(
+			volume, generation_lighting_sets)
+	if not bool(lighting_validation.get("ready", false)):
+		return {"error": String(lighting_validation.get("error",
+				"Sky input changed during the streamed bake; the old generation was kept."))}
+	var lighting_sets_after: Dictionary = lighting_validation.get("coefficient_sets", {})
+	var lighting_signature_after := hash([
+		lighting_sets_after.get("lighting", PackedFloat32Array()),
+		lighting_sets_after.get("sky_lighting", PackedFloat32Array()),
+		ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)])
 	if not _bake_request_current(volume, request_generation) \
 			or bake_input_signature != bake_input_signature_after \
+			or lighting_signature_after != generation_lighting_signature \
+			or String(lighting_sets_after.get("directional_source_signature", "")) \
+			!= generation_directional_signature \
+			or not _streamed_entries_emission_snapshot_matches(volume, final_entries,
+				generation_lighting_signature, generation_sky_provenance,
+				Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE,
+				generation_directional_signature, generation_directional_provenance) \
 			or settings_signature != _streamed_settings_signature(volume):
-		return {"error": "Scene or Volume changed during the streamed bake; the old generation was kept."}
+		return {"error": "Scene, lighting, or Volume changed during the streamed bake; the old generation was kept."}
 	var manifest := Manifest.new()
 	manifest.generation = generation_id
 	manifest.scene_identity = SceneTracker.scene_identity(volume)
@@ -375,15 +512,22 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 	manifest.scene_watch_signature_schema_version = SceneTracker.SIGNATURE_SCHEMA_CURRENT
 	manifest.bake_geometry_signature = scene_watch_signature
 	manifest.partial_generation = selected_only
+	manifest.baked_indirect_sh_revision = Data.BAKED_INDIRECT_SH_REVISION
+	manifest.baked_indirect_lighting_signature = generation_lighting_signature
+	manifest.baked_indirect_sky_provenance = generation_sky_provenance.duplicate(true)
+	manifest.baked_indirect_sh_algorithm = Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE
+	manifest.baked_indirect_directional_source_signature = generation_directional_signature
+	manifest.baked_indirect_directional_source_provenance = generation_directional_provenance.duplicate(true)
 	manifest.page_entries = final_entries
 	manifest._build_spatial_index()
-	if not manifest.is_valid():
+	if not manifest.is_valid() or not manifest.has_baked_indirect_sh():
 		return {"error": "Generated page manifest failed validation: %s" % manifest.get_index_error()}
 	var manifest_path := output_root.path_join("manifest_" + generation_id + ".res")
 	if ResourceSaver.save(manifest, manifest_path, ResourceSaver.FLAG_COMPRESS) != OK:
 		return {"error": "Could not save the final page manifest; the prior generation remains active."}
 	var verified_manifest := ResourceLoader.load(manifest_path, "", ResourceLoader.CACHE_MODE_IGNORE) as Manifest
-	if verified_manifest == null or not verified_manifest.is_valid():
+	if verified_manifest == null or not verified_manifest.is_valid() \
+			or not verified_manifest.has_baked_indirect_sh():
 		return {"error": "Published manifest failed reload validation; the prior generation remains active."}
 	verified_manifest.resource_path = manifest_path
 	return {"manifest": verified_manifest, "path": manifest_path,
@@ -394,7 +538,8 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 
 func _bake_streamed_page(volume: FMagicGIVolume, request_generation: int,
 		generation_id: String, page_key: String, core: AABB, support: AABB,
-		geometry: Placement) -> Dictionary:
+		geometry: Placement, lighting_sets: Dictionary,
+		directional_sources: Array[Dictionary]) -> Dictionary:
 	var influence := PagePlanner.influence_bounds(core, volume.probe_spacing,
 			volume.minimum_probe_spacing, volume.clv_cell_size,
 			volume.bake_distance, volume.bake_bounces)
@@ -411,7 +556,8 @@ func _bake_streamed_page(volume: FMagicGIVolume, request_generation: int,
 	if count == 0:
 		return {"empty": true, "entry": _empty_page_entry(
 				generation_id, page_key, core, support, influence)}
-	var work_per_probe_sample := (volume.bake_bounces + 1) * (1 + geometry.emitters.groups.size())
+	var work_per_probe_sample := (volume.bake_bounces + 1) * (1 + geometry.emitters.groups.size()) \
+			+ volume.bake_bounces * _eligible_directional_source_count(directional_sources)
 	var visibility_rays := maxi(volume.bake_samples,
 			Data.VISIBILITY_TEXELS_PER_PROBE * MIN_VISIBILITY_RAYS_PER_TEXEL)
 	var total_work := count * (volume.bake_samples * work_per_probe_sample + visibility_rays)
@@ -431,8 +577,11 @@ func _bake_streamed_page(volume: FMagicGIVolume, request_generation: int,
 	data.primary_sky_visibility.resize(count * 9)
 	data.visibility_moments.resize(count * Data.VISIBILITY_TEXELS_PER_PROBE * Data.VISIBILITY_MOMENT_CHANNELS)
 	data.emitter_transport.resize(count * geometry.emitters.groups.size() * 6)
+	data.prepare_bake_exact_directional_secondary()
+	var bake_emission_sources: PackedFloat32Array = Emission.new().read_source_values(volume, data)
 	if PagePlanner.exceeds_page_limits(count, data.grid_dims, total_work,
-			data.estimate_gpu_bytes(), data.estimate_cpu_bytes() + data.estimate_gpu_bytes() + count * 3 * 4,
+			data.estimate_gpu_bytes(), data.estimate_cpu_bytes() + data.estimate_gpu_bytes() \
+				+ count * (1 + 3 * 4 + 27 * 4 + 27 * 4 + 7 * 16),
 			volume.gpu_resident_budget_bytes, volume.cpu_resident_budget_bytes):
 		return {"split": true}
 	var qmc_dimension_count := (volume.bake_bounces + 1) * 2
@@ -444,8 +593,11 @@ func _bake_streamed_page(volume: FMagicGIVolume, request_generation: int,
 	var page_signature := geometry.scene_signature
 	if not await _run_probe_jobs(data, volume, request_generation, geometry.trace_scene,
 			page_signature, qmc_base_coordinates, minimum_visibility_qmc_coordinates,
-			extra_visibility_qmc_coordinates, visibility_rays):
+			extra_visibility_qmc_coordinates, visibility_rays, directional_sources):
 		return {"error": "Page worker failed or was cancelled."}
+	if not _build_baked_indirect_sh(data, lighting_sets, bake_emission_sources):
+		return {"error": "Page could not produce its persistent indirect-radiance SH field."}
+	data.clear_bake_exact_directional_secondary()
 	if not data.build_cell_indices():
 		return {"error": "Page lookup construction failed."}
 	# The final sparse/fixed lookup arrays are created only after probe work.
@@ -469,6 +621,11 @@ func _bake_streamed_page(volume: FMagicGIVolume, request_generation: int,
 	page.probe_count = count
 	page.geometry_signature = page_signature
 	page.settings_signature = _streamed_settings_signature(volume)
+	page.baked_indirect_sh_revision = Data.BAKED_INDIRECT_SH_REVISION
+	page.baked_indirect_sh_algorithm = data.baked_indirect_sh_algorithm
+	page.baked_indirect_directional_source_signature = data.baked_indirect_directional_source_signature
+	page.baked_indirect_directional_source_provenance = data.baked_indirect_directional_source_provenance.duplicate(true)
+	page.baked_indirect_sky_provenance = data.baked_indirect_sky_provenance.duplicate(true)
 	page.data = data
 	page.cpu_bytes = indexed_cpu_bytes
 	page.gpu_bytes = indexed_gpu_bytes
@@ -485,6 +642,9 @@ func _bake_streamed_page(volume: FMagicGIVolume, request_generation: int,
 		"gpu_bytes": page.gpu_bytes,
 		"geometry_signature": page_signature,
 		"settings_signature": page.settings_signature,
+		"baked_indirect_sh_revision": Data.BAKED_INDIRECT_SH_REVISION,
+		"baked_indirect_sh_algorithm": data.baked_indirect_sh_algorithm,
+		"baked_indirect_directional_source_signature": data.baked_indirect_directional_source_signature,
 		"resource_path": "",
 		"content_hash": "",
 		"empty": false,
@@ -520,6 +680,138 @@ func _create_streamed_page_data(volume: FMagicGIVolume, geometry: Placement,
 	data.stable_probe_ids = geometry.stable_probe_ids
 	return data
 
+## Freeze the complete indirect incident radiance into one persistent SH9
+## field. DirectionalData.relight() returns secondary coefficients in [0,27)
+## and visibility-filtered primary Sky in [27,54); combine them before the
+## receiver cosine evaluation, matching the existing PRT shader contract.
+func _build_baked_indirect_sh(data: Data, lighting_sets: Dictionary,
+		emission_sources: PackedFloat32Array) -> bool:
+	if data == null or data.directional == null \
+			or not data.directional is Data.DirectionalData:
+		return false
+	var lighting: PackedFloat32Array = lighting_sets.get("lighting", PackedFloat32Array())
+	var sky_lighting: PackedFloat32Array = lighting_sets.get("sky_lighting", PackedFloat32Array())
+	var sky_provenance := _baked_sky_provenance(lighting_sets)
+	var directional_sources: Variant = lighting_sets.get("directional_sources", null)
+	var directional_signature := String(lighting_sets.get("directional_source_signature", ""))
+	var directional_provenance := _baked_directional_provenance(lighting_sets)
+	var physical_units: Variant = lighting_sets.get("directional_physical_units", null)
+	if lighting.size() != 27 or sky_lighting.size() != 27 \
+			or emission_sources.size() != data.emitter_count() * 6 \
+			or sky_lighting != sky_provenance.get("radiance_sh", PackedFloat32Array()) \
+			or not Data.is_valid_baked_indirect_sky_provenance(sky_provenance) \
+			or not directional_sources is Array \
+			or physical_units == null \
+			or directional_signature.is_empty() \
+			or not Data.is_valid_baked_indirect_directional_provenance(
+				Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE,
+				directional_signature, directional_provenance) \
+			or directional_provenance.get("physical_units", null) != physical_units \
+			or not data.validate_bake_exact_directional_secondary():
+		return false
+	var composed := PackedFloat32Array()
+	composed.resize(data.probe_count() * 27)
+	for probe in data.probe_count():
+		var relit: PackedFloat32Array = data.directional.relight(
+				probe, sky_lighting, sky_lighting, emission_sources)
+		if relit.size() != 54:
+			return false
+		for coefficient in 27:
+			var value := relit[coefficient] + relit[27 + coefficient] \
+					+ data.bake_exact_directional_secondary[probe * 27 + coefficient]
+			if not is_finite(value):
+				return false
+			composed[probe * 27 + coefficient] = value
+	data._invalidate_baked_indirect_sh_validation_cache()
+	data.invalidate_baked_boundary_tensor_records()
+	data.baked_indirect_sh_revision = 0
+	data.baked_indirect_sh.clear()
+	data.baked_indirect_sh_algorithm = ""
+	data.baked_indirect_directional_source_signature = ""
+	data.baked_indirect_directional_source_provenance.clear()
+	data.baked_indirect_sky_provenance.clear()
+	data._sky_provenance_validation_cached = false
+	data._sky_provenance_validation_result = false
+	data.baked_indirect_sh = composed
+	data.baked_indirect_lighting_signature = hash([
+		lighting, sky_lighting, ProjectSettings.get_setting(
+		"rendering/lights_and_shadows/use_physical_light_units", false)])
+	data.baked_indirect_emission_signature = hash(emission_sources)
+	data.baked_indirect_sky_provenance = sky_provenance
+	data.baked_indirect_sh_algorithm = Data.BAKED_INDIRECT_SH_ALGORITHM_EXACT_DIRECTIONAL_NEE
+	data.baked_indirect_directional_source_signature = directional_signature
+	data.baked_indirect_directional_source_provenance = directional_provenance.duplicate(true)
+	data._sky_provenance_validation_cached = false
+	data._baked_directional_provenance_validation_cached = false
+	data.baked_indirect_sh_revision = Data.BAKED_INDIRECT_SH_REVISION
+	return data.has_baked_indirect_sh() and data.baked_indirect_sh_is_valid()
+
+func _baked_sky_provenance(lighting_sets: Dictionary) -> Dictionary:
+	var radiance: Variant = lighting_sets.get("sky_radiance_sh", PackedFloat32Array())
+	if not radiance is PackedFloat32Array:
+		return {}
+	return {
+		"schema_version": 1,
+		"status": String(lighting_sets.get("sky_snapshot_status", "")),
+		"source": String(lighting_sets.get("sky_source", "")),
+		"source_mode": int(lighting_sets.get("sky_source_mode", -1)),
+		"source_revision": int(lighting_sets.get("sky_source_revision", -1)),
+		"radiance_unit": "scene_linear_radiance",
+		"radiance_energy": float(lighting_sets.get("sky_radiance_energy", NAN)),
+		"radiance_sh": radiance.duplicate(),
+		"input_signature": String(lighting_sets.get("sky_input_signature", "")),
+	}
+
+func _streamed_emission_snapshot_matches(volume: FMagicGIVolume,
+		manifest: Manifest) -> bool:
+	if manifest == null or manifest.baked_indirect_sh_revision != Data.BAKED_INDIRECT_SH_REVISION:
+		return false
+	var emission := Emission.new()
+	for entry_value in manifest.page_entries:
+		var entry: Dictionary = entry_value
+		if bool(entry.get("empty", false)):
+			continue
+		var page_path := String(entry.get("resource_path", ""))
+		var page := ResourceLoader.load(page_path) as Page
+		if page == null or page.data == null or not page.has_baked_indirect_sh() \
+				or page.data.baked_indirect_lighting_signature \
+				!= manifest.baked_indirect_lighting_signature \
+				or page.baked_indirect_sky_provenance != manifest.baked_indirect_sky_provenance \
+				or page.baked_indirect_sh_algorithm != manifest.baked_indirect_sh_algorithm \
+				or page.baked_indirect_directional_source_signature \
+				!= manifest.baked_indirect_directional_source_signature \
+				or page.baked_indirect_directional_source_provenance \
+				!= manifest.baked_indirect_directional_source_provenance:
+			return false
+		if hash(emission.read_source_values(volume, page.data)) \
+				!= page.data.baked_indirect_emission_signature:
+			return false
+	return true
+
+func _streamed_entries_emission_snapshot_matches(volume: FMagicGIVolume,
+		entries: Array[Dictionary], lighting_signature: int, sky_provenance: Dictionary,
+		algorithm: String, directional_signature: String,
+		directional_provenance: Dictionary) -> bool:
+	var emission := Emission.new()
+	for entry in entries:
+		if bool(entry.get("empty", false)):
+			continue
+		var page_path := String(entry.get("resource_path", ""))
+		if page_path.is_empty():
+			return false
+		var page := ResourceLoader.load(page_path) as Page
+		if page == null or page.data == null or not page.has_baked_indirect_sh() \
+				or page.data.baked_indirect_lighting_signature != lighting_signature \
+				or page.baked_indirect_sky_provenance != sky_provenance \
+				or page.baked_indirect_sh_algorithm != algorithm \
+				or page.baked_indirect_directional_source_signature != directional_signature \
+				or page.baked_indirect_directional_source_provenance != directional_provenance:
+			return false
+		if hash(emission.read_source_values(volume, page.data)) \
+				!= page.data.baked_indirect_emission_signature:
+			return false
+	return true
+
 func _page_context_for_geometry(geometry: Placement, volume: FMagicGIVolume,
 		core: AABB, support: AABB) -> PageContext:
 	var context := geometry._volume as PageContext
@@ -551,6 +843,29 @@ func _empty_page_entry(generation_id: String, page_key: String,
 		"influence_bounds": influence, "probe_count": 0,
 		"cpu_bytes": 0, "gpu_bytes": 0, "geometry_signature": 0,
 		"settings_signature": 0, "resource_path": "", "content_hash": "", "empty": true}
+
+func _eligible_directional_source_count(sources: Array[Dictionary]) -> int:
+	var count := 0
+	for source in sources:
+		if int(source.get("sky_mode", -1)) != DirectionalLight3D.SKY_MODE_SKY_ONLY:
+			count += 1
+	return count
+
+func _baked_directional_provenance(lighting_sets: Dictionary) -> Dictionary:
+	var sources_value: Variant = lighting_sets.get("directional_sources", null)
+	var physical_value: Variant = lighting_sets.get("directional_physical_units", null)
+	if typeof(sources_value) != TYPE_ARRAY or typeof(physical_value) != TYPE_BOOL:
+		return {}
+	var sources: Array = sources_value
+	return {
+		"schema_version": Data.BAKED_DIRECTIONAL_SOURCE_SCHEMA_VERSION,
+		"source_scale_convention": "godot_directional_nee_q_v1",
+		"visibility_contract": "all_collected_static_triangles_v1",
+		"angular_source_contract": "collimated_directional_v1",
+		"light_masks_contract": "recorded_not_applied_to_bvh_v1",
+		"physical_units": physical_value,
+		"sources": sources.duplicate(true),
+	}
 
 static func _old_entry_influence_bounds(entry: Dictionary, trace_radius: float) -> AABB:
 	var influence: AABB = entry.get("influence_bounds", AABB())
@@ -605,7 +920,7 @@ func _run_probe_jobs(data: Data, volume: Node3D, generation: int,
 		qmc_base_coordinates: Array[PackedFloat64Array],
 		minimum_visibility_qmc_coordinates: Array[PackedFloat64Array],
 		extra_visibility_qmc_coordinates: Array[PackedFloat64Array],
-		visibility_rays: int) -> bool:
+		visibility_rays: int, directional_sources: Array[Dictionary] = []) -> bool:
 	var worker_limit := clampi(_probe_worker_limit(), 1, 8)
 	var next_probe := 0
 	# One record owns each outstanding task's job and destination probe slot.
@@ -645,7 +960,7 @@ func _run_probe_jobs(data: Data, volume: Node3D, generation: int,
 				var task_id := WorkerThreadPool.add_task(Callable(job, "run").bind(trace_scene,
 					geometry_signature, probe, qmc_base_coordinates,
 					minimum_visibility_qmc_coordinates, extra_visibility_qmc_coordinates,
-					visibility_rays), false, "Magic GI Bake")
+					visibility_rays, directional_sources), false, "Magic GI Bake")
 				if task_id < 0:
 					failed = true
 					break
@@ -671,6 +986,9 @@ func _create_bake_job(data: Data, probe: int) -> BakeJob:
 func _bake_request_current(volume: Node3D, generation: int) -> bool:
 	return is_instance_valid(volume) and volume.is_inside_tree() \
 		and bool(volume.call("is_bake_request_current", generation))
+
+func _bake_request_cancelled(volume: Node3D, generation: int) -> bool:
+	return not _bake_request_current(volume, generation)
 
 ## Randomized Hammersley sequence: the first coordinate is stratified over N
 ## samples and later coordinates use radical inverses in distinct prime bases.

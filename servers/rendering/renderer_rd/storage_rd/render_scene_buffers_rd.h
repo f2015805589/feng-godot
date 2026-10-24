@@ -68,6 +68,8 @@ class RenderSceneBuffersRD : public RenderSceneBuffers {
 
 private:
 	bool can_be_storage = true;
+	// Opt in only for the resolved scene-color target used by the FRP renderer.
+	bool can_copy_from_color = false;
 	bool force_hdr = false;
 	uint32_t max_cluster_elements = 512;
 	RD::DataFormat preferred_data_format = RD::DATA_FORMAT_MAX;
@@ -194,6 +196,7 @@ public:
 	// info from our renderer
 	void set_can_be_storage(const bool p_can_be_storage) { can_be_storage = p_can_be_storage; }
 	bool get_can_be_storage() const { return can_be_storage; }
+	void set_can_copy_from_color(const bool p_can_copy_from_color) { can_copy_from_color = p_can_copy_from_color; }
 	void set_max_cluster_elements(const uint32_t p_max_elements) { max_cluster_elements = p_max_elements; }
 	uint32_t get_max_cluster_elements() { return max_cluster_elements; }
 	void set_preferred_data_format(const RD::DataFormat p_preferred_data_format) { preferred_data_format = p_preferred_data_format; }
@@ -361,7 +364,7 @@ public:
 		}
 	}
 
-	static uint32_t get_color_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+	static uint32_t get_color_usage_bits(bool p_resolve, bool p_msaa, bool p_storage, bool p_can_copy_from = false);
 	static RD::DataFormat get_depth_format(bool p_resolve, bool p_msaa, bool p_storage);
 	static uint32_t get_depth_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 	static RD::DataFormat get_velocity_format();

@@ -241,13 +241,15 @@ void LightmapGIData::set_capture_data(const AABB &p_bounds, bool p_interior, con
 		ERR_FAIL_COND((p_tetrahedra.size() % 4) != 0);
 		ERR_FAIL_COND((p_bsp_tree.size() % 6) != 0);
 		RS::get_singleton()->lightmap_set_probe_capture_data(lightmap, p_points, p_point_sh, p_tetrahedra, p_bsp_tree);
-		RS::get_singleton()->lightmap_set_probe_bounds(lightmap, p_bounds);
 		RS::get_singleton()->lightmap_set_probe_interior(lightmap, p_interior);
 	} else {
 		RS::get_singleton()->lightmap_set_probe_capture_data(lightmap, PackedVector3Array(), PackedColorArray(), PackedInt32Array(), PackedInt32Array());
-		RS::get_singleton()->lightmap_set_probe_bounds(lightmap, AABB());
 		RS::get_singleton()->lightmap_set_probe_interior(lightmap, false);
 	}
+	// Texture-only lightmaps still need their receiver bounds for frustum culling.
+	// Clearing those bounds when no dynamic probes exist makes valid surface
+	// atlases disappear when the camera turns away from the lightmap origin.
+	RS::get_singleton()->lightmap_set_probe_bounds(lightmap, p_bounds);
 	RS::get_singleton()->lightmap_set_baked_exposure_normalization(lightmap, p_baked_exposure);
 	baked_exposure = p_baked_exposure;
 	lightprobe_hash = p_lightprobe_hash;

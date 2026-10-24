@@ -1,0 +1,62 @@
+#ifndef MAGIC_GI_CLV_PROBE_BLOCK_FIELD_FILL_DECLARATIONS_GLSLINC
+#define MAGIC_GI_CLV_PROBE_BLOCK_FIELD_FILL_DECLARATIONS_GLSLINC
+
+// Layout17: baked total-radiance SH9 is aggregated and converted to an exact
+// quadratic E/pi irradiance tensor per CLV cell. Probe gather and exact geometry
+// visibility run once during this block update.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform sampler2D geometry_atlas;
+layout(set = 0, binding = 1) uniform isampler2D index_map;
+layout(set = 0, binding = 2, std430) readonly buffer VisibilityNodes { vec4 nodes[]; } visibility_bvh;
+layout(set = 0, binding = 3, std430) readonly buffer VisibilityTriangles { vec4 triangles[]; } visibility_geometry;
+layout(set = 0, binding = 4, std430) readonly buffer RawDirectional { vec4 values[]; } raw_directional;
+struct FieldJob {
+	vec4 center_spacing; // world center xyz; w=-step requests CLEAR-only
+	ivec4 logical_level; // logical cache cell xyz, clipmap level
+	ivec4 boundary_record; // 1-based boundary-record id; 0 selects the ordinary gather
+};
+layout(set = 0, binding = 5, std430) readonly buffer FieldJobs { FieldJob values[]; } jobs;
+struct BoundaryTensorRecord {
+	ivec4 logical_level; // exact absolute logical cache xyz and level
+	vec4 tensor[7]; // layout17 F0..F6, scene-linear and not codec-scaled
+};
+layout(set = 0, binding = 20, std430) readonly buffer BoundaryTensorRecords {
+	BoundaryTensorRecord values[];
+} boundary_tensor_records;
+#ifdef MAGIC_GI_CLV_BAKED_SH_RGBA16F
+layout(rgba16f, set = 0, binding = 6) uniform writeonly image3D field_image_0;
+layout(rgba16f, set = 0, binding = 7) uniform writeonly image3D field_image_1;
+layout(rgba16f, set = 0, binding = 8) uniform writeonly image3D field_image_2;
+layout(rgba16f, set = 0, binding = 9) uniform writeonly image3D field_image_3;
+layout(rgba16f, set = 0, binding = 10) uniform writeonly image3D field_image_4;
+layout(rgba16f, set = 0, binding = 11) uniform writeonly image3D field_image_5;
+layout(rgba16f, set = 0, binding = 12) uniform writeonly image3D field_image_6;
+#define MAGIC_GI_CLV_BAKED_SH_FORMAT_TAG 16.0
+#else
+layout(rgba32f, set = 0, binding = 6) uniform writeonly image3D field_image_0;
+layout(rgba32f, set = 0, binding = 7) uniform writeonly image3D field_image_1;
+layout(rgba32f, set = 0, binding = 8) uniform writeonly image3D field_image_2;
+layout(rgba32f, set = 0, binding = 9) uniform writeonly image3D field_image_3;
+layout(rgba32f, set = 0, binding = 10) uniform writeonly image3D field_image_4;
+layout(rgba32f, set = 0, binding = 11) uniform writeonly image3D field_image_5;
+layout(rgba32f, set = 0, binding = 12) uniform writeonly image3D field_image_6;
+#define MAGIC_GI_CLV_BAKED_SH_FORMAT_TAG 32.0
+#endif
+layout(rgba32i, set = 0, binding = 13) uniform iimage3D field_tags;
+layout(set = 0, binding = 14, std140) uniform GIParams {
+	mat4 inverse_projection; mat4 world_to_grid; mat4 view_to_world;
+	vec4 grid; vec4 control; vec4 lighting_sh[7]; vec4 sky_lighting_sh[7];
+} params;
+layout(set = 0, binding = 17, r32ui) uniform uimage3D field_support;
+layout(set = 0, binding = 18) uniform sampler2D visibility_moment_atlas;
+layout(set = 0, binding = 19, std140) uniform ClipmapParameters {
+	ivec4 origins[3];
+	vec4 spacing;
+	ivec4 control;
+	vec4 codec; // decode scale, encode scale, format tag, codec revision.
+} clipmap;
+layout(push_constant, std430) uniform FillParameters {
+	int job_count; int resolution; int geometry_epoch; float base_spacing;
+} config;
+
+#endif // MAGIC_GI_CLV_PROBE_BLOCK_FIELD_FILL_DECLARATIONS_GLSLINC

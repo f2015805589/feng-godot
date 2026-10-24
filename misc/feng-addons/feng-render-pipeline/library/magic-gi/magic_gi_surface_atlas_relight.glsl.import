@@ -1,0 +1,13 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bbicw7w6g2dyt"
+path="res://.godot/imported/magic_gi_surface_atlas_relight.glsl-e7fbe615c80f2a0c798e2e0d714fc119.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_surface_atlas_relight.glsl"
+dest_files=["res://.godot/imported/magic_gi_surface_atlas_relight.glsl-e7fbe615c80f2a0c798e2e0d714fc119.res"]
+
+[params]

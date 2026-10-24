@@ -3,6 +3,7 @@ extends SceneTree
 
 const ServiceScript = preload("res://addons/feng-render-pipeline/editor/environment_mixer_service.gd")
 const WindowScript = preload("res://addons/feng-render-pipeline/editor/environment_mixer_window.gd")
+const BuiltinPassScript = preload("res://addons/feng-render-pipeline/passes/builtin_pass.gd")
 
 var checks := 0
 var failures := 0
@@ -29,6 +30,9 @@ func _test_minimal_property_names() -> void:
 	}
 	for kind in probes:
 		var object: Object = probes[kind]
+		if kind == "DirectionalLight3D":
+			# The target path is conditionally exposed after reserving an object slot.
+			object.set("directional_shadow_object_shadow_enabled", true)
 		var available: Dictionary = {}
 		for property_info in object.get_property_list():
 			if int(property_info.get("usage", 0)) & PROPERTY_USAGE_EDITOR:
@@ -39,6 +43,258 @@ func _test_minimal_property_names() -> void:
 				missing.append(String(property_name))
 		require(missing.is_empty(), "%s Minimal controls must match real editable properties: %s" % [kind, ", ".join(missing)])
 		object.free()
+
+
+func _test_directional_shadow_defaults_and_roundtrip() -> void:
+	var light := DirectionalLight3D.new()
+	var contract_probe := DirectionalLight3D.new()
+	contract_probe.set("directional_shadow_object_shadow_enabled", true)
+	var property_info_by_name: Dictionary = {}
+	for property_info in contract_probe.get_property_list():
+		property_info_by_name[String(property_info.get("name", ""))] = property_info
+
+	var required_properties := [
+		"directional_shadow_mode",
+		"directional_shadow_object_shadow_enabled",
+		"directional_shadow_object_shadow_target",
+	]
+	var complete_contract := true
+	for property_name in required_properties:
+		var property_info: Variant = property_info_by_name.get(property_name)
+		var has_editor_and_storage := property_info != null \
+				and (int(property_info.get("usage", 0)) & PROPERTY_USAGE_EDITOR) != 0 \
+				and (int(property_info.get("usage", 0)) & PROPERTY_USAGE_STORAGE) != 0
+		require(has_editor_and_storage,
+				"DirectionalLight3D.%s must be editable and serialized" % property_name)
+		complete_contract = complete_contract and has_editor_and_storage
+	contract_probe.free()
+	if not complete_contract:
+		light.free()
+		return
+
+	var target_info: Dictionary = property_info_by_name["directional_shadow_object_shadow_target"]
+	require(int(target_info.get("hint", -1)) == PROPERTY_HINT_NODE_PATH_VALID_TYPES
+			and String(target_info.get("hint_string", "")).contains("Node3D"),
+			"the reserved object-shadow target must select a Node3D scene path")
+	var mode_info: Dictionary = property_info_by_name["directional_shadow_mode"]
+	var mode_hint := String(mode_info.get("hint_string", ""))
+	require(int(mode_info.get("hint", -1)) == PROPERTY_HINT_ENUM
+			and mode_hint.contains("PSSM 2 Splits (Average):1")
+			and mode_hint.contains("PSSM 4 Splits (Slow):2")
+			and mode_hint.contains("PSSM 3 Splits:3"),
+			"the Inspector enum must expose PSSM 3 while retaining the serialized PSSM 2/4 values")
+	require(int(light.get("directional_shadow_mode")) == DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+			and not bool(light.get("directional_shadow_object_shadow_enabled"))
+			and NodePath(light.get("directional_shadow_object_shadow_target")) == NodePath(""),
+			"new directional lights must default to four CSM splits with object reservation off and no target")
+	require(int(ProjectSettings.get_setting("rendering/frp/shadows/directional_shadow/cascade_size", 0)) == 4096,
+			"FRP must default to 4096 pixels for each directional shadow slot")
+	require(int(ProjectSettings.get_setting("rendering/lights_and_shadows/directional_shadow/size", 0)) == 4096,
+			"the legacy total-atlas setting must retain its independent default for non-FRP renderers")
+
+	var root := Node3D.new()
+	root.name = "ShadowRoundtripRoot"
+	get_root().add_child(root)
+	var sun := DirectionalLight3D.new()
+	sun.name = "Sun"
+	root.add_child(sun)
+	sun.owner = root
+	var role_root := Node3D.new()
+	role_root.name = "CharacterRoot"
+	root.add_child(role_root)
+	role_root.owner = root
+	var body := MeshInstance3D.new()
+	body.name = "Body"
+	body.mesh = SphereMesh.new()
+	role_root.add_child(body)
+	body.owner = root
+
+	sun.set("directional_shadow_mode", 3)
+	sun.set("directional_shadow_object_shadow_enabled", true)
+	sun.set("directional_shadow_object_shadow_target", NodePath("../CharacterRoot"))
+	sun.light_angular_distance = 0.5
+	sun.shadow_blur = 1.25
+
+	var packed := PackedScene.new()
+	var pack_error := packed.pack(root)
+	require(pack_error == OK, "directional shadow configuration fixture must pack as a scene")
+	if pack_error != OK:
+		root.free()
+		light.free()
+		return
+
+	var scene_path := "user://frp_directional_shadow_roundtrip_%d.tscn" % OS.get_process_id()
+	var save_error := ResourceSaver.save(packed, scene_path)
+	require(save_error == OK, "directional shadow configuration must save with its scene")
+	if save_error == OK:
+		var loaded := ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+		require(loaded is PackedScene, "directional shadow scene must reload as a PackedScene")
+		if loaded is PackedScene:
+			var restored_root: Node3D = loaded.instantiate() as Node3D
+			var restored_sun := restored_root.get_node("Sun") as DirectionalLight3D
+			var restored_role_root := restored_root.get_node("CharacterRoot") as Node3D
+			var restored_target := NodePath(restored_sun.get("directional_shadow_object_shadow_target"))
+			require(int(restored_sun.get("directional_shadow_mode")) == 3
+					and bool(restored_sun.get("directional_shadow_object_shadow_enabled"))
+					and restored_target == restored_sun.get_path_to(restored_role_root)
+					and restored_sun.get_node_or_null(restored_target) == restored_role_root
+					and restored_role_root.get_node_or_null("Body") is MeshInstance3D,
+				"PSSM 3+object mode and the multi-mesh role-root NodePath must survive scene serialization")
+			require(is_equal_approx(restored_sun.light_angular_distance, 0.5)
+					and is_equal_approx(restored_sun.shadow_blur, 1.25),
+				"PCSS angular size and blur parameters must survive scene serialization")
+			restored_root.free()
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(scene_path))
+
+	root.free()
+	light.free()
+
+
+func _test_frp_shadow_resolution_setting_storage() -> void:
+	const setting_name := "rendering/frp/shadows/directional_shadow/cascade_size"
+	if not ProjectSettings.has_setting(setting_name):
+		require(false, "FRP must register its per-slot directional-shadow resolution setting")
+		return
+
+	var property_info: Dictionary = {}
+	for candidate in ProjectSettings.get_property_list():
+		if String(candidate.get("name", "")) == setting_name:
+			property_info = candidate
+			break
+	require(not property_info.is_empty()
+				and (int(property_info.get("usage", 0)) & PROPERTY_USAGE_EDITOR) != 0
+				and (int(property_info.get("usage", 0)) & PROPERTY_USAGE_STORAGE) != 0,
+				"FRP per-slot resolution must be visible in Project Settings and persist in project config")
+	require(int(property_info.get("type", -1)) == TYPE_INT
+			and int(property_info.get("hint", -1)) == PROPERTY_HINT_RANGE
+			and String(property_info.get("hint_string", "")).begins_with("256,8192,1"),
+			"FRP per-slot resolution must be an integer setting with the documented 256–8192 range")
+	require(int(ProjectSettings.get_setting(setting_name, 0)) == 4096,
+			"FRP per-slot resolution must default to 4096 pixels")
+
+	var previous_value: Variant = ProjectSettings.get_setting(setting_name)
+	var previous_legacy_value: Variant = ProjectSettings.get_setting(
+			"rendering/lights_and_shadows/directional_shadow/size", 0)
+	# Preserve the arbitrary integer from Project Settings; FRP rounds 3000 up
+	# to a 4096-pixel active slot when it reads the value for rendering.
+	ProjectSettings.set_setting(setting_name, 3000)
+	require(ProjectSettings.get_setting("rendering/lights_and_shadows/directional_shadow/size", 0)
+			== previous_legacy_value,
+			"changing FRP per-slot resolution must not change the legacy non-FRP atlas setting")
+	var config_path := "user://frp_shadow_resolution_%d.godot" % OS.get_process_id()
+	var save_error: Error = ProjectSettings.save_custom(config_path)
+	ProjectSettings.set_setting(setting_name, previous_value)
+	require(save_error == OK, "the FRP cascade-size override must save to a project config")
+	if save_error == OK:
+		var saved_config := ConfigFile.new()
+		var load_error: Error = saved_config.load(config_path)
+		require(load_error == OK
+				and int(saved_config.get_value("rendering", "frp/shadows/directional_shadow/cascade_size", 0)) == 3000,
+				"the entered FRP cascade-size value must round-trip through project config serialization")
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(config_path))
+
+
+func _test_directional_shadow_mixer_controls() -> void:
+	var window = WindowScript.new()
+	var detail_picker := OptionButton.new()
+	detail_picker.add_item("Minimal", WindowScript.DETAIL_MINIMAL)
+	detail_picker.add_item("Normal", WindowScript.DETAIL_NORMAL)
+	detail_picker.add_item("Normal + Advanced", WindowScript.DETAIL_NORMAL_ADVANCED)
+	window.set("_detail_mode_picker", detail_picker)
+
+	var sun := DirectionalLight3D.new()
+	sun.shadow_enabled = true
+	sun.set("directional_shadow_object_shadow_enabled", true)
+	for detail_mode in [WindowScript.DETAIL_MINIMAL, WindowScript.DETAIL_NORMAL, WindowScript.DETAIL_NORMAL_ADVANCED]:
+		detail_picker.select(detail_mode)
+		var filtered: PackedStringArray = window.call("_visible_properties_for", sun)
+		for property_name in WindowScript.DIRECTIONAL_SHADOW_PROPERTIES:
+			require(not filtered.has(String(property_name)),
+					"mixer detail mode %d must leave %s in the renderer Shadow Pass" % [detail_mode, property_name])
+		for property_name in ["rotation", "light_color", "sky_mode"]:
+			require(filtered.has(property_name),
+					"mixer detail mode %d must retain normal sun control %s" % [detail_mode, property_name])
+		require(filtered.has("light_energy") or filtered.has("light_intensity_lux"),
+				"mixer detail mode %d must retain a light intensity control" % detail_mode)
+
+	if not Engine.is_editor_hint():
+		sun.free()
+		detail_picker.free()
+		window.free()
+		return
+
+	var sun_card: Control = window.call("_create_component_card", {
+		"id": &"atmosphere_sun", "label": "Atmosphere Sun",
+	}, WindowScript.CARD_WIDTH, 1.0)
+	require(sun_card.find_child("ActorPicker_atmosphere_sun", true, false) is OptionButton
+			and sun_card.find_child("Details_atmosphere_sun", true, false) is EditorInspector,
+			"the sun card must retain its scene-light picker and normal environment inspector")
+	for removed_control in ["DirectionalShadowSection", "DirectionalShadowSlotResolution", "DirectionalCsmProperties", "DirectionalPcssProperties", "DirectionalSoftShadowQuality"]:
+		require(sun_card.find_child(removed_control, true, false) == null,
+				"the environment mixer must not expose a second shadow configuration control: %s" % removed_control)
+	sun_card.free()
+
+	sun.set("directional_shadow_object_shadow_enabled", false)
+	var target_visible := false
+	for property_info in sun.get_property_list():
+		if String(property_info.get("name", "")) == "directional_shadow_object_shadow_target":
+			target_visible = (int(property_info.get("usage", 0)) & PROPERTY_USAGE_EDITOR) != 0
+	var frp := RenderingServer.get_current_rendering_method() == "frp"
+	require(target_visible == frp, "FRP must allow choosing a target before reserving its slot in Shadow Pass")
+
+	sun.set("directional_shadow_object_shadow_enabled", true)
+	target_visible = false
+	for property_info in sun.get_property_list():
+		if String(property_info.get("name", "")) == "directional_shadow_object_shadow_target":
+			target_visible = (int(property_info.get("usage", 0)) & PROPERTY_USAGE_EDITOR) != 0
+	require(target_visible, "enabling the reservation must expose the Node3D target selector")
+
+	sun.set("directional_shadow_mode", 0)
+	var conditional_fields_hidden := true
+	for property_info in sun.get_property_list():
+		var property_name := String(property_info.get("name", ""))
+		if property_name == "directional_shadow_object_shadow_enabled":
+			conditional_fields_hidden = conditional_fields_hidden \
+					and (int(property_info.get("usage", 0)) & PROPERTY_USAGE_EDITOR) == 0
+		elif property_name == "directional_shadow_object_shadow_target":
+			conditional_fields_hidden = conditional_fields_hidden \
+					and (((int(property_info.get("usage", 0)) & PROPERTY_USAGE_EDITOR) != 0) == frp)
+	require(conditional_fields_hidden,
+			"Orthogonal mode hides native reservation while FRP keeps the pass's target assignable")
+
+	sun.free()
+	detail_picker.free()
+	window.free()
+
+
+func _test_renderer_shadow_stage_schedule() -> void:
+	var active_compositor_path := "res://render/box_compositor.tres"
+	if not ResourceLoader.exists(active_compositor_path):
+		return
+	var compositor: Resource = ResourceLoader.load(active_compositor_path)
+	require(compositor != null and compositor.get("renderer") is Resource,
+			"the test project's actual FRP compositor must reference its renderer resource")
+	if compositor == null or not (compositor.get("renderer") is Resource):
+		return
+	var project_renderer: Resource = compositor.get("renderer")
+	var passes: Array = project_renderer.get("passes")
+	var shadow_index := -1
+	var lighting_index := -1
+	var shadow_provider_count := 0
+	for index in passes.size():
+		var pass_entry: Variant = passes[index]
+		if not (pass_entry is BuiltinPassScript):
+			continue
+		if pass_entry.native_id == 0:
+			shadow_provider_count += 1
+			if pass_entry.is_enabled():
+				shadow_index = index
+		elif pass_entry.native_id == 3 and pass_entry.is_enabled():
+			lighting_index = index
+	require(shadow_index >= 0 and lighting_index > shadow_index,
+			"the actual test-project renderer must schedule enabled Shadow Precompute before Lighting")
+	require(shadow_provider_count == 1,
+			"the actual renderer must contain one real Shadow Precompute entry, without a duplicate shadow pass")
 
 
 func _test_freed_node_references() -> void:
@@ -160,6 +416,7 @@ func _test_card_flow_geometry() -> void:
 
 
 func run() -> void:
+	print("Environment Mixer test context: Engine.is_editor_hint=%s" % Engine.is_editor_hint())
 	var service = ServiceScript.new()
 	var definitions: Array[Dictionary] = service.get_component_definitions()
 	var expected_ids: Array[StringName] = [
@@ -172,6 +429,10 @@ func run() -> void:
 	require(not actual_ids.has(&"magic_gi") and not actual_ids.has(&"rtgi")
 			and not actual_ids.has(&"reflect_probe"), "GI and reflection actors must stay outside the environment mixer")
 	_test_minimal_property_names()
+	_test_directional_shadow_defaults_and_roundtrip()
+	_test_frp_shadow_resolution_setting_storage()
+	_test_directional_shadow_mixer_controls()
+	_test_renderer_shadow_stage_schedule()
 	_test_freed_node_references()
 	_test_module_visibility()
 	await _test_card_flow_geometry()

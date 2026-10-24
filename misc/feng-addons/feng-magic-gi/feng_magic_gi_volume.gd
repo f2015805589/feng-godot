@@ -13,6 +13,10 @@ signal surface_refresh_completed(generation: int, success: bool)
 
 const Runtime = preload("feng_magic_gi_runtime.gd")
 const Baker = preload("feng_magic_gi_baker.gd")
+const VolumeSourceBaker = preload("feng_magic_gi_volume_source_baker.gd")
+const VolumeSourceChunk = preload("feng_magic_gi_volume_source_chunk.gd")
+const PreparedArchive = preload("feng_magic_gi_prepared_brick_archive.gd")
+const PagedSourceBaker = preload("feng_magic_gi_paged_source_baker.gd")
 const Placement = preload("feng_magic_gi_placement.gd")
 const Viz = preload("feng_magic_gi_viz.gd")
 const Data = preload("feng_magic_gi_data.gd")
@@ -29,10 +33,12 @@ const PRT_ONLY_PROPERTIES := [
 	"probe_spacing", "surface_offset", "adaptive_placement", "minimum_probe_spacing",
 	"bake_samples", "bake_bounces", "bake_distance", "terrain_reflectance",
 	"fallback_material_reflectance", "use_clv", "clv_cell_size", "clv_cells_per_frame",
+	"clv_cache_backend",
 	"chunked_baking", "management_block_size", "core_page_size", "bake_output_directory",
-	"stream_distance", "stream_hysteresis", "cpu_resident_budget_mib",
+	"stream_distance", "stream_hysteresis", "gi_radius_m", "cpu_resident_budget_mib",
 	"gpu_resident_budget_mib", "upload_budget_mib_per_frame", "max_inflight_page_loads",
-	"sun", "lighting_environment", "show_probes", "show_sh_probes", "bake_data",
+	"sun", "lighting_environment", "show_probes", "show_sh_probes", "display_probes_by_clv",
+	"probe_clv_level", "probe_clv_view", "bake_data",
 	"bake_manifest",
 ]
 const PRT_ONLY_GROUPS := ["Runtime Cache", "Paged Baking", "Page Streaming"]
@@ -108,7 +114,16 @@ func _validate_property(property: Dictionary) -> void:
 		# Hide PRT controls without removing their serialized values, so switching
 		# modes never discards an existing bake or its settings.
 		property["usage"] = PROPERTY_USAGE_STORAGE
+	elif uses_free_space_clv_bake() and property_name in [
+			"chunked_baking", "management_block_size", "core_page_size",
+			"probe_spacing", "surface_offset", "adaptive_placement", "minimum_probe_spacing",
+			"stream_distance", "stream_hysteresis"]:
+		# Prepared CLV uses per-level bricks and a strict spherical radius.
+		# They do not configure this baker's .25 m source/prepared lattice.
+		property["usage"] = PROPERTY_USAGE_STORAGE
 	elif not is_surfel_mode() and property_name == "surfel_settings":
+		property["usage"] = PROPERTY_USAGE_STORAGE
+	elif property_name in ["probe_clv_level", "probe_clv_view"] and not display_probes_by_clv:
 		property["usage"] = PROPERTY_USAGE_STORAGE
 
 class SurfaceRefreshRequest:
@@ -139,7 +154,7 @@ class SurfaceRefreshRequest:
 		_settings_changed()
 		if _viz != null:
 			Viz.update_box(self, _viz)
-@export_range(0.1, 16.0, 0.1, "or_greater", "suffix:m") var probe_spacing := 1.0:
+@export_range(0.1, 16.0, 0.1, "or_greater", "suffix:m") var probe_spacing := 0.25:
 	set(value):
 		probe_spacing = clampf(value, 0.1, 4096.0)
 		_settings_changed()
@@ -147,8 +162,8 @@ class SurfaceRefreshRequest:
 	set(value):
 		surface_offset = clampf(value, 0.001, 0.2)
 		_settings_changed()
-## Refine near nearby surfaces, corners and thin walls; smooth areas retain Probe Spacing.
-@export var adaptive_placement := true:
+## Keep the requested probe spacing uniform; adaptive refinement can be enabled explicitly.
+@export var adaptive_placement := false:
 	set(value):
 		adaptive_placement = value
 		_settings_changed()
@@ -183,10 +198,32 @@ class SurfaceRefreshRequest:
 		_settings_changed()
 @export_range(0.0, 8.0, 0.01) var gi_strength := 1.0
 @export_group("Runtime Cache")
-@export var use_clv := true
-@export_range(0.1, 2.0, 0.025, "suffix:m") var clv_cell_size := 0.5:
+@export var use_clv := true:
 	set(value):
-		clv_cell_size = clampf(value, 0.1, 2.0) if is_finite(value) else 0.5
+		if use_clv == value:
+			return
+		use_clv = value
+		notify_property_list_changed()
+		_settings_changed(false)
+## Backend 1 relights resident CLV blocks from the baked directional TransferMatrix.
+## Baked total-indirect SH is not a dynamic relighting input.
+@export_enum("Legacy per-probe/pixel PRT", "MagicDawn CLV Block PRT (dynamic)") var clv_cache_backend := 1:
+	set(value):
+		var next := clampi(int(value), 0, 1)
+		if clv_cache_backend == next:
+			return
+		clv_cache_backend = next
+		notify_property_list_changed()
+		if is_inside_tree():
+			Runtime.publish(self)
+## CLV cell spacing is independent of the PRT probe spacing.
+@export_range(0.1, 2.0, 0.025, "suffix:m") var clv_cell_size := 0.25:
+	set(value):
+		var next := clampf(value, 0.1, 2.0) if is_finite(value) else 0.25
+		if is_equal_approx(clv_cell_size, next):
+			return
+		clv_cell_size = next
+		_settings_changed(false)
 @export_range(32, 512, 32) var clv_cells_per_frame := 256:
 	set(value):
 		clv_cells_per_frame = clampi(value, 32, 512)
@@ -212,18 +249,25 @@ class SurfaceRefreshRequest:
 		bake_output_directory = value.strip_edges().trim_suffix("/")
 		_settings_changed(false)
 @export_group("Page Streaming")
+## Camera-centered spherical loading and shading cutoff for paged CLV PRT.
+## The intersecting boundary brick retains its one-cell interpolation halo.
+@export_range(32.0, 512.0, 16.0, "suffix:m") var gi_radius_m := 512.0:
+	set(value):
+		gi_radius_m = clampf(value, 32.0, 512.0) if is_finite(value) else 512.0
 @export_range(32.0, 512.0, 16.0, "suffix:m") var stream_distance := 128.0:
 	set(value):
 		stream_distance = clampf(value, 32.0, 512.0)
 @export_range(0.0, 128.0, 4.0, "suffix:m") var stream_hysteresis := 32.0:
 	set(value):
 		stream_hysteresis = clampf(value, 0.0, 128.0)
-@export_range(32, 1024, 32, "suffix:MiB") var cpu_resident_budget_mib := 256:
+@export_range(32, 4096, 32, "suffix:MiB") var cpu_resident_budget_mib := 1024:
 	set(value):
-		cpu_resident_budget_mib = clampi(value, 32, 1024)
+		cpu_resident_budget_mib = clampi(value, 32, 4096)
 @export_range(64, 512, 32, "suffix:MiB") var gpu_resident_budget_mib := 128:
 	set(value):
 		gpu_resident_budget_mib = clampi(value, 64, 512)
+## Legacy page-upload budget. Prepared CLV reports this as a telemetry threshold;
+## new spatial operators are uploaded atomically, not deferred across frames.
 @export_range(4, 64, 4, "suffix:MiB") var upload_budget_mib_per_frame := 16:
 	set(value):
 		upload_budget_mib_per_frame = clampi(value, 4, 64)
@@ -246,6 +290,27 @@ class SurfaceRefreshRequest:
 		show_sh_probes = value
 		_sync_preview_exposure_request()
 		_refresh_viz()
+## Display the active view's resident CLV cells instead of the baked source probes.
+## Both marker colors and SH spheres use the current relit lighting. Editor only.
+@export var display_probes_by_clv := false:
+	set(value):
+		display_probes_by_clv = value
+		_preview_revision += 1
+		notify_property_list_changed()
+		_sync_preview_exposure_request()
+		_refresh_viz()
+## All levels shows cascade shells; select a level to inspect its complete grid.
+@export_enum("All Levels:-1", "L0:0", "L1:1", "L2:2", "L3:3", "L4:4", "L5:5", "L6:6", "L7:7", "L8:8", "L9:9") var probe_clv_level := -1:
+	set(value):
+		probe_clv_level = clampi(value, -1, 9)
+		_preview_revision += 1
+		_refresh_viz()
+## Select which editor 3D viewport supplies the resident CLV layout in split views.
+@export_enum("Viewport 1:0", "Viewport 2:1", "Viewport 3:2", "Viewport 4:3") var probe_clv_view := 0:
+	set(value):
+		probe_clv_view = clampi(value, 0, 3)
+		_preview_revision += 1
+		_refresh_viz()
 @export var enabled := true:
 	set(value):
 		enabled = value
@@ -259,6 +324,9 @@ class SurfaceRefreshRequest:
 		bake_data = value
 		if bake_data != null and not bake_data.changed.is_connected(_on_data_changed):
 			bake_data.changed.connect(_on_data_changed)
+		if bake_data != null:
+			bake_data._invalidate_baked_indirect_sh_validation_cache()
+			bake_data.has_baked_indirect_sh() # One-time payload/provenance validation at assignment.
 		_invalidate_data_cache()
 		_data_change_revision += 1
 		_preview_revision += 1
@@ -276,7 +344,13 @@ class SurfaceRefreshRequest:
 	set(value):
 		if bake_manifest == value:
 			return
+		if bake_manifest != null and bake_manifest.changed.is_connected(_on_manifest_changed):
+			bake_manifest.changed.disconnect(_on_manifest_changed)
 		bake_manifest = value
+		if bake_manifest != null:
+			if not bake_manifest.changed.is_connected(_on_manifest_changed):
+				bake_manifest.changed.connect(_on_manifest_changed)
+			bake_manifest.has_baked_indirect_sh() # Prime strict backend-1 validation once on load/publish.
 		if not is_surfel_mode():
 			_restore_prt_probe_layout()
 		if is_inside_tree() and not _bake_assigning_manifest:
@@ -339,6 +413,7 @@ var _bake_assigning_data := false
 var _bake_assigning_manifest := false
 var _streamed_bake_completed_pages := 0
 var _streamed_bake_total_pages := 0
+var _free_space_bake_stage := ""
 var _bake_generation := 0
 var _next_geometry_check := 0
 var _quick_scene_signature := 0
@@ -367,6 +442,11 @@ var _visibility_upgrade_attempt := 0
 func _enter_tree() -> void:
 	set_notify_transform(true)
 	set_process(true)
+	if bake_data != null:
+		bake_data.has_baked_indirect_sh()
+	if bake_manifest != null:
+		bake_manifest.has_baked_indirect_sh()
+		bake_manifest.total_probe_count()
 	Runtime.register(self)
 	_sync_preview_exposure_request()
 
@@ -480,11 +560,140 @@ func has_usable_bake() -> bool:
 		_validity_checked = true
 	return _cached_data_valid
 
+## Backend 1 readiness comes from valid geometry/probe data plus a directional
+## TransferMatrix. Revision-2 baked radiance SH is only a legacy diagnostic.
+func has_valid_directional_transfer() -> bool:
+	if bake_manifest != null or bake_data == null or not has_usable_bake():
+		return false
+	return bake_data.directional is Data.DirectionalData
+
+func directional_transfer_status() -> Dictionary:
+	var result := {
+		"ready": false,
+		"status": "missing_bake_data",
+		"message": "Bake valid probe geometry and directional TransferMatrix to use dynamic CLV PRT.",
+		"probe_count": 0,
+		"source_count": 0,
+		"transfer_bytes": 0,
+		"storage": "none",
+	}
+	if bake_manifest != null:
+		if not bake_manifest.is_valid():
+			result["status"] = "invalid_manifest"
+			result["message"] = "The streamed page manifest is invalid. Rebuild the page generation."
+		else:
+			result["status"] = "awaiting_streamed_page_transfer"
+			result["storage"] = "streamed_pages"
+			result["message"] = "Dynamic CLV PRT becomes ready as pages with valid directional TransferMatrix data are admitted. Older baked-SH-only pages are rejected; rebuild those pages."
+		return result
+	if bake_data == null:
+		return result
+	result["storage"] = "scene_bake_data_resource"
+	result["probe_count"] = bake_data.probe_count()
+	result["source_count"] = bake_data.emitter_count()
+	if not has_usable_bake():
+		result["status"] = "invalid_geometry_or_probe_data"
+		result["message"] = "The saved geometry/probe bake is invalid. Run a full Bake before using dynamic CLV PRT."
+		return result
+	var directional: Variant = bake_data.directional
+	if directional == null:
+		result["status"] = "missing_directional_transfer"
+		result["message"] = "This bake has no directional TransferMatrix. Baked-only SH cannot drive dynamic CLV PRT; run a full Bake."
+		return result
+	if not directional is Data.DirectionalData:
+		result["status"] = "invalid_directional_transfer"
+		result["message"] = "This bake has an unsupported directional TransferMatrix resource. Run a full Bake."
+		return result
+	# Data.is_valid() validates matrix revision, dimensions, source count, and
+	# finite values before has_usable_bake() returns true.
+	result["ready"] = true
+	result["status"] = "ready"
+	result["transfer_revision"] = directional.revision
+	result["transfer_bytes"] = (directional.transfer.size() + directional.sky.size()
+			+ directional.emission.size()) * 4
+	result["message"] = "Dynamic CLV PRT has valid geometry/probe and directional TransferMatrix data."
+	return result
+
+## True when a legacy revision-2 baked SH field is available for diagnostics.
+## Dynamic backend-1 readiness is reported by has_valid_directional_transfer().
+func has_baked_indirect_sh() -> bool:
+	if bake_manifest != null:
+		return bake_manifest.has_baked_indirect_sh()
+	return bake_data != null and has_usable_bake() and bake_data.has_baked_indirect_sh()
+
+## Compact bake provenance for runtime diagnostics and external verification.
+func baked_indirect_status() -> Dictionary:
+	var status := {
+		"ready": has_baked_indirect_sh(),
+		"semantics": "legacy_revision_2_sh_diagnostic_only",
+		"baking": is_baking(),
+		"revision": 0,
+		"probe_count": 0,
+		"float_count": 0,
+		"bytes": 0,
+		"storage": "none",
+		"path": "",
+		"radiance_unit": "linear_hdr_radiance",
+		"includes_primary_sky": false,
+		"includes_direct_light": false,
+		"field_semantics": "unavailable",
+		"requires_native_sky_ownership": true,
+		"sky_snapshot_status": "unverified_legacy_or_unavailable",
+		"sky_source": "",
+		"sky_input_signature": "",
+		"rebake_reason": "",
+		"probe_spacing": probe_spacing,
+		"clv_cell_size": clv_cell_size,
+	}
+	if bake_manifest != null:
+		status["storage"] = "immutable_page_resources"
+		status["path"] = bake_manifest.resource_path
+		status["revision"] = bake_manifest.baked_indirect_sh_revision
+		status["probe_count"] = bake_manifest.total_probe_count()
+		status["float_count"] = int(status["probe_count"]) * 27
+		status["bytes"] = int(status["float_count"]) * 4
+		status["page_count"] = bake_manifest.get_page_count()
+		var manifest_provenance: Dictionary = bake_manifest.baked_indirect_sky_provenance
+		status["sky_snapshot_status"] = String(manifest_provenance.get("status", "unverified_legacy_or_unavailable"))
+		status["sky_source"] = String(manifest_provenance.get("source", ""))
+		status["sky_input_signature"] = String(manifest_provenance.get("input_signature", ""))
+		status["includes_primary_sky"] = bake_manifest.has_baked_indirect_sh()
+		status["field_semantics"] = "secondary_plus_visibility_filtered_primary_sky" \
+				if bool(status["includes_primary_sky"]) else "legacy_geometry_transport_baked_sh_unverified"
+		if bake_manifest.baked_indirect_sh_revision == Data.BAKED_INDIRECT_SH_REVISION \
+				and not bool(status["includes_primary_sky"]):
+			status["rebake_reason"] = "This legacy SH field predates Sky provenance validation; it does not affect dynamic CLV PRT readiness."
+	elif bake_data != null:
+		status["storage"] = "scene_bake_data_resource"
+		status["path"] = bake_data.resource_path
+		if String(status["path"]).is_empty():
+			var tree := get_tree() if is_inside_tree() else null
+			var scene: Node = tree.edited_scene_root if tree != null else null
+			status["path"] = scene.scene_file_path if scene != null else ""
+		status["revision"] = bake_data.baked_indirect_sh_revision
+		status["probe_count"] = bake_data.probe_count()
+		status["float_count"] = bake_data.baked_indirect_sh.size()
+		status["bytes"] = bake_data.baked_indirect_sh.size() * 4
+		var data_provenance: Dictionary = bake_data.baked_indirect_sky_provenance
+		status["sky_snapshot_status"] = String(data_provenance.get("status", "unverified_legacy_or_unavailable"))
+		status["sky_source"] = String(data_provenance.get("source", ""))
+		status["sky_input_signature"] = String(data_provenance.get("input_signature", ""))
+		status["includes_primary_sky"] = bake_data.has_baked_indirect_sh()
+		status["field_semantics"] = "secondary_plus_visibility_filtered_primary_sky" \
+				if bool(status["includes_primary_sky"]) else "legacy_geometry_transport_baked_sh_unverified"
+		if bake_data.baked_indirect_sh_revision == Data.BAKED_INDIRECT_SH_REVISION \
+				and not bool(status["includes_primary_sky"]):
+			status["rebake_reason"] = "This legacy SH field predates Sky provenance validation; it does not affect dynamic CLV PRT readiness."
+	return status
+
 ## Indicates that this volume has saved bake data but it no longer matches the
 ## checked scene/layout. The valid old bake remains available for preview.
 func needs_rebake() -> bool:
 	return (bake_manifest != null or bake_data != null) \
-			and (_layout_stale or _layout_dirty or _scene_signature_checked and not has_bake())
+			and (_layout_stale or _layout_dirty \
+			or (_scene_signature_checked and not has_bake()) \
+			or (clv_cache_backend == 1 and bake_manifest == null \
+					and bake_data != null and not has_valid_directional_transfer()))
 
 func has_legacy_sampler_signature() -> bool:
 	return bake_data != null and _scene_signature_checked \
@@ -495,7 +704,7 @@ func bake_staleness_reasons() -> PackedStringArray:
 	if bake_manifest != null:
 		if not bake_manifest.is_valid():
 			reasons.append("the streamed page manifest is invalid")
-		elif bake_manifest.bake_settings_signature != Baker.new()._streamed_settings_signature(self):
+		elif bake_manifest.bake_settings_signature != _settings_signature_for_manifest(bake_manifest):
 			reasons.append("volume bake settings changed")
 		elif _source_watch_stale:
 			reasons.append("scene sources changed since the bake")
@@ -505,6 +714,9 @@ func bake_staleness_reasons() -> PackedStringArray:
 		return reasons
 	if bake_data == null:
 		return reasons
+	if clv_cache_backend == 1 and not has_valid_directional_transfer():
+		reasons.append(String(directional_transfer_status().get("message",
+			"this bake lacks a valid directional TransferMatrix; run a full Bake")))
 	if bake_data.format_version < Data.FORMAT_VERSION:
 		reasons.append("format %d lacks static segment blockers; upgrade a matching v5 bake or rebake to v6" % bake_data.format_version)
 	if has_legacy_sampler_signature():
@@ -563,6 +775,16 @@ func set_streamed_bake_progress(completed: int, total: int) -> void:
 
 func streamed_bake_progress() -> Vector2i:
 	return Vector2i(_streamed_bake_completed_pages, _streamed_bake_total_pages)
+
+func free_space_bake_stage() -> String:
+	return _free_space_bake_stage
+
+func uses_free_space_clv_bake() -> bool:
+	return not is_surfel_mode() and use_clv and clv_cache_backend == 1
+
+func has_free_space_source_generation() -> bool:
+	return bake_manifest != null and is_instance_valid(bake_manifest) \
+			and bake_manifest.transport_domain in [VolumeSourceBaker.TRANSPORT_DOMAIN, PreparedArchive.DOMAIN]
 
 func is_baking() -> bool:
 	return _baking or _bake_start_pending
@@ -640,6 +862,8 @@ func bake() -> bool:
 	_bake_start_pending = false
 	_layout_dirty = false
 	_layout_refresh_deadline_msec = 0
+	if uses_free_space_clv_bake():
+		return await _bake_free_space_source_generation()
 	if chunked_baking:
 		return await _bake_streamed_generation(Vector2i(2147483647, 2147483647))
 	_baking = true
@@ -679,7 +903,8 @@ func bake() -> bool:
 	return has_bake()
 
 func bake_chunk(chunk_x: int, chunk_z: int) -> bool:
-	if is_surfel_mode() or not chunked_baking or not is_inside_tree() or is_baking():
+	if is_surfel_mode() or uses_free_space_clv_bake() or not chunked_baking \
+			or not is_inside_tree() or is_baking():
 		return false
 	_bake_start_pending = true
 	var start_generation := _bake_generation
@@ -690,6 +915,143 @@ func bake_chunk(chunk_x: int, chunk_z: int) -> bool:
 		return false
 	_bake_start_pending = false
 	return await _bake_streamed_generation(Vector2i(chunk_x, chunk_z))
+
+func _bake_free_space_source_generation() -> bool:
+	if absf(clv_cell_size - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
+		push_warning("FMagicGI: free-space CLV PRT currently requires CLV Cell Size to be 0.25 m; no new generation was published.")
+		bake_status_changed.emit()
+		return false
+	var output_root := resolved_bake_directory()
+	if output_root.is_empty() or not output_root.begins_with("res://"):
+		push_warning("FMagicGI: free-space CLV PRT Bake requires a writable res:// output directory; the previous bake remains active.")
+		bake_status_changed.emit()
+		return false
+	_baking = true
+	_bake_cancel_requested = false
+	_free_space_bake_stage = "Preparing free-space CLV PRT source"
+	_streamed_bake_completed_pages = 0
+	_streamed_bake_total_pages = 0
+	bake_status_changed.emit()
+	var generation := _bake_generation
+	var scene_watch_signature := SceneTracker.stable_scene_signature(self)
+	var input_signature := SceneTracker.bake_content_signature(self)
+	var world_bounds := global_transform * AABB(-size * 0.5, size)
+	var source_dims := Vector3i((world_bounds.size / 0.25).ceil())
+	var bounded_multires := source_dims.x > 256 or source_dims.y > 256 or source_dims.z > 256 \
+		or float(source_dims.x) * source_dims.y * source_dims.z > 32768.0
+	var settings_signature := PagedSourceBaker.settings_signature(self) if bounded_multires \
+		else VolumeSourceBaker.settings_signature(self)
+	var progress := Callable(self, "_on_free_space_bake_progress")
+	var cancelled := Callable(self, "_free_space_bake_cancelled").bind(generation)
+	var source_baker := VolumeSourceBaker.new()
+	var generation_id := "prepared_%d_%d" % [Time.get_ticks_usec(), get_instance_id()]
+	var result: Dictionary
+	if bounded_multires:
+		result = await source_baker.bake_paged_async(self, generation_id, output_root,
+			{"scene_watch_signature": scene_watch_signature}, progress, cancelled)
+	else:
+		result = await source_baker.bake_async(self, {}, progress, cancelled)
+	if not is_instance_valid(self):
+		return false
+	if generation != _bake_generation or _bake_cancel_requested:
+		_finish_free_space_bake(false)
+		return false
+	if not bool(result.get("ok", false)):
+		_finish_free_space_bake(false, String(result.get("error", "Free-space CLV PRT source bake failed.")))
+		return false
+	var chunk := result.get("chunk") as VolumeSourceChunk
+	if not bounded_multires and (chunk == null or not chunk.is_valid(chunk.geometry_signature,
+			chunk.emitter_ids, chunk.emitter_static_signatures)):
+		_finish_free_space_bake(false, "Free-space CLV PRT source failed final geometry/TransferMatrix validation.")
+		return false
+	_free_space_bake_stage = "Validating captured scene before publication"
+	bake_status_changed.emit()
+	if generation != _bake_generation \
+			or input_signature != SceneTracker.bake_content_signature(self) \
+			or scene_watch_signature != SceneTracker.stable_scene_signature(self) \
+			or settings_signature != (PagedSourceBaker.settings_signature(self) if bounded_multires \
+				else VolumeSourceBaker.settings_signature(self)):
+		_finish_free_space_bake(false, "Scene, lighting-source identity, or Volume settings changed during the free-space bake; the previous generation remains active.")
+		return false
+	_free_space_bake_stage = "Saving and validating paged prepared transfer"
+	bake_status_changed.emit()
+	var saved: Dictionary = result
+	if not bounded_multires:
+		# Preserve the exact small-room bake and an on-demand source-debug archive.
+		var source_saved: Dictionary = VolumeSourceBaker.save_generation(self, chunk,
+			generation_id + "_source", output_root, settings_signature, scene_watch_signature, cancelled)
+		if source_saved.has("error"):
+			_finish_free_space_bake(false, String(source_saved.error))
+			return false
+		saved = PreparedArchive.save_source(chunk, source_saved.manifest, generation_id,
+			output_root, 16, cancelled)
+	if not is_instance_valid(self):
+		return false
+	if generation != _bake_generation or _bake_cancel_requested:
+		_finish_free_space_bake(false)
+		return false
+	if saved.has("error"):
+		_finish_free_space_bake(false, String(saved.error))
+		return false
+	var manifest := saved.get("manifest") as Manifest
+	if manifest == null or not manifest.is_valid() \
+			or manifest.transport_domain != PreparedArchive.DOMAIN:
+		_finish_free_space_bake(false, "The saved free-space CLV PRT manifest failed final validation; the previous generation remains active.")
+		return false
+	# Publish only after the immutable page and manifest have both survived reload.
+	_bake_assigning_manifest = true
+	bake_manifest = manifest
+	_bake_assigning_manifest = false
+	_bake_assigning_data = true
+	bake_data = null
+	_bake_assigning_data = false
+	_current_stable_source_signature = scene_watch_signature
+	_current_scene_signature = scene_watch_signature
+	_exact_scene_signature_available = false
+	_scene_signature_checked = true
+	_source_watch_stale = false
+	_legacy_manifest_unverified = false
+	_current_quick_source_signature = SceneTracker.quick_source_signature_uncached(self)
+	_current_watch_signature = SceneTracker.quick_signature_uncached(self)
+	_quick_scene_signature = _current_watch_signature
+	_pending_scene_signature = _current_watch_signature
+	_legacy_watch_baseline_signature = _current_watch_signature
+	_layout_stale = false
+	_layout_dirty = false
+	_layout_refresh_deadline_msec = 0
+	_clear_candidate_layout()
+	_layout_epoch += 1
+	_preview_revision += 1
+	_preview_layout_match_key = ""
+	_free_space_bake_stage = "Complete"
+	_baking = false
+	_bake_cancel_requested = false
+	Runtime.publish(self)
+	update_configuration_warnings()
+	bake_status_changed.emit()
+	return has_bake()
+
+func _on_free_space_bake_progress(stage: String, completed: int, total: int,
+		_batch: int, _batch_count: int) -> void:
+	if not _baking:
+		return
+	_free_space_bake_stage = stage
+	_streamed_bake_completed_pages = maxi(completed, 0)
+	_streamed_bake_total_pages = maxi(total, 0)
+	bake_status_changed.emit()
+
+func _free_space_bake_cancelled(generation: int) -> bool:
+	return not is_instance_valid(self) or not is_inside_tree() or is_surfel_mode() \
+			or generation != _bake_generation or _bake_cancel_requested
+
+func _finish_free_space_bake(success: bool, error_message := "") -> void:
+	_baking = false
+	_bake_cancel_requested = false
+	_free_space_bake_stage = "Complete" if success else ""
+	if not error_message.is_empty():
+		push_warning("FMagicGI: " + error_message)
+		update_configuration_warnings()
+	bake_status_changed.emit()
 
 func _cancel_and_wait_for_surface_refresh() -> void:
 	if not _refresh_active:
@@ -817,6 +1179,15 @@ func _settle_layout_change() -> void:
 	if _has_saved_bake():
 		_layout_stale = not _saved_bake_matches_current()
 		Viz.set_layout_stale(_viz, _layout_stale)
+		Runtime.publish(self)
+		update_configuration_warnings()
+		bake_status_changed.emit()
+		return
+	if uses_free_space_clv_bake():
+		# No surface-probe layout is consumed by the free-space TransferMatrix bake.
+		_scene_signature_checked = false
+		_layout_stale = false
+		Viz.set_layout_stale(_viz, false)
 		Runtime.publish(self)
 		update_configuration_warnings()
 		bake_status_changed.emit()
@@ -1192,7 +1563,7 @@ func _saved_bake_matches_current() -> bool:
 				and bake_manifest.scene_watch_signature <= 0:
 			return false
 		if not has_usable_bake() \
-				or Baker.new()._streamed_settings_signature(self) != bake_manifest.bake_settings_signature:
+				or _settings_signature_for_manifest(bake_manifest) != bake_manifest.bake_settings_signature:
 			return false
 		if bake_manifest.scene_watch_signature > 0:
 			return _saved_source_signature_matches_current()
@@ -1225,6 +1596,15 @@ func _saved_bake_matches_current() -> bool:
 		return Data.geometry_signature_matches(bake_data.scene_signature, _current_scene_signature)
 	return _legacy_watch_baseline_signature > 0 \
 			and _legacy_watch_baseline_signature == _current_watch_signature
+
+func _settings_signature_for_manifest(manifest: Manifest) -> int:
+	if manifest != null and manifest.transport_domain == PreparedArchive.DOMAIN \
+			and manifest.prepared_bake_algorithm == "multires_independent_transport_v1":
+		return PagedSourceBaker.settings_signature(self, {"prepared_levels": manifest.prepared_level_count,
+			"core_axis": manifest.prepared_core_axis})
+	if manifest != null and manifest.transport_domain in [VolumeSourceBaker.TRANSPORT_DOMAIN, PreparedArchive.DOMAIN]:
+		return VolumeSourceBaker.settings_signature(self)
+	return Baker.new()._streamed_settings_signature(self)
 
 func _set_probe_layout_from_data(data: Data) -> void:
 	if data == null:
@@ -1288,6 +1668,8 @@ func is_layout_stale() -> bool:
 	return _layout_stale or _layout_dirty
 
 func _on_data_changed() -> void:
+	if bake_data != null:
+		bake_data._invalidate_baked_indirect_sh_validation_cache()
 	_invalidate_data_cache()
 	_data_change_revision += 1
 	_preview_revision += 1
@@ -1299,15 +1681,28 @@ func _on_data_changed() -> void:
 		_schedule_saved_source_validation()
 	Runtime.publish(self)
 
+func _on_manifest_changed() -> void:
+	if bake_manifest != null:
+		bake_manifest._invalidate_validation_cache()
+		bake_manifest.has_baked_indirect_sh()
+	if is_inside_tree():
+		Runtime.publish(self)
+
 func _get_configuration_warnings() -> PackedStringArray:
 	var warnings := PackedStringArray()
 	if is_surfel_mode():
 		return warnings
 	var dims := grid_dimensions()
-	if not chunked_baking and (dims.x > Data.MAX_GRID_AXIS \
+	if uses_free_space_clv_bake() and absf(clv_cell_size - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
+		warnings.append("Free-space CLV PRT source cells are fixed at 0.25 m. Set CLV Cell Size to 0.25 m or use another backend.")
+	if clv_cache_backend == 1 and bake_manifest != null \
+			and bake_manifest.transport_domain.is_empty() \
+			and bake_manifest.has_baked_indirect_sh():
+		warnings.append("This manifest contains legacy baked indirect SH, not a free-space TransferMatrix. Run a full free-space CLV PRT Bake; the old field is not converted.")
+	if not uses_free_space_clv_bake() and not chunked_baking and (dims.x > Data.MAX_GRID_AXIS \
 			or dims.y > Data.MAX_GRID_AXIS or dims.z > Data.MAX_GRID_AXIS):
 		warnings.append("The lookup grid is limited to 64 cells per axis. Reduce the volume or increase Probe Spacing.")
-	if not _placement_warning_message.is_empty():
+	if not uses_free_space_clv_bake() and not _placement_warning_message.is_empty():
 		warnings.append(_placement_warning_message)
 	if bake_manifest != null and _scene_signature_checked:
 		if not has_usable_bake():
@@ -1329,10 +1724,15 @@ func _get_configuration_warnings() -> PackedStringArray:
 			var emission_warning := Runtime.emission_warning(self)
 			if not emission_warning.is_empty():
 				warnings.append(emission_warning)
+	elif clv_cache_backend == 1 and bake_manifest == null and bake_data != null \
+			and not bool(directional_transfer_status().get("ready", false)):
+		warnings.append(String(directional_transfer_status().get("message", "Dynamic CLV PRT needs a valid directional TransferMatrix.")))
 	var current_layout_count := candidate_probe_count() if _candidate_layout_ready else probe_count()
-	if not chunked_baking and current_layout_count >= Placement.MAX_PROBES:
+	if not uses_free_space_clv_bake() and not chunked_baking \
+			and current_layout_count >= Placement.MAX_PROBES:
 		warnings.append("Surface sample limit reached. Increase Probe Spacing or reduce the volume.")
-	if not chunked_baking and current_layout_count == 0 and _scene_signature_checked:
+	if not uses_free_space_clv_bake() and not chunked_baking \
+			and current_layout_count == 0 and _scene_signature_checked:
 		warnings.append("No supported surface geometry intersects this volume; the baker will not create air samples.")
 	return warnings
 

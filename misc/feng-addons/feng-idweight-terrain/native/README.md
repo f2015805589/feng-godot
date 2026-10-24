@@ -17,6 +17,17 @@ links project addons directly to `misc/feng-addons/` when opening a project.
 Restart the editor after rebuilding a loaded DLL. The `native/.gdignore` file excludes
 compiler sources from project resource scanning.
 
+### Active Windows debug library
+
+The terrain project currently routes `windows.debug.x86_64` through
+`bin/libfeng-idweight-terrain.windows.debug.x86_64.gl-normal-fix.dll`. SCons still
+builds the standard `bin/libfeng-idweight-terrain.windows.debug.x86_64.dll` name.
+After editors using the active DLL have exited, copy the fresh build to the active
+filename; if the standard DLL is still locked, build in an independent staging copy
+and copy that output instead. Once the old standard DLL is released, it can be
+replaced with the rebuilt library and the `.gdextension` debug x64 mapping restored
+to the standard filename.
+
 Validate R16 rendering and editor integration before release using the relevant
 checks in [`tests/README.md`](tests/README.md).
 

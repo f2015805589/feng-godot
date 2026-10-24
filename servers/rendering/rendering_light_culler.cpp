@@ -72,7 +72,7 @@ String RenderingLightCuller::Data::plane_bitfield_to_string(unsigned int BF) {
 }
 #endif
 
-void RenderingLightCuller::prepare_directional_light(const RendererSceneCull::Instance *p_instance, int32_t p_directional_light_id) {
+void RenderingLightCuller::prepare_directional_light(const RendererSceneCull::Instance *p_instance, int32_t p_directional_light_id, int32_t p_cascade_count, const real_t *p_cascade_distances) {
 	//data.directional_light = p_instance;
 	// Something is probably going wrong, we shouldn't have this many directional lights...
 	ERR_FAIL_COND(p_directional_light_id > 512);
@@ -83,10 +83,10 @@ void RenderingLightCuller::prepare_directional_light(const RendererSceneCull::In
 		data.directional_cull_planes.resize(p_directional_light_id + 1);
 	}
 
-	_prepare_light(*p_instance, p_directional_light_id);
+	_prepare_light(*p_instance, p_directional_light_id, p_cascade_count, p_cascade_distances);
 }
 
-bool RenderingLightCuller::_prepare_light(const RendererSceneCull::Instance &p_instance, int32_t p_directional_light_id) {
+bool RenderingLightCuller::_prepare_light(const RendererSceneCull::Instance &p_instance, int32_t p_directional_light_id, int32_t p_directional_cascade_count, const real_t *p_cascade_distances) {
 	if (!data.is_active()) {
 		return true;
 	}
@@ -112,7 +112,9 @@ bool RenderingLightCuller::_prepare_light(const RendererSceneCull::Instance &p_i
 			lsource.type = LightSource::ST_DIRECTIONAL;
 
 			lsource.range = RSG::light_storage->light_get_param(p_instance.base, RSE::LIGHT_PARAM_SHADOW_MAX_DISTANCE);
-			switch (RSG::light_storage->light_directional_get_shadow_mode(p_instance.base)) {
+			if (p_directional_cascade_count > 0) {
+				lsource.cascade_count = p_directional_cascade_count;
+			} else switch (RSG::light_storage->light_directional_get_shadow_mode(p_instance.base)) {
 				case RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL:
 					lsource.cascade_count = 1;
 					break;
@@ -122,8 +124,11 @@ bool RenderingLightCuller::_prepare_light(const RendererSceneCull::Instance &p_i
 				case RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS:
 					lsource.cascade_count = 4;
 					break;
+				case RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_3_SPLITS:
+					lsource.cascade_count = 3;
+					break;
 				default:
-					ERR_FAIL_V_MSG(false, "Only directional lights with 1, 2, or 4 shadow cascades are supported.");
+					ERR_FAIL_V_MSG(false, "Only directional lights with 1, 2, 3, or 4 shadow cascades are supported.");
 					break;
 			}
 			lsource.cascade_splits[0] = RSG::light_storage->light_get_param(p_instance.base, RSE::LIGHT_PARAM_SHADOW_SPLIT_1_OFFSET);
@@ -161,6 +166,11 @@ bool RenderingLightCuller::_prepare_light(const RendererSceneCull::Instance &p_i
 			};
 			// If not 4 cascades, replace last used cascade plane distance with max shadow range (shadow far plane distance).
 			plane_distances[used_planes - 1] = shadow_far;
+			if (p_cascade_distances) {
+				for (int i = 0; i < used_planes; i++) {
+					plane_distances[i] = p_cascade_distances[i];
+				}
+			}
 #ifdef LIGHT_CULLER_DEBUG_LOGGING
 			if (is_logging()) {
 				print_line("cascade split planes (first " + itos(used_planes) + " used): " +

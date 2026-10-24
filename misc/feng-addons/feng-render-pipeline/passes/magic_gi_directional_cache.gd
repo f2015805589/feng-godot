@@ -13,6 +13,14 @@ var _emission := RID()
 var _sources := RID()
 var _normals := RID()
 var lighting := RID()
+## Normal-independent, uncalibrated directional SH sidecar for the layout-14 V0 field.
+## The existing calibrated `lighting` buffer and its 20-vec4 stride are unchanged.
+var raw_lighting := RID()
+var raw_lighting_bytes := 0
+## Static revision-2 total indirect SH9 used by the layout-16 block producer.
+## Stride is seven vec4s per probe (27 coefficient lanes + zero padding).
+var baked_indirect_lighting := RID()
+var baked_indirect_lighting_bytes := 0
 var probes := 0
 var emitters := 0
 var epoch := 0
@@ -25,6 +33,10 @@ var _upload_task_offset := 0
 var _ready := false
 var _failed := false
 var _payloads: Dictionary = {}
+var _raw_source_key: Array = []
+var _clv_input_key: Array = []
+var _clv_input_revision := 0
+var _clv_sources_ready := false
 
 func create(rd: RenderingDevice, data: Resource) -> bool:
 	if not begin_create(rd, data):
@@ -65,11 +77,22 @@ func begin_create(rd: RenderingDevice, data: Resource, packed_upload: Dictionary
 		for normal: Vector3 in data.get("normals"):
 			packed_normals.append_array([normal.x, normal.y, normal.z, 0.0])
 		normals_bytes = packed_normals.to_byte_array()
+	var baked_lighting_bytes: PackedByteArray = packed_upload.get(
+		"baked_indirect_sh_bytes", PackedByteArray())
+	var has_baked_indirect := data.has_method("has_baked_indirect_sh") \
+			and bool(data.call("has_baked_indirect_sh"))
+	if has_baked_indirect and baked_lighting_bytes.is_empty() \
+			and data.has_method("make_baked_indirect_sh_upload_bytes"):
+		baked_lighting_bytes = data.call("make_baked_indirect_sh_upload_bytes")
+	if has_baked_indirect and baked_lighting_bytes.size() != probes * 28 * 4:
+		return false
+	baked_indirect_lighting_bytes = baked_lighting_bytes.size() if has_baked_indirect else 0
 	var payloads := {
 		"transfer": transfer_bytes,
 		"sky": sky_bytes,
 		"emission": emission_bytes,
 		"normals": normals_bytes,
+		"baked_indirect_lighting": baked_lighting_bytes,
 	}
 	_allocation_tasks = [
 		{"name": "transfer", "size": maxi(4, transfer_bytes.size())},
@@ -79,7 +102,15 @@ func begin_create(rd: RenderingDevice, data: Resource, packed_upload: Dictionary
 		{"name": "lighting", "size": maxi(4, probes * 20 * 16)},
 		{"name": "normals", "size": maxi(4, normals_bytes.size())},
 	]
+	if has_baked_indirect:
+		_allocation_tasks.append({"name": "baked_indirect_lighting",
+			"size": baked_lighting_bytes.size()})
+	raw_lighting_bytes = maxi(4, probes * 18 * 16)
 	_source_key.clear()
+	_raw_source_key.clear()
+	_clv_input_key.clear()
+	_clv_input_revision = 0
+	_clv_sources_ready = false
 	_spirv = RelightShader.get_spirv()
 	_payloads = payloads
 	if _spirv == null or RelightShader.base_error != "" \
@@ -124,6 +155,7 @@ func allocate_step(rd: RenderingDevice, max_allocations: int) -> int:
 			"sources": _sources = rid
 			"lighting": lighting = rid
 			"normals": _normals = rid
+			"baked_indirect_lighting": baked_indirect_lighting = rid
 		var payload_key := String(task["name"])
 		if payload_key == "normals":
 			payload_key = "normals"
@@ -178,6 +210,16 @@ func upload_step(rd: RenderingDevice, byte_budget: int) -> int:
 func is_ready() -> bool:
 	return _ready and not _failed
 
+## Allocate the normal-independent sidecar only when the private layout-14 test
+## is selected. Authored backends keep the original memory footprint.
+func ensure_raw_sidecar(rd: RenderingDevice) -> bool:
+	if not _ready or probes <= 0:
+		return false
+	if raw_lighting.is_valid():
+		return true
+	raw_lighting = rd.storage_buffer_create(raw_lighting_bytes)
+	return raw_lighting.is_valid()
+
 ## Stop future work while keeping partial RIDs visible to owned_rids() so the
 ## pass can release them together with its failed page-ledger admission.
 func abort() -> void:
@@ -190,15 +232,19 @@ func abort() -> void:
 	_upload_task_offset = 0
 	_payloads.clear()
 
-func update(rd: RenderingDevice, ubo: RID, snapshot: Dictionary, surface_lighting: RID) -> bool:
-	if not _ready:
+func update(rd: RenderingDevice, ubo: RID, snapshot: Dictionary, surface_lighting: RID,
+		write_raw_sidecar := false) -> bool:
+	if not _ready or (write_raw_sidecar and not ensure_raw_sidecar(rd)):
 		return false
 	var sources: PackedFloat32Array = snapshot.get("emission_sources", PackedFloat32Array())
 	if sources.size() != emitters * 6:
 		return false
 	var key := [snapshot.get("lighting"), snapshot.get("sky_lighting"), sources, snapshot.get("emission_revision", 0)]
-	if key == _source_key:
+	if key == _source_key and (not write_raw_sidecar or key == _raw_source_key):
 		return true
+	var raw_output := raw_lighting if write_raw_sidecar else lighting
+	if not raw_output.is_valid():
+		return false
 	if not sources.is_empty():
 		var bytes := sources.to_byte_array()
 		if rd.buffer_update(_sources, 0, bytes.size(), bytes) != OK:
@@ -206,10 +252,10 @@ func update(rd: RenderingDevice, ubo: RID, snapshot: Dictionary, surface_lightin
 	var uniforms := UniformSetCacheRD.get_cache(_shader, 0, [
 		U.storage_buffer(0, _transfer), U.storage_buffer(1, _sky), U.storage_buffer(2, _emission),
 		U.storage_buffer(3, _sources), U.uniform_buffer(4, ubo), U.storage_buffer(5, lighting), U.storage_buffer(6, _normals),
-		U.storage_buffer(7, surface_lighting)])
+		U.storage_buffer(7, surface_lighting), U.storage_buffer(8, raw_output)])
 	if not uniforms.is_valid():
 		return false
-	var push := PackedInt32Array([probes, emitters]).to_byte_array()
+	var push := PackedInt32Array([probes, emitters, 1 if write_raw_sidecar else 0]).to_byte_array()
 	var list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, _pipeline)
 	rd.compute_list_bind_uniform_set(list, uniforms, 0)
@@ -217,11 +263,65 @@ func update(rd: RenderingDevice, ubo: RID, snapshot: Dictionary, surface_lightin
 	rd.compute_list_dispatch(list, (probes + 63) / 64, 1, 1)
 	rd.compute_list_end()
 	_source_key = key.duplicate(true)
+	_raw_source_key = key.duplicate(true) if write_raw_sidecar else []
 	epoch += 1
 	return true
 
+## Keep the immutable transfer resources and update only the live emitter inputs.
+## Directional/sky SH stay in the per-view GI UBO; this revision tracks their
+## signature together with the source payload so CLV blocks use one coherent epoch.
+func update_clv_inputs(rd: RenderingDevice, snapshot: Dictionary) -> bool:
+	if not _ready or _failed or not _transfer.is_valid() or not _sky.is_valid() \
+			or not _emission.is_valid() or not _sources.is_valid():
+		return false
+	var sources: PackedFloat32Array = snapshot.get("emission_sources", PackedFloat32Array())
+	if sources.size() != emitters * 6:
+		return false
+	var key := [snapshot.get("lighting"), snapshot.get("sky_lighting"), sources,
+		snapshot.get("emission_revision", 0)]
+	if key == _clv_input_key:
+		return true
+	if not sources.is_empty():
+		var bytes := sources.to_byte_array()
+		if rd.buffer_update(_sources, 0, bytes.size(), bytes) != OK:
+			return false
+	_clv_input_key = key.duplicate(true)
+	_clv_input_revision += 1
+	_clv_sources_ready = true
+	return true
+
+func get_clv_transfer_bindings() -> Dictionary:
+	return {
+		"transfer": _transfer,
+		"sky": _sky,
+		"emission": _emission,
+		"sources": _sources,
+		"probes": probes,
+		"emitters": emitters,
+		"lighting_revision": _clv_input_revision,
+		"sources_ready": _clv_sources_ready,
+	}
+
+func get_clv_input_revision() -> int:
+	return _clv_input_revision
+
+func get_clv_input_state() -> Dictionary:
+	return {"lighting_revision": _clv_input_revision,
+		"sources_ready": _clv_sources_ready, "probes": probes, "emitters": emitters}
+
+func raw_sidecar_matches(snapshot: Dictionary) -> bool:
+	if not raw_lighting.is_valid():
+		return false
+	var sources: PackedFloat32Array = snapshot.get("emission_sources", PackedFloat32Array())
+	if sources.size() != emitters * 6:
+		return false
+	var key := [snapshot.get("lighting"), snapshot.get("sky_lighting"), sources,
+		snapshot.get("emission_revision", 0)]
+	return key == _raw_source_key
+
 func owned_rids() -> Array[RID]:
-	return [_pipeline, _shader, _transfer, _sky, _emission, _sources, _normals, lighting]
+	return [_pipeline, _shader, _transfer, _sky, _emission, _sources, _normals,
+		lighting, raw_lighting, baked_indirect_lighting]
 
 static func _buffer(rd: RenderingDevice, values: PackedFloat32Array) -> RID:
 	var bytes := values.to_byte_array()

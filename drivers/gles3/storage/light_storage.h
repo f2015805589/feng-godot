@@ -442,6 +442,10 @@ public:
 	virtual uint32_t light_get_max_sdfgi_cascade(RID p_light) override { return 0; }
 	virtual uint64_t light_get_version(RID p_light) const override;
 	virtual uint32_t light_get_cull_mask(RID p_light) const override;
+	virtual void light_directional_set_shadow_object_shadow_enabled(RID p_light, bool p_enabled) override {}
+	virtual bool light_directional_get_shadow_object_shadow_enabled(RID p_light) const override { return false; }
+	virtual void light_directional_set_shadow_object_shadow_instances(RID p_light, const Vector<RID> &p_instances) override {}
+	virtual Vector<RID> light_directional_get_shadow_object_shadow_instances(RID p_light) const override { return Vector<RID>(); }
 
 	/* LIGHT INSTANCE API */
 
@@ -453,6 +457,7 @@ public:
 
 	virtual void light_instance_set_transform(RID p_light_instance, const Transform3D &p_transform) override;
 	virtual void light_instance_set_aabb(RID p_light_instance, const AABB &p_aabb) override;
+	virtual void light_instance_set_directional_shadow_object_state(RID p_light_instance, uint32_t p_cascade_count, bool p_object_reserved, bool p_object_active) override {}
 	virtual void light_instance_set_shadow_transform(RID p_light_instance, const Projection &p_projection, const Transform3D &p_transform, float p_far, float p_split, int p_pass, float p_shadow_texel_size, float p_bias_scale = 1.0, float p_range_begin = 0, const Vector2 &p_uv_scale = Vector2()) override;
 	virtual void light_instance_mark_visible(RID p_light_instance) override;
 
@@ -916,6 +921,7 @@ public:
 	virtual void directional_shadow_atlas_set_size(int p_size, bool p_16_bits = true) override;
 	virtual int get_directional_light_shadow_size(RID p_light_instance) override;
 	virtual void set_directional_shadow_count(int p_count) override;
+	virtual bool set_directional_shadow_lights(const Vector<RID> &p_light_instances) override;
 
 	Rect2i get_directional_shadow_rect();
 	void update_directional_shadow_atlas();

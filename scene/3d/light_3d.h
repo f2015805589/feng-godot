@@ -163,9 +163,10 @@ class DirectionalLight3D : public Light3D {
 
 public:
 	enum ShadowMode {
-		SHADOW_ORTHOGONAL,
-		SHADOW_PARALLEL_2_SPLITS,
-		SHADOW_PARALLEL_4_SPLITS,
+		SHADOW_ORTHOGONAL = 0,
+		SHADOW_PARALLEL_2_SPLITS = 1,
+		SHADOW_PARALLEL_4_SPLITS = 2,
+		SHADOW_PARALLEL_3_SPLITS = 3,
 	};
 
 	enum SkyMode {
@@ -178,14 +179,25 @@ private:
 	bool blend_splits;
 	ShadowMode shadow_mode;
 	SkyMode sky_mode = SKY_MODE_LIGHT_AND_SKY;
+	bool object_shadow_enabled = false;
+	NodePath object_shadow_target;
+
+	void _update_object_shadow_target_instances();
+	void _collect_object_shadow_instances(Node *p_node, Vector<RID> &r_instances) const;
 
 protected:
 	static void _bind_methods();
 	void _validate_property(PropertyInfo &p_property) const;
+	void _notification(int p_what);
 
 public:
 	void set_shadow_mode(ShadowMode p_mode);
 	ShadowMode get_shadow_mode() const;
+
+	void set_object_shadow_enabled(bool p_enabled);
+	bool is_object_shadow_enabled() const;
+	void set_object_shadow_target(const NodePath &p_target);
+	NodePath get_object_shadow_target() const;
 
 	void set_blend_splits(bool p_enable);
 	bool is_blend_splits_enabled() const;
@@ -194,6 +206,7 @@ public:
 	SkyMode get_sky_mode() const;
 
 	DirectionalLight3D();
+	PackedStringArray get_configuration_warnings() const override;
 };
 
 VARIANT_ENUM_CAST(DirectionalLight3D::ShadowMode)
