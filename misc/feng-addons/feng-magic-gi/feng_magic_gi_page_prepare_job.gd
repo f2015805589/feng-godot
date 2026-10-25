@@ -4,7 +4,6 @@ extends RefCounted
 ## validation, texture packing, and large float-to-byte copies off the main loop.
 
 const Page = preload("feng_magic_gi_page.gd")
-const Data = preload("feng_magic_gi_data.gd")
 const VolumeSourceChunk = preload("feng_magic_gi_volume_source_chunk.gd")
 
 var page: Page
@@ -33,8 +32,7 @@ func configure(source_page: Page, generation: String, page_key: String,
 func run() -> void:
 	valid = false
 	error = ""
-	if page == null or not is_instance_valid(page) \
-			or not page.is_header_valid(expected_generation, expected_page_key):
+	if page == null or not page.is_header_valid(expected_generation, expected_page_key):
 		error = "Loaded page failed generation, key, bounds, payload header, or budget validation."
 		return
 	if not expected_content_hash.is_empty() and FileAccess.get_sha256(resource_path) != expected_content_hash:
@@ -46,31 +44,16 @@ func run() -> void:
 	if page.prepared_transfer_brick != null:
 		_prepare_transfer_brick()
 		return
-	if not page.is_valid(expected_generation, expected_page_key):
-		error = "Loaded legacy page failed Data validation."
-		return
 	var data := page.data
-	if not data is Data:
-		error = "Loaded page has no supported FMagicGIData payload."
-		return
+	# Header admission owns page identity/budgets; packing owns deep Data validation.
 	var packed := data.make_render_upload()
 	if packed.is_empty():
 		error = "Could not prepare the immutable page render textures and buffers."
 		return
-	var directional: Variant = data.directional
-	if directional != null:
-		var transfer: PackedFloat32Array = directional.transfer
-		var sky: PackedFloat32Array = directional.sky
-		var source_transport: PackedFloat32Array = directional.emission
-		if not directional.is_valid(data.probe_count(), data.emitter_count()) \
-				or transfer.size() != data.probe_count() * 243 \
-				or sky.size() != data.probe_count() * 81 \
-				or source_transport.size() != data.probe_count() * data.emitter_count() * 54:
-			error = "Directional arrays do not match the immutable page layout."
-			return
-		packed["directional_transfer_bytes"] = transfer.to_byte_array()
-		packed["directional_sky_bytes"] = sky.to_byte_array()
-		packed["directional_emission_bytes"] = source_transport.to_byte_array()
+	if data.directional != null:
+		packed["directional_transfer_bytes"] = data.directional.transfer.to_byte_array()
+		packed["directional_sky_bytes"] = data.directional.sky.to_byte_array()
+		packed["directional_emission_bytes"] = data.directional.emission.to_byte_array()
 	var normal_values := PackedFloat32Array()
 	normal_values.resize(data.probe_count() * 4)
 	for probe in data.probe_count():
@@ -98,10 +81,7 @@ func run() -> void:
 
 func _prepare_free_space_source() -> void:
 	var chunk: VolumeSourceChunk = page.free_space_volume_source
-	if page.data != null or chunk == null \
-			or chunk.probe_count != page.probe_count \
-			or chunk.geometry_signature != page.geometry_signature \
-			or not chunk.is_valid(page.geometry_signature):
+	if not chunk.is_valid(page.geometry_signature):
 		error = "Free-space source page failed deep coefficient, moment, OBB, or geometry-signature validation."
 		return
 	if emission_sources.size() != chunk.emitter_count * 6:
@@ -122,7 +102,7 @@ func _prepare_free_space_source() -> void:
 
 func _prepare_transfer_brick() -> void:
 	var brick: Resource = page.prepared_transfer_brick
-	if not page.is_valid(expected_generation, expected_page_key):
+	if not brick.is_valid(page.geometry_signature):
 		error = "Prepared brick failed deep operator, halo, identity, or bounds validation."
 		return
 	if emission_sources.size() != brick.emitter_count * 6:

@@ -4,10 +4,9 @@ extends RefCounted
 ## One selected FengSkyLight provider per World3D. Providers register on
 ## lifecycle/configuration changes; this registry does not scan the scene tree.
 
-static var _providers_by_world: Dictionary = {} # world id -> provider id -> {ref, order}
+static var _providers_by_world: Dictionary = {} # world id -> registration-ordered provider id -> WeakRef
 static var _world_by_provider: Dictionary = {} # provider id -> world id
 static var _active_by_world: Dictionary = {} # world id -> WeakRef
-static var _registration_order := 0
 
 
 static func retain_capture_effects_until_rendered(effects: Array[CompositorEffect]) -> void:
@@ -30,7 +29,7 @@ static func retain_capture_effects_until_rendered(effects: Array[CompositorEffec
 	)
 
 
-static func refresh_provider(provider: Object) -> void:
+static func refresh_provider(provider: FengSkyLight) -> void:
 	if provider == null or not is_instance_valid(provider):
 		return
 	var provider_id := provider.get_instance_id()
@@ -45,22 +44,17 @@ static func refresh_provider(provider: Object) -> void:
 	if world_id == 0:
 		return
 	var providers: Dictionary = _providers_by_world.get(world_id, {})
-	if not providers.has(provider_id):
-		_registration_order += 1
-		providers[provider_id] = {"ref": weakref(provider), "order": _registration_order}
-	else:
-		var entry: Dictionary = providers[provider_id]
-		entry["ref"] = weakref(provider)
-		providers[provider_id] = entry
+	# Updating an existing key preserves its registration order.
+	providers[provider_id] = weakref(provider)
 	_providers_by_world[world_id] = providers
 	_world_by_provider[provider_id] = world_id
 	_resolve_world(world_id)
 	var selected := _active_provider(world_id)
-	if selected == provider and selected.has_method("_feng_sky_light_refresh_active"):
-		selected.call("_feng_sky_light_refresh_active")
+	if selected == provider:
+		selected._feng_sky_light_refresh_active()
 
 
-static func unregister_provider(provider: Object) -> void:
+static func unregister_provider(provider: FengSkyLight) -> void:
 	if provider == null or not is_instance_valid(provider):
 		return
 	var provider_id := provider.get_instance_id()
@@ -69,26 +63,17 @@ static func unregister_provider(provider: Object) -> void:
 	_world_by_provider.erase(provider_id)
 	if world_id != 0:
 		_resolve_world(world_id)
-	if _providers_by_world.is_empty():
-		_world_by_provider.clear()
 
 
-static func active_for_world(world_id: int) -> Object:
+static func active_for_world(world_id: int) -> FengSkyLight:
 	return _active_provider(world_id)
 
 
 static func snapshot_for_world(world_id: int) -> Dictionary:
 	var provider := _active_provider(world_id)
-	if provider == null or not is_instance_valid(provider) \
-			or not provider.has_method("_feng_sky_light_runtime_snapshot"):
+	if provider == null:
 		return {}
-	var value: Variant = provider.call("_feng_sky_light_runtime_snapshot")
-	if not value is Dictionary or value.is_empty():
-		return {}
-	var snapshot: Dictionary = value.duplicate()
-	snapshot["world_id"] = world_id
-	snapshot["provider_id"] = provider.get_instance_id()
-	return snapshot
+	return _tag_snapshot(provider._feng_sky_light_runtime_snapshot(), provider, world_id)
 
 
 ## Returns only the explicit active FengSkyLight's plain volumetric metadata.
@@ -96,19 +81,21 @@ static func snapshot_for_world(world_id: int) -> Dictionary:
 ## read back CPU radiance SH data.
 static func volumetric_metadata_for_world(world_id: int) -> Dictionary:
 	var provider := _active_provider(world_id)
-	if provider == null or not is_instance_valid(provider) \
-			or not provider.has_method("_feng_sky_light_volumetric_metadata"):
+	if provider == null:
 		return {}
-	var value: Variant = provider.call("_feng_sky_light_volumetric_metadata")
-	if not value is Dictionary or value.is_empty():
-		return {}
-	var metadata: Dictionary = value.duplicate()
-	metadata["world_id"] = world_id
-	metadata["provider_id"] = provider.get_instance_id()
-	return metadata
+	return _tag_snapshot(provider._feng_sky_light_volumetric_metadata(), provider, world_id)
 
 
-static func is_active(provider: Object, world_id: int) -> bool:
+static func _tag_snapshot(value: Dictionary, provider: FengSkyLight, world_id: int) -> Dictionary:
+	if value.is_empty():
+		return {}
+	var snapshot := value.duplicate()
+	snapshot["world_id"] = world_id
+	snapshot["provider_id"] = provider.get_instance_id()
+	return snapshot
+
+
+static func is_active(provider: FengSkyLight, world_id: int) -> bool:
 	return provider != null and is_instance_valid(provider) \
 			and _active_provider(world_id) == provider
 
@@ -120,8 +107,6 @@ static func _remove_candidate(world_id: int, provider_id: int) -> void:
 	providers.erase(provider_id)
 	if providers.is_empty():
 		_providers_by_world.erase(world_id)
-	else:
-		_providers_by_world[world_id] = providers
 
 
 static func _resolve_world(world_id: int) -> void:
@@ -131,55 +116,40 @@ static func _resolve_world(world_id: int) -> void:
 	# world still receives its deactivation callback and releases native routes.
 	var previous := _raw_active_provider(world_id)
 	var providers: Dictionary = _providers_by_world.get(world_id, {})
-	var selected: Object
+	var selected: FengSkyLight
 	var selected_priority := -2147483648
-	var selected_order := 2147483647
 	for provider_id in providers.keys():
-		var entry: Dictionary = providers[provider_id]
-		var reference: WeakRef = entry.get("ref")
-		var candidate := reference.get_ref() if reference != null else null
-		if candidate == null or not is_instance_valid(candidate) \
-				or not candidate.has_method("_feng_sky_light_is_candidate") \
-				or not bool(candidate.call("_feng_sky_light_is_candidate", world_id)):
+		var candidate: FengSkyLight = providers[provider_id].get_ref()
+		if candidate == null or not candidate._feng_sky_light_is_candidate(world_id):
 			providers.erase(provider_id)
 			_world_by_provider.erase(provider_id)
 			continue
-		var priority := int(candidate.get("priority"))
-		var order := int(entry.get("order", 0))
-		if selected == null or priority > selected_priority \
-				or (priority == selected_priority and order < selected_order):
+		# Dictionary iteration keeps the earlier registration on equal priority.
+		if selected == null or candidate.priority > selected_priority:
 			selected = candidate
-			selected_priority = priority
-			selected_order = order
+			selected_priority = candidate.priority
 	if providers.is_empty():
 		_providers_by_world.erase(world_id)
-	else:
-		_providers_by_world[world_id] = providers
 	if previous != selected:
-		if previous != null and is_instance_valid(previous) \
-				and previous.has_method("_feng_sky_light_set_active"):
-			previous.call("_feng_sky_light_set_active", false)
+		if previous != null:
+			previous._feng_sky_light_set_active(false)
 		if selected == null:
 			_active_by_world.erase(world_id)
 		else:
 			_active_by_world[world_id] = weakref(selected)
-			if selected.has_method("_feng_sky_light_set_active"):
-				selected.call("_feng_sky_light_set_active", true)
-	elif selected == null:
-		_active_by_world.erase(world_id)
+			selected._feng_sky_light_set_active(true)
 
 
-static func _active_provider(world_id: int) -> Object:
+static func _active_provider(world_id: int) -> FengSkyLight:
 	var provider := _raw_active_provider(world_id)
-	if provider == null or not provider.has_method("_feng_sky_light_is_candidate") \
-			or not bool(provider.call("_feng_sky_light_is_candidate", world_id)):
+	if provider == null or not provider._feng_sky_light_is_candidate(world_id):
 		return null
 	return provider
 
 
-static func _raw_active_provider(world_id: int) -> Object:
+static func _raw_active_provider(world_id: int) -> FengSkyLight:
 	var reference: WeakRef = _active_by_world.get(world_id)
-	var provider := reference.get_ref() if reference != null else null
+	var provider: FengSkyLight = reference.get_ref() if reference != null else null
 	if provider == null or not is_instance_valid(provider):
 		_active_by_world.erase(world_id)
 		return null

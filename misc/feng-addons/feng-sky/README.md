@@ -196,9 +196,9 @@ uses its width normalized to the same supported range. **Cull Mask** selects
 which render layers enter the capture. Use a smaller distance, lower resolution,
 or disabled capture shadows when frequent full-scene updates are too costly.
 
-Only one provider is active in a `World3D`: higher **Priority** wins and the
-earlier registered provider wins ties. Disabling or removing it hands off to the
-next candidate. The same completed radiance feeds FRP's world IBL/ambient path
+`FengSkyLightRuntime` owns weak, registration-ordered `FengSkyLight` candidates
+per world. Higher **Priority** wins; registration order breaks ties. Refreshing
+a candidate preserves its order, while disabling/removing it hands off ownership. The same completed radiance feeds FRP's world IBL/ambient path
 and `FengMagicGI`'s sky SH term; MagicGI keeps its existing directional-light
 transport contribution. **Radiance Energy** is applied once to both consumers.
 MagicGI reads the provider's cached SH projection instead of baking another

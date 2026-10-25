@@ -6,6 +6,8 @@ extends RefCounted
 ## notifications. Published snapshots contain only packed bytes, value types,
 ## IDs and RIDs; render callbacks never dereference Nodes or Resources.
 
+const SurfaceGeometry = preload("feng_rt_gi_surface_geometry.gd")
+
 var _world: World3D
 var _root: Node
 var _tree: SceneTree
@@ -146,9 +148,7 @@ func snapshot(target: RID, targets: Array[RID]) -> Dictionary:
 					_mesh_payloads.erase(id)
 					_unsupported_payload_material_keys.erase(id)
 		if not _mesh_payloads.has(id):
-			var capture_value: Variant = _capture_mesh(mesh_node, mesh)
-			var captured_payload: Dictionary = capture_value if capture_value is Dictionary \
-					else {"unsupported_reason": "rtgi_mesh_capture_failed"}
+			var captured_payload := _capture_mesh(mesh_node, mesh)
 			_mesh_payloads[id] = captured_payload
 			if not captured_payload.has("surfaces"):
 				_unsupported_payload_material_keys[id] = _unsupported_capture_material_key(mesh_node, mesh)
@@ -373,15 +373,9 @@ func _refresh_payload_materials(node: MeshInstance3D, payload: Dictionary) -> Di
 	var materials: Array = payload.get("materials", [])
 	var copied := false
 	var unsupported_reason := ""
-	for surface_index in mini(surfaces.size(), node.mesh.get_surface_count()):
-		var surface_value: Variant = surfaces[surface_index]
-		if not surface_value is Dictionary:
-			continue
-		var surface: Dictionary = surface_value
-		var material_index := int(surface.get("material_index", -1))
-		if material_index < 0 or material_index >= materials.size():
-			unsupported_reason = "rtgi_material_snapshot_index_invalid"
-			break
+	for surface_index in surfaces.size():
+		var surface: Dictionary = surfaces[surface_index]
+		var material_index: int = surface.material_index
 		var material: Material = _material_source(node, surface_index)
 		var signature := _material_state_signature(material)
 		var previous: Dictionary = materials[material_index]
@@ -417,93 +411,18 @@ func _refresh_payload_materials(node: MeshInstance3D, payload: Dictionary) -> Di
 func _mesh_geometry_matches(mesh: Mesh, payload: Dictionary) -> bool:
 	if int(payload.get("source_mesh_id", 0)) != mesh.get_instance_id():
 		return false
-	var surfaces_value: Variant = payload.get("surfaces", [])
-	if not surfaces_value is Array or surfaces_value.size() != mesh.get_surface_count():
+	var surfaces: Array = payload.get("surfaces", [])
+	if surfaces.size() != mesh.get_surface_count():
 		return false
 	for surface_index in mesh.get_surface_count():
-		var surface_value: Variant = surfaces_value[surface_index]
-		if not surface_value is Dictionary:
-			return false
-		var surface: Dictionary = surface_value
+		var surface: Dictionary = surfaces[surface_index]
 		if int(surface.get("source_geometry_signature", -1)) != _current_surface_geometry_signature(mesh, surface_index):
 			return false
 	return true
 
 
 func _current_surface_geometry_signature(mesh: Mesh, surface_index: int) -> int:
-	var arrays := mesh.surface_get_arrays(surface_index)
-	if arrays.size() < Mesh.ARRAY_MAX \
-			or not arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array \
-			or not arrays[Mesh.ARRAY_NORMAL] is PackedVector3Array:
-		return -1
-	var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-	var normals: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
-	if vertices.is_empty() or vertices.size() != normals.size():
-		return -1
-	var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] \
-		if arrays[Mesh.ARRAY_TEX_UV] is PackedVector2Array else PackedVector2Array()
-	if uvs.is_empty():
-		uvs.resize(vertices.size())
-	if uvs.size() != vertices.size():
-		return -1
-	var packed := PackedFloat32Array()
-	packed.resize(vertices.size() * 8)
-	for index in vertices.size():
-		var v := vertices[index]
-		var n := normals[index]
-		var uv := uvs[index]
-		var offset := index * 8
-		packed[offset] = v.x
-		packed[offset + 1] = v.y
-		packed[offset + 2] = v.z
-		packed[offset + 3] = n.x
-		packed[offset + 4] = n.y
-		packed[offset + 5] = n.z
-		packed[offset + 6] = uv.x
-		packed[offset + 7] = uv.y
-	var bones: PackedInt32Array = arrays[Mesh.ARRAY_BONES] if arrays[Mesh.ARRAY_BONES] is PackedInt32Array else PackedInt32Array()
-	var weights: PackedFloat32Array = arrays[Mesh.ARRAY_WEIGHTS] if arrays[Mesh.ARRAY_WEIGHTS] is PackedFloat32Array else PackedFloat32Array()
-	var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] is PackedInt32Array else PackedInt32Array()
-	if indices.is_empty():
-		if vertices.size() % 3 != 0:
-			return -1
-		indices.resize(vertices.size())
-		for index in vertices.size():
-			indices[index] = index
-	var blend_shape_signature: Array = []
-	if mesh is ArrayMesh:
-		var shapes: Array = mesh.surface_get_blend_shape_arrays(surface_index)
-		if shapes.size() != mesh.get_blend_shape_count():
-			return -1
-		for shape_value in shapes:
-			var shape: Array = shape_value
-			if shape.size() < Mesh.ARRAY_MAX \
-					or not shape[Mesh.ARRAY_VERTEX] is PackedVector3Array \
-					or not shape[Mesh.ARRAY_NORMAL] is PackedVector3Array:
-				return -1
-			blend_shape_signature.append(shape[Mesh.ARRAY_VERTEX].to_byte_array())
-			blend_shape_signature.append(shape[Mesh.ARRAY_NORMAL].to_byte_array())
-	var blend_shape_mode := (mesh as ArrayMesh).get_blend_shape_mode() \
-		if mesh is ArrayMesh else Mesh.BLEND_SHAPE_MODE_RELATIVE
-	return int(hash([packed.to_byte_array(), indices.to_byte_array(),
-		bones.to_byte_array(), weights.to_byte_array(), blend_shape_signature,
-		blend_shape_mode, _surface_primitive_type(mesh, surface_index)]))
-
-
-func _surface_primitive_type(mesh: Mesh, surface_index: int) -> int:
-	# These methods are bound on ArrayMesh, not PrimitiveMesh in GDScript.
-	# PrimitiveMesh generates triangle surfaces and exposes no skin format flags.
-	if mesh is ArrayMesh:
-		var array_mesh := mesh as ArrayMesh
-		return int(array_mesh.surface_get_primitive_type(surface_index))
-	return Mesh.PRIMITIVE_TRIANGLES
-
-
-func _surface_format(mesh: Mesh, surface_index: int) -> int:
-	if mesh is ArrayMesh:
-		var array_mesh := mesh as ArrayMesh
-		return int(array_mesh.surface_get_format(surface_index))
-	return 0
+	return int(SurfaceGeometry.capture(mesh, surface_index).get("source_geometry_signature", -1))
 
 func _watch_skeleton(skeleton: Skeleton3D) -> void:
 	var skeleton_id := skeleton.get_instance_id()
@@ -677,76 +596,13 @@ func _capture_mesh(node: MeshInstance3D, mesh: Mesh) -> Dictionary:
 	var materials: Array[Dictionary] = []
 	var unsupported_material_reason := ""
 	for surface_index in mesh.get_surface_count():
-		var arrays := mesh.surface_get_arrays(surface_index)
-		if _surface_primitive_type(mesh, surface_index) != Mesh.PRIMITIVE_TRIANGLES \
-				or arrays.size() < Mesh.ARRAY_MAX \
-				or not arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array \
-				or not arrays[Mesh.ARRAY_NORMAL] is PackedVector3Array:
-			return {"unsupported_reason": "rtgi_requires_vertex_normal_uv1"}
-		var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-		var normals: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
-		var uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV] if arrays[Mesh.ARRAY_TEX_UV] is PackedVector2Array else PackedVector2Array()
-		if vertices.is_empty() or vertices.size() != normals.size():
-			return {"unsupported_reason": "rtgi_mesh_attribute_count_mismatch"}
-		for vertex_index in vertices.size():
-			if not vertices[vertex_index].is_finite() or not normals[vertex_index].is_finite():
-				return {"unsupported_reason": "rtgi_mesh_source_contains_nonfinite_position_or_normal"}
-		if uvs.is_empty():
-			uvs.resize(vertices.size())
-		for uv in uvs:
-			if not is_finite(uv.x) or not is_finite(uv.y):
-				return {"unsupported_reason": "rtgi_mesh_source_contains_nonfinite_uv"}
-		var bones: PackedInt32Array = arrays[Mesh.ARRAY_BONES] if arrays[Mesh.ARRAY_BONES] is PackedInt32Array else PackedInt32Array()
-		var weights: PackedFloat32Array = arrays[Mesh.ARRAY_WEIGHTS] if arrays[Mesh.ARRAY_WEIGHTS] is PackedFloat32Array else PackedFloat32Array()
-		var bones_per_vertex := 8 if (_surface_format(mesh, surface_index) & Mesh.ARRAY_FLAG_USE_8_BONE_WEIGHTS) != 0 else 4
-		var skinned := not bones.is_empty() or not weights.is_empty()
-		if skinned and (bones.size() != vertices.size() * bones_per_vertex or weights.size() != bones.size()):
-			return {"unsupported_reason": "rtgi_skin_attribute_count_mismatch"}
-		if skinned:
-			for bone_index in bones:
-				if bone_index < 0:
-					return {"unsupported_reason": "rtgi_skin_bone_index_negative"}
-			for bone_weight in weights:
-				if not is_finite(bone_weight) or bone_weight < 0.0:
-					return {"unsupported_reason": "rtgi_skin_weight_nonfinite_or_negative"}
-		var max_weighted_bone_index := -1
-		if skinned:
-			for influence_index in bones.size():
-				if weights[influence_index] > 0.0:
-					max_weighted_bone_index = maxi(max_weighted_bone_index, bones[influence_index])
-		if vertices.is_empty() or vertices.size() != normals.size() or vertices.size() != uvs.size():
-			return {"unsupported_reason": "rtgi_mesh_attribute_count_mismatch"}
-		var indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX] if arrays[Mesh.ARRAY_INDEX] is PackedInt32Array else PackedInt32Array()
-		if indices.is_empty():
-			if vertices.size() % 3 != 0:
-				return {"unsupported_reason": "rtgi_non_triangle_surface"}
-			indices.resize(vertices.size())
-			for index in vertices.size():
-				indices[index] = index
-		if indices.size() % 3 != 0:
-			return {"unsupported_reason": "rtgi_non_triangle_indices"}
-		for index in indices:
-			if index < 0 or index >= vertices.size():
-				return {"unsupported_reason": "rtgi_index_out_of_range"}
+		var surface := SurfaceGeometry.capture(mesh, surface_index)
+		if surface.has("unsupported_reason"):
+			return surface
 		var vertex_base := vertices_bytes.size()
-		var packed := PackedFloat32Array()
-		packed.resize(vertices.size() * 8)
-		for index in vertices.size():
-			var v := vertices[index]
-			var n := normals[index]
-			var uv := uvs[index]
-			var offset := index * 8
-			packed[offset] = v.x
-			packed[offset + 1] = v.y
-			packed[offset + 2] = v.z
-			packed[offset + 3] = n.x
-			packed[offset + 4] = n.y
-			packed[offset + 5] = n.z
-			packed[offset + 6] = uv.x
-			packed[offset + 7] = uv.y
-		vertices_bytes.append_array(packed.to_byte_array())
 		var index_base := indices_bytes.size()
-		indices_bytes.append_array(indices.to_byte_array())
+		vertices_bytes.append_array(surface.vertex_bytes)
+		indices_bytes.append_array(surface.index_bytes)
 		var material: Material = node.get_active_material(surface_index)
 		var source_material: Material = material if material != null else _default_material
 		var material_row := _capture_material(source_material)
@@ -758,42 +614,11 @@ func _capture_mesh(node: MeshInstance3D, mesh: Mesh) -> Dictionary:
 				unsupported_material_reason = str(material_row.get("reason", "rtgi_material_unsupported"))
 		var material_index := materials.size()
 		materials.append(material_row)
-		var blend_shape_rows: Array[Dictionary] = []
-		if mesh is ArrayMesh:
-			var shape_arrays: Array = mesh.surface_get_blend_shape_arrays(surface_index)
-			if shape_arrays.size() != mesh.get_blend_shape_count():
-				return {"unsupported_reason": "rtgi_blend_shape_surface_mismatch"}
-			for shape_index in shape_arrays.size():
-				var shape: Array = shape_arrays[shape_index]
-				if shape.size() < Mesh.ARRAY_MAX or not shape[Mesh.ARRAY_VERTEX] is PackedVector3Array:
-					return {"unsupported_reason": "rtgi_blend_shape_vertex_data_unavailable"}
-				var shape_vertices: PackedVector3Array = shape[Mesh.ARRAY_VERTEX]
-				var shape_normals: PackedVector3Array = shape[Mesh.ARRAY_NORMAL] if shape[Mesh.ARRAY_NORMAL] is PackedVector3Array else PackedVector3Array()
-				if shape_vertices.size() != vertices.size() or shape_normals.size() != vertices.size():
-					return {"unsupported_reason": "rtgi_blend_shape_attribute_count_mismatch"}
-				for shape_vertex_index in shape_vertices.size():
-					if not shape_vertices[shape_vertex_index].is_finite() \
-							or not shape_normals[shape_vertex_index].is_finite():
-						return {"unsupported_reason": "rtgi_blend_shape_source_contains_nonfinite_data"}
-				blend_shape_rows.append({"vertices": shape_vertices, "normals": shape_normals})
-		var blend_shape_signature: Array = []
-		for blend_shape in blend_shape_rows:
-			blend_shape_signature.append(blend_shape.vertices.to_byte_array())
-			blend_shape_signature.append(blend_shape.normals.to_byte_array())
-		var blend_shape_mode := (mesh as ArrayMesh).get_blend_shape_mode() \
-				if mesh is ArrayMesh else Mesh.BLEND_SHAPE_MODE_RELATIVE
-		var source_geometry_signature := int(hash([packed.to_byte_array(), indices.to_byte_array(),
-			bones.to_byte_array(), weights.to_byte_array(), blend_shape_signature,
-			blend_shape_mode, _surface_primitive_type(mesh, surface_index)]))
-		surfaces.append({"vertex_base_byte": vertex_base, "index_base_byte": index_base,
-			"vertex_count": vertices.size(), "index_count": indices.size(), "material_index": material_index,
-			"source_geometry_signature": source_geometry_signature,
-			"surface_index": surface_index,
-			"flags": int(material_row.get("flags", 0)), "bones": bones, "weights": weights,
-			"bones_per_vertex": bones_per_vertex, "skinned": skinned,
-			"max_weighted_bone_index": max_weighted_bone_index,
-			"blend_shapes": blend_shape_rows,
-			"blend_shape_mode": blend_shape_mode})
+		surface.erase("vertex_bytes")
+		surface.erase("index_bytes")
+		surface.merge({"vertex_base_byte": vertex_base, "index_base_byte": index_base,
+			"material_index": material_index, "flags": int(material_row.get("flags", 0))})
+		surfaces.append(surface)
 	if surfaces.is_empty():
 		return {"unsupported_reason": "rtgi_mesh_has_no_triangle_surfaces"}
 	var payload := {"source_mesh_id": mesh.get_instance_id(),

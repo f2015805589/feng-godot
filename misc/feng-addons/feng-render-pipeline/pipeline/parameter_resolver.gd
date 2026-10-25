@@ -18,11 +18,13 @@ static func _collect(entry: FengPass, result: Array[FengPass], visited: Dictiona
 		_collect(carried, result, visited)
 
 static func authored(entries: Array) -> Dictionary:
+	return _authored(sources(entries))
+
+static func _authored(all: Array[FengPass]) -> Dictionary:
 	var result := {}
 	# Children first: the containing pipeline entry is the final authored layer.
-	var all := sources(entries)
-	all.reverse()
-	for entry in all:
+	for index in range(all.size() - 1, -1, -1):
+		var entry := all[index]
 		var source := entry.get_parameter_source()
 		var values := source.get_frp_parameters().duplicate()
 		if values.has("enabled"):
@@ -52,51 +54,48 @@ static func volume_modules(entries: Array) -> Array[FengPass]:
 		result.append(source)
 	return result
 
-static func volume_schema(entries: Array) -> Dictionary:
+## Build one revision's author snapshot from a single carried-pass graph walk.
+static func context(entries: Array) -> Dictionary:
+	var all := sources(entries)
 	var schema := {}
-	for source in volume_modules(entries):
-		var fields := {}
-		for info in source.get_volume_parameter_list():
-			fields[String(info.name)] = info
-		schema[source.get_parameter_key()] = fields
-		for native_id in source.provides_native_ids:
-			schema[native_id] = fields
-	for entry in sources(entries):
-		var source_key: Variant = entry.get_parameter_source().get_parameter_key()
-		if schema.has(source_key):
-			schema[entry.get_parameter_key()] = schema[source_key]
-	return schema
-
-static func volume_aliases(entries: Array) -> Dictionary:
-	var result := {}
-	for entry in sources(entries):
+	var modules := {}
+	var aliases := {}
+	var bindings: Array = []
+	for entry in all:
+		var source := entry.get_parameter_source()
+		var key: Variant = source.get_parameter_key()
+		if not modules.has(key):
+			var fields := {}
+			for info in source.get_volume_parameter_list():
+				fields[String(info.name)] = info
+			if not fields.is_empty():
+				modules[key] = true
+				schema[key] = fields
+				for native_id in source.provides_native_ids:
+					schema[native_id] = fields
+		var entry_aliases: Array = [entry.get_parameter_key()]
+		entry_aliases.append_array(entry.provides_native_ids)
+		for alias in entry_aliases:
+			aliases[alias] = key
+		bindings.append({"key": key, "aliases": entry_aliases})
+	for entry in all:
 		var key: Variant = entry.get_parameter_source().get_parameter_key()
-		result[entry.get_parameter_key()] = key
-		for native_id in entry.provides_native_ids:
-			result[native_id] = key
-	return result
+		if schema.has(key):
+			schema[entry.get_parameter_key()] = schema[key]
+	return {"base": _authored(all), "schema": schema, "aliases": aliases, "bindings": bindings}
 
 static func resolve(entries: Array, overrides: Dictionary) -> Dictionary:
-	return resolve_context(entries, overrides, {"base": authored(entries), "schema": volume_schema(entries)})
-
-static func parameter_bindings(entries: Array) -> Array:
-	var result: Array = []
-	for entry in sources(entries):
-		var aliases: Array = [entry.get_parameter_key()]
-		aliases.append_array(entry.provides_native_ids)
-		result.append({"key": entry.get_parameter_source().get_parameter_key(), "aliases": aliases})
-	return result
+	return resolve_context(overrides, context(entries))
 
 ## Reuse the renderer's revision-cached author schema on numeric Volume updates.
 ## Alias expansion retains the same precedence as a full pipeline application.
-static func resolve_context(entries: Array, overrides: Dictionary, context: Dictionary) -> Dictionary:
+static func resolve_context(overrides: Dictionary, context: Dictionary) -> Dictionary:
 	if overrides.is_empty():
-		return context.get("base", {}).duplicate(true)
+		return context.base.duplicate(true)
 	var expanded := overrides.duplicate(true)
 	# A script that implements a native slot has two consumers: the script reads
 	# its own key, while native feature setup (for example jitter) reads the slot.
-	var bindings: Array = context.bindings if context.has("bindings") else parameter_bindings(entries)
-	for binding in bindings:
+	for binding in context.bindings:
 		var key: Variant = binding.key
 		var aliases: Array = binding.aliases
 		var merged: Dictionary = expanded.get(key, {}).duplicate()
@@ -106,29 +105,20 @@ static func resolve_context(entries: Array, overrides: Dictionary, context: Dict
 			expanded[key] = merged
 			for alias in aliases:
 				expanded[alias] = merged.duplicate()
-	var resolved := with_overrides(context.get("base", {}), expanded, context.get("schema", {}))
+	var resolved := with_overrides(context.base, expanded, context.schema)
 	# Eye Adaptation's automatic source selection needs to distinguish an authored
 	# default from an explicit Volume contribution, even when the resolved value is
 	# numerically equal to that default. This private bit is added after schema
 	# validation, so it is not an authorable Volume parameter or shared resolver data.
 	var eye_values: Variant = expanded.get("library:eye_adaptation", {})
-	var schema_value: Variant = context.get("schema", {})
-	var eye_schema: Variant = {}
-	if schema_value is Dictionary:
-		eye_schema = schema_value.get("library:eye_adaptation", {})
-	var has_eye_volume_override := false
-	if eye_values is Dictionary and eye_schema is Dictionary:
+	var eye_schema: Dictionary = context.schema.get("library:eye_adaptation", {})
+	if eye_values is Dictionary:
 		for field in eye_values:
-			# The source selector chooses which provider to read. It is not itself
-			# an override of the pass's exposure settings in Automatic mode.
 			if field != "exposure_source" and eye_schema.has(field):
-				has_eye_volume_override = true
+				var parameters: Dictionary = resolved.get("library:eye_adaptation", {})
+				parameters["_frp_volume_eye_exposure_override"] = true
+				resolved["library:eye_adaptation"] = parameters
 				break
-	if has_eye_volume_override:
-		var eye_parameters_value: Variant = resolved.get("library:eye_adaptation", {})
-		var eye_parameters: Dictionary = eye_parameters_value.duplicate() if eye_parameters_value is Dictionary else {}
-		eye_parameters["_frp_volume_eye_exposure_override"] = true
-		resolved["library:eye_adaptation"] = eye_parameters
 	return resolved
 
 static func warnings(entries: Array) -> PackedStringArray:

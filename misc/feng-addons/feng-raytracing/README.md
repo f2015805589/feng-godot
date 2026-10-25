@@ -26,13 +26,13 @@ ArrayMesh and PrimitiveMesh triangle surfaces support rigid transforms, skeletal
 
 Terrain3D/GridMap, custom shader materials, transparent materials, material overlays and advanced material layers are unsupported. Their presence in the visible world causes an explicit warning and retains native indirect lighting; unsupported geometry is not silently removed from the acceleration structure. Local omni/spot/area light nodes are not evaluated by this pass; opaque emissive mesh surfaces are sampled as area emitters. WorldEnvironment ambient and sky reflection remain isolated from the FengSkyLight indirect inputs.
 
-The pass must run before Reflection Resolve, native Sky, Transparent, Temporal AA, Bloom and Post Process. The validator checks these native pass bounds and requires Reflection Resolve after enabled GI/SSR providers. Custom Height Fog is not represented by a native pass ID, so keep Height Fog after RTGI; the validator cannot currently detect a manually moved Height Fog pass that runs first.
+The validator enforces native pass ordering. Custom Height Fog must be placed after RTGI manually because it has no native pass ID.
 
 ## Backend and lifetime
 
 Vulkan requires ray-tracing pipelines and buffer device addresses. D3D12 requires DXR and compatible `dxcompiler.dll` plus `dxil.dll` beside the executable. A missing capability leaves the raster path available. The engine exposes paired GLSL/SPIR-V and native HLSL RT stages; resources use matching set/binding and register/space indices.
 
-Scene discovery, finalized skeleton poses, blend-shape weights and material extraction run on the main thread. The runtime owns its typed WorldSnapshot registry; immutable value snapshots cross to the render thread. Diffuse and reflection share one per-target/view scene owner, BLAS/TLAS, material and texture uploads, while keeping independent trace outputs and temporal histories. Geometry changes rebuild scene resources; material edits refresh shading data. Deformation updates vertex buffers and BLAS, while transform changes rebuild TLAS. The emissive sampling distribution follows source changes, and the scene owner tracks activity for both effects so idle target/view resources expire after 120 frames.
+Scene discovery, finalized skeleton poses, blend-shape weights and material extraction run on the main thread. `FengRTGIWorldSnapshot` owns scene subscriptions, material refresh and instance slots. Its initial capture and dirty-mesh comparison share the pure surface packer in `scene/feng_rt_gi_surface_geometry.gd`; immutable value snapshots cross to the render thread. Diffuse and reflection share one per-target/view scene owner, BLAS/TLAS, material and texture uploads, while keeping independent trace outputs and temporal histories. Geometry changes rebuild scene resources; material edits refresh shading data. Deformation updates vertex buffers and BLAS, while transform changes rebuild TLAS. The emissive sampling distribution follows source changes, and the scene owner tracks activity for both effects so idle target/view resources expire after 120 frames.
 
 ## Validation
 
@@ -42,6 +42,7 @@ Run the scripts in `tests` from an isolated project with the FRP, ray-tracing, M
 - `test_rt_gi_reflections.gd`: Sky-lit nonemissive geometry, material response, runtime toggle, independent HDR/exposure history readback, invalid-trace preservation, duplicate-owner preservation and diffuse-only versus diffuse-plus-reflection GPU timings.
 - `test_rt_gi_denoise.gd` and `test_rt_gi_reflection_denoise.gd`: noise convergence, material boundaries, camera motion, disocclusion, exposure and mirror preservation.
 - `test_rt_gi_scene.gd`: complete FRP on/off rendering and viewport timing in a small synthetic scene.
+- `test_rt_gi_primitive_capture_cpu.gd`: headless geometry contract checks for primitive meshes, indexed skin/blend-shape inputs, dirty geometry and unsupported surfaces.
 
 Timings are fixture measurements, not a production benchmark.
 

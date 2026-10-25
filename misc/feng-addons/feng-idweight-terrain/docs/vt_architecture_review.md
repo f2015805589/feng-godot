@@ -42,7 +42,11 @@ performs its guarded native calls. Overview/image math and page rows are data he
 SVT bands and CDLOD controls own their panels. Inspector and plugin callers guard their
 own optional native methods. `asset_dock.gd` owns EditorDock hosting, asset-source
 bindings and list selection; list containers and entries own their resource subscriptions.
-`ui_decal.gd` owns cursor visuals. Signals and temporary resources are released by the object that registered them.
+`ui_decal.gd` owns cursor visuals. The dock owns the shared VT window and removal
+confirmation; lists receive a confirmation action, and the inspector receives an overview
+action. Neither reaches through the host's node hierarchy or private window state.
+Asset-swap selection resolves the current resource into the filtered list's index.
+Signals and temporary resources are released by the object that registered them.
 Node resource replacement disconnects the old material/assets graph before uninitializing it;
 asset-list membership owns each asset subscription. Bulk and single sector remaps use the
 same ownership transitions; public nearest-surface queries share the region-boundary sampler.

@@ -28,4 +28,4 @@ External cubemap `capture_position` and `capture_basis` are in world space. The 
 
 ## Runtime ownership
 
-Capture clones the active FengRenderer, including subclasses, and follows typed FengPass parameter sources to filter recursive work. The probe node owns its private viewport and camera; the camera retains the compositor, renderer, and capture passes. Capture completion, failure, and cancellation share one teardown transition. The runtime owns published capture status and complete cubemap snapshots; the capture pass owns the GPU textures, including the previous complete cube while a replacement is built.
+The probe owns its viewport/camera and clones the active FengRenderer, preserving subclasses and filtering recursive passes through typed FengPass parameter sources. The camera retains the compositor, renderer and capture passes. Completion, failure and cancellation share one teardown transition. The runtime owns immutable status and cubemap snapshots under a mutex; only the node starts batches, and callbacks update an existing matching batch. The capture pass owns GPU textures and retains the previous complete cube during replacement.

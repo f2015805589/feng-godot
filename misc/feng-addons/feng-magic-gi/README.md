@@ -147,6 +147,7 @@ backend 1 的动态 CLV relight 使用当前支持的远场方向光、`FengSkyL
 - `FMagicGIVolume` 管理设置、布局匹配、异步烘焙和预览
 - `FMagicGIPlacement` 管理几何、布点和 BVH；`FMagicGIEmitterBakeSet` 通过 Placement 的 `emitters` 独占发光绑定、签名和面积采样，Baker 直接读取同一对象；`FMagicGIEmitterBinding` 管理稳定键和签名；`FMagicGISceneTracker` 跟踪场景/资源变化
 - `FMagicGIBaker` 管理烘焙提交，`feng_magic_gi_directional_baker.gd` 积分路径，`feng_magic_gi_directional_data.gd` 定义方向数据，`feng_magic_gi_adaptive_layout.gd` 选择局部密度；`feng_magic_gi_visibility.gd` 构建和验证静态遮挡 BVH；`FMagicGIData` 验证持久化资源、组合发光响应并打包上传数据
+- 分页准备先由 `FMagicGIPage.is_header_valid()` 验证资源身份、边界和预算，再由各载荷的转换入口完成深度验证；legacy Data 的 `make_render_upload()` 同时验证并打包，避免重复遍历全部传输系数。
 - `FMagicGIRuntime` 选择 Volume 并发布世界/视口快照；每个 `RuntimeState` 只持有注册信息和独立的光照/发光对象；`FMagicGIEmission` 独占源参数、响应缓存和警告，诊断刷新不改写已发布响应。warning getter 只读
 - `FengMagicGIPass` 通过可选 Runtime 路径消费快照，管理 RD 纹理、UBO 和释放。Inspector/Viz 负责编辑器操作与预览
 

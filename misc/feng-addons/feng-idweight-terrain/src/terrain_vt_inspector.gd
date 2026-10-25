@@ -4,10 +4,8 @@
 extends EditorInspectorPlugin
 class_name TerrainVTInspectorPlugin
 
-## The production EditorPlugin owns the Surface VT editor window. Keeping that
-## ownership in one place lets this inspector entry work for the selected
-## Terrain3D node without creating a second window or duplicating its state.
-var editor_plugin: EditorPlugin
+## The host supplies the action; the inspector does not own the dock or window.
+var open_overview: Callable
 
 const AVT_LAYOUT_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_avt_layout_preview.gd")
 const CLIPMAP_PREVIEW_SCRIPT: Script = preload("res://addons/feng-idweight-terrain/src/vt_clipmap_preview.gd")
@@ -20,89 +18,23 @@ func _can_handle(p_object: Object) -> bool:
 func _parse_group(p_object: Object, p_group: String) -> void:
 	if not _can_handle(p_object):
 		return
-	# One host, not two: the native binary always publishes `vt_page_status`, so
-	# the "SVT but no VT Page subgroup" shape this entry used to fall back to
-	# cannot occur and there is nothing to build for it.
-	var native_page_group := p_group == "Surface VT/VT Page" or p_group.ends_with("/VT Page")
-	if not native_page_group:
+	if p_group != "Surface VT/VT Page" and not p_group.ends_with("/VT Page"):
 		return
-
 	var section := VBoxContainer.new()
 	section.name = "TerrainVTPageSection"
-	section.set_meta("native_vt_page", native_page_group)
+	section.set_meta("native_vt_page", true)
 	section.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	# The native subgroup already supplies the foldout container. This control is
-	# the content inside it, and keeps a stable name for editor tests and
-	# inspection tools.
-	var body: VBoxContainer = section
-	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	body.add_theme_constant_override("separation", 2)
-
-	# The debug views, one per VT method that has a layout to draw, each gated on the delivery
-	# matrix: a method no cell selects owns no layout, so its whole block - heading, view and note -
-	# is hidden rather than shown empty, and its preview never runs the scan behind it. The control
-	# owns that decision and reports it through `availability_changed`, because a group's controls
-	# are not rebuilt when one property changes: the matrix can move under an open section, and a
-	# block whose visibility was decided once at parse time would stay wrong.
-	var avt_block := VBoxContainer.new()
-	avt_block.name = "TerrainAVTDebugBlock"
-	avt_block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	avt_block.add_theme_constant_override("separation", 2)
-	body.add_child(avt_block)
-
-	var avt_header := Label.new()
-	avt_header.name = "TerrainAVTVTPageHeader"
-	avt_header.text = "AVT VT Page · camera layout / allocation"
-	avt_header.tooltip_text = "Read-only AVT world-sector layout and current virtual allocations for the editor camera"
-	avt_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	avt_block.add_child(avt_header)
-
-	var avt_preview = AVT_LAYOUT_PREVIEW_SCRIPT.new()
-	avt_preview.name = "TerrainAVTLayoutPreview"
-	# The preview computes its minimum height from the Inspector width so a
-	# narrow dock keeps a square map while a wide dock gives the map more room.
-	avt_preview.custom_minimum_size = Vector2.ZERO
-	avt_preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	avt_preview.set_terrain(p_object)
-	avt_block.add_child(avt_preview)
-
-	var description := Label.new()
-	description.name = "TerrainVTPageDescription"
-	description.text = "Near-field AVT layout follows the editor camera; outside the radius uses SVT."
-	description.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	avt_block.add_child(description)
-
-	# The clipmap's debug view is the same kind of page as the AVT one and sits beside it: the
-	# matrix's two *VT* methods each have a layout, and the two bands' pages are what the physical
-	# residency list below cannot show.
-	var clipmap_block := VBoxContainer.new()
-	clipmap_block.name = "TerrainClipmapDebugBlock"
-	clipmap_block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	clipmap_block.add_theme_constant_override("separation", 2)
-	body.add_child(clipmap_block)
-
-	var clipmap_header := Label.new()
-	clipmap_header.name = "TerrainClipmapDebugHeader"
-	clipmap_header.text = "Clipmap VT Page · layer units / world"
-	clipmap_header.tooltip_text = "Read-only clipmap layer: its units' world squares and addressing for the selected implementation, and the strips it still has queued"
-	clipmap_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	clipmap_block.add_child(clipmap_header)
-
-	var clipmap_preview = CLIPMAP_PREVIEW_SCRIPT.new()
-	clipmap_preview.name = "TerrainClipmapPreview"
-	clipmap_preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	clipmap_preview.set_terrain(p_object)
-	clipmap_block.add_child(clipmap_preview)
-
-	var clipmap_note := Label.new()
-	clipmap_note.name = "TerrainClipmapDebugNote"
-	clipmap_note.text = "One clipmap delivery, two storages: the LOD level array and the packed block atlas. A unit is snapped to its own texel size, so moving the target costs strips rather than a rebuild; the stored content never moves."
-	clipmap_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	clipmap_block.add_child(clipmap_note)
-	_connect_debug_block(clipmap_preview, clipmap_block)
-
-	_connect_debug_block(avt_preview, avt_block)
+	section.add_theme_constant_override("separation", 2)
+	_add_debug_preview(section, p_object, AVT_LAYOUT_PREVIEW_SCRIPT,
+		["TerrainAVTDebugBlock", "TerrainAVTVTPageHeader", "TerrainAVTLayoutPreview", "TerrainVTPageDescription"],
+		"AVT VT Page · camera layout / allocation",
+		"Read-only AVT world-sector layout and current virtual allocations for the editor camera",
+		"Near-field AVT layout follows the editor camera; outside the radius uses SVT.")
+	_add_debug_preview(section, p_object, CLIPMAP_PREVIEW_SCRIPT,
+		["TerrainClipmapDebugBlock", "TerrainClipmapDebugHeader", "TerrainClipmapPreview", "TerrainClipmapDebugNote"],
+		"Clipmap VT Page · layer units / world",
+		"Read-only clipmap world units, addressing and queued strips",
+		"Clipmap supports LOD arrays and packed block atlases. Units snap to their texel size; moving the target updates exposed strips.")
 
 	var open_button := Button.new()
 	open_button.name = "TerrainVTPageOpenOverview"
@@ -110,7 +42,7 @@ func _parse_group(p_object: Object, p_group: String) -> void:
 	open_button.tooltip_text = "Open Surface VT and show the VT Page overview"
 	open_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	open_button.pressed.connect(_open_vt_page_overview.bind(p_object))
-	body.add_child(open_button)
+	section.add_child(open_button)
 
 	add_custom_control(section)
 
@@ -160,20 +92,37 @@ func _parse_property(
 	return false
 
 
-# The preview answers its gate during set_terrain(), before the host connects.
-# Read that answer once, then follow it without querying the native API again.
-func _connect_debug_block(p_preview: TerrainVTLayoutPreview, p_block: Control) -> void:
-	p_preview.availability_changed.connect(func(p_available: bool) -> void: p_block.visible = p_available)
-	p_block.visible = p_preview.is_available()
+# Both blocks share construction and availability wiring; each preview owns its native gate.
+func _add_debug_preview(p_section: VBoxContainer, p_terrain: Object, p_script: Script,
+		p_names: Array[String], p_title: String, p_tooltip: String, p_description: String) -> void:
+	var block := VBoxContainer.new()
+	block.name = p_names[0]
+	block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	block.add_theme_constant_override("separation", 2)
+	p_section.add_child(block)
+	var header := Label.new()
+	header.name = p_names[1]
+	header.text = p_title
+	header.tooltip_text = p_tooltip
+	header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	block.add_child(header)
+	var preview: TerrainVTLayoutPreview = p_script.new()
+	preview.name = p_names[2]
+	preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	preview.set_terrain(p_terrain)
+	block.add_child(preview)
+	var description := Label.new()
+	description.name = p_names[3]
+	description.text = p_description
+	description.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	block.add_child(description)
+	preview.availability_changed.connect(func(available: bool): block.visible = available)
+	block.visible = preview.is_available()
 
 
 func _open_vt_page_overview(p_terrain: Object) -> void:
-	if p_terrain == null or not is_instance_valid(p_terrain):
-		return
-	if editor_plugin == null or not is_instance_valid(editor_plugin):
-		return
-	if editor_plugin.has_method("open_vt_page_overview"):
-		editor_plugin.call("open_vt_page_overview", p_terrain)
+	if is_instance_valid(p_terrain) and open_overview.is_valid():
+		open_overview.call(p_terrain)
 
 
 func _on_bake_all_svt_pressed(p_terrain: Object, p_controls: VBoxContainer) -> void:

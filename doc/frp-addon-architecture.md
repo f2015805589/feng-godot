@@ -80,7 +80,8 @@ Shader 重导入、执行模式、工作组和 dispatch target 的作者变更�
 
 Pass 仅缓存属性结构，读取参数时获取实时导出值。`property_list_changed` / `script_changed`
 使结构及关联缓存失效；没有 Volume 字段的 Pass 跳过 Volume 属性反射。
-Renderer 的 `get_volume_context()` 按参数版本缓存作者值、元数据和别名，对外返回隔离快照。
+ParameterResolver 一次遍历去重后的携带资源图，统一生成作者值、字段权限、别名与绑定。
+Renderer 的 `get_volume_context()` 按参数版本缓存该快照，对外返回隔离副本。
 
 ## 逐视图执行与生命周期
 

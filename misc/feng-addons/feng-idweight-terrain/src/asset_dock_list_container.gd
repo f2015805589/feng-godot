@@ -10,6 +10,7 @@ const ListEntry := preload("res://addons/feng-idweight-terrain/src/asset_dock_li
 
 
 var plugin: EditorPlugin
+var confirm_removal: Callable
 var type := Terrain3DAssets.TYPE_TEXTURE
 var entries: Array[ListEntry]
 var selected_id: int = 0
@@ -56,16 +57,14 @@ func _observe_resource(p_resource: Resource) -> void:
 		return
 	if _observed_resources.has(p_resource):
 		return
-	if not p_resource.id_changed.is_connected(set_selected_after_swap):
-		p_resource.id_changed.connect(set_selected_after_swap)
+	p_resource.id_changed.connect(set_selected_after_swap.bind(p_resource.get_instance_id()))
 	_observed_resources.append(p_resource)
 
 
 func _disconnect_resource_signals() -> void:
 	for p_resource in _observed_resources:
-		if is_instance_valid(p_resource) and p_resource.has_signal(&"id_changed") and \
-				p_resource.id_changed.is_connected(set_selected_after_swap):
-			p_resource.id_changed.disconnect(set_selected_after_swap)
+		if is_instance_valid(p_resource):
+			p_resource.id_changed.disconnect(set_selected_after_swap.bind(p_resource.get_instance_id()))
 	_observed_resources.clear()
 
 
@@ -180,9 +179,11 @@ func _on_resource_hovered(p_id: int):
 			plugin.terrain.assets.create_mesh_thumbnails(p_id, Vector2i(512, 512), true)
 
 
-func set_selected_after_swap(p_type: Terrain3DAssets.AssetType, p_old_id: int, p_new_id: int) -> void:
+func set_selected_after_swap(_type: Terrain3DAssets.AssetType, _old_id: int, _new_id: int, p_instance_id: int) -> void:
 	EditorInterface.mark_scene_as_unsaved()
-	set_selected_id(clamp(p_new_id, 0, entries.size() - 2))
+	var index := _index_of_asset(instance_from_id(p_instance_id).id)
+	if index >= 0:
+		set_selected_id(index)
 
 
 func clicked_id(p_id: int) -> void:
@@ -263,34 +264,32 @@ func _on_resource_inspected(p_resource: Resource) -> void:
 func _on_resource_changed(p_resource: Resource, p_id: int) -> void:
 	if not p_resource and _clearing_resource:
 		return
+	var target: Terrain3D = plugin.get_terrain()
+	if target == null:
+		return
 	if not p_resource:
-		if plugin.debug:
-			print("Terrain3DListContainer ", name, ": _on_resource_changed: removing asset ID: ", p_id)
 		_clearing_resource = true
-		# The dock is this widget's host and owns the confirmation dialog: asset list -> ScrollContainer
-		# -> Box -> dock. The chain is the contract between the two files; `plugin.asset_dock` names the
-		# same node, and neither is checked, so the host has to keep that shape.
-		var asset_dock: Control = get_parent().get_parent().get_parent()
-		if type == Terrain3DAssets.TYPE_TEXTURE:
-			asset_dock.confirm_dialog.dialog_text = "Are you sure you want to clear this texture?"
-		else:
-			asset_dock.confirm_dialog.dialog_text = "Are you sure you want to clear this mesh and delete all instances?"
-		asset_dock.confirm_dialog.popup_centered()
-		await asset_dock.confirmation_closed
-		if not asset_dock._confirmed:
-			update_asset_list()
-			_clearing_resource = false
-			return
-		
+	var assets := target.assets
 	if not plugin.is_terrain_valid():
 		plugin.select_terrain()
 		await get_tree().process_frame
 
-	if plugin.is_terrain_valid():
+	if not p_resource:
+		if plugin.debug:
+			print("Terrain3DListContainer ", name, ": _on_resource_changed: removing asset ID: ", p_id)
+		var get_asset: Callable = assets.get_texture_asset if type == Terrain3DAssets.TYPE_TEXTURE else assets.get_mesh_asset
+		var previous: Resource = get_asset.call(p_id)
+		if not await confirm_removal.call(type) or get_asset.call(p_id) != previous:
+			update_asset_list()
+			_clearing_resource = false
+			return
+		
+	# A confirmation or selection wait cannot retarget an edit to a new terrain/library.
+	if is_instance_valid(target) and plugin.get_terrain() == target and target.assets == assets:
 		if type == Terrain3DAssets.TYPE_TEXTURE:
-			plugin.terrain.assets.set_texture_asset(p_id, p_resource)
+			assets.set_texture_asset(p_id, p_resource)
 		else:
-			plugin.terrain.assets.set_mesh_asset(p_id, p_resource)
+			assets.set_mesh_asset(p_id, p_resource)
 
 		# If removing an entry, clear inspector
 		if not p_resource:

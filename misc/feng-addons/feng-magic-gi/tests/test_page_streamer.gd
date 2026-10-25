@@ -34,6 +34,18 @@ func _run() -> void:
 	page.data = data
 	_check(page.is_valid(page.generation, page.page_key), "page wrapper validates bounds, version, and memory metadata")
 
+	for fault in ["valid", "probe_count", "directional_size", "directional_nan", "normals"]:
+		var candidate: Page = page.duplicate(true)
+		match fault:
+			"probe_count": candidate.probe_count += 1
+			"directional_size": candidate.data.directional.sky.resize(1)
+			"directional_nan": candidate.data.directional.transfer[0] = NAN
+			"normals": candidate.data.normals.clear()
+		var job := preload("../feng_magic_gi_page_prepare_job.gd").new()
+		job.configure(candidate, candidate.generation, candidate.page_key, "", "", PackedFloat32Array())
+		job.run()
+		_check(job.valid == (fault == "valid"), "page preparation admission: " + fault)
+
 	var output := "user://magic_gi_streamer_test_%d" % Time.get_ticks_usec()
 	var absolute_output := ProjectSettings.globalize_path(output)
 	_check(DirAccess.make_dir_recursive_absolute(absolute_output) == OK,

@@ -87,11 +87,13 @@ func _create_asset_lists() -> void:
 	texture_list = ListContainer.new()
 	texture_list.name = "TextureList"
 	texture_list.plugin = plugin
+	texture_list.confirm_removal = _confirm_asset_removal
 	texture_list.type = Terrain3DAssets.TYPE_TEXTURE
 	asset_container.add_child(texture_list, true)
 	mesh_list = ListContainer.new()
 	mesh_list.name = "MeshList"
 	mesh_list.plugin = plugin
+	mesh_list.confirm_removal = _confirm_asset_removal
 	mesh_list.type = Terrain3DAssets.TYPE_MESH
 	mesh_list.visible = false
 	asset_container.add_child(mesh_list, true)
@@ -121,6 +123,13 @@ func _create_confirm_dialog() -> void:
 	confirm_dialog.hide()
 	confirm_dialog.confirmed.connect(func() -> void: _confirmed = true; confirmation_closed.emit() )
 	confirm_dialog.canceled.connect(func() -> void: _confirmed = false; confirmation_closed.emit() )
+
+
+func _confirm_asset_removal(p_type: int) -> bool:
+	confirm_dialog.dialog_text = "Are you sure you want to clear this texture?" if p_type == Terrain3DAssets.TYPE_TEXTURE else "Are you sure you want to clear this mesh and delete all instances?"
+	confirm_dialog.popup_centered()
+	await confirmation_closed
+	return _confirmed
 
 
 # The dock draws its own panel and, while the dock scene is being edited, leaves the theme icons off
@@ -379,17 +388,19 @@ func _on_management_menu_selected(p_id: int) -> void:
 		MENU_TERRAIN_MAPS:
 			EditorInterface.inspect_object(terrain.data)
 		MENU_VT_EDITOR:
-			_open_vt_editor(terrain)
+			open_vt_editor(terrain)
 
 
-func _open_vt_editor(p_terrain: Object) -> void:
-	if not p_terrain:
+func open_vt_editor(p_terrain: Object, p_overview: bool = false) -> void:
+	if not is_instance_valid(p_terrain):
 		return
-	if not vt_editor or not is_instance_valid(vt_editor):
+	if not is_instance_valid(vt_editor):
 		vt_editor = VT_EDITOR_SCRIPT.new()
 		vt_editor.initialize(plugin)
 		plugin.add_child(vt_editor)
 	vt_editor.open_for_terrain(p_terrain)
+	if p_overview:
+		vt_editor.open_vt_page_view()
 
 
 func _on_debug_view_selected(p_id: int) -> void:

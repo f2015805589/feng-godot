@@ -2,7 +2,6 @@
 class_name FengLightmapVolume
 extends Node3D
 ## Independent surface lightmap baker. `bake()` traces actual UV2 surface points.
-## This volume never reads MagicGI probes, atlases, or stencil data.
 
 enum EnvironmentMode {
 	REJECT_SCENE_ENVIRONMENT,
@@ -42,8 +41,8 @@ const REQUIRED_BACKEND_CONTRACT_VERSION := 4
 @export_range(0,4,1) var display_gutter_pixels: int = 1:
 	set(value):
 		display_gutter_pixels = clampi(value,0,4)
-		if baked_data != null and baked_data.get_script() == DATA_SCRIPT:
-			baked_data.set("display_gutter_pixels", display_gutter_pixels)
+		if baked_data != null:
+			baked_data.display_gutter_pixels = display_gutter_pixels
 @export_group("Bake Settings")
 @export_range(4, 2048, 1) var atlas_resolution: int = 128
 ## Finite spp only controls variance; no denoiser or clamp is applied.
@@ -57,7 +56,7 @@ const REQUIRED_BACKEND_CONTRACT_VERSION := 4
 @export var environment_radiance: Color = Color(0.0, 0.0, 0.0, 1.0)
 ## Unsupported scene inputs are rejected; environment_mode explicitly selects
 ## a captured sky boundary or a constant replacement.
-@export var baked_data: Resource:
+@export var baked_data: DATA_SCRIPT:
 	set(value):
 		if baked_data == value:
 			return
@@ -151,17 +150,18 @@ func _refresh_display() -> void:
 		add_child(display)
 	if baked_data == null and not output_resource_path.is_empty() and ResourceLoader.exists(output_resource_path):
 		var loaded_data := load(output_resource_path)
-		if loaded_data is Resource and loaded_data.get_script() == DATA_SCRIPT:
+		if loaded_data is DATA_SCRIPT:
 			baked_data = loaded_data
-	if baked_data != null and baked_data.get_script() == DATA_SCRIPT:
-		if int(baked_data.get("display_gutter_pixels")) != display_gutter_pixels:
-			baked_data.set("display_gutter_pixels", display_gutter_pixels)
-		if _cached_display_data == null:
-			_cached_display_data = baked_data.call("build_lightmap_gi_data", self, display) as LightmapGIData
-		if _cached_display_data == null:
-			push_error("FengLightmapVolume: could not create the runtime LightmapGI display from baked_data.")
-		elif display.light_data != _cached_display_data:
-			display.light_data = _cached_display_data
+	if baked_data == null:
+		display.light_data = null
+		return
+	baked_data.display_gutter_pixels = display_gutter_pixels
+	if _cached_display_data == null:
+		_cached_display_data = baked_data.build_lightmap_gi_data(self, display)
+	if _cached_display_data == null:
+		push_error("FengLightmapVolume: could not create the runtime LightmapGI display from baked_data.")
+	elif display.light_data != _cached_display_data:
+		display.light_data = _cached_display_data
 
 
 func request_inspector_bake() -> void:
@@ -442,8 +442,8 @@ func validate_saved_bake_inputs() -> Dictionary:
 	# Explicit editor action: never scan/hash scene geometry every frame or on
 	# ordinary resource loading. Old bakes cannot silently certify new lighting.
 	var result := {"ok": false, "error": "No saved FengLightmapData is assigned."}
-	if baked_data != null and baked_data.get_script() == DATA_SCRIPT:
-		var signature := String(baked_data.get("scene_transport_signature"))
+	if baked_data != null:
+		var signature := baked_data.scene_transport_signature
 		var tree := get_tree()
 		var scene: Node = (tree.edited_scene_root if Engine.is_editor_hint() else tree.current_scene) if tree != null else null
 		if scene == null:
@@ -458,7 +458,7 @@ func validate_saved_bake_inputs() -> Dictionary:
 				var collected := SceneInputs.collect(self, bounds, receiver, scene)
 				if not collected.ok:
 					result.error = collected.error
-				elif SceneInputs.signature(collected, self) != signature or bounds != baked_data.get("receiver_bounds_local") or bool(baked_data.get("physical_light_units_enabled")) != bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)):
+				elif SceneInputs.signature(collected, self) != signature or bounds != baked_data.receiver_bounds_local or baked_data.physical_light_units_enabled != bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units", false)):
 					result.error = "Saved bake is stale: scene geometry, materials, emission, lights or receiver bounds changed. Bake again to update indirect light."
 				else:
 					result = {"ok": true, "message": "Saved geometry/material/light inputs match. The sky remains the frozen bake-time capture; rebake after changing the sky or time of day."}

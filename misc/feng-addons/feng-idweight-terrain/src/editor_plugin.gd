@@ -66,7 +66,7 @@ func _enter_tree() -> void:
 	asset_dock = load(ASSET_DOCK).instantiate()
 	asset_dock.initialize(self)
 	vt_inspector_plugin = VT_INSPECTOR_SCRIPT.new()
-	vt_inspector_plugin.editor_plugin = self
+	vt_inspector_plugin.open_overview = open_vt_page_overview
 	add_inspector_plugin(vt_inspector_plugin)
 	terrain_setup = preload("res://addons/feng-idweight-terrain/src/terrain_setup.gd").new()
 	terrain_setup.plugin = self
@@ -93,27 +93,15 @@ func _exit_tree() -> void:
 	godot_editor_window.focus_entered.disconnect(_on_godot_focus_entered)
 
 
-## Open the shared Surface VT editor for an Inspector-selected terrain.
-## Keeping this as a public plugin action avoids reaching into the Inspector
-## plugin's private dock/window state from custom controls.
-func open_vt_editor(p_terrain: Object = null) -> void:
-	var target := p_terrain if p_terrain != null and is_instance_valid(p_terrain) else terrain
-	if target == null or not is_instance_valid(target):
-		return
-	if asset_dock == null or not is_instance_valid(asset_dock):
-		return
-	asset_dock.call("_open_vt_editor", target)
+## The dock owns the shared VT window; callers choose only the terrain and view.
+func open_vt_editor(p_terrain: Object = null, p_overview: bool = false) -> void:
+	var target := p_terrain if is_instance_valid(p_terrain) else terrain
+	if is_instance_valid(target) and is_instance_valid(asset_dock):
+		asset_dock.open_vt_editor(target, p_overview)
 
 
-## Open Surface VT and focus its top-level VT Page hierarchy entry. The window
-## refreshes its stitched baked overview explicitly; no GPU readback is queued.
 func open_vt_page_overview(p_terrain: Object = null) -> void:
-	open_vt_editor(p_terrain)
-	if asset_dock == null or not is_instance_valid(asset_dock):
-		return
-	var window := asset_dock.get("vt_editor") as Window
-	if window != null and is_instance_valid(window) and window.has_method("open_vt_page_view"):
-		window.call("open_vt_page_view")
+	open_vt_editor(p_terrain, true)
 
 
 func _on_godot_focus_entered() -> void:

@@ -18,6 +18,11 @@ const MENU_DEBUG_CONTROL_IDS: int = 12
 const MENU_DEBUG_CONTROL_WEIGHT: int = 13
 const MENU_DEBUG_SLOPE: int = 14
 
+class SelectionProbe extends Terrain3DAssetDockContainer:
+	func set_selected_id(p_id: int) -> void:
+		selected_id = p_id
+
+
 var _finished: bool = false
 
 
@@ -153,6 +158,26 @@ func _run() -> void:
 			"filtered results leaked nodes (%d -> %d) or callbacks (%d)" % [before, after, connections]):
 		return
 	print("PASS repeated asset filtering releases rejected nodes and callbacks")
+
+	# Selection uses the source asset's current identity, not an ID-as-list-index.
+	for ids in [[0, 1, 2], [0, 4, 7]]:
+		var selection := SelectionProbe.new()
+		for id in ids:
+			var asset := Terrain3DTextureAsset.new()
+			asset.id = id
+			selection.add_item(asset)
+		var moved: Resource = selection.entries.back().resource
+		moved.id += 1
+		if not _require(selection.selected_id == 2, "swap must select the final visible asset without an Add tile"):
+			return
+		selection._exit_tree()
+		selection._enter_tree()
+		selection._enter_tree()
+		if not _require(moved.get_signal_connection_list("id_changed").size() == 1, "reparent duplicated the asset swap subscription"):
+			return
+		selection.free()
+		if not _require(moved.get_signal_connection_list("id_changed").is_empty(), "freed list retained its asset swap subscription"):
+			return
 
 	var scene_root := Node3D.new()
 	scene_root.name = "TerrainDockEditorTest"
@@ -348,6 +373,11 @@ func _run() -> void:
 			"Inspector VT Page overview action did not select the VT Page view"):
 		return
 	inspector_vt_editor.hide()
+	inspector_open_button.pressed.emit()
+	if not _require(dock.vt_editor == inspector_vt_editor and inspector_vt_editor.visible,
+			"reopening the overview must reuse the dock-owned window"):
+		return
+	inspector_vt_editor.hide()
 
 	var progress_dialog_closed := await _wait_for_editor_progress_dialog()
 	if not _require(progress_dialog_closed,
@@ -379,6 +409,19 @@ func _run() -> void:
 	await _wait_frames(4)
 	if not _require(not dock.confirm_dialog.visible and terrain.assets.get_texture_count() == 2, "cancel did not preserve texture assets"):
 		return
+	var original_asset := terrain.assets.get_texture_asset(1)
+	var replacement := Terrain3DTextureAsset.new()
+	dock.texture_list._on_resource_changed(null, 1)
+	await _wait_frames(2)
+	if not _require(dock.confirm_dialog.visible, "replacement regression must reach the real confirmation"):
+		return
+	terrain.assets.set_texture_asset(1, replacement)
+	dock.confirm_dialog.confirmed.emit()
+	dock.confirm_dialog.hide()
+	await _wait_frames(2)
+	if not _require(terrain.assets.get_texture_asset(1) == replacement, "stale removal confirmation deleted a replacement asset"):
+		return
+	terrain.assets.set_texture_asset(1, original_asset)
 	await _click(menu)
 	if not _require(menu.get_popup().visible, "routed click on Terrain menu failed"):
 		return

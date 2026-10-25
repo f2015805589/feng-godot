@@ -4,6 +4,12 @@ const SceneInputs = preload("res://addons/feng-lightmap-mc/feng_lightmap_scene_i
 ## CPU-only collection checks. No GPU bake, project scene edits or output atlas.
 
 const Volume = preload("res://addons/feng-lightmap-mc/feng_lightmap_volume.gd")
+class DerivedData extends "res://addons/feng-lightmap-mc/feng_lightmap_data.gd":
+	var display_builds := 0
+	func build_lightmap_gi_data(_volume: Node3D, _display: LightmapGI) -> LightmapGIData:
+		display_builds += 1
+		return LightmapGIData.new()
+
 var checks := 0
 var failures := 0
 
@@ -82,7 +88,7 @@ func _run() -> void:
 	var renamed_snapshot := snapshot.duplicate(true)
 	renamed_snapshot.directional_lights[0].source_path = "/root/DifferentEditorTree/Directional"
 	_check(SceneInputs.signature(renamed_snapshot, volume) == signature, "Persistent transport signature ignores absolute editor tree paths")
-	var saved: Resource = volume.DATA_SCRIPT.new()
+	var saved := DerivedData.new()
 	saved.set("scene_transport_signature",signature)
 	saved.set("receiver_bounds_local",volume.bounds)
 	saved.set("physical_light_units_enabled",ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units",false))
@@ -93,7 +99,19 @@ func _run() -> void:
 	material.emission_enabled = true
 	saved.set("scene_transport_signature","")
 	_check(not volume.validate_saved_bake_inputs().ok, "Legacy data without a source signature is not implicitly current")
+	volume.enabled = true
+	volume.display_gutter_pixels = 2
+	volume._refresh_display()
+	_check(saved.display_gutter_pixels == 2 and saved.display_builds == 2, "Derived bake resources receive typed settings and display invalidation")
+	var invalid_path := "user://lightmap_wrong_resource_%d.tres" % Time.get_ticks_usec()
+	_check(ResourceSaver.save(Resource.new(), invalid_path) == OK, "Wrong external resource fixture saves")
 	volume.baked_data = null
+	volume.output_resource_path = invalid_path
+	volume._refresh_display()
+	_check(volume.baked_data == null and volume.get_node(volume.DISPLAY_NODE_NAME).light_data == null, "Wrong external resource leaves no stale display binding")
+	volume.enabled = false
+	volume.output_resource_path = volume.DEFAULT_OUTPUT
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(invalid_path))
 	sun.light_angular_distance = 0.1
 	var finite_sun := SceneInputs._read_directional_light(sun)
 	_check(finite_sun.ok and is_equal_approx(finite_sun.input.angular_distance,0.1), "Finite disk is retained for native solid-angle integration")

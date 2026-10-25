@@ -21,15 +21,7 @@ const CompositorBinding = preload("pipeline/compositor_binding.gd")
 const ViewExecutionPolicy = preload("pipeline/view_execution_policy.gd")
 const ReflectionPlan = preload("pipeline/reflection_plan.gd")
 
-## Schema 6 moved the default pass set into the addon: every native entry carries the
-## pass script that implements it (FengBuiltinPass.implementation), so the pipeline
-## is plugin-side code and the engine's own passes are the no-pipeline fallback.
-## Schema 7 moved Eye Adaptation before post-tonemap library effects. Schema 8 adds
-## native Bloom after Eye Adaptation and before Color Grade. Schema 9 originally shipped
-## Sky/Cloud/Trace/Fog in the wrong relative order; schema 10 repairs only that exact
-## released stock sequence and keeps later authored schedules unchanged. Schema 11
-## moves the built-in reflection resolve out of authored passes and repairs only the
-## stock RTGI position next to MagicGI.
+## Persisted pipeline format version.
 const PIPELINE_SCHEMA_VERSION := 11
 const MAGIC_GI_SCRIPT_PATH := "res://addons/feng-render-pipeline/passes/magic_gi_pass.gd"
 const RT_GI_SCRIPT_PATH := "res://addons/feng-raytracing/passes/feng_rt_gi_pass.gd"
@@ -53,11 +45,7 @@ const NATIVE_PASS_SCRIPTS := {
 
 const NativePass = preload("passes/native/native_pass.gd")
 
-## Library entries a fresh pipeline seeds at the anchors in their manifest metadata:
-## Shadow Pass, VT, GBuffer, Cloud Shadows, GTAO, Lighting, Magic GI, optional RTGI, SSR,
-## the hidden reflection resolver, Sky,
-## Volumetric Cloud, Height Fog, Cloud Trace, Transparent, Temporal AA, Eye Adaptation,
-## Bloom, Color Grade, Post Process, Debug Buffers.
+## Library metadata and default seed selection.
 const DEFAULT_LIBRARY_ENTRIES := LibraryManager.DEFAULT_LIBRARY_ENTRIES
 
 ## The library entries a fresh pipeline seeds.
@@ -200,37 +188,23 @@ func _set_passes(value: Array[PassBase], emit: bool) -> void:
 func _connect_passes() -> bool:
 	_disconnect_passes()
 	var changed := false
+	var identities := {}
 	for pass_entry in _passes:
-		changed = _observe_pass(pass_entry) or changed
+		changed = _observe_pass(pass_entry, identities) or changed
 	return changed
 
-## Watches one authored pass and everything it carries. A carried pass (an entry's
-## implementation, a native pass's overlay) is a resource of its own, so the inspector
-## edits it directly and Godot does not forward its `changed` to the resource holding
-## it. Without observing them, editing an exposed parameter or switching the carried
-## pass off would only reach the engine on the next unrelated change - and the entry's
-## enabled state, which follows the chain, would look stale.
-func _observe_pass(pass_entry: PassBase) -> bool:
-	if pass_entry == null:
+## Observe the carried resource graph and give distinct resources distinct IDs.
+func _observe_pass(pass_entry: PassBase, identities: Dictionary) -> bool:
+	if pass_entry == null or _observed_passes.has(pass_entry):
 		return false
-	# Repair persisted shader bindings on the main thread before observing changes.
 	var changed := pass_entry.ensure_frp_contract()
-	if _observed_passes.has(pass_entry):
-		return changed
-	if pass_entry.stable_id == &"":
-		# Persist an instance identity; a script path cannot distinguish two copies.
+	if pass_entry.stable_id == &"" or identities.has(pass_entry.stable_id):
 		pass_entry.stable_id = StringName("custom:" + ResourceUID.id_to_text(ResourceUID.create_id()))
-	for observed in _observed_passes:
-		if observed.stable_id == pass_entry.stable_id:
-			# Duplicating a resource duplicates its stored ID too. A second resource
-			# in this pipeline is a new instance; runtime pipeline copies retain IDs.
-			pass_entry.stable_id = StringName("custom:" + ResourceUID.id_to_text(ResourceUID.create_id()))
-			break
+	identities[pass_entry.stable_id] = true
 	_observed_passes.append(pass_entry)
-	if not pass_entry.changed.is_connected(_on_pass_changed):
-		pass_entry.changed.connect(_on_pass_changed)
+	pass_entry.changed.connect(_on_pass_changed)
 	for carried in pass_entry.carried_passes():
-		changed = _observe_pass(carried) or changed
+		changed = _observe_pass(carried, identities) or changed
 	return changed
 
 func _disconnect_passes() -> void:
@@ -350,7 +324,7 @@ func get_pass_parameters() -> Dictionary:
 
 ## Compose validated Volume parameters and frame ownership for either binding path.
 func resolve_view_parameters(overrides: Dictionary, states: Dictionary, context: Dictionary, indirect_owner: Dictionary) -> Dictionary:
-	var resolved := _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, overrides, context), states)
+	var resolved := _with_eye_adaptation_state(ParameterResolver.resolve_context(overrides, context), states)
 	return IndirectGISelection.inject(resolved, _passes, indirect_owner)
 
 func _with_eye_adaptation_state(parameters: Dictionary, states: Variant = null) -> Dictionary:
@@ -379,12 +353,7 @@ func get_volume_context() -> Dictionary:
 ## entire application instead of re-entering library sync from each upload query.
 func _initialized_volume_context() -> Dictionary:
 	if _volume_context_cache.is_empty():
-		_volume_context_cache = {
-			"base": ParameterResolver.authored(_passes),
-			"schema": ParameterResolver.volume_schema(_passes),
-			"aliases": ParameterResolver.volume_aliases(_passes),
-			"bindings": ParameterResolver.parameter_bindings(_passes),
-		}
+		_volume_context_cache = ParameterResolver.context(_passes)
 	return _volume_context_cache
 
 func get_parameter_revision() -> int:
@@ -506,18 +475,11 @@ func _migrate_stock_rtgi_position() -> bool:
 		return false
 	var rtgi = _passes[rtgi_index]
 	_passes.remove_at(rtgi_index)
-	magic_index = -1
-	for index in _passes.size():
-		if _is_exact_script(_passes[index], MAGIC_GI_SCRIPT_PATH):
-			magic_index = index
-			break
-	if magic_index < 0:
-		return false
-	_passes.insert(magic_index + 1, rtgi)
+	_passes.insert(magic_index + 1 - int(rtgi_index < magic_index), rtgi)
 	return true
 
-func _is_exact_script(pass_entry: Variant, script_path: String) -> bool:
-	if pass_entry == null or not pass_entry is Resource:
+func _is_exact_script(pass_entry: FengPass, script_path: String) -> bool:
+	if pass_entry == null:
 		return false
 	var script := pass_entry.get_script() as Script
 	return script != null and script.resource_path == script_path

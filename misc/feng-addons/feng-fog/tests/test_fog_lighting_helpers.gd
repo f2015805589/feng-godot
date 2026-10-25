@@ -6,15 +6,25 @@ const RectLight = preload("res://addons/feng-fog/rendering/lighting/fog_rect_lig
 const CapsuleLight = preload("res://addons/feng-fog/rendering/lighting/fog_capsule_light.gd")
 const FengSkyRuntime = preload("res://addons/feng-sky/feng_sky_light_runtime.gd")
 
-class FakeSkyProvider extends Node3D:
-	var priority := 0
+class FakeSkyProvider extends FengSkyLight:
+	func _ready() -> void:
+		set_process(false)
+
+	func _enter_tree() -> void:
+		pass
+
+	func _exit_tree() -> void:
+		pass
+
+	func _feng_sky_light_refresh_active() -> void:
+		pass
 	var readback_requested := false
 
-	func _feng_sky_light_is_candidate(_world_id: int) -> bool:
-		return true
+	func _feng_sky_light_is_candidate(world_id: int) -> bool:
+		return enabled and is_inside_tree() and get_world_3d().get_instance_id() == world_id
 
-	func _feng_sky_light_set_active(_active: bool) -> void:
-		pass
+	func _feng_sky_light_set_active(active: bool) -> void:
+		_provider_active = active
 
 	func _feng_sky_light_volumetric_metadata() -> Dictionary:
 		return {"ready": true, "source_revision": 5, "radiance_revision": 12,
@@ -582,7 +592,30 @@ func _test_sky_runtime_metadata() -> void:
 			"runtime metadata preserves the authored volumetric scattering intensity")
 	_require(not provider.readback_requested,
 			"volumetric metadata path does not request the CPU radiance SH snapshot")
+	var world_id := world.get_instance_id()
+	var peer := FakeSkyProvider.new()
+	viewport.add_child(peer)
+	FengSkyRuntime.refresh_provider(peer)
+	FengSkyRuntime.refresh_provider(provider)
+	_require(FengSkyRuntime.active_for_world(world_id) == provider, "refresh preserves equal-priority registration order")
+	provider.enabled = false
+	_require(FengSkyRuntime.active_for_world(world_id) == peer and not provider._provider_active, "disable deactivates and hands off")
+	provider.enabled = true
+	_require(FengSkyRuntime.active_for_world(world_id) == peer, "reenabled provider registers after existing candidates")
+	provider.priority = 1
+	_require(FengSkyRuntime.active_for_world(world_id) == provider and not peer._provider_active, "priority change hands off once")
+	var other := SubViewport.new()
+	other.world_3d = World3D.new()
+	root.add_child(other)
+	provider.reparent(other)
+	FengSkyRuntime.refresh_provider(provider)
+	_require(FengSkyRuntime.active_for_world(world_id) == peer and FengSkyRuntime.is_active(provider, other.world_3d.get_instance_id()), "world move resolves both worlds")
+	peer.free()
+	_require(FengSkyRuntime.active_for_world(world_id) == null, "weak registration does not retain freed provider")
+	FengSkyRuntime._resolve_world(world_id)
 	FengSkyRuntime.unregister_provider(provider)
+	_require(not provider._provider_active and FengSkyRuntime._providers_by_world.is_empty(), "last unregister releases registry ownership")
+	other.free()
 	viewport.queue_free()
 	await process_frame
 

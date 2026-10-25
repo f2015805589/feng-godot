@@ -4,6 +4,11 @@ extends SceneTree
 const EyeAdaptation = preload("../passes/eye_adaptation_pass.gd")
 const ParameterResolver = preload("../pipeline/parameter_resolver.gd")
 
+class GraphPass extends FengPass:
+	var children: Array[FengPass] = []
+	func carried_passes() -> Array[FengPass]:
+		return children
+
 var checks := 0
 var failures := 0
 
@@ -72,16 +77,57 @@ func run() -> void:
 		EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS, true, 2) == 2,
 		"explicit Pass Settings preserves manual metering")
 
+	var first := GraphPass.new()
+	var second := GraphPass.new()
+	first.children = [second]
+	second.children = [first]
+	check(ParameterResolver.sources([first, second]).size() == 2, "carried graph cycles are visited once")
+	first.children.clear()
+	second.children.clear()
+
+	var wrapper := FengBuiltinPass.new(6)
+	wrapper.implementation = eye_pass
+	eye_pass.provides_native_ids = [6]
+	var snapshot := ParameterResolver.context([wrapper, eye_pass, wrapper, null])
+	check(ParameterResolver.sources([wrapper, eye_pass, wrapper, null]).size() == 2,
+		"a carried resource appears once even when shared by top-level entries")
+	check(snapshot.base == ParameterResolver.authored([wrapper, eye_pass])
+		and snapshot.schema[6] == snapshot.schema[eye_pass.get_parameter_key()]
+		and snapshot.aliases[6] == eye_pass.get_parameter_key(),
+		"one snapshot keeps authored values, native aliases and field permissions coherent")
+	var resolved_alias := ParameterResolver.resolve_context({6: {"metering_mode": 2}}, snapshot)
+	check(resolved_alias[6].metering_mode == 2
+		and resolved_alias[eye_pass.get_parameter_key()].metering_mode == 2,
+		"native Volume aliases address both the entry and implementing pass")
+	resolved_alias[6].metering_mode = 1
+	check(snapshot.base[6].metering_mode == 0, "resolving aliases preserves the author snapshot")
+	var observer_renderer := FengRenderer.new()
+	var duplicate_eye := eye_pass.duplicate() as FengPass
+	observer_renderer._passes.assign([wrapper, eye_pass, duplicate_eye])
+	observer_renderer._connect_passes()
+	observer_renderer._connect_passes()
+	check(observer_renderer._observed_passes.size() == 3 and eye_pass.stable_id != duplicate_eye.stable_id,
+		"observation deduplicates shared resources and repairs duplicate instance identities")
+	observer_renderer._disconnect_passes()
+
+	eye_pass.provides_native_ids = []
+	wrapper.implementation = null
+
 	var base := {"library:eye_adaptation": {"exposure_source": 0, "metering_mode": 0}}
 	var schema := {"library:eye_adaptation": {
 		"exposure_source": {"type": TYPE_INT},
 		"metering_mode": {"type": TYPE_INT}}}
 	var context := {"base": base, "schema": schema, "bindings": []}
-	var untouched := ParameterResolver.resolve_context([], {}, context)
+	var schema_only := ParameterResolver.resolve_context(
+		{"library:eye_adaptation": {"metering_mode": 2}}, {"base": {}, "schema": schema, "bindings": []})
+	check(schema_only["library:eye_adaptation"].get("_frp_volume_eye_exposure_override", false),
+		"custom schemas may publish exposure ownership without authored defaults")
+
+	var untouched := ParameterResolver.resolve_context({}, context)
 	var untouched_eye: Dictionary = untouched["library:eye_adaptation"]
 	check(not untouched_eye.has("_frp_volume_eye_exposure_override"),
 		"authored Eye defaults do not masquerade as an explicit Volume override")
-	var explicit_same_value := ParameterResolver.resolve_context([], {
+	var explicit_same_value := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"metering_mode": 0}}, context)
 	var explicit_eye: Dictionary = explicit_same_value["library:eye_adaptation"]
 	check(bool(explicit_eye.get("_frp_volume_eye_exposure_override", false)),
@@ -91,7 +137,7 @@ func run() -> void:
 		bool(explicit_eye.get("_frp_volume_eye_exposure_override", false)), true)
 		== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
 		"Automatic selects pass settings when a regular exposure value is overridden by Volume")
-	var explicit_camera := ParameterResolver.resolve_context([], {
+	var explicit_camera := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"exposure_source": EyeAdaptation.EXPOSURE_SOURCE_CAMERA_ATTRIBUTES,
 			"metering_mode": 2}}, context)
 	var explicit_camera_eye: Dictionary = explicit_camera["library:eye_adaptation"]
@@ -103,7 +149,7 @@ func run() -> void:
 			bool(explicit_camera_eye["_frp_volume_eye_exposure_override"]), true)
 			== EyeAdaptation.EXPOSURE_ROUTE_CAMERA_ATTRIBUTES,
 		"Volume source selection is resolved and explicit Camera Attributes wins over other Volume values")
-	var explicit_pass := ParameterResolver.resolve_context([], {
+	var explicit_pass := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"exposure_source": EyeAdaptation.EXPOSURE_SOURCE_PASS_SETTINGS}}, context)
 	var explicit_pass_eye: Dictionary = explicit_pass["library:eye_adaptation"]
 	check(int(explicit_pass_eye.get("exposure_source", -1))
@@ -113,7 +159,7 @@ func run() -> void:
 			bool(explicit_pass_eye.get("_frp_volume_eye_exposure_override", false)), true)
 			== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
 		"Volume can explicitly select Pass Settings")
-	var explicit_auto_only := ParameterResolver.resolve_context([], {
+	var explicit_auto_only := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"exposure_source": EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC}}, context)
 	var explicit_auto_eye: Dictionary = explicit_auto_only["library:eye_adaptation"]
 	check(not bool(explicit_auto_eye.get("_frp_volume_eye_exposure_override", false))
@@ -121,7 +167,7 @@ func run() -> void:
 			int(explicit_auto_eye["exposure_source"]), false, true)
 			== EyeAdaptation.EXPOSURE_ROUTE_PASS_SETTINGS,
 		"selecting Automatic alone uses pass metering rather than the linked camera")
-	var volume_auto_manual := ParameterResolver.resolve_context([], {
+	var volume_auto_manual := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"exposure_source": EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC,
 			"metering_mode": 2}}, context)
 	var volume_auto_manual_eye: Dictionary = volume_auto_manual["library:eye_adaptation"]
@@ -130,7 +176,7 @@ func run() -> void:
 		EyeAdaptation.resolve_exposure_route(int(volume_auto_manual_eye["exposure_source"]), true, true),
 		false, int(volume_auto_manual_eye["metering_mode"])) == 0,
 		"a Volume selecting Automatic still uses Histogram even when its metering override says Manual")
-	var volume_pass_manual := ParameterResolver.resolve_context([], {
+	var volume_pass_manual := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"exposure_source": EyeAdaptation.EXPOSURE_SOURCE_PASS_SETTINGS,
 			"metering_mode": 2}}, context)
 	var volume_pass_manual_eye: Dictionary = volume_pass_manual["library:eye_adaptation"]
@@ -139,12 +185,12 @@ func run() -> void:
 		EyeAdaptation.resolve_exposure_route(int(volume_pass_manual_eye["exposure_source"]), true, true),
 		false, int(volume_pass_manual_eye["metering_mode"])) == 2,
 		"a Volume explicitly selecting Pass Settings retains Manual metering")
-	var unknown_only := ParameterResolver.resolve_context([], {
+	var unknown_only := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"not_a_volume_field": 1}}, context)
 	var unknown_eye: Dictionary = unknown_only["library:eye_adaptation"]
 	check(not unknown_eye.has("_frp_volume_eye_exposure_override"),
 		"unknown keys rejected by the Volume schema do not select the Volume exposure route")
-	var non_exposure_only := ParameterResolver.resolve_context([], {
+	var non_exposure_only := ParameterResolver.resolve_context({
 		"library:eye_adaptation": {"pre_exposure": false,
 			"extend_default_luminance_range": true}}, context)
 	var non_exposure_eye: Dictionary = non_exposure_only["library:eye_adaptation"]
