@@ -17,6 +17,7 @@ rights or setup script.
 | Ray Tracing | Hardware RT scene snapshots, diffuse GI and reflection candidates | FRP; optional NRD backend |
 | Reflect Probe | Probe authoring, capture, cubemap filtering and world snapshots | FRP reflection candidates; optional Sky/Fog/Cloud capture |
 | Magic GI | Surface placement, PRT baking, emitter response and lighting snapshots | FRP consumer; optional SkyLight and terrain geometry |
+| Lightmap MC | CPU surface lightmap collection, baking and display | Native Monte Carlo backend; independent of Magic GI |
 | IDWeight Terrain | Terrain data, VT residency/production and editor tools | Native terrain extension and engine VT hooks |
 | RenderDoc Capture | Editor frame capture and analyzer launch | Native capture integration |
 | GodotTracy | Profiler setup and launch | Optional engine Tracy singleton |
@@ -52,14 +53,19 @@ needed), and finds Visual Studio's bundled CMake automatically. The first build
 downloads D3D12, AccessKit, and NRD dependencies, so network access is required.
 Double-clicking keeps the result window open; use `--no-pause` from a terminal.
 Set `FENG_BUILD_JOBS` to override the default of 8 parallel jobs.
+The native addons share `native_extension.py` for godot-cpp, output naming and
+documentation embedding. Each SConstruct declares only its addon-specific options.
 To build the extensions separately:
 
 ```powershell
 scons -C misc/feng-addons/feng-idweight-terrain/native platform=windows target=template_debug arch=x86_64
 scons -C misc/feng-addons/feng-renderdoc-capture/native platform=windows target=template_debug arch=x86_64
+scons -C misc/feng-addons/feng-lightmap-mc/native platform=windows target=template_debug arch=x86_64
 ```
 
-Close editors using a DLL before rebuilding, then restart to load it.
+Build Lightmap MC separately when using its CPU baker. On Linux, use
+`platform=linux` with the same extension commands. Close editors using a native
+library before rebuilding, then restart to load it.
 `native/.gdignore` keeps compiler sources out of the resource scan. Release
 exports also need `target=template_release` libraries for their target platform.
 

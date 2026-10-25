@@ -6,9 +6,7 @@ extends Window
 const MINIMUM_SIZE := Vector2i(900, 600)
 const CARD_WIDTH := 320.0
 const CARD_MIN_HEIGHT := 260.0
-const MODULE_IDS: Array[StringName] = [
-	&"atmosphere_sun", &"sky_light", &"sky_atmosphere", &"volumetric_cloud", &"height_fog",
-]
+const Service = preload("environment_mixer_service.gd")
 const DETAIL_MINIMAL := 0
 const DETAIL_NORMAL := 1
 const DETAIL_NORMAL_ADVANCED := 2
@@ -78,7 +76,7 @@ const ADVANCED_GROUPS: Array[String] = [
 	"cloud shadowing", "cloud sky ao", "baked radiance",
 ]
 
-var _service: Node
+var _service: Service
 var _header_status: Label
 var _scene_status: Label
 var _create_environment_button: Button
@@ -88,17 +86,11 @@ var _module_visibility_button: MenuButton
 var _module_visibility_menu: PopupMenu
 var _scroll_content: HFlowContainer
 var _columns: Dictionary = {}
-var _visible_modules: Dictionary = {
-	&"atmosphere_sun": true,
-	&"sky_light": true,
-	&"sky_atmosphere": true,
-	&"volumetric_cloud": true,
-	&"height_fog": true,
-}
+var _visible_modules: Dictionary = {}
 var _has_been_popped := false
 
 
-func setup(p_service: Node) -> void:
+func setup(p_service: Service) -> void:
 	if _service != null and is_instance_valid(_service) \
 			and _service.snapshot_changed.is_connected(_on_snapshot_changed):
 		_service.snapshot_changed.disconnect(_on_snapshot_changed)
@@ -292,7 +284,6 @@ func _create_component_card(p_definition: Dictionary, p_card_width: float, p_edi
 		"inspector": inspector,
 		"nodes": [],
 		"active": null,
-		"updating": false,
 	}
 	return panel
 
@@ -319,43 +310,30 @@ func _on_snapshot_changed(p_snapshot: Dictionary) -> void:
 	var components: Dictionary = p_snapshot.get("components", {})
 	for component_id in _columns:
 		var state: Dictionary = _columns[component_id]
-		var rows_value: Variant = components.get(component_id, [])
-		var rows: Array = rows_value if rows_value is Array else []
-		var previous := _valid_node(state.get("active"))
+		var rows: Array = components[component_id]
+		var previous := _valid_node(state.active)
 		var nodes: Array[Node] = []
 		var paths: Array[String] = []
 		for row in rows:
-			if not (row is Dictionary):
-				continue
-			var node := _valid_node(row.get("node"))
+			var node := _valid_node(row.node)
 			if node == null:
 				continue
 			nodes.append(node)
-			paths.append(String(row.get("path", node.name)))
+			paths.append(String(row.path))
 		state["nodes"] = nodes
-		var picker: Variant = state.get("actor_picker")
-		if not is_instance_valid(picker) or not (picker is OptionButton):
-			continue
-		state["updating"] = true
+		var picker: OptionButton = state.actor_picker
 		picker.clear()
 		picker.add_item("选择一个实例" if not nodes.is_empty() else "无实例")
 		for index in nodes.size():
 			picker.add_item(String(nodes[index].name))
 			picker.set_item_tooltip(index + 1, paths[index])
-		var active_index := -1
-		for index in nodes.size():
-			if nodes[index] == previous:
-				active_index = index
-				break
+		var active_index := nodes.find(previous)
 		if active_index < 0 and not nodes.is_empty():
 			active_index = 0
-		picker.select(active_index + 1 if active_index >= 0 else 0)
-		var selected_node: Variant = nodes[active_index] if active_index >= 0 else null
-		state["active"] = _valid_node(selected_node)
-		state["updating"] = false
-		var panel: Variant = state.get("panel")
-		if is_instance_valid(panel) and panel is Control:
-			panel.visible = _visible_modules.get(component_id, true)
+		picker.select(active_index + 1)
+		state["active"] = nodes[active_index] if active_index >= 0 else null
+		var panel: Control = state.panel
+		panel.visible = _visible_modules.get(component_id, true)
 		var add_button := _find_create_button(component_id)
 		if add_button != null:
 			add_button.visible = root != null and nodes.is_empty()
@@ -375,17 +353,14 @@ func _find_create_button(p_component_id: StringName) -> Button:
 
 
 func _update_card_details(p_state: Dictionary, p_rebuild := false) -> void:
-	var active := _valid_node(p_state.get("active"))
+	var active := _valid_node(p_state.active)
 	p_state["active"] = active
-	var empty_label: Variant = p_state.get("empty_label")
-	var inspector: Variant = p_state.get("inspector")
-	if not is_instance_valid(empty_label) or not (empty_label is Label) \
-			or not is_instance_valid(inspector) or not (inspector is EditorInspector):
-		return
+	var empty_label: Label = p_state.empty_label
+	var inspector: EditorInspector = p_state.inspector
 	if active != null:
 		empty_label.hide()
 		inspector.show()
-		inspector.call("set_visible_properties", _visible_properties_for(active))
+		inspector.set_visible_properties(_visible_properties_for(active))
 		if p_rebuild or inspector.get_edited_object() != active:
 			inspector.edit(null)
 			inspector.edit(active)
@@ -399,10 +374,7 @@ func _on_actor_selected(p_index: int, p_component_id: StringName) -> void:
 	if not _columns.has(p_component_id):
 		return
 	var state: Dictionary = _columns[p_component_id]
-	if state.get("updating", false):
-		return
-	var nodes_value: Variant = state.get("nodes", [])
-	var nodes: Array = nodes_value if nodes_value is Array else []
+	var nodes: Array = state.nodes
 	var selected_node: Variant = nodes[p_index - 1] if p_index > 0 and p_index <= nodes.size() else null
 	state["active"] = _valid_node(selected_node)
 	_update_card_details(state)
@@ -425,25 +397,23 @@ func _set_module_visible(p_component_id: StringName, p_visible: bool) -> void:
 	if not _columns.has(p_component_id):
 		return
 	_visible_modules[p_component_id] = p_visible
-	var panel: Variant = _columns[p_component_id].get("panel")
-	if is_instance_valid(panel) and panel is Control:
-		panel.visible = p_visible
+	var panel: Control = _columns[p_component_id].panel
+	panel.visible = p_visible
 	if is_instance_valid(_module_visibility_menu):
-		var item_index := MODULE_IDS.find(p_component_id)
-		if item_index >= 0:
-			var index := _module_visibility_menu.get_item_index(item_index)
-			if index >= 0:
+		for index in _module_visibility_menu.item_count:
+			if _module_visibility_menu.get_item_metadata(index) == p_component_id:
 				_module_visibility_menu.set_item_checked(index, p_visible)
+				break
 	_update_module_visibility_button_text()
 
 
 func _update_module_visibility_button_text() -> void:
 	var visible_count := 0
-	for component_id in MODULE_IDS:
-		if _visible_modules.get(component_id, true):
+	for definition in Service.COMPONENTS:
+		if _visible_modules.get(definition.id, true):
 			visible_count += 1
 	if is_instance_valid(_module_visibility_button):
-		_module_visibility_button.text = "显示模块（%d/5）" % visible_count
+		_module_visibility_button.text = "显示模块（%d/%d）" % [visible_count, Service.COMPONENTS.size()]
 
 
 func _on_add_component_pressed(p_component_id: StringName) -> void:
@@ -472,16 +442,8 @@ func _on_detail_mode_selected(_index: int) -> void:
 
 
 func _update_filter_context(p_rebuild := false) -> void:
-	if p_rebuild:
-		for state in _columns.values():
-			_update_card_details(state, true)
-	else:
-		for state in _columns.values():
-			var active := _valid_node(state.get("active"))
-			state["active"] = active
-			var inspector: Variant = state.get("inspector")
-			if active != null and is_instance_valid(inspector) and (inspector is EditorInspector):
-				inspector.call("set_visible_properties", _visible_properties_for(active))
+	for state in _columns.values():
+		_update_card_details(state, p_rebuild)
 
 
 func _visible_properties_for(p_object: Object) -> PackedStringArray:
@@ -534,25 +496,8 @@ func _visible_properties_for(p_object: Object) -> PackedStringArray:
 
 
 func _component_kind(p_object: Object) -> String:
-	if p_object is DirectionalLight3D:
-		return "DirectionalLight3D"
-	var script := p_object.get_script() as Script
-	while script != null:
-		var global_name := String(script.get_global_name())
-		if MINIMAL_PROPERTIES.has(global_name):
-			return global_name
-		var file_stem := script.resource_path.get_file().get_basename()
-		match file_stem:
-			"feng_sky_light":
-				return "FengSkyLight"
-			"feng_sky_atmosphere":
-				return "FengSkyAtmosphere"
-			"feng_volumetric_cloud":
-				return "FengVolumetricCloud"
-			"feng_height_fog":
-				return "FengHeightFog"
-		script = script.get_base_script()
-	return ""
+	var definition := Service.component_definition(p_object)
+	return definition.get("native_class", definition.get("global_class", ""))
 
 
 func _on_about_to_popup() -> void:

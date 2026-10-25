@@ -7,6 +7,8 @@ snapshot directory for a same-harness red/green comparison.
 from pathlib import Path
 import argparse
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 
@@ -49,9 +51,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="feng-native-helpers-") as temporary:
         root = Path(temporary)
         (root / "methods.inc").write_text(methods)
+        generated = "\n".join((args.source / name).read_text() for name in ("generated_texture.h", "generated_texture.cpp"))
+        (root / "generated_texture.inc").write_text(re.sub(r"^#include[^\n]*\n", "", generated, flags=re.M))
         binary = root / "native_helpers_test"
         subprocess.run([os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                        "-UNDEBUG", "-I", str(root), str(here / "native_helpers_test.cpp"),
+                        "-UNDEBUG", *shlex.split(os.environ.get("CXXFLAGS", "")), "-I", str(root), str(here / "native_helpers_test.cpp"),
                         "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 

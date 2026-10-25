@@ -3,13 +3,11 @@ extends RefCounted
 ## Main-thread scene snapshots and render-thread immutable publication for RTGI.
 
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
-const WORLD_SNAPSHOT_PATH := "res://addons/feng-raytracing/scene/feng_rt_gi_world_snapshot.gd"
+const WorldSnapshot = preload("feng_rt_gi_world_snapshot.gd")
 const ABI_VERSION := 1
 
 static var _worlds_script: GDScript
 static var _worlds_queried := false
-static var _snapshot_type: GDScript
-static var _snapshot_type_queried := false
 static var _world_states: Dictionary = {} # world id -> weak world/root, generation, registry
 static var _published_by_target: Dictionary = {} # target id -> immutable plain dictionary
 static var _published_mutex := Mutex.new()
@@ -36,30 +34,25 @@ static func prepare_target(target: RID) -> Dictionary:
 	var state: Dictionary = _world_states.get(world_id, {})
 	var old_world_ref: WeakRef = state.get("world")
 	var old_root_ref: WeakRef = state.get("root")
-	var old_registry: RefCounted = state.get("registry")
+	var old_registry: WorldSnapshot = state.get("registry")
 	var old_world = old_world_ref.get_ref() if old_world_ref != null else null
 	var old_root = old_root_ref.get_ref() if old_root_ref != null else null
 	if old_world != world or old_root != viewport.get_tree().root or int(state.get("world_generation", -1)) != world_generation:
-		if old_registry != null and old_registry.has_method("detach"):
-			old_registry.call("detach")
+		if old_registry != null:
+			old_registry.detach()
 		_world_states.erase(world_id)
 		old_registry = null
 	if old_registry == null:
-		var snapshot_type := _load_world_snapshot_type()
-		if snapshot_type == null:
-			return _publish_failure(target, "world_snapshot_type_unavailable")
 		_registry_epoch += 1
-		old_registry = snapshot_type.new()
-		if not old_registry.call("attach", world, viewport.get_tree().root, world_generation):
+		old_registry = WorldSnapshot.new()
+		if not old_registry.attach(world, viewport.get_tree().root, world_generation):
 			return _publish_failure(target, "world_snapshot_attach_failed")
 		_world_states[world_id] = {"world": weakref(world), "root": weakref(viewport.get_tree().root),
 			"world_generation": world_generation, "registry": old_registry, "epoch": _registry_epoch}
 	var targets: Variant = worlds.call("targets_for", world)
 	if not targets is Array or not targets.has(target):
 		return _publish_failure(target, "target_left_world_route")
-	var snapshot: Variant = old_registry.call("snapshot", target, targets)
-	if not snapshot is Dictionary:
-		return _publish_failure(target, "world_snapshot_returned_non_dictionary")
+	var snapshot := old_registry.snapshot(target, targets)
 	_publish_generation += 1
 	var published: Dictionary = snapshot.duplicate(false)
 	published["publication"] = _publish_generation
@@ -85,9 +78,9 @@ static func clear_target(target: RID, reason := "inactive") -> void:
 
 static func clear_world(world_id: int) -> void:
 	var state: Dictionary = _world_states.get(world_id, {})
-	var registry: RefCounted = state.get("registry")
-	if registry != null and registry.has_method("detach"):
-		registry.call("detach")
+	var registry: WorldSnapshot = state.get("registry")
+	if registry != null:
+		registry.detach()
 	_world_states.erase(world_id)
 	_published_mutex.lock()
 	var stale_targets: Array[int] = []
@@ -118,15 +111,6 @@ static func _load_snapshot_worlds() -> GDScript:
 			if loaded is GDScript:
 				_worlds_script = loaded
 	return _worlds_script
-
-static func _load_world_snapshot_type() -> GDScript:
-	if not _snapshot_type_queried:
-		_snapshot_type_queried = true
-		if ResourceLoader.exists(WORLD_SNAPSHOT_PATH):
-			var loaded: Variant = load(WORLD_SNAPSHOT_PATH)
-			if loaded is GDScript:
-				_snapshot_type = loaded
-	return _snapshot_type
 
 static var _requests: Dictionary = {}
 static var _started := false

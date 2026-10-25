@@ -6,6 +6,8 @@ maximum opacity, start distance, sky cutoff distance, and directional
 inscattering. The fullscreen path fogs opaque geometry and the sky; forward-only
 opaque and transparent materials evaluate fog at their fragment position.
 
+The runtime owns its bundled light-extension and ray-geometry services directly. Optional Sky and pipeline integrations are resolved at their addon boundary. Geometry registries are reused per world/root and detached when that route changes or disappears.
+
 ## Source and light contract
 
 `fog_inscattering_color` is the authored Fog Inscattering Color. Its default is
@@ -96,19 +98,13 @@ component's sRGB albedo conversion above.
 The addon also provides an opt-in LightmapGI capture-probe adapter. In the
 `FFogBakedLightingVolume` Inspector, assign `source_lightmap_gi_data`, set its
 `source_capture_transform`, and run **Import / Refresh LightmapGI Probes**.
-These are staged inputs: a failed import keeps the last active payload. The
-`capture_lightmap_gi_node(lightmap_gi)` helper reads that node's `light_data`
-and `global_transform` without searching the scene. Probe positions and bounds
-are capture-local and the transform maps them to world space. These captured
-probes contain indirect surface radiance and may contain environment radiance,
-but they are not Unreal volumetric lightmaps, do not contain direct illumination
-evaluated at the probe origin, and do not suppress live direct lights. Ordinary
-surface lightmaps are not treated as volumetric-lightmap data. Runtime lighting
-uses UE's two-band L0/L1 HG path; the adapter also exposes a generic SH9 helper
-that retains L2, which is not the UE default path. UE VLM brick layout,
-BentNormal handling, and native volume-lightmap import are not implemented by
-this LightmapGI probe adapter, so matching its two-band evaluation does not mean
-the underlying baked representation is byte- or feature-equivalent.
+Imports are staged: failure keeps the active payload. The
+`capture_lightmap_gi_node(lightmap_gi)` helper reads the node's `light_data` and
+`global_transform`; positions and bounds are capture-local, with an explicit
+world transform. This source carries indirect surface radiance and optional
+environment radiance. It keeps live direct lights active and uses the two-band
+L0/L1 HG runtime evaluation; the separate SH9 helper retains L2. For payload and
+validation details, see the [baked lighting adapter](rendering/baked_lighting/README.md).
 
 UE-style volumetric lightmap bricks use a separate, mutually exclusive resource
 in the same `baked_irradiance` slot. `FFogVolumetricLightmap` imports an

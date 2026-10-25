@@ -150,5 +150,18 @@ func run() -> void:
 	var non_exposure_eye: Dictionary = non_exposure_only["library:eye_adaptation"]
 	check(not non_exposure_eye.has("_frp_volume_eye_exposure_override"),
 		"pre-exposure and luminance-range settings alone do not select pass exposure")
+	var renderer := FengRenderer.new()
+	eye_pass.stable_id = &"library:eye_adaptation"
+	renderer.passes = [eye_pass]
+	base["library:eye_adaptation"]["pre_exposure"] = true
+	var frame := renderer.resolve_view_parameters({"library:eye_adaptation": {"metering_mode": 0}},
+		{"library:eye_adaptation": false}, context, {"kind": &"magic_gi", "key": "test:gi"})
+	var frame_eye: Dictionary = frame["library:eye_adaptation"]
+	check(frame_eye._frp_volume_eye_exposure_override and not frame_eye.pre_exposure
+		and not frame_eye.frp_eye_adaptation_enabled and frame_eye.feng_indirect_gi_owner.key == "test:gi",
+		"the shared frame resolver composes Volume markers, disabled exposure and planned GI ownership")
+	check(base["library:eye_adaptation"].pre_exposure
+		and not base["library:eye_adaptation"].has("feng_indirect_gi_owner"),
+		"frame resolution keeps the cached authored context isolated")
 	print("EXPOSURE_ROUTING_TEST_DONE checks=%d failures=%d" % [checks, failures])
 	quit(0 if failures == 0 else 1)

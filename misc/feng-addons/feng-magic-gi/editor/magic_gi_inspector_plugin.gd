@@ -301,13 +301,13 @@ func _magic_gi_runtime_state(volume: FMagicGIVolume) -> Dictionary:
 	var renderer: Object = _scene_renderer(volume)
 	if renderer == null:
 		renderer = _renderer_from_compositor(ProjectPipeline.resolve())
-	if renderer == null or not renderer.has_method("get"):
+	if renderer == null:
 		return {"status": "frp_renderer_unavailable"}
 	var passes: Variant = renderer.get("passes")
 	if not passes is Array:
 		return {"status": "frp_pass_list_unavailable"}
 	for pass_entry in passes:
-		if pass_entry is MagicGIPass and pass_entry.has_method("get_magicdawn_runtime_state"):
+		if pass_entry is MagicGIPass:
 			return pass_entry.get_magicdawn_runtime_state()
 	return {"status": "magic_gi_pass_missing"}
 
@@ -335,7 +335,7 @@ func _scene_renderer(volume: FMagicGIVolume) -> Object:
 	return null
 
 func _renderer_from_compositor(compositor: Object) -> Object:
-	if compositor == null or not is_instance_valid(compositor) or not compositor.has_method("get"):
+	if not is_instance_valid(compositor):
 		return null
 	var renderer: Variant = compositor.get("renderer")
 	return renderer if renderer is Resource else null

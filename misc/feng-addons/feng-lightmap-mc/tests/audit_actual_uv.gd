@@ -1,4 +1,6 @@
 extends SceneTree
+
+const SceneInputs = preload("res://addons/feng-lightmap-mc/feng_lightmap_scene_inputs.gd")
 func _initialize() -> void:
 	call_deferred("_run")
 func _run() -> void:
@@ -10,7 +12,7 @@ func _run() -> void:
 	root.add_child(scene)
 	current_scene = scene
 	var volume: Node = scene.get_node("FengLightmapVolume")
-	var collected: Dictionary = volume._collect_scene(scene,scene)
+	var collected: Dictionary = SceneInputs.collect(volume, volume.bounds, scene,scene)
 	if not collected.get("ok",false):
 		push_error(str(collected))
 		quit(1)

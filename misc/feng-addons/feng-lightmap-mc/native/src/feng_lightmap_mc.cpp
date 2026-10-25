@@ -7,6 +7,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 

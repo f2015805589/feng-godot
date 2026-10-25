@@ -1,8 +1,15 @@
 # Feng Lightmap MC
 
-`FengLightmapVolume` is an independent CPU surface lightmap baker. It traces the scene's actual triangles and UV2 surface positions into a separate `FengLightmapData` resource. `LightmapGIData` is only the runtime display format. The baker does not read MagicGI PRT/Surfel probes, CLV caches, SH coefficients, screen buffers, or Godot's `LightmapperRD` kernel. Enabling a lightmap never changes the MagicGI volume's PRT/Surfel selection.
+`FengLightmapVolume` bakes static scene triangles into UV2 surface atlases with a CPU Monte Carlo integrator. `FengLightmapData` persists the raw samples, variance and input signature; `LightmapGIData` provides the runtime display. This addon is independent of Magic GI's PRT and Surfel modes.
 
-The design references are the [Unity/MagicDawn technical introduction](https://developer.unity.cn/projects/6780a20dedbc2a001ee971bb), Tencent MagicDawn's [UV lightmap compression](https://magicdawn.tencent.com/academic/pages/uv.html) and [temporal lightmap sets / NDGI](https://magicdawn.tencent.com/academic/pages/ndgi.html). The introduction describes path-traced lightmap baking and a matching realtime preview. The research pages also describe lossy precomputed lightmap compression and reconstruction; they are not an open-source unbiased baker specification. FengLightmap implements its own surface Monte Carlo estimator. It does not claim to reproduce Tencent's unpublished baking code. Its raw path deliberately avoids lossy Gaussian/neural compression, SH projection, probe reconstruction, denoising and radiance clipping, because those transformations do not preserve an unbiased raw texel estimate.
+## Responsibilities
+
+- `feng_lightmap_volume.gd`: editor actions, asynchronous bake/cancel, sky capture, validated publication and display binding.
+- `feng_lightmap_scene_inputs.gd`: one scene traversal for receiver/transport geometry, materials and analytic lights; deterministic transport-input signatures. It owns no threads, scene nodes or saved resources.
+- `native/`: CPU transport integration over immutable input snapshots.
+- `feng_lightmap_data.gd`: persisted results, chart certificates and cached display reconstruction.
+
+Design references: [MagicDawn introduction](https://developer.unity.cn/projects/6780a20dedbc2a001ee971bb), [UV lightmap compression](https://magicdawn.tencent.com/academic/pages/uv.html), and [temporal lightmap sets](https://magicdawn.tencent.com/academic/pages/ndgi.html). The estimator and its supported surface model are defined below.
 
 ## Bake from the editor
 

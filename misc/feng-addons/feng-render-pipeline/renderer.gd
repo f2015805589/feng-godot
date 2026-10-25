@@ -348,6 +348,11 @@ func get_pass_parameters() -> Dictionary:
 	_ensure_pipeline_initialized(false)
 	return _with_eye_adaptation_state(ParameterResolver.resolve(_passes, _volume_parameters))
 
+## Compose validated Volume parameters and frame ownership for either binding path.
+func resolve_view_parameters(overrides: Dictionary, states: Dictionary, context: Dictionary, indirect_owner: Dictionary) -> Dictionary:
+	var resolved := _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, overrides, context), states)
+	return IndirectGISelection.inject(resolved, _passes, indirect_owner)
+
 func _with_eye_adaptation_state(parameters: Dictionary, states: Variant = null) -> Dictionary:
 	var key := "library:eye_adaptation"
 	var eye_pass_enabled := false
@@ -568,9 +573,8 @@ func apply(compositor: Compositor) -> void:
 		# computed pass defaults, even when a caller did not emit changed.
 		_volume_context_cache = {}
 		context = _initialized_volume_context()
-		parameters = _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, _volume_parameters, context))
 		indirect_owner = IndirectGISelection.resolve(_passes, _is_entry_enabled)
-		parameters = IndirectGISelection.inject(parameters, _passes, indirect_owner)
+		parameters = resolve_view_parameters(_volume_parameters, _volume_pass_states, context, indirect_owner)
 	var result := CompositorBinding.apply(
 		compositor,
 		_manager,
@@ -612,10 +616,8 @@ func apply_volume(compositor: Compositor, parameters: Dictionary, pass_states: D
 		# Fixed presets keep the same resolved upload across boundary crossings.
 		if _volume_binding.parameters != _volume_parameters:
 			_volume_binding.parameters = _volume_parameters.duplicate(true)
-			_volume_binding.resolved = _with_eye_adaptation_state(ParameterResolver.resolve_context(_passes, _volume_parameters, _volume_binding.context))
-			_volume_binding.resolved = IndirectGISelection.inject(
-				_volume_binding.resolved, _passes, _volume_binding.get("indirect_gi_owner", {})
-			)
+			_volume_binding.resolved = resolve_view_parameters(
+				_volume_parameters, _volume_pass_states, _volume_binding.context, _volume_binding.indirect_gi_owner)
 		# Crossing a boundary switches between authored and runtime effect RIDs.
 		# Restore the cached binding even though neither renderer's author changed.
 		if compositor.compositor_effects != _volume_binding.effects:
@@ -652,7 +654,7 @@ func compile_view_plan(states: Dictionary) -> Dictionary:
 	var plan := {
 		"warnings": warnings, "tokens": schedule.tokens, "names": schedule.names,
 		"sources": schedule.effects, "enabled": enabled, "provided": provided_ids,
-		"entries": _passes.duplicate(), "indirect_gi_owner": indirect_owner,
+		"indirect_gi_owner": indirect_owner,
 		"context": _initialized_volume_context().duplicate(true),
 	}
 	if _view_plans.size() == 2:

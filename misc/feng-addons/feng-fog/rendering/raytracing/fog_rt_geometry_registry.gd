@@ -36,6 +36,10 @@ var _world_generation := 0
 var _unsupported_counts: Dictionary = {}
 
 
+func is_attached_to(p_root: Node, p_world: World3D) -> bool:
+	return is_instance_valid(_root) and _root == p_root and _world == p_world
+
+
 func attach(p_root: Node, p_world: World3D) -> bool:
 	if p_root == null or p_world == null or not p_root.is_inside_tree():
 		return false

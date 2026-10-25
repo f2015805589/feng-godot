@@ -262,6 +262,7 @@ func test_directory_switch_keeps_working() -> void:
 	var original := terrain.data_directory
 	terrain.data_directory = ""
 	require(terrain.data.get_region_count() == 0, "clearing the directory should drop the data")
+	require(streamer.get_stats().resident_count == 0, "stats must read the replacement data object")
 	terrain.data_directory = original
 	require(terrain.data_directory == original, "directory should be restored")
 	require(terrain.data.get_region_count() == 25, "restoring the directory should load all 25 regions")
@@ -269,6 +270,7 @@ func test_directory_switch_keeps_working() -> void:
 
 	streamer.clear_tracking()
 	require(streamer.get_streamed_count() == 0, "clear_tracking should empty the streamed set")
+	require(streamer.get_stats().last_center == Vector2i(2147483647, 2147483647), "cleared center uses the documented sentinel")
 	require(streamer.load_region(Vector2i(1, 1)) == Terrain3DStreamer.LOAD_OK, "load after a data rebuild")
 	require(streamer.get_streamed_count() == 1, "the reloaded region should be tracked")
 	require(streamer.unload_region(Vector2i(1, 1)), "unload after a data rebuild")

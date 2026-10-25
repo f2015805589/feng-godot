@@ -20,7 +20,7 @@ def main() -> int:
         (project / folder).mkdir(exist_ok=True)
         env[key] = str(project / folder)
     base = [str(args.editor.resolve()), "--headless", "--path", str(project), "--audio-driver", "Dummy"]
-    phases = [("import", ["--editor", "--recovery-mode", "--import"], "", 0)]
+    phases = [("import", ["--editor", "--import"], "", 0)]
     for name, marker, expected in [
         ("terrain_region_resize_bounds.gd", "PASS terrain region resize bounds preserve original data", 2),
         ("terrain_region_resize_surface.gd", "PASS region resizing preserves authored R16 surface density and bytes", 0),

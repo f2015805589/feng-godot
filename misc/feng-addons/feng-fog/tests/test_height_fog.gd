@@ -90,6 +90,7 @@ func has_property(object: Object, wanted: StringName) -> bool:
 
 
 func run() -> void:
+	test_runtime_registry_lifecycle()
 	test_baked_source_snapshot_modes()
 	test_fsss_source_contract()
 	test_temporal_depth_contract()
@@ -1322,3 +1323,31 @@ func test_fsss_kernel_contract() -> void:
 	var subpixel_width_fade := clampf(0.5, 0.0, 1.0)
 	require(is_zero_approx(zero_width_fade) and is_equal_approx(subpixel_width_fade, 0.5),
 		"UE's W fade must suppress a zero PSF width and preserve fractional subpixel width")
+
+
+func test_runtime_registry_lifecycle() -> void:
+	var viewport := make_viewport()
+	var world := viewport.world_3d
+	var world_id := world.get_instance_id()
+	var first_root := Node3D.new()
+	var second_root := Node3D.new()
+	viewport.add_child(first_root)
+	viewport.add_child(second_root)
+	var initial := FengFogRuntime._ray_geometry_snapshot_for_world(world_id, world, first_root)
+	require(initial.get("abi_version") == 1, "owned geometry service publishes its typed snapshot")
+	initial["abi_version"] = -1
+	require(FengFogRuntime._ray_geometry_snapshot_for_world(world_id, world, first_root).abi_version == 1, "consumer mutation cannot alter later snapshot envelopes")
+	var first = FengFogRuntime._ray_geometry_registries[world_id]
+	FengFogRuntime._ray_geometry_snapshot_for_world(world_id, world, first_root)
+	require(FengFogRuntime._ray_geometry_registries[world_id] == first, "unchanged routes reuse geometry ownership")
+	FengFogRuntime._ray_geometry_snapshot_for_world(world_id, world, second_root)
+	require(first.get_snapshot().is_empty(), "replacing the root detaches the previous geometry registry")
+	var second = FengFogRuntime._ray_geometry_registries[world_id]
+	require(second != first, "replacement root gets a fresh registry")
+	second_root.free()
+	FengFogRuntime._ray_geometry_snapshot_for_world(world_id, world, first_root)
+	require(FengFogRuntime._ray_geometry_registries[world_id] != second and second.get_snapshot().is_empty(), "a freed root can be replaced in the same world")
+	var current = FengFogRuntime._ray_geometry_registries[world_id]
+	FengFogRuntime._prune_ray_geometry_registries({})
+	require(current.get_snapshot().is_empty() and FengFogRuntime._ray_geometry_registries.is_empty(), "pruning releases registry routes")
+	viewport.free()

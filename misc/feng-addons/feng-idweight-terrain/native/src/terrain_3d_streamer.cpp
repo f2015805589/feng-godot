@@ -15,8 +15,8 @@
 // Private Functions
 ///////////////////////////
 
-void Terrain3DStreamer::_sync_data() const {
-	_data = _terrain ? _terrain->get_data() : nullptr;
+Terrain3DData *Terrain3DStreamer::_get_data() const {
+	return _terrain ? _terrain->get_data() : nullptr;
 }
 
 String Terrain3DStreamer::_resolve_directory() const {
@@ -24,18 +24,6 @@ String Terrain3DStreamer::_resolve_directory() const {
 		return _directory;
 	}
 	return _terrain ? _terrain->get_data_directory() : String();
-}
-
-bool Terrain3DStreamer::_is_inside_world(const Vector2i &p_region_loc) const {
-	return Terrain3DData::get_region_map_index(p_region_loc) >= 0;
-}
-
-bool Terrain3DStreamer::_is_resident(const Vector2i &p_region_loc) const {
-	// has_region() is now correct immediately (the slot table validates it), but the
-	// pointer lookup skips a dictionary lookup per region and is what the load and
-	// unload paths need anyway.
-	_sync_data();
-	return _data && _data->get_region_ptr(p_region_loc) != nullptr;
 }
 
 void Terrain3DStreamer::_collect_desired(const Vector2i &p_center, std::vector<Vector2i> &r_desired) const {
@@ -48,7 +36,7 @@ void Terrain3DStreamer::_collect_desired(const Vector2i &p_center, std::vector<V
 			const int step = std::abs(dz) == ring ? 1 : ring * 2;
 			for (int dx = -ring; dx <= ring; dx += step) {
 				const Vector2i loc = p_center + Vector2i(dx, dz);
-				if (_is_inside_world(loc)) { r_desired.push_back(loc); }
+				if (Terrain3DData::get_region_map_index(loc) >= 0) { r_desired.push_back(loc); }
 			}
 		}
 	}
@@ -75,11 +63,7 @@ void Terrain3DStreamer::_collect_unload_candidates(const Vector2i &p_center, std
 	});
 }
 
-Terrain3DStreamer::LoadResult Terrain3DStreamer::_try_load(const Vector2i &p_region_loc) {
-	_sync_data();
-	if (!_data) {
-		return LOAD_FAILED;
-	}
+Terrain3DStreamer::LoadResult Terrain3DStreamer::_try_load(Terrain3DData &p_data, const Vector2i &p_region_loc) {
 	const String directory = _resolve_directory();
 	if (directory.is_empty()) {
 		LOG(ERROR, "Streamer has no data directory; cannot load ", p_region_loc);
@@ -93,9 +77,9 @@ Terrain3DStreamer::LoadResult Terrain3DStreamer::_try_load(const Vector2i &p_reg
 		LOG(DEBUG, "Streamer skipping absent region file ", path);
 		return LOAD_MISSING_FILE;
 	}
-	const int before = _data->get_region_count();
-	_data->load_region(p_region_loc, directory, false);
-	if (_data->get_region_ptr(p_region_loc) == nullptr || _data->get_region_count() <= before) {
+	const int before = p_data.get_region_count();
+	p_data.load_region(p_region_loc, directory, false);
+	if (p_data.get_region_ptr(p_region_loc) == nullptr || p_data.get_region_count() <= before) {
 		_failed_total++;
 		LOG(ERROR, "Streamer failed to load ", path);
 		return LOAD_FAILED;
@@ -107,19 +91,18 @@ Terrain3DStreamer::LoadResult Terrain3DStreamer::_try_load(const Vector2i &p_reg
 	// clean. Terrain3DRegion::save() serializes before clearing the flag, which
 	// would otherwise leave every streamed region permanently "modified" and
 	// permanently protected from unloading.
-	if (Terrain3DRegion *region = _data->get_region_ptr(p_region_loc)) {
+	if (Terrain3DRegion *region = p_data.get_region_ptr(p_region_loc)) {
 		region->set_modified(false);
 	}
 	LOG(DEBUG, "Streamer loaded region ", p_region_loc, " from ", path);
 	return LOAD_OK;
 }
 
-bool Terrain3DStreamer::_try_unload(const Vector2i &p_region_loc) {
-	_sync_data();
-	if (!_data || _streamed.find(p_region_loc) == _streamed.end()) {
+bool Terrain3DStreamer::_try_unload(Terrain3DData &p_data, const Vector2i &p_region_loc) {
+	if (_streamed.find(p_region_loc) == _streamed.end()) {
 		return false;
 	}
-	Terrain3DRegion *region = _data->get_region_ptr(p_region_loc);
+	Terrain3DRegion *region = p_data.get_region_ptr(p_region_loc);
 	if (!region) {
 		_streamed.erase(p_region_loc);
 		return false;
@@ -145,21 +128,17 @@ bool Terrain3DStreamer::_try_unload(const Vector2i &p_region_loc) {
 		}
 		_saved_total++;
 	}
-	_data->unload_region(p_region_loc, false);
+	p_data.unload_region(p_region_loc, false);
 	_streamed.erase(p_region_loc);
 	_unloaded_total++;
 	LOG(DEBUG, "Streamer unloaded region ", p_region_loc);
 	return true;
 }
 
-void Terrain3DStreamer::_notify_region_set_changed() {
-	_sync_data();
-	if (!_data) {
-		return;
-	}
+void Terrain3DStreamer::_notify_region_set_changed(Terrain3DData &p_data) {
 	// all_regions = false: a budgeted step only changed a few slots, so update_maps
 	// uploads those layers instead of reallocating and re-uploading every array.
-	_data->update_maps(TYPE_MAX, false, false);
+	p_data.update_maps(TYPE_MAX, false, false);
 	if (_terrain && _terrain->get_instancer()) {
 		_terrain->get_instancer()->update_mmis(-1, V2I_MAX, true);
 	}
@@ -171,14 +150,12 @@ void Terrain3DStreamer::_notify_region_set_changed() {
 
 void Terrain3DStreamer::initialize(Terrain3D *p_terrain) {
 	_terrain = p_terrain;
-	_sync_data();
 	LOG(INFO, "Terrain3DStreamer initialized, terrain: ", p_terrain);
 }
 
 void Terrain3DStreamer::clear_tracking() {
 	_streamed.clear();
 	_missing.clear();
-	_has_last_center = false;
 	_last_center = V2I_MAX;
 }
 
@@ -189,13 +166,12 @@ int Terrain3DStreamer::chebyshev_distance(const Vector2i &p_a, const Vector2i &p
 bool Terrain3DStreamer::update(const Vector3 &p_center) {
 	_last_loads = 0;
 	_last_unloads = 0;
-	_sync_data();
-	if (!_data) {
+	Terrain3DData *data = _get_data();
+	if (!data) {
 		return false;
 	}
 
-	const Vector2i center = _data->get_region_location(p_center);
-	_has_last_center = true;
+	const Vector2i center = data->get_region_location(p_center);
 	_last_center = center;
 
 	std::vector<Vector2i> desired;
@@ -212,7 +188,7 @@ bool Terrain3DStreamer::update(const Vector3 &p_center) {
 			if (_last_unloads >= _unloads_per_update) {
 				break;
 			}
-			if (_try_unload(loc)) {
+			if (_try_unload(*data, loc)) {
 				_last_unloads++;
 				changed++;
 			}
@@ -224,13 +200,13 @@ bool Terrain3DStreamer::update(const Vector3 &p_center) {
 			if (_last_loads >= _loads_per_update) {
 				break;
 			}
-			if (_is_resident(loc) || _missing.find(loc) != _missing.end()) {
+			if (data->get_region_ptr(loc) != nullptr || _missing.find(loc) != _missing.end()) {
 				continue;
 			}
-			if (_max_resident > 0 && _data->get_region_count() >= _max_resident) {
+			if (_max_resident > 0 && data->get_region_count() >= _max_resident) {
 				break;
 			}
-			const LoadResult result = _try_load(loc);
+			const LoadResult result = _try_load(*data, loc);
 			if (result == LOAD_OK) {
 				_last_loads++;
 				changed++;
@@ -239,7 +215,7 @@ bool Terrain3DStreamer::update(const Vector3 &p_center) {
 	}
 
 	if (changed > 0) {
-		_notify_region_set_changed();
+		_notify_region_set_changed(*data);
 	}
 	return changed > 0;
 }
@@ -253,28 +229,30 @@ int Terrain3DStreamer::flush(const Vector3 &p_center, const int p_max_steps) {
 }
 
 Terrain3DStreamer::LoadResult Terrain3DStreamer::load_region(const Vector2i &p_region_loc) {
-	_sync_data();
-	if (!_is_inside_world(p_region_loc)) {
-		// A caller mistake, not a runtime fault: the 32x32 region map rejects it.
+	Terrain3DData *data = _get_data();
+	if (!data) { return LOAD_FAILED; }
+	if (Terrain3DData::get_region_map_index(p_region_loc) < 0) {
+		// Reject locations outside the region directory.
 		LOG(WARN, "Streamer region ", p_region_loc, " is outside the region map");
 		return LOAD_FAILED;
 	}
-	if (_is_resident(p_region_loc)) {
+	if (data->get_region_ptr(p_region_loc) != nullptr) {
 		_streamed.insert(p_region_loc);
 		return LOAD_OK;
 	}
-	const LoadResult result = _try_load(p_region_loc);
+	const LoadResult result = _try_load(*data, p_region_loc);
 	if (result == LOAD_OK) {
-		_notify_region_set_changed();
+		_notify_region_set_changed(*data);
 	}
 	return result;
 }
 
 bool Terrain3DStreamer::unload_region(const Vector2i &p_region_loc) {
-	if (!_try_unload(p_region_loc)) {
+	Terrain3DData *data = _get_data();
+	if (!data || !_try_unload(*data, p_region_loc)) {
 		return false;
 	}
-	_notify_region_set_changed();
+	_notify_region_set_changed(*data);
 	return true;
 }
 
@@ -316,38 +294,34 @@ void Terrain3DStreamer::set_max_resident(const int p_count) {
 // Introspection
 ///////////////////////////
 
-Array Terrain3DStreamer::get_streamed_locations() const {
-	Array out;
-	std::vector<Vector2i> sorted(_streamed.begin(), _streamed.end());
+namespace {
+Array sorted_locations(const std::unordered_set<Vector2i, Vector2iHash> &p_locations) {
+	std::vector<Vector2i> sorted(p_locations.begin(), p_locations.end());
 	std::sort(sorted.begin(), sorted.end(), [](const Vector2i &p_a, const Vector2i &p_b) {
 		return p_a.y != p_b.y ? p_a.y < p_b.y : p_a.x < p_b.x;
 	});
-	for (const Vector2i &loc : sorted) {
-		out.push_back(loc);
-	}
+	Array out;
+	for (const Vector2i &loc : sorted) { out.push_back(loc); }
 	return out;
+}
+} // namespace
+
+Array Terrain3DStreamer::get_streamed_locations() const {
+	return sorted_locations(_streamed);
 }
 
 Array Terrain3DStreamer::get_missing_locations() const {
-	Array out;
-	std::vector<Vector2i> sorted(_missing.begin(), _missing.end());
-	std::sort(sorted.begin(), sorted.end(), [](const Vector2i &p_a, const Vector2i &p_b) {
-		return p_a.y != p_b.y ? p_a.y < p_b.y : p_a.x < p_b.x;
-	});
-	for (const Vector2i &loc : sorted) {
-		out.push_back(loc);
-	}
-	return out;
+	return sorted_locations(_missing);
 }
 
 Array Terrain3DStreamer::get_desired_locations(const Vector3 &p_center) const {
 	Array out;
-	_sync_data();
-	if (!_data) {
+	Terrain3DData *data = _get_data();
+	if (!data) {
 		return out;
 	}
 	std::vector<Vector2i> desired;
-	_collect_desired(_data->get_region_location(p_center), desired);
+	_collect_desired(data->get_region_location(p_center), desired);
 	for (const Vector2i &loc : desired) {
 		out.push_back(loc);
 	}
@@ -355,7 +329,7 @@ Array Terrain3DStreamer::get_desired_locations(const Vector3 &p_center) const {
 }
 
 Dictionary Terrain3DStreamer::get_stats() const {
-	_sync_data();
+	Terrain3DData *data = _get_data();
 	Dictionary stats;
 	stats["loaded_total"] = _loaded_total;
 	stats["unloaded_total"] = _unloaded_total;
@@ -367,8 +341,8 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	stats["last_unloads"] = _last_unloads;
 	stats["streamed_count"] = get_streamed_count();
 	stats["missing_count"] = get_missing_count();
-	stats["resident_count"] = _data ? _data->get_region_count() : 0;
-	stats["last_center"] = _has_last_center ? _last_center : V2I_MAX;
+	stats["resident_count"] = data ? data->get_region_count() : 0;
+	stats["last_center"] = _last_center;
 	return stats;
 }
 

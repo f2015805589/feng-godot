@@ -180,6 +180,21 @@ func _run() -> void:
 	_check(streamer.ready_pages(PackedFloat32Array(), PackedFloat32Array()).is_empty()
 			and streamer.resident_page_count() == 0,
 		"inactive views release CPU page residency")
+	# Reactivation may reload the same immutable page while an old emission job completes.
+	var emission_job := preload("res://addons/feng-magic-gi/feng_magic_gi_page_emission_job.gd").new()
+	emission_job.configure(data, PackedFloat32Array())
+	var old_emission_task := WorkerThreadPool.add_task(emission_job.run)
+	streamer._emission_tasks[old_emission_task] = {"page_key": "reactivated", "version": 1,
+		"identity": "same-page", "job": emission_job, "sources": PackedFloat32Array()}
+	streamer.deactivate()
+	streamer._resident["reactivated"] = {"version": 1, "base_identity": "same-page",
+		"descriptor": {"emission_payload": PackedFloat32Array([42])}}
+	while not WorkerThreadPool.is_task_completed(old_emission_task):
+		await process_frame
+	streamer._advance_emission_updates(volume)
+	_check(streamer._emission_tasks.is_empty() and streamer._resident.reactivated.descriptor.emission_payload == PackedFloat32Array([42]),
+		"Discarded emission work must drain without overwriting a reactivated page of the same identity")
+	streamer.deactivate()
 	var retired_streamer := Streamer.new()
 	retired_streamer.set_manifest(manifest)
 	retired_streamer.request_view(202, 0, Vector3(0.5, 0.5, 0.5), requested_bounds, Time.get_ticks_msec())

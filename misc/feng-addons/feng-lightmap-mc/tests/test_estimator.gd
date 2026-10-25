@@ -1,5 +1,7 @@
 extends SceneTree
 
+const SceneInputs = preload("res://addons/feng-lightmap-mc/feng_lightmap_scene_inputs.gd")
+
 const RESOLUTION := 4
 const CAVITY_SPP := 8192
 const EXTENSION_PATH := "res://addons/feng-lightmap-mc/feng-lightmap-mc.gdextension"
@@ -80,7 +82,7 @@ func _test_volume_model_rejections() -> void:
 	dynamic_light.light_bake_mode = Light3D.BAKE_DYNAMIC
 	(fixture.root as Node).add_child(dynamic_light)
 	volume.set("environment_mode", 1) # BLACK_OVERRIDE
-	report = volume.call("_collect_scene", fixture.root, fixture.root)
+	report = SceneInputs.collect(volume, volume.bounds, fixture.root, fixture.root)
 	assert(report.get("ok", false), "v3 frontend must collect BAKE_DYNAMIC directional lights")
 	assert(not report.directional_lights[0].direct_enabled, "dynamic directional direct illumination must remain realtime")
 	current_scene = null

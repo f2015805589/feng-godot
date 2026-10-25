@@ -185,8 +185,7 @@ func _clear_shadow(ctx: FRPPassContext, buffers: RenderSceneBuffersRD, rd: Rende
 func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: RenderSceneData,
 		view: int, buffers: RenderSceneBuffersRD, rd: RenderingDevice, owner_id: int,
 		vrt_mode: int) -> bool:
-	var volume_deferred := ctx != null and ctx.has_method("is_volume_deferred_composition") \
-			and bool(ctx.call("is_volume_deferred_composition"))
+	var volume_deferred := ctx != null and ctx.is_volume_deferred_composition()
 	var fsss_deferred := ctx != null \
 			and bool(ctx.get_meta(&"frp_fsss_deferred_composition", false))
 	var composition_deferred := volume_deferred or fsss_deferred
@@ -409,13 +408,8 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 	composite_uniforms.append(RDUniforms.sampled(19, _sampler, current_transmittance))
 	composite_uniforms.append(RDUniforms.sampled(20, _sampler, current_depth))
 	composite_uniforms.append(RDUniforms.sampled(13, _sampler, scene_depth))
-	var volume_packet := PackedFloat32Array()
-	var volume_texture := RID()
-	if ctx.has_method("get_volume_sampling_parameters") and ctx.has_method("get_volume_texture"):
-		var packet_value: Variant = ctx.call("get_volume_sampling_parameters")
-		if packet_value is PackedFloat32Array:
-			volume_packet = packet_value
-		volume_texture = ctx.call("get_volume_texture")
+	var volume_packet := ctx.get_volume_sampling_parameters()
+	var volume_texture := ctx.get_volume_texture()
 	var volume_valid := volume_deferred and volume_packet.size() == 20 and volume_packet[19] > 0.5 \
 			and _valid_texture(rd, volume_texture)
 	if volume_packet.size() != 20:
@@ -451,13 +445,7 @@ func render_clouds(ctx: FRPPassContext, snapshot: Dictionary, scene_data: Render
 		return false
 	ctx.set_cloud_outputs(current_radiance, current_transmittance, current_depth, sky_ambient)
 	if composition_deferred and view == view_count - 1:
-		var frame_generation := -1
-		if ctx.has_method("get_volume_frame_generation"):
-			frame_generation = int(ctx.call("get_volume_frame_generation", 0))
-		elif ctx.has_method("get_volume_frame_inputs"):
-			var frame_inputs: Variant = ctx.call("get_volume_frame_inputs", 0)
-			if frame_inputs is Dictionary and bool(frame_inputs.get("valid", false)):
-				frame_generation = int(frame_inputs.get("frame_generation", -1))
+		var frame_generation := ctx.get_volume_frame_generation(0)
 		var history_material_snapshot: Dictionary = snapshot.get("material", {})
 		var material_revision := int(history_material_snapshot.get("revision", -1))
 		var material_layout := str(history_material_snapshot.get("kernel_layout",

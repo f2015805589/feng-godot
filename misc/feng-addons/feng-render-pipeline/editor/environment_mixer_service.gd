@@ -55,7 +55,7 @@ const COMPONENTS: Array[Dictionary] = [
 var _editor_plugin_ref: WeakRef
 var _scene_root_ref: WeakRef
 var _watched_nodes: Dictionary = {}
-var _undo_redo_manager: Object
+var _undo_redo_manager: EditorUndoRedoManager
 var _snapshot_cache: Dictionary = {}
 var _refresh_queued := false
 var _atmospheric_only := true
@@ -72,12 +72,8 @@ func start(p_editor_plugin: EditorPlugin) -> void:
 		p_editor_plugin.scene_closed.connect(_on_editor_scene_closed)
 	_undo_redo_manager = p_editor_plugin.get_undo_redo()
 	if _undo_redo_manager != null:
-		if _undo_redo_manager.has_signal("history_changed") \
-				and not _undo_redo_manager.is_connected("history_changed", _on_undo_redo_changed):
-			_undo_redo_manager.connect("history_changed", _on_undo_redo_changed)
-		if _undo_redo_manager.has_signal("version_changed") \
-				and not _undo_redo_manager.is_connected("version_changed", _on_undo_redo_changed):
-			_undo_redo_manager.connect("version_changed", _on_undo_redo_changed)
+		_undo_redo_manager.history_changed.connect(_on_undo_redo_changed)
+		_undo_redo_manager.version_changed.connect(_on_undo_redo_changed)
 	var tree := get_tree() if is_inside_tree() else null
 	if tree != null:
 		if not tree.node_added.is_connected(_on_tree_node_added):
@@ -95,10 +91,8 @@ func stop() -> void:
 		if plugin.scene_closed.is_connected(_on_editor_scene_closed):
 			plugin.scene_closed.disconnect(_on_editor_scene_closed)
 	if is_instance_valid(_undo_redo_manager):
-		if _undo_redo_manager.is_connected("history_changed", _on_undo_redo_changed):
-			_undo_redo_manager.disconnect("history_changed", _on_undo_redo_changed)
-		if _undo_redo_manager.is_connected("version_changed", _on_undo_redo_changed):
-			_undo_redo_manager.disconnect("version_changed", _on_undo_redo_changed)
+		_undo_redo_manager.history_changed.disconnect(_on_undo_redo_changed)
+		_undo_redo_manager.version_changed.disconnect(_on_undo_redo_changed)
 	_undo_redo_manager = null
 	var tree := get_tree() if is_inside_tree() else null
 	if tree != null:
@@ -131,10 +125,7 @@ func get_scene_root() -> Node:
 
 
 func get_component_definitions() -> Array[Dictionary]:
-	var result: Array[Dictionary] = []
-	for definition in COMPONENTS:
-		result.append(definition.duplicate(true))
-	return result
+	return COMPONENTS.duplicate(true)
 
 
 func set_atmospheric_only(p_enabled: bool) -> void:
@@ -152,33 +143,16 @@ func get_snapshot() -> Dictionary:
 
 
 func _snapshot_cache_needs_refresh(p_current_root: Node) -> bool:
-	var cached_scene_root: Variant = _snapshot_cache.get("scene_root")
-	var cache_claims_scene := bool(_snapshot_cache.get("has_scene", false))
-	var stale_cached_root := false
-	var cached_root_mismatch := false
-	if cache_claims_scene:
-		if is_instance_valid(cached_scene_root) and cached_scene_root is Node:
-			cached_root_mismatch = p_current_root != cached_scene_root
-		else:
-			stale_cached_root = true
-	var closed_scene_still_cached := p_current_root == null and cache_claims_scene
-	return _snapshot_cache.is_empty() or p_current_root != get_scene_root() \
-			or stale_cached_root or closed_scene_still_cached or cached_root_mismatch \
-			or _snapshot_has_invalid_nodes()
-
-
-func _snapshot_has_invalid_nodes() -> bool:
-	var components: Variant = _snapshot_cache.get("components", {})
-	if not (components is Dictionary):
+	if _snapshot_cache.is_empty() or p_current_root != get_scene_root():
 		return true
-	for rows_value in components.values():
-		if not (rows_value is Array):
-			return true
-		for row_value in rows_value:
-			if not (row_value is Dictionary):
-				return true
-			var node: Variant = row_value.get("node")
-			if not is_instance_valid(node) or not (node is Node):
+	var cached_root: Variant = _snapshot_cache.scene_root
+	if bool(_snapshot_cache.has_scene) != is_instance_valid(cached_root):
+		return true
+	if is_instance_valid(cached_root) and cached_root != p_current_root:
+		return true
+	for rows in _snapshot_cache.components.values():
+		for row in rows:
+			if not is_instance_valid(row.node):
 				return true
 	return false
 
@@ -318,9 +292,7 @@ func _scene_has_camera_attribute_override(p_scene_root: Node) -> bool:
 			return true
 		if node is WorldEnvironment and node.camera_attributes != null:
 			return true
-		for child in node.get_children(false):
-			if child is Node:
-				pending.append(child)
+		pending.append_array(node.get_children(false))
 	return false
 
 
@@ -381,13 +353,10 @@ func _scan_scene(p_root: Node) -> Dictionary:
 		while cursor < pending.size():
 			var node := pending[cursor]
 			cursor += 1
-			for definition in COMPONENTS:
-				if _matches_definition(node, definition):
-					var matches: Array = nodes_by_id[definition["id"]]
-					matches.append(node)
-			for child in node.get_children(false):
-				if child is Node:
-					pending.append(child)
+			var definition := component_definition(node)
+			if not definition.is_empty():
+				nodes_by_id[definition.id].append(node)
+			pending.append_array(node.get_children(false))
 
 		for atmosphere in nodes_by_id[&"sky_atmosphere"]:
 			var linked_sun: Variant = atmosphere.get("sun_light")
@@ -446,19 +415,18 @@ func _scan_scene(p_root: Node) -> Dictionary:
 	}
 
 
-func _matches_definition(p_node: Node, p_definition: Dictionary) -> bool:
-	var native_class := String(p_definition.get("native_class", ""))
-	if not native_class.is_empty():
-		return p_node.is_class(native_class)
-	var expected_path := String(p_definition.get("script_path", ""))
-	var expected_global := StringName(p_definition.get("global_class", ""))
-	var script := p_node.get_script() as Script
+static func component_definition(p_object: Object) -> Dictionary:
+	for definition in COMPONENTS:
+		if definition.has("native_class") and p_object.is_class(definition.native_class):
+			return definition
+	var script := p_object.get_script() as Script
 	while script != null:
-		if (not expected_path.is_empty() and script.resource_path == expected_path) \
-				or (expected_global != StringName() and script.get_global_name() == expected_global):
-			return true
+		for definition in COMPONENTS:
+			if definition.has("script_path") and (script.resource_path == definition.script_path \
+					or script.get_global_name() == definition.global_class):
+				return definition
 		script = script.get_base_script()
-	return false
+	return {}
 
 
 func _current_edited_scene_root() -> Node:
@@ -524,12 +492,9 @@ func _subtree_has_component(p_node: Node) -> bool:
 	while cursor < pending.size():
 		var node := pending[cursor]
 		cursor += 1
-		for definition in COMPONENTS:
-			if _matches_definition(node, definition):
-				return true
-		for child in node.get_children(false):
-			if child is Node:
-				pending.append(child)
+		if not component_definition(node).is_empty():
+			return true
+		pending.append_array(node.get_children(false))
 	return false
 
 
@@ -547,6 +512,5 @@ func _schedule_refresh() -> void:
 
 func _flush_queued_refresh() -> void:
 	_refresh_queued = false
-	if not is_inside_tree():
-		return
-	refresh()
+	if is_inside_tree() and _editor_plugin() != null:
+		refresh()

@@ -14,6 +14,9 @@ using real_t = float;
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CLAMP(v, lo, hi) MIN(MAX(v, lo), hi)
+#define CLASS_NAME_STATIC(...)
+#define V2I_ZERO Vector2i()
+constexpr int DEBUG = 2;
 #define LOG(...)
 struct Vector2i {
 	int x = 0, y = 0;
@@ -21,6 +24,7 @@ struct Vector2i {
 	Vector2i(int px, int py) : x(px), y(py) {}
 	Vector2i operator/(int divisor) const { return {x / divisor, y / divisor}; }
 	bool operator!=(Vector2i other) const { return x != other.x || y != other.y; }
+	bool operator==(Vector2i other) const { return !(*this != other); }
 };
 struct Rect2i {
 	Vector2i position, size;
@@ -63,9 +67,13 @@ struct PackedFloat32Array {
 	float *ptrw() { return data.data(); }
 	bool operator!=(const PackedFloat32Array &other) const { return data != other.data; }
 };
-struct RenderingServer { enum { MULTIMESH_TRANSFORM_3D }; };
+struct RenderingServer { enum { MULTIMESH_TRANSFORM_3D, TEXTURE_LAYERED_2D_ARRAY }; };
 struct Server {
 	int next = 1, releases = 0, uploads = 0, bounds_updates = 0;
+	bool fail_texture = false;
+	template <class T> RID texture_2d_create(const T &) { return fail_texture ? RID() : multimesh_create(); }
+	template <class T> RID texture_2d_layered_create(const T &value, int) { return texture_2d_create(value); }
+	template <class T> void texture_2d_update(RID, const T &, int) { ++uploads; }
 	std::map<int, bool> live;
 	RID multimesh_create() { live[next] = true; return {next++}; }
 	RID instance_create2(RID, RID) { return multimesh_create(); }
@@ -81,7 +89,7 @@ struct Server {
 } server;
 #define RS (&server)
 struct World { RID get_scenario() const { return {}; } } world;
-struct Terrain3D { World *get_world_3d() { return &world; } } terrain;
+struct Terrain3D { static constexpr int debug_level = 0; World *get_world_3d() { return &world; } } terrain;
 struct Time {
 	static Time *get_singleton() { static Time time; return &time; }
 	uint64_t get_ticks_usec() const { return 0; }
@@ -115,9 +123,12 @@ struct Color {
 template <class T> struct Ref : std::shared_ptr<T> {
 	using std::shared_ptr<T>::shared_ptr;
 	bool is_valid() const { return bool(*this); }
+	bool is_null() const { return !*this; }
+	void unref() { this->reset(); }
 };
 struct Image {
-	enum { FORMAT_RGBA8, FORMAT_RGB8 };
+	enum Format { FORMAT_RGBA8, FORMAT_RGB8, FORMAT_MAX };
+	Format get_format() const { return FORMAT_RGBA8; }
 	std::vector<Color> pixels;
 	static Ref<Image> create_empty(int width, int height, bool, int) {
 		Ref<Image> image(new Image);
@@ -131,6 +142,11 @@ struct Image {
 	Color get_pixel(int x, int) const { return pixels.at(x); }
 	void set_pixel(int x, int, Color color) { pixels.at(x) = color; }
 };
+template <class T> struct TypedArray : std::vector<Ref<T>> {
+	bool is_empty() const { return this->empty(); }
+	int64_t size() const { return int64_t(std::vector<Ref<T>>::size()); }
+};
+#include "generated_texture.inc"
 struct Terrain3DUtil {
 	static Ref<Image> pack_image(const Ref<Image> &, const Ref<Image> &, const Ref<Image> &, bool, bool, bool, int, int);
 	static Ref<Image> luminance_to_height(const Ref<Image> &);
@@ -207,10 +223,33 @@ static void cell_bounds() {
 		}
 	}
 }
+static void texture_replacement() {
+	server = {};
+	GeneratedTexture texture;
+	const auto image = gray({0.f, 1.f});
+	for (int cycle = 0; cycle < 3; ++cycle) {
+		texture.create(image);
+		texture.create(texture.get_image());
+		require(server.live.size() == 1 && texture.size() == 2, "2D replacement must own exactly one RID");
+		require(texture.ensure_layers(image, 2), "array replacement must report allocation");
+		require(server.live.size() == 1 && texture.get_layer_count() == 2 && texture.get_image().is_null(), "array replaces 2D backing metadata");
+		const auto rid = texture.get_rid();
+		require(!texture.ensure_layers(image, 2) && texture.get_rid().id == rid.id, "matching layers reuse storage");
+		server.fail_texture = true;
+		require(!texture.ensure_layers(image, 4) && texture.is_dirty() && texture.size() == 0 && server.live.empty(), "failed replacement stays empty and retryable");
+		server.fail_texture = false;
+		require(texture.ensure_layers(image, 4) && !texture.is_dirty(), "failed allocation must retry");
+		texture.clear();
+		texture.clear();
+		require(server.live.empty(), "repeated clear must release exactly once");
+	}
+	require(texture.get_create_count() == 12, "only successful allocations count");
+}
+
 int main() {
 	int failures = 0;
 	const std::pair<const char *, void (*)()> tests[] = {
-		{"CDLOD bounds", cdlod_bounds}, {"region RID release", regular_release},
+		{"texture replacement", texture_replacement}, {"CDLOD bounds", cdlod_bounds}, {"region RID release", regular_release},
 		{"alpha normalization", [] { normalization(false); }},
 		{"luminance normalization", [] { normalization(true); }}, {"cell copy bounds", cell_bounds}};
 	for (const auto &[name, test] : tests) {

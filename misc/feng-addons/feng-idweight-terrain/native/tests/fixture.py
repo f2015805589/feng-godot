@@ -349,7 +349,7 @@ def run_script_test(*, fixture_prefix: str, script: str, marker: str | Sequence[
     try:
         with log.open("w", encoding="utf-8") as out:
             result_code = run_with_offscreen_window(
-                base + ["--headless", "--editor", "--recovery-mode", "--import"],
+                base + ["--headless", "--editor", "--import"],
                 env=environment, stream=out,
                 timeout=timeout_import)
             if result_code is None:

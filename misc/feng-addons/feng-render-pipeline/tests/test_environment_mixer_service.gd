@@ -28,8 +28,11 @@ func _test_minimal_property_names() -> void:
 		"FengVolumetricCloud": load("res://addons/feng-cloud/feng_volumetric_cloud.gd").new(),
 		"FengHeightFog": load("res://addons/feng-fog/feng_height_fog.gd").new(),
 	}
+	var window := WindowScript.new()
 	for kind in probes:
 		var object: Object = probes[kind]
+		require(window._component_kind(object) == kind,
+				"discovery and inspector filtering must share the component definition for %s" % kind)
 		if kind == "DirectionalLight3D":
 			# The target path is conditionally exposed after reserving an object slot.
 			object.set("directional_shadow_object_shadow_enabled", true)
@@ -43,6 +46,7 @@ func _test_minimal_property_names() -> void:
 				missing.append(String(property_name))
 		require(missing.is_empty(), "%s Minimal controls must match real editable properties: %s" % [kind, ", ".join(missing)])
 		object.free()
+	window.free()
 
 
 func _test_directional_shadow_defaults_and_roundtrip() -> void:
@@ -338,6 +342,20 @@ func _test_freed_node_references() -> void:
 	service.free()
 
 
+func _test_stopped_service_refresh() -> void:
+	var service := ServiceScript.new()
+	get_root().add_child(service)
+	var notifications := [0]
+	service.snapshot_changed.connect(func(_snapshot): notifications[0] += 1)
+	service._schedule_refresh()
+	service.stop()
+	service.stop()
+	await process_frame
+	require(notifications[0] == 0 and service._snapshot_cache.is_empty(),
+			"a queued refresh must not revive a stopped service or emit stale scene state")
+	service.free()
+
+
 func _test_module_visibility() -> void:
 	var environment_window = WindowScript.new()
 	require(environment_window.call("_initial_size_for_host", Vector2i(1600, 1000)) == Vector2i(1440, 900),
@@ -345,15 +363,18 @@ func _test_module_visibility() -> void:
 	require(environment_window.call("_initial_size_for_host", Vector2i(1000, 700)) == Vector2i(900, 630),
 			"the first popup should keep the 90% cap on a smaller host")
 	var panels: Dictionary = {}
-	for component_id in WindowScript.MODULE_IDS:
+	for definition in ServiceScript.COMPONENTS:
+		var component_id: StringName = definition.id
 		var panel := PanelContainer.new()
 		panels[component_id] = panel
 		environment_window._columns[component_id] = {"panel": panel}
 		require(panel.visible, "%s is visible when the window opens" % String(component_id))
-	for component_id in WindowScript.MODULE_IDS:
+	for definition in ServiceScript.COMPONENTS:
+		var component_id: StringName = definition.id
 		environment_window.call("_set_module_visible", component_id, component_id == &"height_fog")
 	var visible_ids: Array[StringName] = []
-	for component_id in WindowScript.MODULE_IDS:
+	for definition in ServiceScript.COMPONENTS:
+		var component_id: StringName = definition.id
 		if panels[component_id].visible:
 			visible_ids.append(component_id)
 	require(visible_ids == [&"height_fog"], "module visibility can isolate the Height Fog card without changing other modules")
@@ -434,6 +455,7 @@ func run() -> void:
 	_test_directional_shadow_mixer_controls()
 	_test_renderer_shadow_stage_schedule()
 	_test_freed_node_references()
+	await _test_stopped_service_refresh()
 	_test_module_visibility()
 	await _test_card_flow_geometry()
 

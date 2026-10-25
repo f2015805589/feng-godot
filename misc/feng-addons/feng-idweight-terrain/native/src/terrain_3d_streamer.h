@@ -38,9 +38,6 @@ public:
 
 private:
 	Terrain3D *_terrain = nullptr;
-	// Terrain3D::set_data_directory() recreates Terrain3DData, so this pointer is
-	// re-resolved on every entry point instead of being trusted across calls.
-	mutable Terrain3DData *_data = nullptr;
 
 	// Settings
 	bool _enabled = false;
@@ -60,7 +57,6 @@ private:
 	// Region locations whose file does not exist. Retried only on reset.
 	std::unordered_set<Vector2i, Vector2iHash> _missing;
 	Vector2i _last_center = V2I_MAX;
-	bool _has_last_center = false;
 
 	// Stats
 	int _loaded_total = 0;
@@ -74,14 +70,12 @@ private:
 
 	String _resolve_directory() const;
 	// Defined in the .cpp: it needs the complete Terrain3D type.
-	void _sync_data() const;
-	bool _is_inside_world(const Vector2i &p_region_loc) const;
-	bool _is_resident(const Vector2i &p_region_loc) const;
+	Terrain3DData *_get_data() const;
 	void _collect_desired(const Vector2i &p_center, std::vector<Vector2i> &r_desired) const;
 	void _collect_unload_candidates(const Vector2i &p_center, std::vector<Vector2i> &r_candidates) const;
-	LoadResult _try_load(const Vector2i &p_region_loc);
-	bool _try_unload(const Vector2i &p_region_loc);
-	void _notify_region_set_changed();
+	LoadResult _try_load(Terrain3DData &p_data, const Vector2i &p_region_loc);
+	bool _try_unload(Terrain3DData &p_data, const Vector2i &p_region_loc);
+	void _notify_region_set_changed(Terrain3DData &p_data);
 
 public:
 	Terrain3DStreamer() {}

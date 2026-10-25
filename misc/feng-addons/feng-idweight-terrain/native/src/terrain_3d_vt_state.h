@@ -3,60 +3,10 @@
 #ifndef TERRAIN3D_VT_STATE_H
 #define TERRAIN3D_VT_STATE_H
 
-// Every virtual texture field Terrain3D owns, in one struct.
-//
-// The node's own state (regions, mesh, ocean, CDLOD, targets) stays in terrain_3d.h;
-// this is the shared VT service, the near-field AVT and the far-field SVT together,
-// so "what does the VT layer remember" is one greppable unit instead of a hundred
-// fields interleaved with the renderer's. No algorithm lives here: the fields are plain
-// aggregates, and the small structs below carry only the operations that keep their own
-// invariant.
-//
-// The fields are grouped in the order a reader meets them, and each group has a banner:
-//
-//   1. the shared service   - settings, pool identity and producer handles both views read
-//   2. the near field (AVT) - its settings, plan, working set, motion lead and arrival fade
-//   3. the far field (SVT)  - its settings, root pyramid, cell sources and bake bookkeeping
-//   4. cost and diagnostics - per-phase timings, the stage sums, the counter sets
-//   5. planner scratch      - capacity owned here so a tick does not reallocate it
-//
-// The groups follow the work: a field sits with the view that spends it. Four settings are the
-// exception and live in the service group because both views read them or the baker resolves them
-// once for both tiers - the two compression modes, the source worker count and whether the region
-// texture array is uploaded - so a reader looking for a setting should start there.
-//
-// The fields below that are *one fact* and have to move together. Reading them as independent
-// values is how several of them have been broken already:
-//
-//   * the page-arrival fade is `Terrain3DVTFade` below, because its parts move together: the three
-//     per-slot vectors are the same length by construction, and the texture is rebuilt whenever
-//     that length stops matching the pool's page count, carrying the counters into it so an
-//     arrival that is mid-ramp is not finished as a step. Its methods are the only place a length
-//     changes, which is what keeps a new field from being forgotten by a rebuild or a teardown.
-//   * the standing plan is `Terrain3DAVTPlan` below: the key, the selection with its sampled
-//     length and the single retention flag. `install()` is the one way a completed
-//     plan replaces the standing one, which is what makes forgetting the retention impossible to
-//     forget: a stale "already retained" flag leaves the source queue holding work the new plan
-//     does not name.
-//   * the settled shortcut is `Terrain3DAVTSettled` below: the driver's verdict, the residency
-//     revision an idle pass verified, the set it verified and whether the idle statistics already
-//     describe that run. `can_run()` is the only place the verdict is read, and `fall_through()` /
-//     `unverify()` are the two ways it is dropped - a full pass, and a newly submitted plan.
-//   * the pool is `Terrain3DVTPool` below: the published capacity, the rebuild generation and the
-//     growth wait are one owner because the capacity only reaches the two views through the
-//     generation, and only a rebuild bumps it.
-//   * the bound material is `Terrain3DVTBoundMaterial` below: both tiers' arrays are replaced as one
-//     bundle, so the near field's albedo alone does not identify the set, and `matches()` is the
-//     only place that identity is decided.
-//   * the far field's bake is `Terrain3DSVTBakeJob` below: the queue, the slots protected while
-//     their cell bakes, the cell in flight and the job-scoped counters are one job, serialized by
-//     `explicit_job`. `busy()` is the one predicate the rest of the addon pauses on, and `begin()`
-//     is the only place the counters are reset, so an automatic job cannot replace the counters the
-//     dock and the tests read as "this bake completed".
-//   * the far field's root plan is `Terrain3DSVTRootPlan` below: the key, the pinned pages, the
-//     settled flag and the coverage move together, and `matches()` is the only way to ask whether a
-//     walk can be skipped - a key that still matches while a walk was incomplete is a plan that
-//     never pinned, which is the failure the flag exists to prevent.
+// VT runtime state, grouped by shared service, AVT, SVT, diagnostics and planner scratch.
+// Node/geometry state belongs to Terrain3D. Each aggregate below owns related state
+// and the transitions that preserve its invariant; algorithms live in the corresponding .cpp.
+// See docs/vt_architecture_review.md for ownership and frame flow.
 
 #include <algorithm>
 #include <map>
@@ -100,15 +50,9 @@ enum class PageArrival : uint8_t {
 	ARMED = 2,
 };
 
-// Which source answers "what level is this page wanted at" for the near field's *region* addressing
-// (the legacy path `_surface_vt_mip_for_page()` resolves; the sector path has its own footprint rule).
-//
-// The two are **layered, not alternatives**: the CPU rule always answers for the demand the lead
-// predicts, and the projection pass *refines* that answer while it has a result. Naming them is what
-// makes one distinction explicit, because a caller has to get it right and a single boolean cannot
-// express it: `_vt_projection_demand_enabled()` is the setting - "may the pass run at all" - and
-// `_vt_demand_source()` is this frame - "does it answer now". Both used to be `surface_vt_feedback_enabled`
-// read in two files with two different meanings, and one of them also re-tested `has_result()`.
+// The legacy region-addressing demand source. CPU prediction always supplies demand;
+// projection refines it while a result exists. The enabled setting and this frame's
+// available source are separate decisions.
 enum class TerrainVTPageDemandSource {
 	// The distance rule the page geometry implies, plus the motion/turn lead.
 	CPURule,
@@ -118,16 +62,9 @@ enum class TerrainVTPageDemandSource {
 	Projected,
 };
 
-// The page-arrival fade's whole state: the per-slot ramps, the FIFO that orders the armed
-// arrivals, the one-texel texture the shader reads, and the counters the dock and the tests
-// report. One struct rather than fourteen sibling fields, because its parts are one fact each:
-// the three per-slot vectors are the same length by construction - a slot index past them has to
-// grow all of them, and growing one alone writes past the end of the others, which took three
-// suites down with no output before it was found - and the texture is rebuilt whenever that
-// length stops matching the pool's page count. The operations that change a length are methods
-// here, so a field added below is grown and reset in one place instead of four.
-//
-// See terrain_3d_vt_fade.cpp for what the pass does with them; this file holds no algorithm.
+// Arrival ramps, bounded FIFO, shader texture and diagnostics. Per-slot vectors grow
+// and reset together; texture rebuilds preserve active ramp counters.
+// See terrain_3d_vt_fade.cpp for the update algorithm.
 struct Terrain3DVTFade {
 	// Remaining fade ticks per physical slot; 0 means settled.
 	std::vector<uint8_t> ticks;
@@ -222,11 +159,8 @@ struct Terrain3DVTFade {
 	}
 };
 
-// The shared pool's identity and its growth handshake: the capacity already published to both
-// views, the rebuild generation, and the frame a requested growth has been waited on. They are one
-// owner because a capacity change only reaches the two views through the generation, and that is
-// only bumped when the pool is actually rebuilt - which is why a change that does not invalidate
-// page content must leave it alone, as a test asserts.
+// Shared pool capacity, rebuild generation and bounded growth wait.
+// Only rebuilds advance generation; capacity publication preserves completed plans.
 struct Terrain3DVTPool {
 	// How long the demand pass may skip production while the producer rebuilds its arrays for a
 	// larger capacity. Long enough for the producer's render pass and the pool's own growth (two or
@@ -249,18 +183,9 @@ struct Terrain3DVTPool {
 	// only spends the bake budget on content the growth throws away.
 	uint64_t wait_start = UINT64_MAX;
 
-	// The producer's larger arrays arrived and the views were grown: this is the published capacity
-	// and the wait is over. **No generation bump, because the generation is what tells a consumer to
-	// throw its plan away, and re-planning is the expensive half of the loss.** Growth does release
-	// every resident page - the atlas is one Texture2DArray and `ensure_layers()` recreates it blank
-	// when its layer count changes, which is why `Terrain3DVTPagePool::grow()` evicts every used slot -
-	// but what the consumers keep is their addresses, their source jobs and their completed plans, so
-	// they re-produce the same pages instead of re-deriving which pages they want. The far field's own
-	// root verification (`_svt_plan_roots()` checks every pinned root is still published and still has
-	// content) is what catches the released pins; without it this would have to be bumped, and a bumped
-	// generation costs a root pass of about 200 ms (section 7.7.8). Measured in section 7.7.10: in the
-	// probe's normal session the view's capacity grows 256 -> 512 while this generation stays put, and
-	// `evict_count` jumps by 355 in the interval that contains it.
+	// Publish grown capacity without changing plan generation. Growth evicts physical
+	// pages, but retains virtual addresses, source jobs and completed plans. SVT root
+	// verification detects released pins and schedules their content again.
 	void grow(const int p_capacity) {
 		capacity = p_capacity;
 		wait_start = UINT64_MAX;
@@ -420,13 +345,9 @@ struct Terrain3DAVTSettled {
 	}
 };
 
-// The far field's cell bake: the cells waiting to be baked, the published slots protected while
-// their cell is in flight, the cell being baked right now, the job-scoped counters the dock, the
-// inspector and the tests read as "this bake completed", and the region edits waiting for the
-// auto-bake debounce. One owner because a bake is serialized - an automatic job must not start
-// while an explicit one is in flight, or the counters would be replaced mid-run - and because the
-// queue, the protected slots and the cell in flight are three states of one job rather than three
-// independent lists.
+// Serialized SVT bake state: pending/in-flight cells, protected slots, job counters
+// and debounced region edits. Explicit jobs exclude automatic jobs; begin() resets
+// job counters without discarding queued edits.
 struct Terrain3DSVTBakeJob {
 	// Cells still to bake, oldest first, as (cell x, cell y, mip 0).
 	Array queue;
@@ -513,42 +434,20 @@ struct Terrain3DVTState {
 	// ---- 1. the shared service: one surface service owns the settings and the GPU material cache;
 	// AVT and SVT below are addressing/producer views over its shared physical residency pool. ----
 
-	// Which method carries which channel group, in which distance band. This is the *only* input
-	// to what the layer assembles: a view object exists because a cell selected its method, an
-	// array family is published because a group samples it, the material's shader carries a method's
-	// arm because a cell asked for it, and a pass runs because its service was selected. The default
-	// is the shipped architecture written in this vocabulary - near material on AVT, far material on
-	// SVT, height direct in both bands - so a scene that never writes a cell loads unchanged.
-	// `TerrainVT::DeliveryMatrix` holds the values and the three questions asked of them; see
-	// docs/vt_delivery_assembly.md for the channel inventory and the assembly rule.
+	// DeliveryMatrix selects services, published arrays and shader arms per channel/tier.
+	// Defaults: AVT near material, SVT far material, Direct height in both tiers.
+	// See docs/vt_delivery_assembly.md.
 	TerrainVT::DeliveryMatrix delivery;
-	// The two read-only editor previews, counted. `*_calls` is how many times one was asked and
-	// `*_computed` how many of those asks did the work; the two differ exactly when no cell selects
-	// the method, where the query refuses before its scan. That refusal is the readable half of the
-	// assembly rule ("a method no row selects is never built") and counting it is what makes it a
-	// measurement instead of a claim. `mutable` because the queries are const and these record what
-	// they were asked, not state they set.
+	// Read-only preview telemetry: calls counts requests; computed counts requests
+	// that pass the selected-method gate and scan a layout.
 	mutable uint64_t avt_preview_calls = 0;
 	mutable uint64_t avt_preview_computed = 0;
 	mutable uint64_t clipmap_preview_calls = 0;
 	mutable uint64_t clipmap_preview_computed = 0;
-	// ---- The clipmap layer: one delivery, one object per channel group, two implementations ----
-	// A group no cell delivers by Clipmap has no layer at all: no units, no texture, no jobs and no
-	// budget. `_setup_vt_clipmap()` is the only place one is built, and the assembly rule calls it, so
-	// "no clipmap selected" is zero cost rather than a layer that happens to be idle.
-	//
-	// `implementation` is what the user chooses *inside* the clipmap settings: `LOD` (the toroidal
-	// level ring) or `Atlas` (the block atlas). It is not a delivery and not a second object - the
-	// facade (`terrain_3d_clipmap_layer.h`) owns whichever one is selected, so a switch replaces the
-	// storage rather than adding a second memory.
-	//
-	// `size` is texels an axis of the finest unit, `units` how many units the layer holds, and
-	// `base_world` the metres the finest unit covers: unit l covers `base_world * 2^l` metres in `size`
-	// texels, which is the shared ladder both implementations address by. `budget_texels` is what one
-	// layer may produce in one tick, in channel texels; it is not part of the page budget, because the
-	// clipmap does not touch the shared pool.
-	// New projects choose one documented quality profile. The legacy shapes below are storage-only
-	// migration aliases: old scenes may still supply them, but new scenes use the profile defaults.
+	// Clipmap: one optional layer per channel group, owning either LOD or Atlas storage.
+	// _setup_vt_clipmap() creates only selected groups. Unit l spans base_world * 2^l
+	// metres in size texels; budget_texels bounds one layer's per-tick production.
+	// Legacy shapes remain storage migration aliases; new scenes use quality profiles.
 	TerrainClipmap::Implementation clipmap_implementation = TerrainClipmap::Implementation::LOD;
 	int clipmap_quality = 0; // Standard; see `_clipmap_settings()` for the profile table.
 	TerrainClipmap::Shape clipmap_legacy_shape;
@@ -577,48 +476,20 @@ struct Terrain3DVTState {
 	int clipmap_produced_texels = 0;
 	// Wall time the last completed background LOD ring update spent producing and publishing its level.
 	uint64_t clipmap_worker_usec = 0;
-	// ---- The material group's detail layer, the wide 1024 texels/m patch over the ladder -----------
-	// A sparse, demand-resident layer of fine tiles in front of the camera, above the ladder and
-	// independent of it: the layer keeps its complete, octave-stepped coverage and its fallback, and
-	// the detail layer only exists while the material group is delivered by `Clipmap` *and* this switch
-	// is on. It owns its own GPU arrays, directory and source pipeline; nothing is allocated when it
-	// is not selected, which is the same rule the rings and the two views follow.
-	//
-	// The division of labour, now that the clipmap's own ladder reaches 1024: the *layer* is an
-	// octave ladder over the whole visible field (1024 at the focus falling to 1 at its outer edge),
-	// and the *detail layer* is the same 1024 spent over a wide near patch - `directory_size` tiles of
-	// `tile_size` texels, so 32 m of level-0 density at the shipped shape - under screen-footprint
-	// demand rather than under a ring geometry. Neither replaces the other: the ladder is what the
-	// whole ground is served by and what the arms fall back to, and the detail layer is what makes the
-	// near ground dense *across the view* rather than inside the first quarter-metre.
-	//
-	// `detail_density` is the level-0 density in texels per metre - the measurement the layer exists
-	// to make - and level `l` is that over `2^l` down to `detail_min_density`. `detail_budget_bytes`
-	// is what the whole layer may hold on the GPU; the slot table is *derived* from it, and a budget
-	// that cannot afford one ring of tiles turns the layer off with a log rather than allocating
-	// something unusable. `detail_demand_radius` bounds the near field the layer sharpens, in metres;
-	// beyond it the ladder serves.
-	// The layer's own switch. **On by default.** Selecting `Clipmap` for the material group is the
-	// whole instruction: the ladder's own finest unit is a quarter of a metre wide, so a user who asked
-	// for 1024 texels/m would still read the wider near field as blur with the layer off - the switch
-	// is not the answer to "why is my near material mushy". The layer is therefore part of what
-	// selecting the method means, and a project that wants the ladder's own picture turns it off. With
-	// it off nothing is allocated: no textures, no directory and no job queue.
+	// Optional material detail cache above the Clipmap ladder, enabled by default.
+	// Owns separate arrays, directory and source queue only while selected and enabled.
+	// Level l uses detail_density / 2^l texels/m down to detail_min_density;
+	// detail_budget_bytes determines slot capacity, detail_demand_radius bounds coverage.
+	// The ladder supplies the fallback outside resident detail tiles.
 	bool detail_enabled = true;
 	real_t detail_density = 1024.f;
-	// The coarsest detail level. 128 gives four levels (1024/512/256/128) out of the same slot table
-	// the three-level shape used. The coarsest level is the cheap one - a tile is `tile_size / 128`
-	// metres wide, four times the area of the finest tile per slot - and the demand fit in the
-	// manager uses it to keep the whole `demand_radius` covered by the detail layer instead of letting
-	// the fringe fall back to the ladder's own, coarser units.
+	// Coarsest detail density. 128 texels/m gives four levels at 1024/512/256/128;
+	// the manager fits their coverage into the shared detail slot budget.
 	real_t detail_min_density = 128.f;
 	int detail_tile_size = 256;
 	int detail_directory_size = 128;
-	// What the whole layer may hold on the GPU. The finest tiles are ~2 MiB each, so this is what
-	// decides how much of the screen footprint rule the near field can actually be served at; the
-	// manager fits its level bands to the table, and reports the starved remainder rather than hiding
-	// it. 512 MiB keeps the 1024 level over the ground a 1080p view actually reads at the reference
-	// pose and still leaves the coarser levels to cover the rest of `demand_radius`.
+	// GPU memory budget for all detail levels. The manager fits density bands to the
+	// available slots and reports unmet demand.
 	int detail_budget_bytes = 512 * 1024 * 1024;
 	real_t detail_demand_radius = 12.f;
 	real_t detail_texels_per_pixel = 4.f;
@@ -633,19 +504,9 @@ struct Terrain3DVTState {
 	double vt_detail_ms = 0.0;
 	uint64_t vt_detail_worker_us = 0;
 	int vt_page_size = 256;
-	// The page gutter, in texels each side. It is a *bound*, not a policy: a page asked for more
-	// anisotropy than its border can sample reads its own rim instead of the neighbouring ground,
-	// which is why `get_avt_anisotropy()` is the request clamped by this number and the two places
-	// that used to spell the rule separately now ask that one function.
-	//
-	// The arithmetic is the anisotropic kernel's own. With the mip selection holding the minor axis
-	// at about one texel, a ratio of n spans about n texels along the major axis, so its half-extent
-	// is n / 2 and bilinear filtering adds half a texel: `n <= 2 * border - 1`. Five therefore
-	// admits the 8x the near field requests by default (`surface_vt_anisotropy`), at
-	// `page_size + 2 * border` = 266 stored texels a side. Nine - the value this replaces - was
-	// derived from `border - 0.5` and so bought a bound (17x) three times larger than any request
-	// the setting can name, for 7.7% more texels on every page of both views. See
-	// docs/vt_sampling_review.md.
+	// Page gutter in texels per side. CPU/shader anisotropy is bounded by
+	// n <= 2 * border - 1 (kernel half-extent plus bilinear filtering).
+	// A five-texel border supports the default 8x; see docs/vt_sampling_review.md.
 	int vt_page_border = 5;
 	int vt_page_count = 256;
 	// The capacity already published, the rebuild generation and the growth handshake, as one
@@ -658,24 +519,16 @@ struct Terrain3DVTState {
 	// Terrain3DPagePipeline. One thread cannot feed a moving view.
 	int vt_page_workers = 0;
 	bool vt_adaptive_enabled = true;
-	// Storage format of the near field's material page arrays, as a
-	// SurfacePageCompression value (0 = raw, 1 = BC7, 2 = BC3). Resolved and validated by the
-	// surface baker, which reports what was applied and why a request was refused, and
-	// encoded on the GPU by the block encoder, so compressing a page costs this thread
-	// nothing. The far field has its own setting below: the two tiers produce the same pool
-	// but at very different rates, and a codec worth its encode for a page that is written
-	// once is not necessarily worth it for a page every edit rewrites.
+	// Near-field material compression: 0 raw, 1 BC7, 2 BC3. The surface baker validates
+	// and reports the applied format; the GPU encoder produces blocks. SVT selects its
+	// own codec independently.
 	int surface_vt_compression = 0;
 	// Storage format of the far field's material page arrays. A far-field page is assembled
 	// once from a baked cell and never rewritten, so its compressed copy is final: this is
 	// the tier where a codec buys the most memory for the least work.
 	int surface_svt_compression = 0;
-	// Substitutions for a page that is missing or still in production. Both default on: a
-	// miss recovers from a resident coarser level instead of rendering the diagnostic,
-	// which is what a shipped view wants while pages are still arriving. Turning one off
-	// restores the strict residency contract for that field, where a missing page stays
-	// visible as the diagnostic - the only rendering a caller can tell apart from real
-	// material.
+	// Allow missing pages to sample a resident coarser level, independently per tier.
+	// Disable to expose strict selected-page misses through the diagnostic path.
 	bool avt_feedback = true;
 	// Far field: allow a miss at the level the distance rule selected to be served by a
 	// coarser resident level instead of the diagnostic. Off restores the strict walk.
@@ -685,18 +538,12 @@ struct Terrain3DVTState {
 	Dictionary vt_editor_dirty_regions;
 	uint64_t vt_service_frame = UINT64_MAX;
 	bool vt_shared_ready = false;
-	// True while the shared service was built for the ring's bake alone: no paged tier is selected,
-	// so the producer owns the bake shader, the material list and the job buffer but none of the
-	// page arrays. A page selected later moves the service to the page bundle (see
-	// `_configure_vt_service()`), and a page bundle serves a ring as well, so that is the only
-	// direction a rebuild is needed in.
+	// True for a bake-only producer without paged arrays. Selecting AVT/SVT upgrades it
+	// to a page bundle; a page bundle can also serve Clipmap baking.
 	bool vt_ring_only = false;
 	bool vt_materials_dirty = true;
-	// Whether a material list has been asked for on behalf of a *ring* already. `_setup_vt_clipmap()`
-	// runs on every write to the matrix, and a ring that declares baked layers needs the list published
-	// even when no cell takes a page - but asking again is not free: the service answers a publish by
-	// telling every ring its baked layers are stale, which queues a whole level per ring. This is what
-	// makes that need a first-time one.
+	// Whether Clipmap has already requested its initial material-list publication.
+	// Repeated publication invalidates all ring bakes, so matrix refreshes reuse it.
 	bool vt_materials_published = false;
 	bool vt_callback_registered = false;
 	// Warn once when the engine build has no virtual texture update callback: without it the
@@ -707,14 +554,8 @@ struct Terrain3DVTState {
 	std::unique_ptr<Terrain3DPagePipeline> vt_page_pipeline, svt_page_pipeline;
 	std::map<int, Terrain3DPagePipeline::Request> svt_pending_pages;
 	std::shared_ptr<const Terrain3DPagePipeline::Snapshot> vt_source_snapshot;
-	// One produced page's demand record. It is written once for every page a pass hands to the
-	// pool, so it is a plain value in a slot-keyed table and not a Godot Dictionary: building the
-	// Dictionary here - nine String-keyed entries and the nodes they allocate - measured 14.7 us
-	// of an 18.3 us per-page publish on a moving view, which made the *record* of a production the
-	// largest cost the production had. Every reader either wants one field (`queued_frame` for the
-	// retry window, `world_rect` for a region invalidation) or is a diagnostic that can afford to
-	// build the script-facing Dictionary on demand (`get_vt_pages()`); see
-	// `_vt_page_record_dictionary()`.
+	// Slot-keyed production record. Runtime readers consume typed fields; the editor
+	// Dictionary is materialized only on request by _vt_page_record_dictionary().
 	struct PageRecord {
 		// What the page's production is doing. The script-facing state string is spelled from
 		// this, so the two cannot drift.
@@ -764,10 +605,7 @@ struct Terrain3DVTState {
 	// Per-cell probe of the persisted bake, remembered so the render path never stats the
 	// same file twice (1 = present, 2 = absent).
 	std::unordered_map<int64_t, uint8_t> svt_cell_file_probe;
-	// Cells `_svt_cells_have_persisted_bake()` has examined over the session, and the pages it
-	// refused to examine at all. A page-wide scan is a file stat a cell, so the pair is what says
-	// whether a pass spent its time asking the disk about a page the disk could not serve
-	// (alignment document section 7.7.13: a rebuilt root pyramid used to scan 16 x 3969 cells).
+	// Persisted-cell probes and pages rejected before probing, accumulated per session.
 	uint64_t svt_persist_probe_cells = 0;
 	uint64_t svt_persist_probe_skips = 0;
 	// Edit stamp per far-field cell. A resident cell is only reused while its stamp is at
@@ -790,24 +628,14 @@ struct Terrain3DVTState {
 	// Mirrors `vt_page_border`; the setter syncs all three unless the debug direct-material path
 	// keeps them apart.
 	int surface_vt_page_border = 5;
-	// The near field's requested anisotropic filtering, as a multiplier: 0 follows the viewport's
-	// level, any other value is the request. The gutter is the physical bound - a filtering
-	// footprint cannot reach past the border texels a page carries - so the number the shader and
-	// the CPU footprint both use is `get_avt_anisotropy()`, which is this request clamped by
-	// `2 * vt_page_border - 1`. Eight is the default because it is what the default gutter admits.
+	// Requested AVT anisotropy; zero follows the viewport. get_avt_anisotropy() applies
+	// the shared CPU/shader bound of 2 * vt_page_border - 1.
 	int surface_vt_anisotropy = 8;
 	// Sector virtual-image resolution tiers; this does not truncate local page-table mips.
 	int surface_vt_mip_levels = 3;
 	int surface_vt_pages_per_axis = 4;
-	// The near field's reach, in metres around the camera. It is the working set's radius: the plan
-	// covers the reach plus a sector of margin, and its size follows the area (measured at one fixed
-	// pose: 54 sectors and 15 pages at 512 m, 30 and 9 at 384). It shipped at 512, which is what a
-	// 256-slot pool reaches under the reference's per-sector guarantee (section 3 of
-	// docs/vt_reference_avt_alignment.md), and 384 is where that reference implementation's own reach
-	// sits (camera sector +- 6 sectors). The trade is measured in section 7.7.14: the settled plan
-	// falls 44% and the per-move churn does not move at all, while the far field - which excludes
-	// only `0.75 * this` - takes the band the near field gives up. So this is not a way to make an
-	// update faster; it is a way to spend less residency on the ground furthest from the camera.
+	// AVT radius in metres. Planning includes one sector of margin; SVT begins at
+	// 0.75 * this radius and overlaps the outer transition band.
 	real_t surface_vt_distance = 384.f;
 	Vector2i surface_vt_region_grid = Vector2i(2, 2);
 	int surface_vt_selection_mode = 2;
@@ -816,17 +644,8 @@ struct Terrain3DVTState {
 	int avt_directory_mask = 0;
 	int avt_root_level = 1;
 	Terrain3DAVTCoarseImage avt_coarse;
-	// The near field's published statistics, keyed by name. Writing one used to be a String-keyed
-	// Godot Dictionary assignment: a `String` built from the literal, its hash, a boxed Variant and
-	// an inserted node. The AVT tick makes about a hundred of those per planning tick and forty per
-	// production pass, and at the ~1.5 us each measures they were the whole of the `finish` stage
-	// and most of the `key`/plan bookkeeping - the pass spent more time describing itself than
-	// producing. Here the values live in a plain keyed set, written with a `std::string`-keyed
-	// insert, and the Dictionary a script reads is materialized on demand by `to_dictionary()`:
-	// once per report, not once per write.
-	//
-	// `operator[]` is kept so every call site still reads `stats["name"] = value`; it hands back a
-	// one-assignment proxy rather than a Dictionary slot.
+	// Typed runtime statistics; to_dictionary() materializes the script-facing report.
+	// operator[] returns a one-assignment proxy, preserving named call-site updates.
 	struct Stats {
 		std::unordered_map<std::string, Variant> values;
 
@@ -851,10 +670,7 @@ struct Terrain3DVTState {
 		}
 	};
 	Stats avt_sector_stats;
-	// The session sums, the tick counters and the peak reading are one owner - `Terrain3DAVTCost
-	// avt_cost`, in the cost section below (part 4) - so what a pass *did* is not mixed into what the
-	// near field *is*. This dictionary is the live reading of the pass that just ran; `avt_cost` is
-	// what makes a mean over a sweep readable.
+	// Live pass statistics. Session sums and peak snapshots belong to avt_cost below.
 	uint64_t avt_plan_epoch = 0;
 	// How many frames apart the plan is re-derived, and the frame the last chain ran on. The plan
 	// is re-derived once per interval rather than once per frame; a key that changed inside the
@@ -867,12 +683,8 @@ struct Terrain3DVTState {
 	// retention flag that says whether the source queue already holds it.
 	// See `Terrain3DAVTPlan` above for why replacing the plan has to forget the retention.
 	Terrain3DAVTPlan avt_plan;
-	// Motion look-ahead: the planner plans for where the camera will be in
-	// `vt_motion_lead_ms`, not for where it is. A page takes several frames to
-	// assemble and a compressed page several more to encode and read back, so demand
-	// issued at the moment a page becomes visible can only ever be late. The velocity
-	// is exponentially smoothed and the lead is clamped by the near field's reach, so
-	// a stop or a reversal does not leave the plan pointing at a stale position.
+	// Smoothed camera-velocity prediction over vt_motion_lead_ms, clamped by AVT reach.
+	// Stops and reversals update the prediction rather than retaining a stale lead.
 	real_t vt_motion_lead_ms = 250.f;
 	Vector2 avt_motion_velocity;
 	uint64_t avt_motion_stamp_us = 0;
@@ -880,52 +692,32 @@ struct Terrain3DVTState {
 	bool avt_motion_valid = false;
 	// A camera cut invalidates the old-view retention tail at the next plan install.
 	bool avt_discard_retained = false;
-	// Whether the view the near field is filling is still unserved: a cut, a teleport or a plan that
-	// mostly names ground the previous one did not. It is the whole of the cold-view rate - while it
-	// holds, the near field takes the full batch instead of its even share with the far field - and
-	// the production pass clears it on the first tick every page the image samples has a slot and
-	// content. There is no timer, no rate multiple and no episode counter.
+	// Unserved view after a cut, teleport or substantially new plan. Uses the full batch
+	// until every sampled page has a slot and content.
 	bool avt_view_unserved = false;
-	// The near field's page budget: the two settings (`surface_vt_page_batch_default` and
-	// `surface_vt_page_batch_max`), the tier the tick's motion currently resolves them to, and the
-	// hysteresis that moves it. One owner with one reader path - `_avt_tick_allowance()`, which the
-	// production pass, the producer's frame budget, the source queue window and the encode ring all
-	// derive from - so a change applies on the next tick. See `Terrain3DAVTPageBudget`.
+	// Page budget settings and hysteresis. _avt_tick_allowance() supplies the same live
+	// allowance to production, source queues, frame budgeting and encoding.
 	Terrain3DAVTPageBudget avt_page_budget;
-	// Whether the last motion sample was a discontinuity: a step over `MOTION_MAX_TURN_STEP` or a
-	// displacement past `avt_motion_spatial_discontinuity_distance()`. The motion sampler raises it
-	// on the tick it sees one and the budget governor consumes it on the same tick, so it is a tick's
-	// event rather than a lasting state - which is what the escalated tier is: the answer to an event.
+	// One-tick discontinuity event from camera turn/displacement, consumed by the budget
+	// governor in the same tick.
 	bool avt_motion_discontinuity = false;
 	// Lead actually applied to the last submitted plan, for diagnostics and tests.
 	Vector2 avt_motion_lead;
-	// The turn half of the same look-ahead. A camera that turns sweeps new world into the frustum
-	// at every distance at once, so a plan that only moves the eye describes the frustum the camera
-	// will *have* while looking where it looks now - which is the one thing a turn makes wrong, and
-	// is why a turn streams while a straight run does not. What is predicted is the gaze direction,
-	// estimated from consecutive forward vectors: roll spins the frustum about the direction it is
-	// already looking along and sweeps no new world into it, so it is deliberately not predicted.
+	// Gaze prediction from consecutive forward vectors. Roll does not change that
+	// vector and therefore contributes no predicted turn.
 	Vector3 avt_motion_turn;
 	Vector3 avt_motion_last_forward;
 	// Turn lead actually applied to the last submitted plan: an axis and an angle in radians,
 	// which is what `_vt_lead_camera_transform()` rotates the predicted basis by.
 	Vector3 avt_motion_turn_lead;
-	// How long a page has been demanded without content, keyed by its address. With a
-	// lead the plan is predictive, so a page it names is not late yet - only a page that
-	// has been demanded for at least one lead and still has no content is what the image
-	// being rendered shows as a miss. Entries are dropped as pages become ready, so this
-	// only ever holds the pages currently in flight.
+	// Demand age by page address. A page is late after one lead window without content;
+	// ready pages leave this map.
 	std::unordered_map<uint64_t, uint64_t> avt_demand_age;
-	// Scratch the production pass fills and the source pipeline consumes: the requests it retains
-	// and the requests it primes. Both are built from the pass's missing list - up to the whole
-	// plan - and were local vectors, so a moving view allocated and freed a thirty-kilobyte vector
-	// twice a tick. Held here, `clear()` keeps the capacity and a tick allocates nothing.
+	// Reusable retain/prime request vectors built from the missing-page plan.
 	std::vector<Terrain3DPagePipeline::Request> avt_retain_requests;
 	std::vector<Terrain3DPagePipeline::Request> avt_prime_requests;
-	// Pages of the sampled prefix that have no content this pass, and of those, the ones
-	// whose production is still inside its window. Kept as state and not only as a stat:
-	// the editor has to keep rendering while a page is still owed, and a demand waiting on
-	// a source job or a free slot has no render work of its own to report.
+	// Sampled pages still missing and those within their production window. Pending
+	// source work keeps editor rendering active even without queued GPU work.
 	int avt_missing_pages = 0;
 	int avt_pending_pages = 0;
 	// Plans kept while the lead is applied, so retention does not drop the view being
@@ -935,31 +727,19 @@ struct Terrain3DVTState {
 	// lead. The pool capacity request counts them, so a look-ahead plan cannot grow the
 	// pool exactly large enough to evict the view it is leading.
 	int avt_retained_pages = 0;
-	// Sampling density belongs to the installed plan. The plan has no *global* capacity bias - the
-	// coarsening is per level and lives in the indirection as the plan marker
-	// (`Terrain3DVirtualTexture::set_planned_levels()`), so the strict resolve reads the level the
-	// plan actually holds instead of being handed a footprint scaled by one number - so this is the
-	// configured texels-per-pixel and nothing else; it stays a member because the material is
-	// published from it and the shader divides its footprint by it.
+	// Configured sampling texels-per-pixel published with the installed plan.
+	// Per-level coarsening lives in indirection plan markers, not a global density bias.
 	float avt_density_scale = 1.f;
-	// The settled shortcut: the caller's verdict that the standing plan is this tick's, the pool
-	// residency revision an idle pass verified, the resident set it verified and whether the idle
-	// statistics already describe that run. See `Terrain3DAVTSettled` above for why they are one
-	// owner and which operation moves each of them.
+	// Standing-plan/residency verification and once-per-idle-run statistics.
+	// Transitions are owned by Terrain3DAVTSettled.
 	Terrain3DAVTSettled avt_settled;
-	// Page-arrival fade, in ticks. A page that has just arrived is blended against the level
-	// it replaced, so a page arrival is a ramp rather than a step - which is what a fast turn
-	// makes obvious, because the view then refines in the rectangular grid its pages are.
-	// 0 disables it and costs nothing: the shader then reads a settled page on every fetch.
+	// Page-arrival fade in ticks; zero disables blending against the replaced level.
 	int vt_page_fade_frames = 12;
 	// The fade's buffer, FIFO, texture and counters, in one owner: `Terrain3DVTFade` above holds
 	// the fields and the only operations that change their length.
 	Terrain3DVTFade fade;
-	// Scratch for the near field's classification, kept here so a tick does not allocate: the
-	// slot each page of the plan resolved to, and the producer's answer for all of them at once.
-	// The producer's readiness is behind a mutex, and the walk used to ask it twice per page -
-	// once for the sampled answer and once more inside the staleness check - so a 250 page plan
-	// against a mostly missing view took five hundred queue locks to read one array.
+	// Reusable slot/readiness batches. One producer query reads readiness for the whole
+	// plan instead of taking its queue mutex per page.
 	std::vector<int> avt_verify_slots;
 	std::vector<uint8_t> avt_verify_ready;
 	std::vector<Vector2i> avt_registered_owners;
@@ -990,20 +770,14 @@ struct Terrain3DVTState {
 	real_t surface_vt_feedback_min_extent = 8.f;
 	Vector2i surface_vt_feedback_origin;
 
-	// ---- 3. the far field (SVT): a world-space page grid at a coarser texel density, so the
-	// surface channel does not have to keep every region's payload resident. A page spans several
-	// regions and its mip chain is world-space, which is what the region-aligned near field above
-	// cannot express. On by default; the region texture array still serves whenever no page covers a
-	// texel. ----
+	// ---- 3. SVT: world-space far-field page grid and persistent cell sources. ----
 
 	Terrain3DVirtualTexture *surface_svt = nullptr;
 	// One mip 0 page covers this many metres.
 	real_t surface_svt_page_world = 256.f;
 	int surface_svt_page_size = 256;
-	// Mirrors `vt_page_border`, which both views share. The far field samples with a plain
-	// `textureLod` (no gradients, no anisotropy), so the gutter it carries is for its own mip
-	// transitions rather than for a filtering footprint - see docs/vt_sampling_review.md for the
-	// shared bound and what a page's border costs both views.
+	// Shared page border mirrored from vt_page_border. SVT uses textureLod;
+	// its gutter supports mip transitions. See docs/vt_sampling_review.md.
 	int surface_svt_page_border = 5;
 	int surface_svt_page_count = 256;
 	// -1 means auto: the coarsest level the world grid can publish.
@@ -1014,16 +788,8 @@ struct Terrain3DVTState {
 	// what lets the shader resolve any world position without the region texture array,
 	// so it is the far field's fallback rather than a separate fallback page.
 	int surface_svt_root_mips = 2;
-	// Which set answers a far-field fragment whose selected page is not resident (H2 in
-	// `docs/vt_reference_avt_alignment.md`). 0 is the root pyramid above: one complete level window over
-	// the whole addressable domain, so every world position resolves, at a granularity of kilometres
-	// per page. 1 is the reference's per-unit guarantee: the coarsest level that covers each *visible* page,
-	// requested unconditionally, so the fallback's granularity is the unit the fragment is looking at
-	// and a fallback page that lands or leaves changes its own rectangle rather than a continent.
-	//
-	// The two are alternatives, not layers: both publish into `svt_roots.pages`, so the pin budget,
-	// the plan key and the reuse/verify path are the same for either. Default 0 keeps every recorded
-	// measurement valid; the policy is switched on numbers, never on preference.
+	// SVT fallback policy: 0 pins a root pyramid over the addressable world; 1 pins a
+	// coarse cover for visible pages. Both use svt_roots and the same verification path.
 	int surface_svt_fallback_policy = 0;
 	int vt_svt_visible_pages = 0;
 	// Far-field roots this pass keeps resident and protected, the identity they were planned for and
@@ -1043,13 +809,8 @@ struct Terrain3DVTState {
 	// Pages re-produced because the table named them but the producer had no content for
 	// them. A value that keeps growing in a settled view is a production that never lands.
 	uint64_t svt_requeues = 0;
-	// P0 instrumentation for the world mip cap, kept because H3 step 1 turned what it measured into
-	// an assertion. A cap change *was* treated as a content change - every region marked for re-bake
-	// and the material's region arrays rebuilt - and these counters said how often that happened and
-	// what it cost. Since H3 step 1 it publishes the cap and refreshes the uniform, so
-	// `svt_cap_dirty_regions` is the property `vt_svt_coverage` asserts and is zero because the
-	// change marks nothing. Read them from `get_vt_settings()`; see
-	// docs/vt_reference_avt_alignment.md sections 4/H3 and 7.
+	// World-mip-cap telemetry. Cap changes update uniforms without dirtying regions;
+	// vt_svt_coverage asserts svt_cap_dirty_regions remains zero.
 	uint64_t svt_cap_changes = 0;
 	uint64_t svt_cap_dirty_regions = 0;
 	double svt_cap_change_ms = 0.0;
@@ -1063,31 +824,18 @@ struct Terrain3DVTState {
 	// The coarseness floor the last over-subscribed pass raised its detail pages to, or
 	// 0 when the distance-selected set fit. Diagnostics and tests only.
 	int svt_floor_level = 0;
-	// The capacity that decision was made against: the pool left once the pinned roots have taken
-	// theirs. Published beside the floor because the floor is a function of it - a reader cannot
-	// tell "no pressure" from "plenty of room" without both, and a test that asks about the floor
-	// has to fix this number to be asking a question with an answer.
+	// Capacity available to detail pages after pinned roots, used to select the floor.
 	int svt_detail_capacity = 0;
-	// Breakdown of the far field's worst pass, published as `svt_stats` and attributed to
-	// `svt_worst_ms`. The near field has `avt_sector_stats`; without the same for the far
-	// field a peak in `svt_cpu_ms` could not be told apart between the visible-footprint
-	// walk, the root pyramid plan and the detail set, which are three different fixes. A
-	// pass records its stages in locals and only the pass that becomes the new worst writes
-	// the dictionary, so the instrumentation is not a per-tick dictionary cost.
+	// Stage breakdown of the worst SVT pass. Updated only when svt_worst_ms increases;
+	// these values describe that peak, not the latest tick.
 	Dictionary svt_stats;
 	double svt_worst_ms = 0.0;
 	// Frame the worst pass above was taken on, so the breakdown can be read as "this is what
 	// the peak cost" rather than as a value of the current tick.
 	uint64_t svt_worst_frame = 0;
-	// Distance -> level table for the far field, in metres. Entry m is the largest
-	// camera distance at which world mip m is sampled, so the table states the level
-	// bands explicitly instead of deriving them from the page size. Empty keeps the
-	// automatic rule (one level per doubling of surface_svt_page_world).
-	//
-	// Both the page producer and the shader resolve a level through this one table, so
-	// a page is always produced at exactly the level the shader samples, and the
-	// rendered level is a pure function of distance: it cannot change when the working
-	// set, the pool pressure or the visible region set changes underneath it.
+	// Distance-to-mip table in metres, shared by CPU production and shader sampling.
+	// Entry m is the maximum distance for world mip m. Empty uses one level per doubling
+	// of surface_svt_page_world; residency pressure does not change these bands.
 	PackedFloat32Array surface_svt_mip_distances;
 	Vector3i surface_svt_scan_key = Vector3i(INT32_MAX, INT32_MAX, INT32_MAX);
 	int64_t surface_svt_root_cursor = 0;
@@ -1096,20 +844,11 @@ struct Terrain3DVTState {
 	// the virtual textures serve every surface read, which is what removes the
 	// density-squared array cost; the array stays allocated but blank.
 	bool surface_array_enabled = true;
-	// ---- 4. cost and diagnostics: what this layer cost and why, for both views. The live phase
-	// values describe the tick that just ran and the `*_sum_ms` fields are cumulative since
-	// startup, so a mean over a sweep is their difference across it. ----
-	// The near field's cost: every sum, counter and peak reading its report prints, in one owner.
-	// Nothing here is model state - no algorithm branches on one of these - so a reader can tell
-	// what a pass *did* (this) from what the near field *is* (the members around it). The live
-	// per-pass readings are the `avt_sector_stats` dictionary above; these are the session sums
-	// that make a mean over a sweep readable.
+	// ---- 4. Diagnostics: latest-tick values, session sums and peak snapshots. ----
+	// AVT live pass readings are in avt_sector_stats; cumulative *_sum_ms values and
+	// pass_count support interval means without affecting runtime decisions.
 	struct Terrain3DAVTCost {
-		// Stage sums for the same pass, so the mean of a stage can be read beside the live value of
-		// the last one. The dictionary only ever holds the pass that just ran, and a pass that
-		// installed a plan costs several times one that reused it, so a single reading of it says
-		// nothing about where a sweep's average went: `report()` prints the cumulative sums and the
-		// pass count, and the mean of a sweep is their difference across it.
+		// Cumulative stage times; divide interval deltas by the pass-count delta for means.
 		double classify_sum_ms = 0.0;
 		double retain_sum_ms = 0.0;
 		double prime_sum_ms = 0.0;
@@ -1117,11 +856,8 @@ struct Terrain3DVTState {
 		double refill_sum_ms = 0.0;
 		double finish_sum_ms = 0.0;
 		uint64_t pass_count = 0;
-		// The same accounting for the tick around the pass, so the difference between the two is what
-		// a tick that took the idle shortcut costs - the near field's own report only counts the
-		// passes that did work, and a settled turn is mostly not those. `reuse_ticks + chain_ticks` is
-		// the number of ticks that reached the production pass, so subtracting `pass_count` leaves
-		// the ticks it answered as already settled.
+		// Sector tick accounting. reuse_ticks + chain_ticks counts production-pass entries;
+		// subtract pass_count to count settled shortcuts.
 		uint64_t sector_ticks = 0;
 		uint64_t reuse_ticks = 0;
 		uint64_t chain_ticks = 0;
@@ -1134,10 +870,7 @@ struct Terrain3DVTState {
 		double install_sum_ms = 0.0;
 		double chain_sum_ms = 0.0;
 		double produce_sum_ms = 0.0;
-		// The whole sector update, from its entry to its return, summed on the same clock the tick
-		// uses for the phase it reports. The stage sums above describe what the function did; this is
-		// what the phase measured, so a difference between them is time the phase spent outside the
-		// function rather than inside it.
+		// Whole sector-update and outer-wrapper time, distinct from internal stage sums.
 		double update_sum_ms = 0.0;
 		double wrapper_sum_ms = 0.0;
 		// The near field's stage timings as of the pass that produced `vt_avt_peak_ms`, and when that
@@ -1166,10 +899,7 @@ struct Terrain3DVTState {
 		double invalidate_sum_ms = 0.0;
 		double payload_sum_ms = 0.0;
 		double queue_sum_ms = 0.0;
-		// The queue call split further, because `queue_sum_ms` is the whole per-page publish cost
-		// and it is not one thing: `queue_record_sum_ms` is the page record - a String-keyed
-		// Dictionary with eight entries, built and inserted on every produced page - and
-		// `queue_bake_sum_ms` is the producer handoff itself. They have different fixes.
+		// Queue time split between typed page-record publication and the baker handoff.
 		double queue_record_sum_ms = 0.0;
 		double queue_bake_sum_ms = 0.0;
 	};
@@ -1180,12 +910,8 @@ struct Terrain3DVTState {
 	double vt_cpu_ms = 0.0;
 	double vt_cpu_peak_ms = 0.0;
 	double svt_cpu_ms = 0.0;
-	// Phase breakdown of the same section: the shared-service check, the near field's demand pass,
-	// the far field's demand pass, the page-arrival fade, and the far-field bake. `vt_topup_ms` is
-	// kept as a reported key only: the near field used to be run a second time in a "top-up" phase
-	// with the budget the far field did not spend, and that pass is gone, so what the residual now
-	// measures is the bookkeeping between the far-field phase and the bake - microseconds, never a
-	// phase's own cost. See Terrain3D::__physics_process() for why the pass went.
+	// Per-tick phase timings. vt_topup_ms is the compatibility report key for residual
+	// bookkeeping between SVT and bake, not a separate production pass.
 	double vt_service_ms = 0.0;
 	// The ring phase. It is reported beside the service's phases but it is not one of them: no ring
 	// touches the shared pool, so this is the only phase that is pure production.
@@ -1214,28 +940,15 @@ struct Terrain3DVTState {
 	// `vt_cpu_peak_ms` can be attributed to one view without a profiler.
 	double vt_avt_peak_ms = 0.0;
 	double vt_svt_peak_ms = 0.0;
-	// CPU budget for one phase of the VT section, in milliseconds. 0 disables it, which is the
-	// default: the phases have no fixed cost left to cap, and a page a phase is not given time
-	// to publish is a page the view keeps missing. An explicit update_surface_vt() /
-	// update_surface_svt() call is never budgeted - the page count it passes is the caller's
-	// own bound.
-	//
-	// Re-armed at the start of every phase, so the setting bounds what one pass may spend
-	// rather than what the whole section may spend, which is the number a profiler attributes
-	// a peak to. A deadline shared by the section was consumed by the service check and the
-	// far field before the near field ran, so the near field found it already expired on every
-	// tick of a moving view, emitted its one-page floor and stopped - the shape that makes a
-	// turning view refine in visible blocks. Set it (0.1 is a reasonable cap) when a hard
-	// per-phase bound matters more than the pages it costs.
+	// Soft per-phase CPU budget in milliseconds; zero disables it. Each physics phase
+	// re-arms its deadline. Explicit update_surface_vt()/update_surface_svt() calls use
+	// the caller's page count and are not time-budgeted.
 	real_t vt_frame_budget_ms = 0.0f;
 	// Absolute deadline of the tick that is running, or 0 when the caller is not the
 	// physics tick. Every phase that can stop between two units of work reads it.
 	uint64_t vt_tick_deadline_us = 0;
-	// Set while the physics tick's VT section is running. The source workers are woken at the end of
-	// the tick rather than at the end of each demand pass, because a worker woken inside a phase
-	// starts competing for this thread's cores and the phases are measured as wall time on this
-	// thread. A caller that drives `update_surface_vt()` directly has no tick to wait for, so the
-	// pass flushes its own wakes in that case - see `_flush_source_wakes()`.
+	// True during the physics VT section: worker wakes flush once at its end.
+	// Direct demand calls flush their own wakes via _flush_source_wakes().
 	bool vt_tick_active = false;
 	// ---- 5. planner scratch: capacity owned by this struct so a plan tick reuses it instead of
 	// reallocating. Staged near-field planner scratch: the scan and the hierarchy the chain's

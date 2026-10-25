@@ -355,7 +355,6 @@ func _rebuild_active_metadata(volume: FMagicGIVolume) -> void:
 		_rebuild_prepared_active_metadata(volume)
 		return
 	var candidates: Dictionary = {}
-	var now := Time.get_ticks_msec()
 	for view in _views.values():
 		var camera: Vector3 = view.get("camera", Vector3.ZERO)
 		var distance := maxf(volume.stream_distance, 0.1)
@@ -377,8 +376,6 @@ func _rebuild_active_metadata(volume: FMagicGIVolume) -> void:
 			candidates[page_key] = metadata
 	for key in candidates:
 		_active_metadata[String(key)] = candidates[key]
-	# The camera requests are refreshed by the pass every rendered frame. Prune
-	# here as well so a view leaving the tree cannot pin pages indefinitely.
 
 func _rebuild_prepared_active_metadata(volume: FMagicGIVolume) -> void:
 	# Each level requests its own bounded window. A 512 m L0 request would
@@ -781,7 +778,7 @@ func _advance_emission_updates(volume: FMagicGIVolume) -> void:
 		var resident: Dictionary = _resident.get(key, {})
 		if resident.get("emission_task", -1) == task_id:
 			resident.erase("emission_task")
-		if job == null or not job.valid or resident.is_empty() \
+		if bool(record.get("discard", false)) or job == null or not job.valid or resident.is_empty() \
 				or int(resident.get("version", -1)) != int(record.get("version", -2)) \
 				or String(resident.get("base_identity", "")) != String(record.get("identity", "")):
 			if not resident.is_empty():

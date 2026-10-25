@@ -43,6 +43,8 @@ flowchart TD
 | `editor/volume_preview.gd` | 编辑器视图选择、临时 compositor 和退出恢复 |
 | `editor/pass_library_controller.gd` | 库菜单、条目操作、资源选择与完整 UndoRedo 事务 |
 | `passes/snapshot_worlds.gd` | viewport → World3D → render target 的共享查询与缓存 |
+| `editor/environment_mixer_service.gd` | 组件定义、场景发现、变更观察和创建事务；窗口共用其组件分类 |
+| `editor/environment_mixer_window.gd` | 卡片布局、实例选择和 Inspector 字段过滤；场景节点失效检查保留在消费边界 |
 | `editor_plugin.gd`、`project_pipeline.gd` | 编辑器服务、项目路径/UID 解析与默认世界安装 |
 | `world_compositor.gd` | 世界 compositor 选择规则，包括引擎 WorldEnvironment 分组约定 |
 
@@ -58,6 +60,8 @@ VolumeEvaluator 只依赖位置、Volume 配置以及设置来源的 `get_instan
 Pass 通过 `get_frp_parameters()` 声明全局参数，通过 `get_volume_parameter_names()`
 开放 Volume 字段。两份声明独立；Profile、模块和旧字典均按当前字段权限过滤。
 参数层次为作者值 → 条目覆盖 → Volume 结果，运行时快照保持与作者资源隔离。
+Renderer 的 `resolve_view_parameters()` 统一合成字段覆盖、曝光开关和 GI 所有权；
+共享绑定与逐视图 ViewState 共用该入口，ViewState 只管理执行对象和绑定缓存。
 
 `enabled` 作为 Volume 字段也需要 Pass 明确开放；`false` 是关闭覆盖。
 模块的 `overrides/字段名` 控制是否参与混合，关闭后保留编辑值。连续字段插值，离散字段
@@ -118,12 +122,15 @@ Magic GI、Height Fog 等消费者通过软加载访问可选 producer runtime�
 匹配快照。`snapshot_worlds.gd` 提供共享世界/目标查询；producer 的参数、发布和选择仍由其
 runtime 拥有。未安装消费者插件时，producer 可继续自己的工作。
 
-Magic GI 在数据 identity、cache key 或版本变化时验证并上传 PRT 传输/几何 atlas 与有符号
-格索引；太阳/环境变化只更新 SH 和相机数据。查询在世界空间进行，检查附近 27 个格、
-每格最多 8 个样本，用法线和平面距离选取最近四点插值，最后乘接收表面的
-`albedo * (1 - metallic) * AO`。传输不包含接收材质和当前直接光。
-v4 烘焙将 primary SkyLight 可见性与 secondary transport 分开，按覆盖权重替换全局漫反射；
-v2/v3 保留 additive 行为。无匹配有效烘焙时贡献纹理清零，场景 HDR 保持原值。
+Magic GI 的 Volume 持有作者配置与烘焙资源，Runtime 发布世界级不可变快照，
+PageStreamer 管理页面加载、预算与退休任务。PRT 烘焙端生成传输算子，渲染端根据
+当前光照重照明驻留 CLV，由原生 Lighting 消费；Surfel 模式使用共享场景快照与硬件光追。
+格式、后端和覆盖限制由 [Magic GI 说明](../misc/feng-addons/feng-magic-gi/README.md) 维护。
+
+FengLightmapVolume 独立负责烘焙调度、取消、保存与显示；`feng_lightmap_scene_inputs.gd`
+把场景几何、材质和灯光转换为 CPU 输入，并生成持久化签名。收集器不持有 Volume、
+不管理线程或写文件；原生积分器只消费输入快照。完成时重新收集核验后才保存资源。
+RTGI 的 Runtime 直接拥有同插件的 WorldSnapshot，跨插件世界路由仍通过可选接口获取。
 
 `FengVolumetricCloudPass` 统一拥有 FengCloudGPU 及清理生命周期；Shadow、Trace 和
 Composite 保留各自阶段行为。即时清理与渲染线程延迟清理共用资源释放入口。

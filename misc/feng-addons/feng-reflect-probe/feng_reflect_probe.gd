@@ -17,9 +17,9 @@ const Runtime = preload("rendering/feng_reflect_probe_runtime.gd")
 const DataScript = preload("feng_reflect_probe_data.gd")
 const SnapshotWorlds = preload("res://addons/feng-render-pipeline/passes/snapshot_worlds.gd")
 const WorldCompositor = preload("res://addons/feng-render-pipeline/world_compositor.gd")
+const ProjectPipeline = preload("res://addons/feng-render-pipeline/project_pipeline.gd")
 const RendererScript = preload("res://addons/feng-render-pipeline/renderer.gd")
 const CompositorScript = preload("res://addons/feng-render-pipeline/compositor.gd")
-const PassBase = preload("res://addons/feng-render-pipeline/passes/pass_base.gd")
 const BuiltinPass = preload("res://addons/feng-render-pipeline/passes/builtin_pass.gd")
 const NativeSpec = preload("res://addons/feng-render-pipeline/pipeline/native_spec.gd")
 const CaptureContextPass = preload("passes/reflection_capture_context_pass.gd")
@@ -486,17 +486,10 @@ func _ensure_capture_rig() -> bool:
 				insert_index = index
 				break
 		cloned_passes.insert(insert_index, capture_pass)
-	if cloned_passes.is_empty() or cloned_passes[0] != capture_context \
-			or not cloned_passes.has(capture_pass):
-		push_warning("FengReflectProbe: the private capture plan is missing its metadata or HDR copy pass.")
-		return false
 	renderer.passes = cloned_passes
-	if not renderer.has_method("set_reflection_capture_mode"):
-		push_warning("FengReflectProbe: the installed FengRenderer lacks set_reflection_capture_mode(); update the render-pipeline addon.")
-		return false
-	renderer.call("set_reflection_capture_mode", true)
+	renderer.set_reflection_capture_mode(true)
 	var compositor = CompositorScript.new()
-	compositor.set("renderer", renderer)
+	compositor.renderer = renderer
 	var viewport := SubViewport.new()
 	viewport.name = "_FengReflectProbeCapture"
 	viewport.size = Vector2i(_effective_resolution(), _effective_resolution())
@@ -530,78 +523,59 @@ func _ensure_capture_rig() -> bool:
 	SnapshotWorlds.register_viewport(viewport, self)
 	return _capture_target.is_valid()
 
-func _clone_source_renderer() -> Resource:
-	var main_viewport := get_viewport()
-	var source_camera := main_viewport.get_camera_3d() if main_viewport != null else null
-	var active := WorldCompositor.active_compositor(main_viewport, source_camera)
-	var renderer: Resource
-	if active != null and active.get_script() != null \
-			and active.get_script().resource_path == "res://addons/feng-render-pipeline/compositor.gd":
-		renderer = active.get("renderer")
+func _clone_source_renderer() -> FengRenderer:
+	var viewport := get_viewport()
+	var camera := viewport.get_camera_3d() if viewport != null else null
+	var active := WorldCompositor.active_compositor(viewport, camera)
+	var renderer: FengRenderer = active.renderer if active is CompositorScript else null
 	if renderer == null:
-		var project_pipeline := load("res://addons/feng-render-pipeline/project_pipeline.gd")
-		if project_pipeline is Script and project_pipeline.has_method("resolve"):
-			var project_compositor = project_pipeline.call("resolve")
-			if project_compositor != null and project_compositor.get_script() != null \
-					and project_compositor.get_script().resource_path == "res://addons/feng-render-pipeline/compositor.gd":
-				renderer = project_compositor.get("renderer")
+		var project_compositor := ProjectPipeline.resolve()
+		if project_compositor is CompositorScript:
+			renderer = project_compositor.renderer
 	if renderer == null:
 		renderer = RendererScript.new()
-	if renderer.get_script() == null \
-			or renderer.get_script().resource_path != "res://addons/feng-render-pipeline/renderer.gd":
-		push_warning("FengReflectProbe: active compositor is not a FengRenderer; using FRP's default capture schedule.")
-		renderer = RendererScript.new()
-	var copy: Resource = renderer.duplicate(true)
-	return copy
+	return renderer.duplicate(true) as FengRenderer
 
-func _skip_in_capture(entry: Variant) -> bool:
+func _skip_in_capture(entry: FengPass) -> bool:
 	if entry == null:
 		return true
 	if _native_id(entry) == NativeSpec.PASS_TEMPORAL_AA:
 		return true
-	if entry is PassBase and entry.provides_native_ids.has(NativeSpec.PASS_TEMPORAL_AA):
+	if entry.provides_native_ids.has(NativeSpec.PASS_TEMPORAL_AA):
 		return true
 	var source := _parameter_source(entry)
-	for candidate in [entry, source]:
+	var candidates: Array[FengPass] = [entry, source]
+	for candidate in candidates:
 		if candidate == null:
 			continue
-		var stable_id := StringName(candidate.get("stable_id"))
+		var stable_id := candidate.stable_id
 		if stable_id == &"library:eye_adaptation":
 			return true
-		if candidate.has_method("get_indirect_gi_kind") \
-				and StringName(candidate.call("get_indirect_gi_kind")) == &"rt_gi":
+		if candidate.get_indirect_gi_kind() == &"rt_gi":
 			return true
-		if candidate.has_method("get_reflection_source_kind"):
-			var kind := StringName(candidate.call("get_reflection_source_kind"))
-			if kind != &"":
-				return true
+		if candidate.get_reflection_source_kind() != &"":
+			return true
 		var script := candidate.get_script() as Script
 		if script != null and script.resource_path.ends_with("/passes/eye_adaptation_pass.gd"):
 			return true
 	return false
 
-func _parameter_source(entry: Variant) -> Variant:
-	var source: Variant = entry
+func _parameter_source(entry: FengPass) -> FengPass:
+	var source := entry
 	var seen := {}
-	for _iteration in 8:
-		if source == null or not is_instance_valid(source) or not source.has_method("get_parameter_source"):
-			break
+	while source != null:
 		var id: int = source.get_instance_id()
 		if seen.has(id):
 			break
 		seen[id] = true
-		var next: Variant = source.call("get_parameter_source")
+		var next := source.get_parameter_source()
 		if next == null or next == source:
 			break
 		source = next
 	return source
 
-func _native_id(entry: Variant) -> int:
-	if entry == null:
-		return -1
-	if entry is BuiltinPass:
-		return int(entry.get("native_id"))
-	return -1
+func _native_id(entry: FengPass) -> int:
+	return entry.native_id if entry is BuiltinPass else -1
 
 func _set_capture_camera(face: int) -> void:
 	if _capture_camera == null or not is_instance_valid(_capture_camera):

@@ -103,6 +103,16 @@ func run() -> void:
 			"runtime fallback must leave exactly one diffuse writer after an RTGI failure")
 	require(selection.is_resolved_reflection_owner(failed_rt_owner, rt.key),
 			"a diffuse-only runtime failure must keep the hardware-capable RTGI reflection slot independent")
+	var reflection_peer: Variant = provider_script.new()
+	reflection_peer.kind = selection.KIND_RT
+	reflection_peer.key = "test:reflection_peer"
+	reflection_peer.enabled = true
+	reflection_peer.indirect_gi_available = false
+	reflection_peer.hardware_rt_supported = true
+	for fallback_candidates in [[rt], [rt, magic], [rt, reflection_peer], [rt, reflection_peer, magic]]:
+		var reflected: Dictionary = selection.resolve(fallback_candidates, Callable(self, "_enabled"))
+		require(selection.is_resolved_reflection_owner(reflected, rt.key) == (not fallback_candidates.has(reflection_peer)),
+			"Unique/duplicate reflection eligibility must agree with and without a MagicGI diffuse fallback")
 	var retry_status: Dictionary = availability_state.get_status(true, "", "Fixture GPU", 220)
 	require(bool(retry_status.get("available", false))
 			and retry_status.get("state") == "retry_probe",

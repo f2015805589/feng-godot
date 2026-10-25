@@ -1,4 +1,6 @@
 extends SceneTree
+
+const SceneInputs = preload("res://addons/feng-lightmap-mc/feng_lightmap_scene_inputs.gd")
 ## CPU-only collection checks. No GPU bake, project scene edits or output atlas.
 
 const Volume = preload("res://addons/feng-lightmap-mc/feng_lightmap_volume.gd")
@@ -49,7 +51,15 @@ func _run() -> void:
 	sun.name = "Directional"
 	sun.light_bake_mode = Light3D.BAKE_DYNAMIC
 	scene.add_child(sun)
-	var data := volume._collect_scene(scene,scene)
+	var surface_material := StandardMaterial3D.new()
+	surface_material.albedo_color = Color.RED
+	receiver.set_surface_override_material(0, surface_material)
+	_check(SceneInputs.collect(volume, volume.bounds, scene, scene).albedo[0].is_equal_approx(material.albedo_color.srgb_to_linear()), "Instance override wins over surface override")
+	receiver.material_override = null
+	_check(SceneInputs.collect(volume, volume.bounds, scene, scene).albedo[0].is_equal_approx(Color.RED), "Surface override is used when instance override is absent")
+	receiver.material_override = material
+	receiver.set_surface_override_material(0, null)
+	var data := SceneInputs.collect(volume, volume.bounds, scene,scene)
 	_check(data.get("ok",false), "Smooth Burley/GGX sphere + dynamic directional collection must succeed: %s" % data.get("error",""))
 	_check(data.normals.size() == data.vertices.size(), "Normals preserve per-corner data")
 	_check(data.roughness.size() == data.albedo.size() and data.metallic.size() == data.albedo.size(), "PBR data remain per triangle")
@@ -65,13 +75,13 @@ func _run() -> void:
 		_check(normal.dot(data.normals[offset]) > 0.0, "Shading normals stay in geometric front hemisphere")
 	sun.light_bake_mode = Light3D.BAKE_STATIC
 	sun.light_indirect_energy = 0.4
-	var directional := volume._read_directional_light(sun)
+	var directional := SceneInputs._read_directional_light(sun)
 	_check(directional.ok and directional.input.direct_enabled and is_equal_approx(directional.input.indirect_energy,0.4), "Static direct and indirect multipliers are distinct")
-	var snapshot := volume._collect_scene(scene,scene)
-	var signature := volume._collection_signature(snapshot)
+	var snapshot := SceneInputs.collect(volume, volume.bounds, scene,scene)
+	var signature := SceneInputs.signature(snapshot, volume)
 	var renamed_snapshot := snapshot.duplicate(true)
 	renamed_snapshot.directional_lights[0].source_path = "/root/DifferentEditorTree/Directional"
-	_check(volume._collection_signature(renamed_snapshot) == signature, "Persistent transport signature ignores absolute editor tree paths")
+	_check(SceneInputs.signature(renamed_snapshot, volume) == signature, "Persistent transport signature ignores absolute editor tree paths")
 	var saved: Resource = volume.DATA_SCRIPT.new()
 	saved.set("scene_transport_signature",signature)
 	saved.set("receiver_bounds_local",volume.bounds)
@@ -85,11 +95,11 @@ func _run() -> void:
 	_check(not volume.validate_saved_bake_inputs().ok, "Legacy data without a source signature is not implicitly current")
 	volume.baked_data = null
 	sun.light_angular_distance = 0.1
-	var finite_sun := volume._read_directional_light(sun)
+	var finite_sun := SceneInputs._read_directional_light(sun)
 	_check(finite_sun.ok and is_equal_approx(finite_sun.input.angular_distance,0.1), "Finite disk is retained for native solid-angle integration")
 	sun.light_angular_distance = 0.0
 	sun.light_cull_mask = 1
-	_check(not volume._read_directional_light(sun).ok, "Light linking is rejected instead of omitted")
+	_check(not SceneInputs._read_directional_light(sun).ok, "Light linking is rejected instead of omitted")
 	sun.light_cull_mask = 0xFFFFF
 	sun.light_bake_mode = Light3D.BAKE_DISABLED
 	var external := MeshInstance3D.new()
@@ -100,7 +110,7 @@ func _run() -> void:
 	external.gi_mode = GeometryInstance3D.GI_MODE_STATIC
 	external.position = Vector3(10,0,0)
 	scene.add_child(external)
-	data = volume._collect_scene(scene,scene)
+	data = SceneInputs.collect(volume, volume.bounds, scene,scene)
 	_check(data.ok and data.transport_only_mesh_count == 1 and data.mesh_nodes.size() == 1, "Outside mesh is complete transport-only geometry without UV2")
 	_check(data.excluded_lights.size() == 1 and data.directional_lights.is_empty(), "Disabled directional is explicitly excluded")
 	var area := AreaLight3D.new()
@@ -112,19 +122,19 @@ func _run() -> void:
 	area.light_indirect_energy = 0.7
 	area.light_bake_mode = Light3D.BAKE_DYNAMIC
 	scene.add_child(area)
-	var rectangle := volume._read_area_light(area)
+	var rectangle := SceneInputs._read_area_light(area)
 	_check(rectangle.ok and not rectangle.input.direct_enabled, "Dynamic analytic area source keeps direct realtime")
 	_check(rectangle.input.axis_u.length() == 2.0 and rectangle.input.axis_v.length() == 3.0, "Area rectangle preserves authored full axes")
 	_check(is_equal_approx(rectangle.input.indirect_energy,0.7), "Area indirect multiplier stays separate")
 	var physical := bool(ProjectSettings.get_setting("rendering/lights_and_shadows/use_physical_light_units",false))
 	_check(rectangle.input.attenuation == (2.0 if physical else 1.25), "Area attenuation follows physical units convention")
-	data = volume._collect_scene(scene,scene)
+	data = SceneInputs.collect(volume, volume.bounds, scene,scene)
 	_check(data.ok and data.area_lights.size() == 1, "Analytic area remains independent scene source")
 	area.area_texture = GradientTexture2D.new()
-	_check(not volume._read_area_light(area).ok, "Textured area light must not silently become uniform")
+	_check(not SceneInputs._read_area_light(area).ok, "Textured area light must not silently become uniform")
 	area.area_texture = null
 	receiver.scale.x = -1.5
-	data = volume._collect_scene(scene,scene)
+	data = SceneInputs.collect(volume, volume.bounds, scene,scene)
 	var mirrored_ok := true
 	for offset in range(0,data.vertices.size(),3):
 		var normal: Vector3 = (data.vertices[offset+1]-data.vertices[offset]).cross(data.vertices[offset+2]-data.vertices[offset]).normalized()
@@ -142,10 +152,10 @@ func _run() -> void:
 	volume.environment_radiance = Color(0.8,0.4,0.2)
 	_check(volume._resolve_environment(scene).radiance == volume.environment_radiance, "Uniform override remains explicit linear radiance")
 	material.roughness = 0.0
-	_check(not volume._read_material(material,receiver,0).ok, "Unrepresented delta specular is rejected")
+	_check(not SceneInputs._read_material(material,receiver,0).ok, "Unrepresented delta specular is rejected")
 	material.roughness = 0.32
 	material.diffuse_mode = BaseMaterial3D.DIFFUSE_TOON
-	_check(not volume._read_material(material,receiver,0).ok, "Unrepresented diffuse model is rejected")
+	_check(not SceneInputs._read_material(material,receiver,0).ok, "Unrepresented diffuse model is rejected")
 	current_scene = null
 	scene.free()
 	print("FengLightmap frontend v3: %d checks passed; %d failures" % [checks,failures])

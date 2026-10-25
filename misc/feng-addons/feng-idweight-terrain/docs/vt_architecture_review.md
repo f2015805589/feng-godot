@@ -29,6 +29,11 @@ owns the state transitions behind its public operations. The source is grouped b
 | `terrain_3d_mesher*`, `terrain_3d_cdlod*`, `terrain_3d_instancer*` | Geometry, optional CDLOD and mesh-instance lifetime |
 
 Multi-file implementations share constants/helpers through their internal headers.
+GeneratedTexture owns texture replacement and storage metadata; array reuse is distinct
+from 2D storage, and an invalid allocation remains retryable. Streamer resolves the
+current Terrain3DData once per public operation and passes it through its batch helpers;
+it does not retain a second data pointer across directory replacement.
+
 CPU and shader addressing change together. `_configure_surface_view()` applies the
 same complete configuration on initial setup and pool rebuild.
 

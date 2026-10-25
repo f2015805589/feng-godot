@@ -298,8 +298,7 @@ func _watch_mesh(mesh: Resource) -> void:
 	if _mesh_callbacks.has(mesh_id):
 		return
 	var callback := Callable(self, "_on_mesh_changed").bind(mesh_id)
-	if mesh.has_signal("changed"):
-		mesh.changed.connect(callback)
+	mesh.changed.connect(callback)
 	_mesh_callbacks[mesh_id] = {"mesh": weakref(mesh), "callback": callback}
 
 func _on_mesh_changed(_mesh_id: int) -> void:
@@ -310,8 +309,7 @@ func _watch_material(resource: Resource) -> void:
 	if _mesh_callbacks.has(resource_id):
 		return
 	var callback := Callable(self, "_on_material_changed").bind(resource_id)
-	if resource.has_signal("changed"):
-		resource.changed.connect(callback)
+	resource.changed.connect(callback)
 	_mesh_callbacks[resource_id] = {"mesh": weakref(resource), "callback": callback}
 
 func _on_material_changed(_resource_id: int) -> void:

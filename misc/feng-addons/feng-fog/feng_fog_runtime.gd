@@ -19,8 +19,8 @@ const BAKED_LIGHTING_PROVIDER_PATH := "res://addons/feng-fog/rendering/baked_lig
 const VOLUMETRIC_LIGHTMAP_PROVIDER_PATH := "res://addons/feng-fog/rendering/baked_lighting/volumetric_lightmap/fog_volumetric_lightmap_provider.gd"
 const BAKED_SOURCE_LIGHTMAP_GI_PROBES := "lightmap_gi_probe_tetra"
 const BAKED_SOURCE_UE_VOLUMETRIC_BRICKS := "ue_volumetric_lightmap_bricks"
-const LIGHT_EXTENSION_REGISTRY_PATH := "res://addons/feng-fog/rendering/lighting/light_extensions/fog_light_extension_registry.gd"
-const RAY_GEOMETRY_REGISTRY_PATH := "res://addons/feng-fog/rendering/raytracing/fog_rt_geometry_registry.gd"
+const LightExtensions = preload("rendering/lighting/light_extensions/fog_light_extension_registry.gd")
+const RayGeometryRegistry = preload("rendering/raytracing/fog_rt_geometry_registry.gd")
 ## Optional render-target registry shared by the FRP snapshot consumers.
 const SNAPSHOT_WORLDS_PATH := "res://addons/feng-render-pipeline/passes/snapshot_worlds.gd"
 
@@ -40,9 +40,7 @@ static var _next_sky_light_runtime_probe_msec := 0
 static var _sky_light_runtime: GDScript = null
 static var _baked_payload_cache: Dictionary = {} ## resource instance id -> weak source, revision, immutable payload
 static var _baked_snapshot_provider: RefCounted
-static var _light_extension_registry: GDScript
-static var _ray_geometry_registry_script: GDScript
-static var _ray_geometry_registries: Dictionary = {} ## world id -> registry + weak world/root
+static var _ray_geometry_registries: Dictionary = {} ## world id -> owned geometry registry
 
 static func _snapshot_worlds() -> GDScript:
 	if not _worlds_queried:
@@ -135,14 +133,7 @@ static func _volumetric_environment_metadata_for_world(world_id: int) -> Diction
 static func _light_extension_metadata_for_world(world_id: int) -> Dictionary:
 	if world_id == 0:
 		return {}
-	if _light_extension_registry == null:
-		if not ResourceLoader.exists(LIGHT_EXTENSION_REGISTRY_PATH):
-			return {}
-		var loaded: Variant = load(LIGHT_EXTENSION_REGISTRY_PATH)
-		if not loaded is GDScript or not loaded.has_method("snapshot_metadata_for_world"):
-			return {}
-		_light_extension_registry = loaded
-	var raw: Variant = _light_extension_registry.call("snapshot_metadata_for_world", world_id)
+	var raw := LightExtensions.snapshot_metadata_for_world(world_id)
 	if not raw is Dictionary or not bool(raw.get("valid", false)) \
 			or int(raw.get("world_id", 0)) != world_id:
 		return {}
@@ -157,54 +148,25 @@ static func _ray_geometry_snapshot_for_world(world_id: int, world: World3D,
 		root: Node) -> Dictionary:
 	if world_id == 0 or world == null or root == null or not root.is_inside_tree():
 		return {}
-	if _ray_geometry_registry_script == null:
-		if not ResourceLoader.exists(RAY_GEOMETRY_REGISTRY_PATH):
-			return {}
-		var loaded: Variant = load(RAY_GEOMETRY_REGISTRY_PATH)
-		if not loaded is GDScript or not loaded.has_method("new"):
-			return {}
-		_ray_geometry_registry_script = loaded
-	var entry_value: Variant = _ray_geometry_registries.get(world_id)
-	var registry: Variant
-	if entry_value is Dictionary:
-		var old_world_ref: WeakRef = entry_value.get("world")
-		var old_root_ref: WeakRef = entry_value.get("root")
-		var old_world: Object = old_world_ref.get_ref() if old_world_ref != null else null
-		var old_root: Object = old_root_ref.get_ref() if old_root_ref != null else null
-		registry = entry_value.get("registry")
-		if old_world != world or old_root != root:
-			if registry != null and registry.has_method("detach"):
-				registry.call("detach")
-			registry = null
+	var registry: RayGeometryRegistry = _ray_geometry_registries.get(world_id)
+	if registry != null and not registry.is_attached_to(root, world):
+		registry.detach()
+		registry = null
 	if registry == null:
-		var created: Variant = _ray_geometry_registry_script.new()
-		if not created is RefCounted or not created.has_method("attach"):
+		registry = RayGeometryRegistry.new()
+		if not registry.attach(root, world):
 			return {}
-		registry = created
-		if not bool(registry.call("attach", root, world)):
-			registry.call("detach")
-			return {}
-	_ray_geometry_registries[world_id] = {
-		"registry": registry,
-		"world": weakref(world),
-		"root": weakref(root),
-	}
-	var raw_snapshot: Variant = registry.call("get_snapshot")
-	if not raw_snapshot is Dictionary or int(raw_snapshot.get("abi_version", 0)) != 1:
-		return {}
-	return raw_snapshot.duplicate(false)
+		_ray_geometry_registries[world_id] = registry
+	return registry.get_snapshot()
 
 
 static func _prune_ray_geometry_registries(active_worlds: Dictionary) -> void:
 	for world_id in _ray_geometry_registries.keys():
-		if active_worlds.has(world_id):
-			continue
-		var entry_value: Variant = _ray_geometry_registries[world_id]
-		if entry_value is Dictionary:
-			var registry: Variant = entry_value.get("registry")
-			if registry != null and registry.has_method("detach"):
-				registry.call("detach")
-		_ray_geometry_registries.erase(world_id)
+		if not active_worlds.has(world_id):
+			var registry: RayGeometryRegistry = _ray_geometry_registries[world_id]
+			registry.detach()
+			_ray_geometry_registries.erase(world_id)
+
 
 ## Adds the sky model's mean incident radiance independently of the authored
 ## Fog Inscattering Color and directional sunlight terms.

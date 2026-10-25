@@ -59,31 +59,15 @@ static func resolve(passes: Array, is_entry_enabled_fn: Callable) -> Dictionary:
 			owner["fallback_key"] = fallback.get("key", "")
 			owner["fallback_blocked"] = bool(fallback.get("blocked", false))
 		return owner
-	if not magic_candidates.is_empty():
-		var magic_owner := _single_or_blocked(KIND_MAGIC, magic_candidates)
-		if not unavailable_rt_candidates.is_empty():
-			magic_owner["unavailable_providers"] = unavailable_rt_candidates
-		if reflection_rt_candidates.size() == 1:
-			magic_owner["reflection_kind"] = KIND_RT
-			magic_owner["reflection_key"] = reflection_rt_candidates[0].get("key", "")
-			magic_owner["reflection_blocked"] = false
-		elif reflection_rt_candidates.size() > 1:
-			magic_owner["reflection_kind"] = KIND_RT
-			magic_owner["reflection_key"] = ""
-			magic_owner["reflection_blocked"] = true
-		return magic_owner
-	var no_diffuse_owner := {"kind": &"", "key": ""}
+	var diffuse_owner := _single_or_blocked(KIND_MAGIC, magic_candidates) \
+		if not magic_candidates.is_empty() else {"kind": &"", "key": ""}
 	if not unavailable_rt_candidates.is_empty():
-		no_diffuse_owner["unavailable_providers"] = unavailable_rt_candidates
-	if reflection_rt_candidates.size() == 1:
-		no_diffuse_owner["reflection_kind"] = KIND_RT
-		no_diffuse_owner["reflection_key"] = reflection_rt_candidates[0].get("key", "")
-		no_diffuse_owner["reflection_blocked"] = false
-	elif reflection_rt_candidates.size() > 1:
-		no_diffuse_owner["reflection_kind"] = KIND_RT
-		no_diffuse_owner["reflection_key"] = ""
-		no_diffuse_owner["reflection_blocked"] = true
-	return no_diffuse_owner
+		diffuse_owner["unavailable_providers"] = unavailable_rt_candidates
+	if not reflection_rt_candidates.is_empty():
+		diffuse_owner["reflection_kind"] = KIND_RT
+		diffuse_owner["reflection_key"] = reflection_rt_candidates[0].key if reflection_rt_candidates.size() == 1 else ""
+		diffuse_owner["reflection_blocked"] = reflection_rt_candidates.size() > 1
+	return diffuse_owner
 
 static func _provider_availability(entry: Variant) -> Dictionary:
 	if entry == null or not entry.has_method("get_indirect_gi_availability"):
