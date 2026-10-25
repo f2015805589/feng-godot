@@ -64,10 +64,11 @@ func _parse_begin(_object: Object) -> void:
 	ui["chunk_button"] = chunk_button
 
 	var quality_label := Label.new()
-	quality_label.text = "Bake quality (rays per point)"
+	quality_label.text = "Bake samples (rays per point; bounces are separate)"
 	container.add_child(quality_label)
 	ui["quality_label"] = quality_label
 	var quality := OptionButton.new()
+	quality.tooltip_text = "Each value is transport rays per point or source cell. Bounce count is a separate setting. Doubling samples roughly doubles transport bake time."
 	for preset_index in Volume.BAKE_QUALITY_SAMPLES.size():
 		var samples: int = Volume.BAKE_QUALITY_SAMPLES[preset_index]
 		quality.add_item("%s — %d rays" % [Volume.BAKE_QUALITY_NAMES[preset_index], samples], samples)
@@ -102,14 +103,17 @@ func _update_preview_status(volume: FMagicGIVolume, info: Label) -> void:
 		return
 	var snapshot := Runtime.preview_snapshot(volume)
 	var count: int = snapshot.get("positions", PackedVector3Array()).size()
-	var mode := "CLV Cells" if volume.display_probes_by_clv else "Source Probes"
+	var mode := "CLV SH2 (resident grid centers)" if volume.display_probes_by_clv \
+			else "Source SH2 (relocated probes)"
 	if not volume.display_probes_by_clv and snapshot.get("source_kind", "") == "prepared_brick":
-		mode = "Prepared Core Cells"
+		mode = "Prepared Core SH2 (grid centers)"
 	info.text = "Probe Preview: %s / %d" % [mode, count]
 	if volume.display_probes_by_clv:
-		info.text += "\nSelect an actual resident level L0–L9; availability follows the baked generation."
+		info.text += "\nSelect an actual resident level L0–L9; positions follow the selected viewport's resident grid."
 	if volume.show_sh_probes:
-		info.text += "\nLive SH spheres: %d / %d (uniform sample, max 256)" % [mini(count, 256), count]
+		info.text += "\nLive SH2 spheres: %d / %d (uniform sample, max 256); lobes reconstruct diffuse E/pi." % [mini(count, 256), count]
+		if not volume.display_probes_by_clv and mode.begins_with("Source SH2"):
+			info.text += " Source points include baked relocation."
 	if not bool(snapshot.get("current_available", false)):
 		info.text += "\n" + String(snapshot.get("status", "Waiting for live GI response"))
 
@@ -151,6 +155,12 @@ func _update_status(volume: FMagicGIVolume, info: Label, ui: Dictionary) -> void
 			info.text = "Paged CLV PRT: %.0f m camera radius; %d baked levels, %d total bricks. Resident %d / requested %d; loading %d." % [
 				volume.gi_radius_m, volume.bake_manifest.prepared_level_count, page_count,
 				int(stream.get("resident_pages", 0)), int(stream.get("active_pages", 0)), int(stream.get("loading_pages", 0))]
+			if volume.bake_manifest.bake_samples > 0 and volume.bake_manifest.bake_bounces > 0:
+				info.text += "\nBake provenance: %d transport rays/cell, %d bounces, %d visibility-moment rays/cell." % [
+					volume.bake_manifest.bake_samples, volume.bake_manifest.bake_bounces,
+					volume.bake_manifest.bake_moment_rays]
+			else:
+				info.text += "\nBake sample/bounce provenance: unknown (legacy manifest)."
 			info.text += "\nCPU %.1f / %.0f MiB; actual GPU pool + fields %.1f / %.0f MiB." % [
 				float(cpu_current) / 1048576.0, float(volume.cpu_resident_budget_bytes) / 1048576.0,
 				float(runtime.get("gpu_bytes", 0)) / 1048576.0, float(volume.gpu_resident_budget_bytes) / 1048576.0]
@@ -342,8 +352,8 @@ func _update_controls(volume: FMagicGIVolume, ui: Dictionary) -> void:
 	var quality_label: Label = ui.get("quality_label")
 	if is_instance_valid(quality_label):
 		quality_label.visible = prt_visible
-		quality_label.text = "Bake quality (transport rays per source cell)" if source_bake \
-				else "Bake quality (rays per surface point)"
+		quality_label.text = "Bake samples (rays per source cell; bounces separate)" if source_bake \
+				else "Bake samples (rays per surface point; bounces separate)"
 	var quality: OptionButton = ui.get("quality")
 	if is_instance_valid(quality):
 		quality.visible = prt_visible

@@ -1,8 +1,8 @@
 @tool
 extends RefCounted
-## Exact slicing/persistence of prepared linear transport. No relighting,
-## geometric fit or coefficient quantization occurs during legacy migration.
+## Exact slicing/persistence of versioned prepared linear transport.
 const Chunk = preload("feng_magic_gi_volume_source_chunk.gd")
+const Builder = preload("feng_magic_gi_clv_transfer_builder.gd")
 const Brick = preload("feng_magic_gi_prepared_transfer_brick.gd")
 const Page = preload("feng_magic_gi_page.gd")
 const Manifest = preload("feng_magic_gi_manifest.gd")
@@ -30,6 +30,8 @@ static func slice_source(source: Chunk, core_axis := 16,
 
 static func _slice(source: Chunk, level: int, core: Vector3i,
 		core_size: Vector3i, dims: Vector3i) -> Brick:
+	if source.clv_preparation_schema_version != 2:
+		return null
 	var offset := source.clv_prepared_offsets[level]
 	var any_valid := false
 	for z in range(core.z, core.z + core_size.z):
@@ -39,6 +41,7 @@ static func _slice(source: Chunk, level: int, core: Vector3i,
 					any_valid = true
 	if not any_valid: return null
 	var brick := Brick.new()
+	brick.operator_schema_version = 2
 	brick.source_origin_world = source.origin_world
 	brick.level = level
 	brick.cell_origin = (core - Vector3i.ONE).max(Vector3i.ZERO)
@@ -97,6 +100,7 @@ static func save_page(brick: Brick, generation: String, generation_root: String)
 		"prepared_level": brick.level, "cell_origin": brick.cell_origin, "dimensions": brick.dimensions,
 		"core_cell_origin": brick.core_cell_origin, "core_dimensions": brick.core_dimensions,
 		"prepared_source_signature": brick.directional_source_signature,
+		"prepared_operator_schema_version": brick.operator_schema_version,
 		"maximum_operator_row_l1": brick.maximum_operator_row_l1,
 		"resource_path": path, "content_hash": FileAccess.get_sha256(path), "empty": false}}
 
@@ -122,13 +126,16 @@ static func save_source(source: Chunk, template: Manifest, generation: String,
 	manifest.transport_domain = DOMAIN
 	manifest.prepared_source_origin_world = source.origin_world
 	manifest.prepared_core_axis = core_axis
-	manifest.prepared_bake_algorithm = "legacy_prepared_exact_slice_v1"
+	manifest.prepared_bake_algorithm = "prepared_clv_sh2_l0_l1_v3"
+	manifest.bake_settings_signature = hash([manifest.bake_settings_signature,
+		Builder.REVISION])
 	if template.get_page_count() == 1:
 		manifest.prepared_debug_source_path = String(template.page_entries[0].get("resource_path", ""))
 	manifest.prepared_level_count = int(result.level_count)
 	manifest.prepared_emitter_ids = source.emitter_ids
 	manifest.prepared_emitter_static_signatures = source.emitter_static_signatures
 	manifest.prepared_source_signature = source.directional_source_signature
+	manifest.prepared_operator_schema_version = source.clv_preparation_schema_version
 	manifest.prepared_source_transform_world = source.source_transform_world
 	manifest.prepared_source_size_m = source.source_size_m
 	manifest.prepared_maximum_operator_row_l1 = float(source.clv_preparation_stats.get("maximum_operator_row_l1", 0.0))

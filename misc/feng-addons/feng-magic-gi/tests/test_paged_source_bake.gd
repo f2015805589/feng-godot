@@ -1,6 +1,7 @@
 extends SceneTree
 const Volume = preload("../feng_magic_gi_volume.gd")
 const PagedBaker = preload("../feng_magic_gi_paged_source_baker.gd")
+const SourceBaker = preload("../feng_magic_gi_volume_source_baker.gd")
 const Page = preload("../feng_magic_gi_page.gd")
 var checks := 0
 var failures := 0
@@ -15,6 +16,26 @@ func check(value: bool, message: String) -> void:
 		push_error(message)
 
 func run() -> void:
+	check(Volume.BAKE_QUALITY_SAMPLES == [128, 256, 512, 1024, 2048],
+		"bake preset menu spans preview through reference samples")
+	var default_volume := Volume.new()
+	check(default_volume.bake_samples == 256,
+		"the existing 256-sample default remains unchanged")
+	default_volume.free()
+	var sampling_cache := SourceBaker.make_sampling_cache(32, 3, 256)
+	check(bool(sampling_cache.get("ok", false))
+			and sampling_cache.coordinates.size() == 8
+			and sampling_cache.minimum_moment_coordinates[0].size() == 256
+			and sampling_cache.extra_moment_coordinates[0].is_empty(),
+		"batch-local sampling cache preserves requested dimensions and moment counts")
+	check(SourceBaker._sampling_cache_matches(sampling_cache, 32, 3, 256),
+		"matching sample settings reuse the immutable base sequence")
+	check(not SourceBaker._sampling_cache_matches(sampling_cache, 64, 3, 256),
+		"a different sample count cannot reuse an incompatible sequence")
+	check(not SourceBaker._sampling_cache_matches(sampling_cache, 32, 2, 256),
+		"a different bounce count cannot reuse a different-dimensional sequence")
+	check(not SourceBaker._sampling_cache_matches(sampling_cache, 32, 3, 512),
+		"a different moment ray count cannot reuse an incomplete sequence")
 	var large := Vector3i(4096, 4096, 4096)
 	for level in 10:
 		var dims := Vector3i((Vector3(large) / float(1 << level)).ceil())
@@ -54,7 +75,12 @@ func run() -> void:
 	if bool(result.get("ok", false)):
 		var manifest: Resource = result.manifest
 		check(manifest.is_valid() and manifest.prepared_level_count == 10, "all ten real traced levels persist")
+		check(manifest.prepared_bake_algorithm == "multires_independent_transport_sh2_v3",
+			"paged bake records the direct surface target algorithm revision")
 		check(manifest.bake_settings_signature == PagedBaker.settings_signature(volume, options), "new bake signature is reproducible")
+		check(manifest.bake_samples == volume.bake_samples and manifest.bake_bounces == volume.bake_bounces
+				and manifest.bake_moment_rays == 256,
+			"reloaded manifest records exact transport sampling provenance")
 		check(int(result.peak_working_source_cells) <= 28 * 28 * 28, "bake reports bounded peak source allocation")
 		var level_counts := PackedInt32Array()
 		level_counts.resize(10)

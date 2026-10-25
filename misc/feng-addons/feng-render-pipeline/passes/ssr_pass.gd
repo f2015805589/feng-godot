@@ -22,7 +22,15 @@ const HALF_FORMAT := RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT
 const HIT_FORMAT := RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
 const HIZ_FORMAT := RenderingDevice.DATA_FORMAT_R32G32_SFLOAT
 
+enum ResolutionMode { HALF_RESOLUTION, FULL_RESOLUTION }
+
 @export_group("Screen Space Reflections")
+## Full resolution avoids the half-resolution receiver and trace grid.
+## It uses more GPU time and history memory.
+@export_enum("Half Resolution", "Full Resolution") var resolution_mode: int = ResolutionMode.HALF_RESOLUTION:
+	set(value):
+		resolution_mode = clampi(value, ResolutionMode.HALF_RESOLUTION, ResolutionMode.FULL_RESOLUTION)
+		emit_changed()
 @export_range(8, 128, 1) var max_steps := 48:
 	set(value):
 		max_steps = clampi(value, 8, 128)
@@ -114,7 +122,7 @@ func get_reflection_source_kind() -> StringName:
 	return &"ssr"
 
 func get_volume_parameter_names() -> PackedStringArray:
-	return PackedStringArray(["max_steps", "max_distance", "thickness", "max_roughness",
+	return PackedStringArray(["resolution_mode", "max_steps", "max_distance", "thickness", "max_roughness",
 			"history_weight", "intensity"])
 
 func refresh_resource_flags() -> void:
@@ -211,7 +219,10 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		_clear_output(rd, output)
 		return
 	var half_size := Vector2i(maxi(1, ceili(float(size.x) * 0.5)), maxi(1, ceili(float(size.y) * 0.5)))
-	var state := _ensure_view_state(buffers, view, size, half_size, rd)
+	var selected_resolution_mode := clampi(int(_frame_parameters.get("resolution_mode", resolution_mode)),
+			ResolutionMode.HALF_RESOLUTION, ResolutionMode.FULL_RESOLUTION)
+	var working_size := size if selected_resolution_mode == ResolutionMode.FULL_RESOLUTION else half_size
+	var state := _ensure_view_state(buffers, view, size, working_size, rd)
 	if state.is_empty():
 		_clear_output(rd, output)
 		return
@@ -362,7 +373,8 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	rd.compute_list_bind_uniform_set(list, trace_set, 0)
 	rd.compute_list_set_push_constant(list,
 			PackedFloat32Array([near_plane, far_plane, 0.0, 0.0]).to_byte_array(), 16)
-	rd.compute_list_dispatch(list, ceili(float(half_size.x) / WORKGROUP_SIZE), ceili(float(half_size.y) / WORKGROUP_SIZE), 1)
+	rd.compute_list_dispatch(list, ceili(float(working_size.x) / WORKGROUP_SIZE),
+			ceili(float(working_size.y) / WORKGROUP_SIZE), 1)
 	rd.compute_list_end()
 	list = rd.compute_list_begin()
 	if list < 0:
@@ -372,7 +384,8 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		return
 	rd.compute_list_bind_compute_pipeline(list, _pipelines[4])
 	rd.compute_list_bind_uniform_set(list, temporal_set, 0)
-	rd.compute_list_dispatch(list, ceili(float(half_size.x) / WORKGROUP_SIZE), ceili(float(half_size.y) / WORKGROUP_SIZE), 1)
+	rd.compute_list_dispatch(list, ceili(float(working_size.x) / WORKGROUP_SIZE),
+			ceili(float(working_size.y) / WORKGROUP_SIZE), 1)
 	rd.compute_list_add_barrier(list)
 	rd.compute_list_bind_compute_pipeline(list, _pipelines[5])
 	rd.compute_list_bind_uniform_set(list, upsample_set, 0)
@@ -462,7 +475,7 @@ func _is_camera_cut(state: Dictionary, transform: Transform3D, projection: Proje
 	return delta > 0.25
 
 func _ensure_view_state(buffers: RenderSceneBuffersRD, view: int, full_size: Vector2i,
-		half_size: Vector2i, rd: RenderingDevice) -> Dictionary:
+		working_size: Vector2i, rd: RenderingDevice) -> Dictionary:
 	var key := buffers.get_instance_id()
 	var entry: Dictionary = _states.get(key, {})
 	if not entry.is_empty() and entry["wr"].get_ref() == null:
@@ -474,12 +487,12 @@ func _ensure_view_state(buffers: RenderSceneBuffersRD, view: int, full_size: Vec
 		entry = {"wr": weakref(buffers), "views": {}}
 		_states[key] = entry
 	var state: Dictionary = entry["views"].get(view, {})
-	if not state.is_empty() and (state["full_size"] != full_size or state["half_size"] != half_size):
+	if not state.is_empty() and (state["full_size"] != full_size or state["half_size"] != working_size):
 		_free_view_state(rd, state)
 		entry["views"].erase(view)
 		state = {}
 	if state.is_empty():
-		state = _create_view_state(full_size, half_size, rd)
+		state = _create_view_state(full_size, working_size, rd)
 		if state.is_empty():
 			_sync_owned_rid_snapshot()
 			return {}
@@ -488,25 +501,25 @@ func _ensure_view_state(buffers: RenderSceneBuffersRD, view: int, full_size: Vec
 	_sync_owned_rid_snapshot()
 	return state
 
-func _create_view_state(full_size: Vector2i, half_size: Vector2i,
+func _create_view_state(full_size: Vector2i, working_size: Vector2i,
 		rd: RenderingDevice) -> Dictionary:
 	if not _hiz_format_supported or not _hit_format_supported:
 		return {}
 	var state := {
 		"full_size": full_size,
-		"half_size": half_size,
+		"half_size": working_size,
 		"hiz": RID(),
 		"hiz_mip_views": [],
 		"hiz_source_views": [],
 		"color_copy": _create_texture(rd, full_size, HALF_FORMAT),
-		"raw": _create_texture(rd, half_size, HALF_FORMAT),
-		"raw_receiver": _create_texture(rd, half_size, HALF_FORMAT),
-		"raw_hit": _create_texture(rd, half_size, HIT_FORMAT),
-		"raw_material": _create_texture(rd, half_size, HALF_FORMAT),
-		"raw_previous_hit": _create_texture(rd, half_size, HALF_FORMAT),
+		"raw": _create_texture(rd, working_size, HALF_FORMAT),
+		"raw_receiver": _create_texture(rd, working_size, HALF_FORMAT),
+		"raw_hit": _create_texture(rd, working_size, HIT_FORMAT),
+		"raw_material": _create_texture(rd, working_size, HALF_FORMAT),
+		"raw_previous_hit": _create_texture(rd, working_size, HALF_FORMAT),
 		"history": [
-			[_create_texture(rd, half_size, HALF_FORMAT), _create_texture(rd, half_size, HALF_FORMAT), _create_texture(rd, half_size, HIT_FORMAT), _create_texture(rd, half_size, HALF_FORMAT)],
-			[_create_texture(rd, half_size, HALF_FORMAT), _create_texture(rd, half_size, HALF_FORMAT), _create_texture(rd, half_size, HIT_FORMAT), _create_texture(rd, half_size, HALF_FORMAT)],
+			[_create_texture(rd, working_size, HALF_FORMAT), _create_texture(rd, working_size, HALF_FORMAT), _create_texture(rd, working_size, HIT_FORMAT), _create_texture(rd, working_size, HALF_FORMAT)],
+			[_create_texture(rd, working_size, HALF_FORMAT), _create_texture(rd, working_size, HALF_FORMAT), _create_texture(rd, working_size, HIT_FORMAT), _create_texture(rd, working_size, HALF_FORMAT)],
 		],
 		"ubo": rd.uniform_buffer_create(UBO_SIZE),
 		"read_index": 0,

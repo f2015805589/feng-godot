@@ -27,18 +27,18 @@ void main() {
 	if (cell >= config.cell_count) return;
 	int source = indices.values[cell];
 	bool valid = source >= 0 && source < config.source_count;
-	vec3 sh[9];
-	for (int outgoing = 0; outgoing < 9; outgoing++) {
+	vec3 sh[4];
+	for (int outgoing = 0; outgoing < 4; outgoing++) {
 		vec3 value = vec3(0.0);
 		if (valid) {
-			int row = (source * 9 + outgoing) * config.columns;
-			for (int incoming = 0; incoming < 9; incoming++) {
+			int row = (source * 4 + outgoing) * config.columns;
+			for (int incoming = 0; incoming < 4; incoming++) {
 				int k = row + incoming * 3;
 				value += vec3(operators.values[k], operators.values[k + 1], operators.values[k + 2]) * (coefficient(params.lighting_sh, incoming) * config.output_scale);
-				value += operators.values[row + 27 + incoming] * (coefficient(params.sky_lighting_sh, incoming) * config.output_scale);
+				value += operators.values[row + 12 + incoming] * (coefficient(params.sky_lighting_sh, incoming) * config.output_scale);
 			}
 			for (int e = 0; e < config.emitter_count; e++) {
-				int k = row + 36 + e * 6;
+				int k = row + 16 + e * 6;
 				for (int c = 0; c < 3; c++) {
 					value[c] += operators.values[k + c] * (emitters.values[e * 6 + c] * config.output_scale)
 						+ operators.values[k + 3 + c] * (emitters.values[e * 6 + 3 + c] * config.output_scale);
@@ -46,12 +46,12 @@ void main() {
 			}
 		}
 		sh[outgoing] = value;
-		valid = valid && magic_gi_sh9_tensor_finite_vec3(value);
+		valid = valid && magic_gi_sh4_finite_vec3(value);
 	}
-	vec4 packed[7];
-	magic_gi_sh9_tensor_pack_e_over_pi(sh, valid ? 1.0 : 0.0, packed);
+	vec4 packed[4];
+	magic_gi_sh4_pack_raw(sh, valid ? 1.0 : 0.0, packed);
 	ivec3 position = ivec3(cell % config.dim_x, (cell / config.dim_x) % config.dim_y, cell / (config.dim_x * config.dim_y));
-	for (int field = 0; field < 7; field++) {
+	for (int field = 0; field < 4; field++) {
 		imageStore(output_field, position + ivec3(0, 0, field * config.dim_z), valid ? packed[field] : vec4(0.0));
 	}
 }

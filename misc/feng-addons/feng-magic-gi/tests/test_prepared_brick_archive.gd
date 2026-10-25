@@ -98,7 +98,8 @@ func fixture() -> Chunk:
 			source.receiver_visibility_moments[cell * 128 + texel * 2] = 2
 			source.receiver_visibility_moments[cell * 128 + texel * 2 + 1] = 4
 	source.directional_source_signature = source.make_directional_source_signature()
-	source.clv_preparation_revision = 1
+	source.clv_preparation_revision = Chunk.CLV_PREPARATION_REVISION_CURRENT
+	source.clv_preparation_schema_version = 2
 	source.clv_preparation_signature = source.directional_source_signature
 	var total := 0
 	for level in 4:
@@ -108,7 +109,7 @@ func fixture() -> Chunk:
 		total += dims.x * dims.y * dims.z
 	source.clv_prepared_validity.resize(total)
 	source.clv_prepared_validity.fill(1)
-	source.clv_prepared_operators.resize(total * 9 * 36)
+	source.clv_prepared_operators.resize(total * 4 * 16)
 	for i in source.clv_prepared_operators.size():
 		source.clv_prepared_operators[i] = float(i % 23 - 11) * 0.01
 	return source

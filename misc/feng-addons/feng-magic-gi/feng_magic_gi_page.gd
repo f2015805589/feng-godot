@@ -46,11 +46,18 @@ func is_header_valid(expected_generation := "", expected_key := "") -> bool:
 	if free_space_volume_source != null:
 		# A dynamic free-space page stores exactly one transport domain. Keeping the
 		# legacy surface payload beside it would load two large coefficient sets.
+		var source_gpu_bytes := free_space_volume_source.estimated_gpu_payload_bytes()
+		var claims_prepared := free_space_volume_source.format_version == VolumeSourceChunk.FORMAT_VERSION_PACKED \
+				or free_space_volume_source.clv_preparation_revision != 0
+		if claims_prepared and not free_space_volume_source.has_preinterpolated_clv():
+			# A stale derived operator is ignored for raw-source diagnostics. It is
+			# rejected by is_valid() below and therefore cannot enter runtime GI.
+			source_gpu_bytes = 0
 		return data == null and free_space_volume_source.is_header_valid(geometry_signature) \
 				and free_space_volume_source.probe_count == probe_count \
 				and free_space_volume_source.geometry_signature == geometry_signature \
 				and cpu_bytes >= free_space_volume_source.estimated_payload_bytes() \
-				and gpu_bytes >= free_space_volume_source.estimated_gpu_payload_bytes()
+				and gpu_bytes >= source_gpu_bytes
 	return data != null and data.probe_count() == probe_count \
 			and cpu_bytes >= data.estimate_cpu_bytes() \
 			and gpu_bytes >= data.estimate_gpu_bytes()
@@ -64,6 +71,16 @@ func is_valid(expected_generation := "", expected_key := "") -> bool:
 		return free_space_volume_source.is_valid(geometry_signature) \
 				and free_space_volume_source.probe_count == probe_count
 	return data != null and data.is_valid() and data.probe_count() == probe_count
+
+## Deep-validates the raw source payload for diagnostics that intentionally read
+## the original SH9 bake data. It does not validate or enable its prepared CLV
+## operators; runtime page admission continues to use is_valid().
+func is_source_data_valid(expected_generation := "", expected_key := "") -> bool:
+	if not is_header_valid(expected_generation, expected_key) \
+			or free_space_volume_source == null:
+		return false
+	return free_space_volume_source.is_source_data_valid(geometry_signature) \
+			and free_space_volume_source.probe_count == probe_count
 
 func has_baked_indirect_sh() -> bool:
 	return data != null and is_valid() \

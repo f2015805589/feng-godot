@@ -137,9 +137,14 @@ bool project_previous_position(vec3 view_position, out vec4 previous_guide) {
 }
 
 vec3 rough_reflection_direction(vec3 normal, vec3 view_direction, float roughness, vec2 pixel) {
-	float noise = hash12(pixel, params.options.y);
-	float angle = noise * 6.28318530718;
-	float radial = sqrt(fract(noise * 17.0 + 0.37)) * roughness * roughness * 1.6;
+	// Cranley-Patterson-rotated R2 samples give each pixel a progressive low-discrepancy
+	// angle/radius pair instead of injecting a fresh white-noise pair every frame.
+	float sample_index = max(params.options.y, 0.0) + 1.0;
+	float sample_angle = fract(hash12(pixel, 0.0) + sample_index * 0.75487766625);
+	float sample_radius = fract(hash12(pixel + vec2(37.0, 17.0), 0.0)
+			+ sample_index * 0.56984029099);
+	float angle = sample_angle * 6.28318530718;
+	float radial = sqrt(sample_radius) * roughness * roughness * 1.6;
 	vec3 helper = abs(normal.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
 	vec3 tangent = safe_normalize(cross(helper, normal), vec3(1.0, 0.0, 0.0));
 	vec3 bitangent = cross(normal, tangent);

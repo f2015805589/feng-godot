@@ -2,7 +2,7 @@
 extends RefCounted
 ## Debug-only relighting of immutable free-space source probes. Safe to invoke
 ## from a worker: no scene traversal, Resource loading, RenderingServer, or RD.
-## The result contains raw signed incident-radiance SH, with no convolution,
+## The result contains raw signed incident-radiance SH2, with no convolution,
 ## strength, exposure, material response, or clamping of individual coefficients.
 
 const Chunk = preload("feng_magic_gi_volume_source_chunk.gd")
@@ -20,6 +20,8 @@ static func build(chunk: Chunk, lighting: PackedFloat32Array,
 		"spacings": PackedFloat32Array(),
 		"lods": PackedInt32Array(),
 		"response_sh": PackedFloat32Array(),
+		"response_coefficient_count": 4,
+		"response_sh_semantics": "raw_signed_world_incident_radiance_sh2_l0_l1_coefficient_major_rgb",
 		"source_indices": PackedInt32Array(),
 		"current_available": false,
 		"layout_key": "",
@@ -55,13 +57,13 @@ static func build(chunk: Chunk, lighting: PackedFloat32Array,
 	lods.resize(positions.size())
 	lods.fill(-1) # Original source probes are not cells of a resident CLV LOD.
 	var response := PackedFloat32Array()
-	response.resize(positions.size() * 27)
+	response.resize(positions.size() * 12)
 	result["positions"] = positions
 	result["spacings"] = spacings
 	result["lods"] = lods
 	result["source_indices"] = indices
 	result["response_sh"] = response
-	result["layout_key"] = "source:%d:%d" % [chunk.get_instance_id(),
+	result["layout_key"] = "source-sh2:%d:%d" % [chunk.get_instance_id(),
 		hash([positions, indices, chunk.spacing_m])]
 	if chunk.emitter_count < 0 or chunk.emitter_count > 32 \
 			or storage_count <= 0 \
@@ -73,21 +75,23 @@ static func build(chunk: Chunk, lighting: PackedFloat32Array,
 			or not _finite(lighting) or not _finite(sky_lighting) \
 			or not _finite(emission_sources):
 		return result
-	# Same coefficient-major indexing as magic_gi_dynamic_volume_relight.glsl:
-	# [source][outgoing9][incoming9][RGB], achromatic primary-sky matrix, and
-	# [emitter][source][outgoing9][base RGB, textured RGB]. Keep all families signed
-	# until the consumer evaluates the complete directional response.
+	# Match the live prepared CLV's effective SH2 lighting: take only the L0+L1
+	# input/output bands from each source SH9 matrix. The source stays at its
+	# relocation-adjusted point, but L2 lighting and output bands are intentionally
+	# omitted so this preview is comparable to the runtime's SH2 representation.
+	# Matrices remain coefficient-major: [source][outgoing9][incoming9][RGB],
+	# achromatic sky, and [emitter][source][outgoing9][base/textured RGB].
 	for probe in indices.size():
 		if probe % 32 == 0 and cancelled.is_valid() and bool(cancelled.call()):
 			return {}
 		var source := chunk.storage_index(indices[probe])
-		for outgoing in 9:
+		for outgoing in 4:
 			var red := 0.0
 			var green := 0.0
 			var blue := 0.0
 			var transfer_row := source * 243 + outgoing * 27
 			var sky_row := source * 81 + outgoing * 9
-			for incoming in 9:
+			for incoming in 4:
 				var light_index := incoming * 3
 				var transfer_index := transfer_row + light_index
 				var sky := chunk.sky[sky_row + incoming]
@@ -111,7 +115,7 @@ static func build(chunk: Chunk, lighting: PackedFloat32Array,
 				response.fill(0.0)
 				result["response_sh"] = response
 				return result
-			var output := probe * 27 + outgoing * 3
+			var output := probe * 12 + outgoing * 3
 			response[output] = red
 			response[output + 1] = green
 			response[output + 2] = blue

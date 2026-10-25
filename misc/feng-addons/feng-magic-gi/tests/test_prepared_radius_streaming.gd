@@ -20,6 +20,7 @@ func fixture() -> Resource:
 	var manifest := Manifest.new()
 	manifest.generation = "radius"
 	manifest.transport_domain = "prepared_free_space_bricks_v1"
+	manifest.prepared_operator_schema_version = 2
 	manifest.prepared_level_count = 10
 	manifest.prepared_source_origin_world = Vector3.ONE * 0.125
 	manifest.prepared_source_size_m = Vector3.ONE * 4096.0
@@ -44,6 +45,7 @@ func fixture() -> Resource:
 				Vector3.ONE * 16 * step)
 			entries.append({"page_key": "%d:%s" % [level, origin], "prepared_level": level,
 				"prepared_source_signature": manifest.prepared_source_signature,
+				"prepared_operator_schema_version": 2,
 				"core_cell_origin": origin, "core_dimensions": Vector3i.ONE * 16,
 				"core_bounds": core, "support_bounds": core.grow(step), "influence_bounds": core.grow(step),
 				"resource_path": "res://unused-selection-fixture.res", "probe_count": 1,
@@ -56,6 +58,22 @@ func run() -> void:
 	check(manifest.is_valid(), "sparse multi-kilometer index validates: " + manifest.get_index_error())
 	var header: Resource = Header.from_manifest(manifest)
 	check(header != null and header.is_header_valid(), "header supports >256 cells without dense data")
+	var legacy: Resource = manifest.duplicate(true)
+	legacy.prepared_operator_schema_version = 1
+	var legacy_entries: Array[Dictionary] = legacy.page_entries.duplicate(true)
+	for entry in legacy_entries: entry["prepared_operator_schema_version"] = 1
+	legacy.configure(legacy_entries)
+	check(not legacy.is_valid() and Header.from_manifest(legacy) == null,
+		"legacy SH9 prepared manifest is refused instead of misdecoded")
+	var legacy_streamer := Streamer.new()
+	legacy_streamer.set_manifest(legacy)
+	check(legacy_streamer.warning.contains("legacy SH9") and legacy_streamer.warning.contains("Rebake"),
+		"legacy prepared cache reports the SH2 rebake requirement")
+	var legacy_volume := Volume.new()
+	legacy_volume.bake_manifest = legacy
+	check(legacy_volume.needs_rebake() \
+			and legacy_volume.directional_transfer_status().status == "prepared_clv_sh2_rebake_required",
+		"volume readiness flags old prepared schema as requiring rebake")
 	for resolution in [16, 24, 32]:
 		var layout := Layout.build(header, Vector3.ONE * 1024.0, resolution, 512.0)
 		check(layout.valid and layout.level_count == (10 if resolution == 16 else 9), "radius coverage chooses sufficient levels")

@@ -3,6 +3,7 @@ extends RefCounted
 const U = preload("../rd/uniforms.gd")
 const PATH := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_debug.glsl"
 const PAGED_PATH := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_paged_volume_debug.glsl"
+const PREPARED_PATH := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_prepared_volume_debug.glsl"
 var _shader := RID()
 var _pipeline := RID()
 var _shader_path := ""
@@ -16,8 +17,10 @@ func draw(rd: RenderingDevice, cache: RefCounted, owner: RID, frame_bytes: Packe
 	if cache == null or not cache.has_method("get_runtime_state"):
 		return "dynamic_debug_cache_unavailable"
 	var state: Dictionary = cache.get_runtime_state()
-	var paged := int(state.get("layout_version", 0)) == 6
-	if not _ensure(rd, paged):
+	var layout_version := int(state.get("layout_version", 0))
+	var paged := layout_version == 7
+	var prepared_sh2 := layout_version == 8
+	if not _ensure(rd, paged, prepared_sh2):
 		return "dynamic_debug_shader_unavailable"
 	if frame_bytes.size() != 448: return "dynamic_debug_camera_unavailable"
 	if not _frame.is_valid(): _frame = rd.uniform_buffer_create(448, frame_bytes)
@@ -46,9 +49,9 @@ func draw(rd: RenderingDevice, cache: RefCounted, owner: RID, frame_bytes: Packe
 	rd.compute_list_end()
 	return "native_preinterpolated_clv_debug_current"
 
-func _ensure(rd: RenderingDevice, paged := false) -> bool:
+func _ensure(rd: RenderingDevice, paged := false, prepared_sh2 := false) -> bool:
 	if rd == null: return false
-	var path := PAGED_PATH if paged else PATH
+	var path := PAGED_PATH if paged else (PREPARED_PATH if prepared_sh2 else PATH)
 	if _shader_path != path:
 		# Descriptor sets are shader-owned in UniformSetCacheRD. Dropping the old
 		# shader invalidates its sets; retain only the shared samplers/frame UBO.

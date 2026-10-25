@@ -11,3 +11,4 @@ source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_baked_s
 dest_files=["res://.godot/imported/magic_gi_baked_sh_clv_probe_block_field_fill_r16.glsl-65a61f418c794a9e1d07448d63891eda.res"]
 
 [params]
+

@@ -1112,7 +1112,8 @@ void FRPPassContext::set_magic_gi_dynamic_volume_input(int p_view, const Array &
 			"Magic GI dynamic volume response resolution must be 8, 12, or 16.");
 	ERR_FAIL_COND_MSG(p_layout_version != MAGIC_GI_DYNAMIC_VOLUME_LAYOUT_VERSION &&
 			p_layout_version != MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION &&
-			p_layout_version != MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION,
+			p_layout_version != MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION &&
+			p_layout_version != MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION,
 			"Magic GI dynamic volume layout version mismatch.");
 	ERR_FAIL_COND_MSG(p_publication_token <= 0,
 			"Magic GI dynamic volume publication token must be positive.");
@@ -1159,7 +1160,8 @@ bool FRPPassContext::has_magic_gi_dynamic_volume_input(int p_view) const {
 			input.expected_volume_parameters_size_bytes != expected_parameters_size ||
 			(input.layout_version != MAGIC_GI_DYNAMIC_VOLUME_LAYOUT_VERSION &&
 					input.layout_version != MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION &&
-					input.layout_version != MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) ||
+					input.layout_version != MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION &&
+					input.layout_version != MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION) ||
 			input.dimensions.x <= 0 || input.dimensions.y <= 0 || input.dimensions.z <= 0 ||
 			(input.response_resolution != 8 && input.response_resolution != 12 &&
 					input.response_resolution != 16) ||
@@ -1339,6 +1341,8 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_parameters_size"), &FRPPassContext::get_magic_gi_paged_prepared_parameters_size);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_max_lods"), &FRPPassContext::get_magic_gi_paged_prepared_max_lods);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_abi_version"), &FRPPassContext::get_magic_gi_paged_prepared_abi_version);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_prepared_sh2_layout_version"), &FRPPassContext::get_magic_gi_prepared_sh2_layout_version);
+	ClassDB::bind_method(D_METHOD("get_magic_gi_prepared_sh2_parameters_size"), &FRPPassContext::get_magic_gi_prepared_sh2_parameters_size);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_clv_layout_version"), &FRPPassContext::get_magic_gi_clv_layout_version);
 	ClassDB::bind_method(D_METHOD("supports_magic_gi_clv_resolution", "resolution"), &FRPPassContext::supports_magic_gi_clv_resolution);
 	ClassDB::bind_method(D_METHOD("clear_magic_gi_clv_inputs"), &FRPPassContext::clear_magic_gi_clv_inputs);

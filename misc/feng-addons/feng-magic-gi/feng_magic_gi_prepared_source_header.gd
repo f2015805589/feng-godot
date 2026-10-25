@@ -15,6 +15,7 @@ extends Resource
 @export_storage var directional_source_signature := ""
 @export_storage var geometry_signature := 0
 @export_storage var maximum_operator_row_l1 := 0.0
+@export_storage var operator_schema_version := 0
 @export_storage var clv_prepared_dimensions := PackedInt32Array()
 
 func is_header_valid() -> bool:
@@ -27,6 +28,7 @@ func is_header_valid() -> bool:
 			or minf(domain_bounds_world.size.x, minf(domain_bounds_world.size.y, domain_bounds_world.size.z)) <= 0 \
 			or emitter_count < 0 or emitter_count > 32 or emitter_ids.size() != emitter_count \
 			or emitter_static_signatures.size() != emitter_count or directional_source_signature.is_empty() \
+			or operator_schema_version != 2 \
 			or clv_prepared_dimensions.size() != prepared_level_count * 3 \
 			or not is_finite(maximum_operator_row_l1) or maximum_operator_row_l1 < 0.0:
 		return false
@@ -61,6 +63,7 @@ static func from_manifest(manifest: Resource) -> Resource:
 	result.directional_source_signature = manifest.prepared_source_signature
 	result.geometry_signature = manifest.bake_geometry_signature
 	result.maximum_operator_row_l1 = manifest.prepared_maximum_operator_row_l1
+	result.operator_schema_version = int(manifest.get("prepared_operator_schema_version"))
 	for level in result.prepared_level_count:
 		var dims := Vector3i((Vector3(result.dimensions) / float(1 << level)).ceil())
 		result.clv_prepared_dimensions.append_array(PackedInt32Array([dims.x, dims.y, dims.z]))

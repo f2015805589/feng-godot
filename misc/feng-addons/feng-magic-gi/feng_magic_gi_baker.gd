@@ -508,6 +508,8 @@ func bake_streamed_generation(volume: FMagicGIVolume, request_generation: int,
 	manifest.management_block_size = volume.management_block_size
 	manifest.page_core_size = volume.core_page_size
 	manifest.bake_settings_signature = settings_signature
+	manifest.bake_samples = volume.bake_samples
+	manifest.bake_bounces = volume.bake_bounces
 	manifest.scene_watch_signature = scene_watch_signature
 	manifest.scene_watch_signature_schema_version = SceneTracker.SIGNATURE_SCHEMA_CURRENT
 	manifest.bake_geometry_signature = scene_watch_signature

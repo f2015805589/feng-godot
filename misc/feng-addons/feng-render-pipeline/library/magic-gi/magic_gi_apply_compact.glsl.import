@@ -11,3 +11,4 @@ source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply_c
 dest_files=["res://.godot/imported/magic_gi_apply_compact.glsl-65bebdc37832dd393403cb6065c6af49.res"]
 
 [params]
+

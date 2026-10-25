@@ -3,7 +3,7 @@ extends "magic_gi_dynamic_volume_cache.gd"
 ## A fixed resident CLV of baked linear transfer operators. Geometry is used
 ## only by the offline builder; updates are matrix products and texture stores.
 
-const PREPARED_LAYOUT := 5
+const PREPARED_LAYOUT_VERSION := 8
 const PREPARED_LEVELS := 4
 const PREPARED_SHADER := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_transfer_relight.glsl"
 const PREPARED_SHADER_R16 := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_transfer_relight_r16.glsl"
@@ -15,6 +15,11 @@ var _prepared_dimensions := PackedInt32Array()
 var _prepared_offsets := PackedInt32Array()
 var _prepared_validity := PackedByteArray()
 var _operator_columns := 0
+var _operator_schema_version := 2
+var _input_coefficient_count := 4
+var _output_coefficient_count := 4
+var _response_field_count := 4
+var _runtime_layout_version := PREPARED_LAYOUT_VERSION
 var _gpu_bytes := 0
 var _operator_bound := 0.0
 var _half_fields := false
@@ -62,6 +67,9 @@ func create(rd: RenderingDevice, source: Resource, prepared_validation := false,
 	if resolution not in [16, 24, 32]:
 		_error = "prepared_clv_resolution_must_be_16_24_or_32"
 		return false
+	if source != null and int(source.get("clv_preparation_schema_version")) != 2:
+		_error = "prepared_sh9_cache_requires_sh2_rebake"
+		return false
 	if rd == null or source == null or not source.has_preinterpolated_clv() \
 			or (not prepared_validation and not source.is_valid()):
 		_error = "preinterpolated_clv_source_invalid"
@@ -71,16 +79,21 @@ func create(rd: RenderingDevice, source: Resource, prepared_validation := false,
 	emitter_count = source.emitter_count
 	source_signature = source.directional_source_signature
 	domain_bounds_world = source.domain_bounds_world
+	_operator_schema_version = 2
+	_input_coefficient_count = 4
+	_output_coefficient_count = 4
+	_response_field_count = 4
+	_runtime_layout_version = PREPARED_LAYOUT_VERSION
 	_prepared_dimensions = source.clv_prepared_dimensions
 	_prepared_offsets = source.clv_prepared_offsets
 	_prepared_validity = source.clv_prepared_validity
 	source_probe_count = _prepared_validity.size()
-	_operator_columns = 36 + emitter_count * 6
+	_operator_columns = 16 + emitter_count * 6
 	_operator_bound = float(source.clv_preparation_stats.get("maximum_operator_row_l1", 0.0))
 	_half_fields = is_finite(_operator_bound) and _operator_bound > 0.0
 	dimensions = Vector3i(resolution, resolution, resolution * PREPARED_LEVELS)
 	clip_cell_count = dimensions.x * dimensions.y * dimensions.z
-	response_resolution = 8 # Legacy bridge field; layout 5 selects seven packed tensors.
+	response_resolution = 8 # Legacy bridge field; the response field count is explicit below.
 	response_tile_size = 1
 	var operators: PackedFloat32Array = source.clv_prepared_operators
 	_transfer = rd.storage_buffer_create(operators.size() * 4, operators.to_byte_array())
@@ -103,7 +116,7 @@ func create(rd: RenderingDevice, source: Resource, prepared_validation := false,
 		else RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
 	format.width = dimensions.x
 	format.height = dimensions.y
-	format.depth = dimensions.z * 7
+	format.depth = dimensions.z * _response_field_count
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT \
 		| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
 	texture_fields = [rd.texture_create(format, RDTextureView.new(), [])]
@@ -125,7 +138,7 @@ func create(rd: RenderingDevice, source: Resource, prepared_validation := false,
 		return false
 	_shader = rd.shader_create_from_spirv(spirv, "Magic GI CLV Transfer Relight")
 	_pipeline = rd.compute_pipeline_create(_shader)
-	_gpu_bytes = operators.size() * 4 + clip_cell_count * (4 + 7 * (8 if _half_fields else 16)) + empty.size() * 4 + 124
+	_gpu_bytes = operators.size() * 4 + clip_cell_count * (4 + _response_field_count * (8 if _half_fields else 16)) + empty.size() * 4 + 124
 	return update_clipmap(rd, source, camera_world, true, camera_forward) and is_ready_resources()
 
 func update_clipmap(rd: RenderingDevice, source: Resource, camera_world: Vector3,
@@ -187,9 +200,9 @@ func update_clipmap(rd: RenderingDevice, source: Resource, camera_world: Vector3
 		_error = "clv_index_upload_failed"
 		return false
 	var bytes := origins.to_byte_array()
-	bytes.append_array(PackedInt32Array([dimensions.x, dimensions.y, dimensions.z, PREPARED_LAYOUT]).to_byte_array())
+	bytes.append_array(PackedInt32Array([dimensions.x, dimensions.y, dimensions.z, _runtime_layout_version]).to_byte_array())
 	bytes.append_array(PackedFloat32Array([_decode_scale]).to_byte_array())
-	bytes.append_array(PackedInt32Array([7, PREPARED_LEVELS, resolution]).to_byte_array())
+	bytes.append_array(PackedInt32Array([_response_field_count, PREPARED_LEVELS, resolution]).to_byte_array())
 	if parameters.is_valid():
 		if rd.buffer_update(parameters, 0, bytes.size(), bytes) != OK: return false
 	else:
@@ -267,7 +280,9 @@ func request_editor_snapshot(rd: RenderingDevice, request: Dictionary) -> Error:
 	if rd == null or not _ready or not is_ready_resources() or request.is_empty():
 		return ERR_UNAVAILABLE
 	var metadata := request.duplicate(true)
-	metadata["layout_version"] = int(get_runtime_state().get("layout_version", PREPARED_LAYOUT))
+	metadata["layout_version"] = int(get_runtime_state().get("layout_version", _runtime_layout_version))
+	metadata["response_field_count"] = _response_field_count
+	metadata["operator_schema_version"] = _operator_schema_version
 	metadata["dimensions"] = dimensions
 	metadata["resident_indices"] = _resident_indices.duplicate()
 	metadata["half_fields"] = _half_fields
@@ -287,7 +302,12 @@ func request_editor_snapshot(rd: RenderingDevice, request: Dictionary) -> Error:
 		Callable(EditorSnapshot, "receive_readback").bind(metadata))
 
 func get_runtime_state() -> Dictionary:
-	return {"layout_version": PREPARED_LAYOUT, "preinterpolated_transfer": true,
+	return {"layout_version": _runtime_layout_version, "preinterpolated_transfer": true,
+		"operator_schema_version": _operator_schema_version,
+		"operator_input_coefficients": _input_coefficient_count,
+		"operator_output_coefficients": _output_coefficient_count,
+		"response_field_count": _response_field_count,
+		"sh_basis": "real_orthonormal_l0_l1_coefficients4",
 		"runtime_geometry_queries": 0, "runtime_pixel_neighbor_loop": false,
 		"field_format": "RGBA16F" if _half_fields else "RGBA32F", "decode_scale": _decode_scale,
 		"probe_count": probe_count, "source_probe_count": source_probe_count,

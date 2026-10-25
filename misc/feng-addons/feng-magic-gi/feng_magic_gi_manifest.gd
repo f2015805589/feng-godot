@@ -25,6 +25,9 @@ const MAX_INDEXED_BLOCKS := 262144
 @export_storage var prepared_source_transform_world := Transform3D.IDENTITY
 @export_storage var prepared_source_size_m := Vector3.ZERO
 @export_storage var prepared_maximum_operator_row_l1 := 0.0
+## Prepared free-space CLV format: four L0+L1 coefficients by 16 inputs.
+## Zero marks an unversioned/legacy manifest, which must be rebaked.
+@export_storage var prepared_operator_schema_version := 0
 @export_storage var prepared_core_axis := 16
 @export_storage var prepared_bake_algorithm := ""
 ## Optional old source page path used only by explicit source-Probe diagnostics.
@@ -34,6 +37,11 @@ const MAX_INDEXED_BLOCKS := 262144
 @export_storage var page_core_size := 32.0
 @export_storage var bake_geometry_signature := 0
 @export_storage var bake_settings_signature := 0
+## Optional bake provenance. Zero values mean this generation predates the
+## metadata or the setting does not apply; never infer them from a live Volume.
+@export_storage var bake_samples := 0
+@export_storage var bake_bounces := 0
+@export_storage var bake_moment_rays := 0
 ## Persistent scene-content fingerprint captured at bake/load boundaries. The
 ## page geometry-signature format remains unchanged; old manifests omit this.
 @export_storage var scene_watch_signature := 0
@@ -97,6 +105,7 @@ func is_valid() -> bool:
 		return false
 	if transport_domain == "prepared_free_space_bricks_v1" \
 			and (prepared_level_count < 1 or prepared_level_count > 10 \
+			or prepared_operator_schema_version != 2 \
 			or not prepared_source_origin_world.is_finite() \
 			or prepared_source_signature.is_empty() \
 			or prepared_core_axis < 1 or prepared_core_axis > 32 \
@@ -277,7 +286,8 @@ func _build_spatial_index() -> void:
 		var prepared_level := int(entry.get("prepared_level", -1))
 		if transport_domain == "prepared_free_space_bricks_v1" \
 				and (prepared_level < 0 or prepared_level >= prepared_level_count \
-				or String(entry.get("prepared_source_signature", "")) != prepared_source_signature):
+				or String(entry.get("prepared_source_signature", "")) != prepared_source_signature \
+				or int(entry.get("prepared_operator_schema_version", 0)) != prepared_operator_schema_version):
 			_index_error = "Invalid prepared brick identity/level: %s" % page_key
 			return
 		if page_key.is_empty() or _metadata_by_key.has(page_key) \

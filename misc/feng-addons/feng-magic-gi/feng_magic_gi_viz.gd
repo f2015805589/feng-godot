@@ -642,8 +642,9 @@ static func _volume_probe_spacing(preview_snapshot: Dictionary, index: int, fall
 static func _volume_sh_available(preview_snapshot: Dictionary) -> bool:
 	var positions: PackedVector3Array = preview_snapshot.get("positions", PackedVector3Array())
 	var response_sh: PackedFloat32Array = preview_snapshot.get("response_sh", PackedFloat32Array())
+	var coefficients := int(preview_snapshot.get("response_coefficient_count", 0))
 	return bool(preview_snapshot.get("current_available", false)) and not positions.is_empty() \
-			and response_sh.size() == positions.size() * 27
+			and coefficients == 4 and response_sh.size() == positions.size() * 12
 
 static func _update_volume_probe_colors(mm: MultiMesh, preview_snapshot: Dictionary) -> void:
 	var available := _volume_sh_available(preview_snapshot)
@@ -653,7 +654,7 @@ static func _update_volume_probe_colors(mm: MultiMesh, preview_snapshot: Diction
 		var color := UNAVAILABLE_COLOR
 		var compensate := true
 		if available:
-			var offset := index * 27
+			var offset := index * 12
 			var mean := Vector3(response_sh[offset], response_sh[offset + 1], response_sh[offset + 2]) * (0.2820947918 * strength)
 			if mean.is_finite():
 				mean = mean.max(Vector3.ZERO)
@@ -706,15 +707,16 @@ static func _update_volume_sh_texture(node: MultiMeshInstance3D, preview_snapsho
 	if indices.is_empty():
 		return
 	var response_sh: PackedFloat32Array = preview_snapshot.get("response_sh", PackedFloat32Array())
+	const COEFFICIENT_COUNT := 4
 	var packed := PackedFloat32Array()
-	packed.resize(indices.size() * 27)
+	packed.resize(indices.size() * COEFFICIENT_COUNT * 3)
 	for row in indices.size():
-		var source := indices[row] * 27
-		if source + 27 > response_sh.size():
+		var source := indices[row] * COEFFICIENT_COUNT * 3
+		if source + COEFFICIENT_COUNT * 3 > response_sh.size():
 			return
-		for coefficient in 27:
-			packed[row * 27 + coefficient] = response_sh[source + coefficient]
-	var image := Image.create_from_data(9, indices.size(), false, Image.FORMAT_RGBF, packed.to_byte_array())
+		for coefficient in COEFFICIENT_COUNT * 3:
+			packed[row * COEFFICIENT_COUNT * 3 + coefficient] = response_sh[source + coefficient]
+	var image := Image.create_from_data(COEFFICIENT_COUNT, indices.size(), false, Image.FORMAT_RGBF, packed.to_byte_array())
 	var texture: ImageTexture = node.get_meta("volume_preview_texture") if node.has_meta("volume_preview_texture") else null
 	if texture == null:
 		texture = ImageTexture.create_from_image(image)
@@ -723,6 +725,7 @@ static func _update_volume_sh_texture(node: MultiMeshInstance3D, preview_snapsho
 		texture.update(image)
 	var material := node.material_override as ShaderMaterial
 	material.set_shader_parameter("response_sh", texture)
+	material.set_shader_parameter("response_coefficient_count", COEFFICIENT_COUNT)
 	material.set_shader_parameter("response_strength", float(preview_snapshot.get("strength", 1.0)))
 	_set_preview_view_parameters(material, preview_snapshot.get("editor_views", []))
 	node.set_meta("volume_preview_revision", int(preview_snapshot.get("revision", 0)))

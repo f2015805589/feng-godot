@@ -3,6 +3,8 @@ extends SceneTree
 const Chunk = preload("../feng_magic_gi_volume_source_chunk.gd")
 const Archive = preload("../feng_magic_gi_source_archive.gd")
 const Builder = preload("../feng_magic_gi_clv_transfer_builder.gd")
+const Page = preload("../feng_magic_gi_page.gd")
+const SourcePreview = preload("../feng_magic_gi_source_preview.gd")
 var checks := 0
 var failures := 0
 
@@ -17,6 +19,11 @@ func check(condition: bool, message: String) -> void:
 
 func run() -> void:
 	var source := _fixture()
+	var old_prepared_revision := source.duplicate(true) as Chunk
+	old_prepared_revision.clv_preparation_revision = 3
+	check(Builder.REVISION == Chunk.CLV_PREPARATION_REVISION_CURRENT \
+			and not old_prepared_revision.has_preinterpolated_clv(),
+		"all-level footprint preparation invalidates revision-three prepared operators")
 	check(source.format_version == 1 and source.is_valid(), "dense default remains readable v1")
 	var result := Archive.pack(source)
 	check(bool(result.get("ok", false)), "valid prepared source can be losslessly packed")
@@ -25,6 +32,54 @@ func run() -> void:
 		return
 	var packed: Chunk = result.chunk
 	check(packed.format_version == 2 and packed.is_valid(), "packed v2 passes deep validation")
+	var old_packed := packed.duplicate(true) as Chunk
+	old_packed.clv_preparation_revision = 2
+	old_packed.clv_preparation_schema_version = 0 # Field was absent in the old packed source.
+	old_packed.clv_prepared_operators.resize(11 * 9 * 48) # Legacy SH9 prepared data for E=2.
+	check(old_packed.is_header_valid() and old_packed.is_source_data_valid(),
+		"packed v2 with legacy prepared revision remains structurally and deeply valid as raw source")
+	check(not old_packed.has_preinterpolated_clv() and not old_packed.is_valid(),
+		"legacy prepared operators cannot pass current prepared-CLV validation")
+	var old_source_page := Page.new()
+	old_source_page.generation = "old-generation"
+	old_source_page.page_key = "source"
+	old_source_page.core_bounds = AABB(Vector3.ZERO, Vector3.ONE)
+	old_source_page.support_bounds = AABB(Vector3(-1, -1, -1), Vector3.ONE * 3.0)
+	old_source_page.probe_count = old_packed.probe_count
+	old_source_page.geometry_signature = old_packed.geometry_signature
+	old_source_page.free_space_volume_source = old_packed
+	old_source_page.cpu_bytes = old_packed.estimated_payload_bytes()
+	old_source_page.gpu_bytes = 0 # Source-only diagnostics do not upload stale operators.
+	check(old_source_page.is_header_valid() and old_source_page.is_source_data_valid(),
+		"source-only diagnostic page can expose old raw source payload")
+	check(not old_source_page.is_valid(),
+		"source-only diagnostic acceptance does not make stale prepared operators runtime-valid")
+	var current_source_page := old_source_page.duplicate(true) as Page
+	current_source_page.free_space_volume_source = packed
+	current_source_page.cpu_bytes = packed.estimated_payload_bytes()
+	check(not current_source_page.is_header_valid(),
+		"a current prepared source page still requires its declared GPU operator residency")
+	var source_lighting := PackedFloat32Array()
+	source_lighting.resize(27)
+	var source_sky := PackedFloat32Array()
+	source_sky.resize(27)
+	var source_emission := PackedFloat32Array()
+	source_emission.resize(old_packed.emitter_count * 6)
+	var source_preview := SourcePreview.build(old_packed, source_lighting, source_sky, source_emission)
+	check(bool(source_preview.get("current_available", false)),
+		"SH2 source diagnostic can still relight raw packed data with legacy prepared revision")
+	var malformed_old_source := old_packed.duplicate(true) as Chunk
+	malformed_old_source.source_storage_indices[2] = 0
+	check(not malformed_old_source.is_source_data_valid(),
+		"raw-source validation still rejects a duplicate packed payload mapping")
+	var malformed_old_page := old_source_page.duplicate(true) as Page
+	malformed_old_page.free_space_volume_source = malformed_old_source
+	check(not malformed_old_page.is_source_data_valid(),
+		"source-page raw validation rejects an invalid packed mapping")
+	malformed_old_source = old_packed.duplicate(true) as Chunk
+	malformed_old_source.transfer[0] = NAN
+	check(not malformed_old_source.is_source_data_valid(),
+		"raw-source validation still rejects non-finite source coefficients")
 	check(source.format_version == 1 and source.transfer.size() == 8 * 243,
 			"packing does not mutate the input or its dense arrays")
 	check(packed.probe_count == 8 and packed.cell_count() == 8 \
@@ -109,10 +164,22 @@ func run() -> void:
 			"nan": malformed.transfer[0] = NAN
 			"no_prepared": malformed.clv_preparation_revision = 0
 		check(not malformed.is_valid(), mutation + " is rejected before unsafe payload indexing")
+	var packed_builder := Builder.new()
+	packed_builder.set("_source", packed)
+	packed_builder.set("_columns", 28)
+	packed_builder.set("_output_coefficients", 4)
+	var packed_matrix: PackedFloat32Array = packed_builder.call("_source_matrix", 2)
+	var dense_builder := Builder.new()
+	dense_builder.set("_source", source)
+	dense_builder.set("_columns", 28)
+	dense_builder.set("_output_coefficients", 4)
+	var dense_matrix: PackedFloat32Array = dense_builder.call("_source_matrix", 2)
+	check(packed_matrix.to_byte_array() == dense_matrix.to_byte_array(),
+		"packed source preparation resolves SH9 and emitter coefficients through storage_index")
 	var rejected: Dictionary = await Builder.new().prepare_async(packed, null)
 	check(not bool(rejected.get("ok", false)) \
-			and String(rejected.get("error", "")).contains("original_dense_bake"),
-			"packed archives never silently rebuild geometry-conditioned prepared transport")
+			and String(rejected.get("error", "")).contains("invalid_clv_transfer_preparation_input"),
+			"packed archives can be reused when geometry is supplied but still reject missing inputs")
 	var path := "res://source_archive_roundtrip.res"
 	check(ResourceSaver.save(packed, path, ResourceSaver.FLAG_COMPRESS) == OK, "packed resource saves")
 	var restored := ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE) as Chunk
@@ -148,13 +215,16 @@ func _fixture() -> Chunk:
 			source.receiver_visibility_moments[logical * 128 + texel * 2] = 2
 			source.receiver_visibility_moments[logical * 128 + texel * 2 + 1] = 4
 	source.directional_source_signature = source.make_directional_source_signature()
-	source.clv_preparation_revision = 1
+	source.clv_preparation_revision = Chunk.CLV_PREPARATION_REVISION_CURRENT
+	source.clv_preparation_schema_version = 2
 	source.clv_preparation_signature = source.directional_source_signature
 	source.clv_prepared_dimensions = PackedInt32Array([2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1])
 	source.clv_prepared_offsets = PackedInt32Array([0, 8, 9, 10])
 	source.clv_prepared_validity.resize(11)
 	source.clv_prepared_validity.fill(1)
-	source.clv_prepared_operators.resize(11 * 9 * 48)
+	# E=2: four output SH coefficients over 16 compact input columns plus
+	# six retained emission columns per emitter.
+	source.clv_prepared_operators.resize(11 * 4 * 28)
 	for i in source.clv_prepared_operators.size():
 		source.clv_prepared_operators[i] = float(i % 19 - 10) * 0.0001
 	return source

@@ -28,7 +28,9 @@ class SourceJob:
 	func run(chunk: Resource, lighting: PackedFloat32Array, sky: PackedFloat32Array,
 			emission: PackedFloat32Array) -> void:
 		result = SourcePreview.build(chunk, lighting, sky, emission, is_cancelled)
-		if not result.is_empty(): result["source_kind"] = "original_source_probe"
+		if not result.is_empty():
+			result["source_kind"] = "original_source_probe"
+			result["source_preview_mode"] = "SH2 runtime-input comparison"
 	func run_prepared(pages: Array, lighting: PackedFloat32Array, sky: PackedFloat32Array) -> void:
 		result = BrickPreview.build(pages, lighting, sky, is_cancelled)
 
@@ -123,7 +125,7 @@ static func snapshot(volume: Object, pages: Array, lighting: PackedFloat32Array,
 		var page_identity: Array = []
 		for page in prepared_pages:
 			page_identity.append([page.prepared_transfer_brick.get_instance_id(), page.get("cache_key", ""), page.get("emission_sources")])
-		var source_key := "%d:%s" % [chunk.get_instance_id(), source_page.get("cache_key", "")] if chunk != null \
+		var source_key := "source-sh2:%d:%s" % [chunk.get_instance_id(), source_page.get("cache_key", "")] if chunk != null \
 				else "prepared:%d" % hash(page_identity)
 		var key := "%s:%d" % [source_key, hash([lighting, sky, emission])]
 		var cached: Dictionary = _cached.get(id, {})
@@ -222,7 +224,9 @@ static func _poll_debug_loads() -> void:
 			_debug_failures[id] = record.path
 
 static func _filter_clv(id: int, input: Dictionary, level: int) -> Dictionary:
-	var key := "%s:%s:%d" % [input.get("revision", 0), input.get("layout_key", ""), level]
+	var coefficient_count := int(input.get("response_coefficient_count", 0))
+	var key := "%s:%s:%d:%d" % [input.get("revision", 0), input.get("layout_key", ""),
+			level, coefficient_count]
 	var previous: Dictionary = _filtered_clv.get(id, {})
 	if previous.get("_filter_key", "") == key:
 		return previous
@@ -254,20 +258,25 @@ static func _filter_clv(id: int, input: Dictionary, level: int) -> Dictionary:
 	output_positions.resize(kept.size())
 	output_spacings.resize(kept.size())
 	output_lods.resize(kept.size())
-	var has_sh := coefficients.size() == positions.size() * 27
+	# This debug path represents the prepared free-space runtime, which is SH2.
+	# A topology-only CLV snapshot may omit SH entirely; legacy SH9 must never be
+	# surfaced as if it were the same response domain.
+	var response_stride := 12 if coefficient_count == 4 else 0
+	var has_sh := response_stride > 0 and coefficients.size() == positions.size() * response_stride
 	if has_sh:
-		output_sh.resize(kept.size() * 27)
+		output_sh.resize(kept.size() * response_stride)
 	for output in kept.size():
 		var index := kept[output]
 		output_positions[output] = positions[index]
 		output_spacings[output] = spacings[index]
 		output_lods[output] = lods[index]
 		if has_sh:
-			for channel in 27:
-				output_sh[output * 27 + channel] = coefficients[index * 27 + channel]
+			for channel in response_stride:
+				output_sh[output * response_stride + channel] = coefficients[index * response_stride + channel]
 	var result := input.duplicate()
 	result.merge({"positions": output_positions, "spacings": output_spacings,
 		"lods": output_lods, "response_sh": output_sh,
+		"response_coefficient_count": coefficient_count if has_sh else 0,
 		"layout_key": "%s:%s:%d" % [input.get("layout_key", ""), input.get("clipmap_revision", 0), level],
 		"revision": hash(key), "_filter_key": key}, true)
 	_filtered_clv[id] = result

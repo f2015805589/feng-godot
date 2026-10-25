@@ -6,6 +6,7 @@ const Chunk = preload("../feng_magic_gi_volume_source_chunk.gd")
 const Manifest = preload("../feng_magic_gi_manifest.gd")
 const Page = preload("../feng_magic_gi_page.gd")
 const VolumeSourceBaker = preload("../feng_magic_gi_volume_source_baker.gd")
+const Builder = preload("../feng_magic_gi_clv_transfer_builder.gd")
 const SceneTracker = preload("../feng_magic_gi_scene_tracker.gd")
 const Emission = preload("../feng_magic_gi_emission.gd")
 
@@ -54,8 +55,9 @@ func _run() -> void:
 	var manifest: Manifest = volume.bake_manifest
 	var manifest_path := manifest.resource_path
 	_check(manifest.transport_domain == "prepared_free_space_bricks_v1" \
-			and manifest.prepared_bake_algorithm == "legacy_prepared_exact_slice_v1",
-		"small ordinary Bake publishes an exact prepared brick generation")
+			and manifest.prepared_bake_algorithm == "prepared_clv_sh2_l0_l1_v3",
+		"small ordinary Bake publishes a fresh SH2 brick generation (domain=%s algorithm=%s)" \
+		% [manifest.transport_domain, manifest.prepared_bake_algorithm])
 	_check(manifest.get_page_count() == 4 and manifest.prepared_level_count == 4 \
 			and not manifest.has_baked_indirect_sh(),
 		"small fixture persists four real levels without inventing distant probes or frozen SH")
@@ -74,8 +76,32 @@ func _run() -> void:
 		await _finish(scene_root)
 		return
 	var chunk: Chunk = page.free_space_volume_source
-	_check(chunk.has_preinterpolated_clv() and chunk.clv_preparation_revision == 1,
+	_check(chunk.has_preinterpolated_clv() \
+			and chunk.clv_preparation_revision == Chunk.CLV_PREPARATION_REVISION_CURRENT,
 		"ordinary Bake persists geometry-conditioned linear transfer for native CLV relighting")
+	_check(int(manifest.bake_settings_signature) == hash([VolumeSourceBaker.settings_signature(volume), Builder.REVISION]) \
+			and int(manifest.bake_settings_signature) != VolumeSourceBaker.settings_signature(volume),
+		"prepared cache signature includes the CLV target algorithm revision while raw source settings stay stable")
+	_check(int(chunk.clv_preparation_stats.get("surface_target_constraints", 0)) > 0 \
+			and int(chunk.clv_preparation_stats.get("surface_direct_probes", 0)) > 0,
+		"surface constraints use direct bake targets and the existing ray budget")
+	var preparation_stats: Dictionary = chunk.clv_preparation_stats
+	_check(int(preparation_stats.get("rank_selected_constraints", 0)) > 0 \
+			and int(preparation_stats.get("rank_selected_constraints", 0)) \
+			+ int(preparation_stats.get("rank_dropped_constraints", 0)) \
+			== int(preparation_stats.get("constraint_candidates", -1)) \
+			and int(preparation_stats.get("surface_target_constraints", 0)) \
+			== int(preparation_stats.get("rank_selected_constraints", 0)),
+		"every selected constraint at every LOD uses the same surface estimator after rank selection")
+	var prepared_cell_count := 0
+	for level in 4:
+		prepared_cell_count += chunk.clv_prepared_dimensions[level * 3] \
+				* chunk.clv_prepared_dimensions[level * 3 + 1] \
+				* chunk.clv_prepared_dimensions[level * 3 + 2]
+	_check(chunk.clv_preparation_schema_version == 2 \
+			and chunk.clv_prepared_operators.size() == prepared_cell_count \
+				* 4 * (16 + 6 * chunk.emitter_count),
+		"fresh Bake writes the compact SH2 v2 operator stride with four retained source coefficients")
 	var invalid_bound: Chunk = chunk.duplicate(true)
 	invalid_bound.clv_preparation_stats["maximum_operator_row_l1"] = 0.00000001
 	_check(not invalid_bound.is_valid(),
@@ -140,7 +166,7 @@ func _run() -> void:
 	_check(_has_nonzero(refreshed_live_values) and refreshed_live_values != initial_live_values,
 		"emitter color/energy edits update the live source values without rebaking transport")
 	_check(SceneTracker.stable_scene_signature(volume) == saved_source_signature
-			and VolumeSourceBaker.settings_signature(volume) == saved_settings_signature
+			and int(volume.call("_settings_signature_for_manifest", manifest)) == saved_settings_signature
 			and bool(volume.call("_saved_bake_matches_current")),
 		"live sun direction/color/energy and emitter enabled/color/energy preserve saved source validity")
 
@@ -166,8 +192,10 @@ func _run() -> void:
 			and FileAccess.file_exists(manifest_path),
 		"cancellation does not publish over or remove the previous valid generation")
 
-	print("FREE_SPACE_VOLUME_BAKE_INTEGRATION checks=%d failures=%d manifest=%s page=%s" % [
-		checks, failures, manifest_path, page_path])
+	print("FREE_SPACE_VOLUME_BAKE_INTEGRATION checks=%d failures=%d surface_targets=%d direct_probes=%d direct_bake_usec=%d manifest=%s page=%s" % [
+		checks, failures, int(chunk.clv_preparation_stats.get("surface_target_constraints", 0)),
+		int(chunk.clv_preparation_stats.get("surface_direct_probes", 0)),
+		int(chunk.clv_preparation_stats.get("surface_direct_bake_usec", 0)), manifest_path, page_path])
 	await _finish(scene_root)
 
 func _add_emissive_wall(scene_root: Node3D) -> void:
@@ -183,6 +211,16 @@ func _add_emissive_wall(scene_root: Node3D) -> void:
 	material.emission_energy_multiplier = 2.0
 	mesh_instance.set_surface_override_material(0, material)
 	scene_root.add_child(mesh_instance)
+	var ceiling := MeshInstance3D.new()
+	ceiling.name = "FixtureCeiling"
+	var ceiling_mesh := BoxMesh.new()
+	ceiling_mesh.size = Vector3(0.5, 0.1, 0.5)
+	ceiling.mesh = ceiling_mesh
+	ceiling.position = Vector3(0.0, 0.3, 0.0)
+	var ceiling_material := StandardMaterial3D.new()
+	ceiling_material.albedo_color = Color(0.55, 0.52, 0.48)
+	ceiling.material_override = ceiling_material
+	scene_root.add_child(ceiling)
 
 func _cancel_on_classification(volume: Volume) -> void:
 	if cancel_armed or not is_instance_valid(volume):

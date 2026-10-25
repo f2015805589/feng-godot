@@ -105,14 +105,15 @@ FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；
 
 ### 默认库效果
 
-- **Magic GI**：新 backend 1 / layout 5 在 Lighting 前用当前太阳、天空和自发光重照明
-  预插值 TransferMatrix，原生 Lighting 从 `4×16³` CLV 硬件插值采样；运行时没有 BVH、
-  逐像素邻居循环或额外全屏 Apply。最细 source 间距 0.25 m，完整 SH9，FP32 relight 和
-  带 HDR 缩放的 RGBA16F 缓存。Bake 由 feng-magic-gi 的 **Bake Free-space CLV PRT** 提供。
-  Debug Buffers → Magic GI 按需输出当前贡献。有效 TransferMatrix 缺失时需重新 Bake。
-  架构参考腾讯公开的 CLV PRT 流程，不宣称与其私有代码或 SH2 资源兼容。白盒 RTX 3080 Ti /
-  D3D12 / 1080p 连续重光照总 GPU 增量约 0.266 ms，P95 0.281 ms；未过滤尖峰仍存在，
-  不是所有帧的硬上限。完整方法和旧路径说明见 `feng-magic-gi/README.md`。
+- **Magic GI**：backend 1 的 prepared CLV schema 2 在 Lighting 前用当前太阳、天空和自发光
+  重照明预插值 TransferMatrix，原生 Lighting 从 `4×16³` CLV 硬件插值采样；整块驻留为
+  layout 8，分页驻留为 layout 7，均使用 L0+L1 四系数 SH2。运行时没有 BVH、逐像素邻居循环
+  或额外全屏 Apply。最细 source 间距 0.25 m，FP32 relight 和带 HDR 缩放的 RGBA16F 缓存。
+  Bake 由 feng-magic-gi 的 **Bake Free-space CLV PRT** 提供；旧 SH9 prepared generation 需重新 Bake。
+  Debug Buffers → Magic GI 按需输出当前贡献。架构参考腾讯公开的 CLV PRT 流程，不宣称复现其私有实现。
+  旧 SH9 prepared 路径的 2026-10-23 profile（含 0.266 ms 增量）不代表当前 SH2。当前 SH2
+  的完整 GI 总成本尚未隔离测量，因此不能据此宣称低于 0.5 ms。完整方法和 legacy backend 0
+  说明见 `feng-magic-gi/README.md`。
 - **RTGI**：默认加入并关闭。启用 ray-tracing 插件后，可在 Lighting 后提供漫反射 GI 和镜面候选；
   漫反射 GI 和镜面反射是独立槽位，Magic GI 可继续提供漫反射。
   RTGI 资源携带完整 GBuffer 和间接高光输入，仅在启用且设备支持硬件光追时启动场景快照运行时。
@@ -120,7 +121,15 @@ FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；
 	深度层级、透视校正的层级射线遍历、时域过滤和引导式上采样，不调用 Godot Environment SSR。
 	Max Steps 是层级节点访问预算；耗尽时按未命中处理，不表示屏幕最大像素数。命中候选按覆盖率参与合成；
 	未命中区域继续按 `FengReflectionSettings` 的优先级使用后续来源。Thickness 限制命中可接受的表面平面误差；
-	它只收紧像素覆盖容差，不扩大命中范围。
+	它只收紧像素覆盖容差，不扩大命中范围。`Resolution Mode` 默认 Half Resolution；Full Resolution
+	让接收面、命中和 history 也在内部全分辨率运行，减少半分辨率网格引入的子像素反射抖动，代价是更多 GPU 时间和 history 显存。
+	白盒场景 RTX 3080 Ti / D3D12 / 1920×1080 的 46 帧 ROI 测量中，Full 将局部逐像素亮度标准差降低约 37–42%；隔离 SSR 增量为
+	Half 0.523 ms、Full 0.735 ms（Full 多 0.211 ms）。两种模式仍是屏幕空间反射：屏幕外或被遮挡的命中无法提供，继续由 Reflection Resolve 使用后续来源。
+	1920×1080 时，工作与 history 纹理约占每视口 63 MiB（Half）或 253 MiB（Full），另加共享尺寸的 color copy 与 HiZ。
+	质量档参考 [Epic 单独 SSR 的公开质量控制](https://dev.epicgames.com/documentation/unreal-engine/screen-space-reflections-in-unreal-engine)；
+	[Epic 对 Lumen Screen Tracing 的说明](https://dev.epicgames.com/documentation/en-us/unreal-engine/lumen-technical-details-in-unreal-engine)
+	则描述了 Lumen 先做屏幕追踪、未命中后继续使用其场景表示的混合路径。FRP 这里是独立 SSR 候选，miss 由 Reflection Resolve 选用其他来源，
+	不声称复刻 Unreal 的内部 SSR 或 Lumen Reflections 实现。
 - **Reflection Resolve**：FRP 内部调度，在 GI、SSR、FengReflectProbe 候选之后、Sky 之前执行，
 	不显示在 Passes 数组或库菜单。场景中的 `FengReflectionSettings` 节点默认按所在 `World3D`
 	作用于该世界已注册的 viewport（包括编辑器视口和 SubViewport）；填写 Target Viewport 后只作用于

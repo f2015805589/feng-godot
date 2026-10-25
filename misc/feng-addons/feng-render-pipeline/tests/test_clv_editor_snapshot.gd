@@ -28,36 +28,24 @@ func make_fixture(half_fields: bool) -> Dictionary:
 	for cell in RESIDENT_CELLS:
 		indices[cell] = cell + 100
 	var original := PackedFloat32Array()
-	for coefficient in 9:
+	for coefficient in 4:
 		for channel in 3:
 			original.append(float(coefficient + 1) * (0.13 + channel * 0.07)
 				* (-1.0 if coefficient % 2 else 1.0))
-	# Pack independent signed raw SH into the runtime's seven RGBA tensor fields.
-	# The decoder must undo both the tensor transform and diffuse convolution.
+	# Pack signed L0+L1 coefficients directly into the compact four-field layout.
 	var packed := PackedFloat32Array()
-	packed.resize(28)
-	for channel in 3:
-		packed[channel] = 0.2820947918 * original[channel] \
-			- 0.078847891325 * original[18 + channel] + 0.136568553825 * original[24 + channel]
-		packed[8 + channel] = 0.2820947918 * original[channel] \
-			- 0.078847891325 * original[18 + channel] - 0.136568553825 * original[24 + channel]
-		packed[16 + channel] = 0.2820947918 * original[channel] \
-			+ 2.0 * 0.078847891325 * original[18 + channel]
-		packed[4 + channel] = 0.325735007933 * original[9 + channel]
-		packed[12 + channel] = 0.325735007933 * original[3 + channel]
-		packed[20 + channel] = 0.325735007933 * original[6 + channel]
-		packed[channel * 4 + 3] = 0.27313710765 * original[12 + channel]
-		packed[(channel + 3) * 4 + 3] = 0.27313710765 * original[15 + channel]
-		packed[24 + channel] = 0.27313710765 * original[21 + channel]
-	packed[27] = 1.0
+	packed.resize(16)
+	for component in 12:
+		packed[component] = original[component]
+	packed[15] = 1.0
 	var width := 2 if half_fields else 4
 	var data := PackedByteArray()
-	data.resize(32 * 7 * 4 * width)
+	data.resize(32 * 4 * 4 * width)
 	for cell in RESIDENT_CELLS:
-		for field in 7:
+		for field in 4:
 			for lane in 4:
 				var offset: int = ((int(field) * 32 + int(cell)) * 4 + int(lane)) * width
-				var value := packed[field * 4 + lane] / 8.0 if field * 4 + lane != 27 else 1.0
+				var value := packed[field * 4 + lane] / 8.0 if field * 4 + lane != 15 else 1.0
 				if half_fields:
 					data.encode_half(offset, value)
 				else:
@@ -67,23 +55,27 @@ func make_fixture(half_fields: bool) -> Dictionary:
 		"lod_origins": PackedVector3Array([
 			Vector3.ZERO, Vector3(10, 0, 0), Vector3(20, 0, 0), Vector3(30, 0, 0)]),
 		"lod_spacings": PackedFloat32Array([0.25, 0.5, 1.0, 2.0]), "decode_scale": 8.0,
-		"half_fields": half_fields, "include_sh": true, "layout_key": "fixture"}}
+		"half_fields": half_fields, "include_sh": true, "layout_key": "fixture",
+		"layout_version": 7, "operator_schema_version": 2, "response_field_count": 4}}
 
 func run() -> void:
 	for half_fields in [false, true]:
 		var fixture := make_fixture(half_fields)
 		var result := Broker.decode_snapshot(fixture.data, fixture.metadata)
 		check(result.current_available, "decode accepted")
-		check(result.positions.size() == 4 and result.response_sh.size() == 108,
+		check(result.positions.size() == 4 and result.response_sh.size() == 48
+				and result.response_coefficient_count == 4,
 			"four real resident cells")
+		check(result.response_sh_semantics == "raw_signed_world_incident_radiance_sh2_l0_l1_coefficient_major_rgb",
+			"CLV preview exposes the signed SH2 coefficient contract shared with source preview")
 		check(result.lods == PackedInt32Array([0, 1, 2, 3]), "all real lods")
 		check(result.positions[3] == Vector3(32, 2, 2),
 			"position matches actual origin/grid spacing")
 		for probe in 4:
-			for component in 27:
-				check(absf(result.response_sh[probe * 27 + component] - fixture.original[component])
+			for component in 12:
+				check(absf(result.response_sh[probe * 12 + component] - fixture.original[component])
 					< (0.002 if half_fields else 0.00001),
-					"signed raw SH inverse cosine convolution: half=%s probe=%d component=%d"
+					"signed raw SH2 coefficient decode: half=%s probe=%d component=%d"
 					% [half_fields, probe, component])
 		var bad: PackedByteArray = fixture.data.slice(0, 8)
 		check(not Broker.decode_snapshot(bad, fixture.metadata).current_available,

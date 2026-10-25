@@ -125,12 +125,21 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	source.directional_source_signature = source.make_directional_source_signature()
 	if not _classify_cells(source, volume, geometry, progress, cancelled):
 		return _failure("Free-space cell classification was cancelled or failed.")
+	var sampling_cache: Dictionary = options.get("_magic_gi_sampling_cache", {})
+	var reused_sampling_cache := _sampling_cache_matches(sampling_cache, samples, bounces, moment_rays)
+	if progress.is_valid():
+		progress.call("Classifying free-space cells", source.probe_count, source.probe_count, 0, 0)
+		if not reused_sampling_cache:
+			progress.call("Preparing free-space sample coordinates", 0, 1, 0, 0)
 	var scratch := _make_worker_input(source, volume,
 			options.get("global_cell_origin", Vector3i.ZERO), int(options.get("source_level", -1)) if multires else -1)
-	var coordinates := _build_qmc_coordinates(samples, (bounces + 1) * 2)
-	var minimum_moment_rays := Chunk.MIN_MOMENT_RAYS
-	var minimum_moment_coordinates := _build_qmc_coordinates(minimum_moment_rays, 2)
-	var extra_moment_coordinates := _build_qmc_coordinates(moment_rays - minimum_moment_rays, 2)
+	if not reused_sampling_cache:
+		sampling_cache = make_sampling_cache(samples, bounces, moment_rays)
+	if not bool(sampling_cache.get("ok", false)):
+		return _failure("Could not prepare deterministic free-space sample coordinates.")
+	var coordinates: Array[PackedFloat64Array] = sampling_cache.coordinates
+	var minimum_moment_coordinates: Array[PackedFloat64Array] = sampling_cache.minimum_moment_coordinates
+	var extra_moment_coordinates: Array[PackedFloat64Array] = sampling_cache.extra_moment_coordinates
 	var estimated_work_units_per_cell := samples * (bounces + 1) \
 			* (1 + source.emitter_count) + moment_rays
 	if estimated_work_units_per_cell > max_work_per_batch:
@@ -152,6 +161,10 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	var completed := 0
 	var rejected_transport_cells := 0
 	var batch_count := ceili(float(valid_indices.size()) / float(jobs_per_batch))
+	if progress.is_valid():
+		if not reused_sampling_cache:
+			progress.call("Preparing free-space sample coordinates", 1, 1, 0, 0)
+		progress.call("Baking free-space transfer", 0, valid_indices.size(), 0, batch_count)
 	for batch_start in range(0, valid_indices.size(), jobs_per_batch):
 		if _cancelled(cancelled):
 			return _failure("Free-space transport bake was cancelled.")
@@ -208,7 +221,8 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	if clv_builder_script == null:
 		return _failure("The CLV transfer preinterpolator is unavailable.")
 	var clv_builder: RefCounted = clv_builder_script.new()
-	var clv_result: Dictionary = await clv_builder.prepare_async(source, geometry, cancelled, progress)
+	var clv_result: Dictionary = await clv_builder.prepare_async(source, geometry,
+		cancelled, progress, coordinates, {})
 	if not bool(clv_result.get("ok", false)):
 		return _failure("CLV transfer preparation failed: " + str(clv_result.get("error", "invalid_output")))
 	# Keep every valid baked probe and all prepared operators exactly. Packing
@@ -355,6 +369,9 @@ static func save_generation(volume: Node3D, chunk: Resource, generation: String,
 	manifest.page_core_size = maxf(volume.core_page_size, largest_extent)
 	manifest.bake_geometry_signature = chunk.geometry_signature
 	manifest.bake_settings_signature = settings_signature
+	manifest.bake_samples = chunk.bake_samples
+	manifest.bake_bounces = chunk.bake_bounces
+	manifest.bake_moment_rays = chunk.moment_rays
 	manifest.scene_watch_signature = scene_watch_signature
 	manifest.scene_watch_signature_schema_version = SceneTracker.SIGNATURE_SCHEMA_CURRENT
 	manifest.partial_generation = false
@@ -543,7 +560,41 @@ func _clear_cell(destination: Chunk, cell: int) -> void:
 	for coefficient in Chunk.MOMENT_TEXELS_PER_CELL * Chunk.MOMENT_CHANNELS:
 		destination.receiver_visibility_moments[moment_start + coefficient] = 0.0
 
-func _build_qmc_coordinates(sample_count: int, dimensions: int) -> Array[PackedFloat64Array]:
+static func make_sampling_cache(samples: int, bounces: int, moment_rays: int) -> Dictionary:
+	if samples <= 0 or samples > MAX_BAKE_SAMPLES \
+			or bounces <= 0 or bounces > MAX_BAKE_BOUNCES \
+			or moment_rays < MIN_MOMENT_RAYS or moment_rays > MAX_MOMENT_RAYS:
+		return {"ok": false}
+	var minimum_moment_rays := Chunk.MIN_MOMENT_RAYS
+	var coordinates := _build_qmc_coordinates(samples, (bounces + 1) * 2)
+	return {"ok": true, "samples": samples, "bounces": bounces,
+		"moment_rays": moment_rays,
+		"coordinates": coordinates,
+		"minimum_moment_coordinates": _build_qmc_coordinates(minimum_moment_rays, 2),
+		"extra_moment_coordinates": _build_qmc_coordinates(moment_rays - minimum_moment_rays, 2)}
+
+static func _sampling_cache_matches(cache: Dictionary, samples: int, bounces: int,
+		moment_rays: int) -> bool:
+	if not bool(cache.get("ok", false)) or int(cache.get("samples", -1)) != samples \
+			or int(cache.get("bounces", -1)) != bounces \
+			or int(cache.get("moment_rays", -1)) != moment_rays:
+		return false
+	var coordinates: Variant = cache.get("coordinates", null)
+	var minimum: Variant = cache.get("minimum_moment_coordinates", null)
+	var extra: Variant = cache.get("extra_moment_coordinates", null)
+	return _qmc_coordinates_match(coordinates, (bounces + 1) * 2, samples) \
+			and _qmc_coordinates_match(minimum, 2, Chunk.MIN_MOMENT_RAYS) \
+			and _qmc_coordinates_match(extra, 2, moment_rays - Chunk.MIN_MOMENT_RAYS)
+
+static func _qmc_coordinates_match(value: Variant, dimensions: int, samples: int) -> bool:
+	if not value is Array or value.size() != dimensions:
+		return false
+	for coordinate_value in value:
+		if not coordinate_value is PackedFloat64Array or coordinate_value.size() != samples:
+			return false
+	return true
+
+static func _build_qmc_coordinates(sample_count: int, dimensions: int) -> Array[PackedFloat64Array]:
 	var coordinates: Array[PackedFloat64Array] = []
 	coordinates.resize(dimensions)
 	for dimension in dimensions:

@@ -187,38 +187,27 @@ func _validate_property(property: Dictionary) -> void:
 			property["usage"] = PROPERTY_USAGE_STORAGE
 
 func _magicdawn_backend_selected_for_inspector() -> bool:
-	if _last_clv_cache_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
-		return true
 	if not Engine.is_editor_hint():
 		return false
-	# Inspector can be opened before the tool runtime has published a viewport
-	# snapshot. Read the edited scene's authored Volume directly in that case.
-	var edited_root := EditorInterface.get_edited_scene_root()
-	if edited_root != null:
-		if _node_selects_magicdawn_backend(edited_root):
-			return true
-		for volume in edited_root.find_children("*", "FMagicGIVolume", true, false):
-			if _node_selects_magicdawn_backend(volume):
-				return true
+	# CompositorEffect property validation can run on the renderer's thread.
+	# Read only the immutable values the addon runtime published on the main
+	# thread; walking the edited scene here can cross a Node thread-group boundary.
 	var runtime_script := _get_runtime_script()
 	if runtime_script == null or not runtime_script.has_method("snapshots"):
 		return false
 	var snapshots_value: Variant = runtime_script.call("snapshots")
+	return _snapshots_select_magicdawn_backend(snapshots_value)
+
+func _snapshots_select_magicdawn_backend(snapshots_value: Variant) -> bool:
 	if not snapshots_value is Array:
 		return false
 	for snapshot_value in snapshots_value:
-		if snapshot_value is Dictionary and _clv_cache_backend(snapshot_value) \
+		if snapshot_value is Dictionary \
+				and int(snapshot_value.get("clv_cache_backend", CLV_CACHE_BACKEND_LEGACY)) \
 				== CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
 				and bool(snapshot_value.get("use_clv", true)):
 			return true
 	return false
-
-func _node_selects_magicdawn_backend(node: Object) -> bool:
-	if node == null or not is_instance_valid(node) or not node.has_method("is_surfel_mode"):
-		return false
-	return not bool(node.call("is_surfel_mode")) \
-			and bool(node.get("use_clv")) \
-			and int(node.get("clv_cache_backend")) == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART
 
 var _relight_shader := RID()
 var _relight_pipeline := RID()
@@ -2539,16 +2528,16 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		return
 	var paged := snapshot.get("prepared_source_header") is Resource
 	if paged and (not ctx.has_method("get_magic_gi_paged_prepared_abi_version") \
-			or int(ctx.call("get_magic_gi_paged_prepared_abi_version")) != 1 \
+			or int(ctx.call("get_magic_gi_paged_prepared_abi_version")) != 2 \
 			or not ctx.has_method("get_magic_gi_paged_prepared_layout_version") \
-			or int(ctx.call("get_magic_gi_paged_prepared_layout_version")) != 6 \
+			or int(ctx.call("get_magic_gi_paged_prepared_layout_version")) != 7 \
 			or not ctx.has_method("get_magic_gi_paged_prepared_parameters_size") \
 			or int(ctx.call("get_magic_gi_paged_prepared_parameters_size")) != 208 \
 			or not ctx.has_method("get_magic_gi_paged_prepared_max_lods") \
 			or int(ctx.call("get_magic_gi_paged_prepared_max_lods")) < 10):
 		ctx.call("clear_magic_gi_dynamic_volume_inputs")
 		_dynamic_volume_runtime_state["status"] = "paged_prepared_bridge_incompatible"
-		_dynamic_volume_runtime_state["fallback_reason"] = "engine_requires_paged_clv_abi_1"
+		_dynamic_volume_runtime_state["fallback_reason"] = "engine_requires_paged_clv_sh2_abi_2"
 		return
 	var source_value: Variant = snapshot.get("prepared_source_header") if paged \
 		else snapshot.get("free_space_volume_source")
@@ -2603,6 +2592,15 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 	var page_key := str(snapshot.get("free_space_source_page_key", cache_key))
 	var use_prepared: bool = source.has_method("has_preinterpolated_clv") and source.has_preinterpolated_clv()
 	var selected_prepared_resolution := _effective_prepared_clv_resolution()
+	if use_prepared and not paged \
+			and (not ctx.has_method("get_magic_gi_prepared_sh2_layout_version") \
+				or int(ctx.call("get_magic_gi_prepared_sh2_layout_version")) != 8 \
+				or not ctx.has_method("get_magic_gi_prepared_sh2_parameters_size") \
+				or int(ctx.call("get_magic_gi_prepared_sh2_parameters_size")) != 96):
+		ctx.call("clear_magic_gi_dynamic_volume_inputs")
+		_dynamic_volume_runtime_state["status"] = "whole_volume_prepared_bridge_incompatible"
+		_dynamic_volume_runtime_state["fallback_reason"] = "engine_requires_whole_volume_clv_sh2_layout_8_abi_1"
+		return
 	var cache_identity := "%s:%s:%d:%d:%s:angular%d" % [cache_key, page_key,
 			source.get_instance_id(), expected_geometry_signature, source_signature,
 		dynamic_volume_response_resolution]
@@ -2695,12 +2693,22 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		var moments: RID = cache.get_moments_texture()
 		var relocation: RID = cache.get_relocation_buffer()
 		var validity_buffer: RID = cache.get_validity_buffer()
+		var cache_runtime_state: Dictionary = cache.get_runtime_state()
+		var cache_layout_version := int(cache_runtime_state.get("layout_version",
+				DynamicVolumeCache.LAYOUT_VERSION))
+		# Use the bridge discriminator reported by the engine; the SH payload schema
+		# remains explicit in the cache UBO and its operator-schema metadata.
+		var bridge_layout_version := cache_layout_version
+		if bool(cache_runtime_state.get("paged_prepared_transfer", false)):
+			bridge_layout_version = int(ctx.call("get_magic_gi_paged_prepared_layout_version"))
+		elif bool(cache_runtime_state.get("preinterpolated_transfer", false)):
+			bridge_layout_version = int(ctx.call("get_magic_gi_prepared_sh2_layout_version"))
 		for view in view_count:
 			ctx.call("set_magic_gi_dynamic_volume_input", view, fields,
 					cache.parameters, owner_ubos[view], cache.dimensions,
 					moments, relocation, validity_buffer, cache.origin_world,
 					cache.spacing_m, cache.response_resolution,
-					int(cache.get_runtime_state().get("layout_version", DynamicVolumeCache.LAYOUT_VERSION)), token, frame_token)
+					bridge_layout_version, token, frame_token)
 			owner_ok = owner_ok and bool(ctx.call("has_magic_gi_dynamic_volume_input", view))
 		if not owner_ok:
 			ctx.call("clear_magic_gi_dynamic_volume_inputs")
@@ -2711,8 +2719,10 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		# its native consumer nor its debug mirror reads the separate sky MRT.
 		# Keep the output request for older layouts' screen replacement paths;
 		# other passes retain their own requests through the shared context.
-		var needs_sky_diffuse_output := replacement_requested \
-				and int(cache.get_runtime_state().get("layout_version", 0)) not in [5, 6]
+		var prepared_cache_state: Dictionary = cache.get_runtime_state()
+		var is_prepared_sh2 := bool(prepared_cache_state.get("preinterpolated_transfer", false)) \
+				or bool(prepared_cache_state.get("paged_prepared_transfer", false))
+		var needs_sky_diffuse_output := replacement_requested and not is_prepared_sh2
 		if needs_sky_diffuse_output:
 			ctx.request_sky_light_diffuse()
 		_replacement_request_prepared = replacement_requested
@@ -2740,7 +2750,7 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 			"cache_revision": int(cache.get_runtime_state().get("relight_revision", -1)),
 			"dispatch_token": int(cache.get_runtime_state().get("dispatch_count", 0)),
 			"active": false, "half_size": Vector2i.ZERO}
-		if int(cache.get_runtime_state().get("layout_version", 0)) in [5, 6]:
+		if is_prepared_sh2:
 			_dynamic_volume_screen_runtime_state["status"] = "native_preinterpolated_clv"
 		elif view_count == 1 and ctx.has_method("enqueue_after_operation"):
 			var frame_ubo_bytes := _build_dynamic_volume_screen_frame_bytes(scene_data,
@@ -5815,7 +5825,8 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	_last_prt_three_stage_stage_values = PackedInt32Array([MAGIC_GI_PRT_STAGE_LEGACY])
 	_frame_prt_scale = 1
 	if _dynamic_volume_publication_token > 0 and _dynamic_volume_cache != null \
-			and int(_dynamic_volume_cache.get_runtime_state().get("layout_version", 0)) in [5, 6]:
+			and (bool(_dynamic_volume_cache.get_runtime_state().get("preinterpolated_transfer", false)) \
+				or bool(_dynamic_volume_cache.get_runtime_state().get("paged_prepared_transfer", false))):
 		_render_preinterpolated_clv_debug(buffers, view, rd)
 		return
 	if _frame_snapshot.get("prepared_source_header") is Resource:
@@ -10267,7 +10278,7 @@ func get_magicdawn_runtime_state() -> Dictionary:
 		state["backend"] = "preinterpolated_clv_transfer"
 		state["layout_version"] = int(volume_cache_state.get("layout_version", 0))
 		state["prt_model"] = "CLV_TRANSFER_MATRIX_RELIGHT"
-		state["sh_basis"] = "real_orthonormal_degree2_coefficients9"
+		state["sh_basis"] = "real_orthonormal_l0_l1_coefficients4"
 		state["runtime_geometry_queries"] = 0
 		state["pixel_csr_fallback"] = false
 		state["resident_levels"] = volume_cache_state.get("clipmap_lod_count", 0)

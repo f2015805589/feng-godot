@@ -302,15 +302,51 @@ private:
 		// Reuse the previously unused 256|64 combination for the prepared-transfer
 		// sampler. It keeps the mode table size and startup compilation unchanged.
 		FRP_LIGHTING_MODE_MAGIC_GI_PREINTERPOLATED_VOLUME = 320,
+		// Reuse the existing 256|64 prepared-volume selector for the compact
+		// whole-volume SH2 ABI. The serialized layout discriminator remains 8.
+		FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME = 320,
 		// Combined 128|256 selects the compact dynamic-volume screen-cache
 		// consumer while preserving existing mode count and the direct fallback.
 		FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE = 384,
-		// 256|128|64 is reserved for layout-6 prepared volumes; the extra bit
-		// distinguishes its 208-byte parameter ABI from the layout-5 sampler.
+		// 256|128|64 selects paged prepared SH2's 208-byte parameter ABI.
 		FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME = 448,
 		FRP_LIGHTING_MODE_MAX = 512
 	};
 
+	enum class PreparedSH2LightingVariant {
+		NONE,
+		WHOLE_VOLUME,
+		PAGED_VOLUME,
+	};
+
+	static constexpr PreparedSH2LightingVariant _get_prepared_sh2_lighting_variant(int p_mode) {
+		constexpr int selector_mask = FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME |
+				FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
+		const int selector = p_mode & selector_mask;
+		if (selector == FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME) {
+			return PreparedSH2LightingVariant::PAGED_VOLUME;
+		}
+		if (selector == FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME) {
+			return PreparedSH2LightingVariant::WHOLE_VOLUME;
+		}
+		return PreparedSH2LightingVariant::NONE;
+	}
+
+	static constexpr bool _prepared_sh2_lighting_variants_keep_base_flags_disjoint() {
+		for (int base_flags = 0; base_flags < 16; base_flags++) {
+			if (_get_prepared_sh2_lighting_variant(
+					FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME | base_flags) !=
+					PreparedSH2LightingVariant::WHOLE_VOLUME) {
+				return false;
+			}
+			if (_get_prepared_sh2_lighting_variant(
+					FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME | base_flags) !=
+					PreparedSH2LightingVariant::PAGED_VOLUME) {
+				return false;
+			}
+		}
+		return true;
+	}
 	struct FrpLighting {
 		FrpLightingShaderRD shader;
 		RID shader_version;

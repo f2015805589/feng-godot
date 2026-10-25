@@ -1,7 +1,7 @@
 @tool
 class_name FMagicGIPreparedTransferBrick
 extends Resource
-## One immutable, world-lattice-aligned page of linear SH9 transfer operators.
+## One immutable, world-lattice-aligned page of linear SH transfer operators.
 ## Core cells have unique ownership; the one-cell support border is an exact
 ## copy of neighboring lattice samples, never a separately fitted light field.
 const MAX_LEVELS := 10
@@ -10,6 +10,9 @@ const MAX_PAYLOAD_BYTES := 64 * 1024 * 1024
 const SOURCE_SPACING_M := 0.25
 
 @export_storage var format_version := 1
+## Prepared operators use the compact L0+L1 four-coefficient schema.
+## Zero marks an unversioned resource so it cannot be decoded accidentally.
+@export_storage var operator_schema_version := 0
 @export_storage var source_origin_world := Vector3.ZERO
 @export_storage var source_spacing_m := SOURCE_SPACING_M
 @export_storage var level := 0
@@ -34,7 +37,16 @@ func spacing_m() -> float:
 	return source_spacing_m * float(1 << level)
 
 func operator_stride() -> int:
-	return 9 * (36 + 6 * emitter_count)
+	return operator_output_coefficient_count() * operator_columns()
+
+func operator_input_coefficient_count() -> int:
+	return 4
+
+func operator_output_coefficient_count() -> int:
+	return 4
+
+func operator_columns() -> int:
+	return 16 + 6 * emitter_count
 
 func cell_count() -> int:
 	if dimensions.x <= 0 or dimensions.y <= 0 or dimensions.z <= 0 \
@@ -72,7 +84,8 @@ func estimated_gpu_payload_bytes() -> int:
 func is_header_valid(expected_geometry := 0, expected_ids := PackedStringArray(),
 		expected_signatures := PackedInt64Array()) -> bool:
 	var count := cell_count()
-	if format_version != 1 or count <= 0 or probe_count != count \
+	if format_version != 1 or operator_schema_version != 2 \
+			or count <= 0 or probe_count != count \
 			or level < 0 or level >= MAX_LEVELS or source_spacing_m != SOURCE_SPACING_M \
 			or not source_origin_world.is_finite() or not source_transform_world.is_finite() \
 			or absf(source_transform_world.basis.determinant()) < 0.00000001 \
@@ -101,13 +114,14 @@ func is_header_valid(expected_geometry := 0, expected_ids := PackedStringArray()
 func is_valid(expected_geometry := 0, expected_ids := PackedStringArray(),
 		expected_signatures := PackedInt64Array()) -> bool:
 	if not is_header_valid(expected_geometry, expected_ids, expected_signatures): return false
-	var columns := 36 + 6 * emitter_count
+	var columns := operator_columns()
+	var output_count := operator_output_coefficient_count()
 	for cell in cell_count():
 		if validity[cell] > 1: return false
-		for row in 9:
+		for row in output_count:
 			var row_l1 := 0.0
 			for column in columns:
-				var value := operators[(cell * 9 + row) * columns + column]
+				var value := operators[(cell * output_count + row) * columns + column]
 				if not is_finite(value) or (validity[cell] == 0 and value != 0.0): return false
 				row_l1 += absf(value)
 			if maximum_operator_row_l1 > 0.0 and row_l1 > maximum_operator_row_l1 * 1.000001: return false

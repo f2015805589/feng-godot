@@ -186,6 +186,8 @@ class TestOutput:
 	var transfer := PackedFloat32Array()
 	var primary_sky_visibility := PackedFloat32Array()
 	var emitter_transport := PackedFloat32Array()
+	var bake_exact_directional_secondary := PackedFloat32Array()
+	var bake_exact_directional_secondary_valid := false
 
 	func probe_count() -> int:
 		return positions.size()
@@ -974,6 +976,7 @@ func _make_scheduler_data(positions: PackedVector3Array,
 	data.emitter_transport.resize(positions.size() * emitter_keys.size() * 6)
 	data.directional = Data.DirectionalData.new()
 	data.directional.allocate(positions.size(), emitter_keys.size())
+	data.prepare_bake_exact_directional_secondary()
 	return data
 
 func _scheduler_payload_bytes_equal(a: Data, b: Data) -> bool:
@@ -981,6 +984,8 @@ func _scheduler_payload_bytes_equal(a: Data, b: Data) -> bool:
 		and a.primary_sky_visibility.to_byte_array() == b.primary_sky_visibility.to_byte_array() \
 		and a.visibility_moments.to_byte_array() == b.visibility_moments.to_byte_array() \
 		and a.emitter_transport.to_byte_array() == b.emitter_transport.to_byte_array() \
+		and a.bake_exact_directional_secondary.to_byte_array() \
+			== b.bake_exact_directional_secondary.to_byte_array() \
 		and a.directional.transfer.to_byte_array() == b.directional.transfer.to_byte_array() \
 		and a.directional.sky.to_byte_array() == b.directional.sky.to_byte_array() \
 		and a.directional.emission.to_byte_array() == b.directional.emission.to_byte_array()

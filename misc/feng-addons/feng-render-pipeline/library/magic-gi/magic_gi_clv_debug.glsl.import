@@ -11,3 +11,4 @@ source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_deb
 dest_files=["res://.godot/imported/magic_gi_clv_debug.glsl-7a6f9514e969e6daa7ba41ef7d1884fb.res"]
 
 [params]
+

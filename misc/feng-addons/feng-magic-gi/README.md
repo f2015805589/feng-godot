@@ -1,6 +1,6 @@
 # Feng Magic GI
 
-Feng Magic GI 提供两种漫反射全局光照模式。默认 `PRT MagicGI` / `clv_cache_backend=1` 烘焙自由空间 TransferMatrix，并在烘焙端把几何遮挡和插值预处理为 CLV 线性算子；运行时以当前太阳、天空和已绑定自发光重照明，再由原生 PBR 硬件插值采样。当前新 Bake 使用分页 layout 6，旧单块 layout 5 仍可读取；重照明和像素采样均无 BVH 查询。`Surfel MagicGI` 在运行时维护表面缓存并用光追更新间接光。两种模式共用 `FMagicGIVolume`；独立的 FengLightmap Volume 不参与本 PRT 路径。
+Feng Magic GI 提供两种漫反射全局光照模式。默认 `PRT MagicGI` / `clv_cache_backend=1` 烘焙自由空间 TransferMatrix，并在烘焙端把几何遮挡和插值预处理为 CLV 线性算子；运行时以当前太阳、天空和已绑定自发光重照明，再由原生 PBR 硬件插值采样。当前 prepared CLV 使用 schema 2 的 SH2 紧凑算子：整块驻留使用 layout 8/96 字节 UBO，分页驻留使用 layout 7/208 字节 UBO，响应均为四个 RGBA 字段。旧 SH9 prepared generation 会明确拒绝并要求重新 Bake；其他独立 GI 后端仍按各自格式工作。重照明和像素采样均无 BVH 查询。`Surfel MagicGI` 在运行时维护表面缓存并用光追更新间接光。两种模式共用 `FMagicGIVolume`；独立的 FengLightmap Volume 不参与本 PRT 路径。
 
 ## 512 m 分页 CLV PRT
 
@@ -36,9 +36,11 @@ Ray Guiding 使用每个表面记录的 4×4 余弦半球分布，继续保留�
 
 Surfel 的 `Debug View` 可通过 Feng Render Pipeline 的 `Debug Buffers` → `Magic GI` 查看贡献；调试内容只写入 sidecar，不改变正常 `SceneColor`。
 
-### 旧单块 PRT MagicGI 烘焙数据（layout 5）
+### 自由空间 PRT source 与 prepared SH2 v2
 
-新 Bake 保存 `FMagicGIVolumeSourceChunk`，manifest 的 `transport_domain=regular_free_space_clv_v1`，最细间距固定 0.25 m。每个有效自由空间样本保存 SH9→SH9 RGB 次级传输、SH9→SH9 首段天空传输和每个稳定发光源的方向传输。SH degree 为 0–2，共 9 个实正交系数。其后 `feng_magic_gi_clv_transfer_builder.gd` 离线生成四级规则格的几何约束线性算子：遮挡射线与接触面约束仅在这一步执行，整个过程不代入某一时刻的太阳/天空/发光强度。`clv_prepared_operators` 因而仍是 TransferMatrix，不是烘焙好的间接光 SH。
+新 Bake 保存 `FMagicGIVolumeSourceChunk`，manifest 的 `transport_domain=regular_free_space_clv_v1`，最细间距固定 0.25 m。source archive 保留 SH9 原始 Transfer 与天空数据供诊断；builder 从未准备的 source 数据重新拟合 SH2，不截取已经做过 SH9 边界拟合的矩阵。prepared schema 2 每个输出 RGB 通道保存 L0+L1 四个实正交系数；输入为 12 个 secondary RGB 系数、4 个天空系数及每个稳定发光源的 6 个方向传输值，即每 cell `4 × (16 + 6E)` floats。它在 Bake 时重做四级规则格的几何约束线性拟合：遮挡射线与接触面约束只在这一步执行，且不代入某一时刻的太阳/天空/发光强度。`clv_prepared_operators` 是 TransferMatrix，不是烘焙好的间接光 SH。该实现采用 GDC 讲稿中的 L0+L1 系数数目，不声称复现腾讯完整私有实现。
+
+CLV preparation revision 4 在所有 LOD 上使用同一表面传输估计，避免细层的直接表面目标与粗层的截断 Probe 目标在交界处混合出暗斑。每个约束在本级网格覆盖的表面区域内做四点积分，并把原射线预算分配给这些点；不足四条射线时仍用单点。样点必须留在连通的接收面，不能穿过薄墙借光；边缘有效样点会重新归一化。邻近表面使用相关的采样序列降低空间噪声，不使用屏幕滤波。它是有限空间分辨率的 PRT 重建，不代表能精确恢复小于网格间距的接触阴影。变化只发生在烘焙准备阶段，运行时仍为四系数、四次纹理采样，原始 source 可复用，但旧 prepared 算子需重新准备。
 
 页面保留有效源 Probe 的原始传输以便诊断；当前运行时只上传 prepared operators。准备完成后采用 v2 紧凑源存储，省略无效格子的全零 Transfer、天空、发光与距离矩载荷，并保存逻辑格到载荷的索引。原始有效点、迁移位置、全部有效系数和 prepared 算子保持不变；这项优化减少 CPU 常驻数据与校验工作，不降低烘焙射线数，也不改变运行时 GI。若索引开销抵消节省，则保留原存储。旧 v1 自由空间源继续读取；v2 仅走 prepared 路径，不能当作稠密数组交给旧动态缓存或重新拟合器。
 
@@ -48,7 +50,7 @@ Surfel 的 `Debug View` 可通过 Feng Render Pipeline 的 `Debug Buffers` → `
 
 ### 源 Probe 与运行时容量
 
-**Magic GI pass → Prepared CLV Resolution** 控制 layout 5 每一级的边长，可选 16、24、32，默认 16。四级总容量分别为 16,384、55,296、131,072 个槽。最细间距仍为 0.25 m，四级依次为 0.25 / 0.5 / 1 / 2 m；增大边长扩大覆盖范围，不增加源 Probe、不改变烘焙，也不让原始低频 SH 恢复更多角向细节。
+**Magic GI pass → Prepared CLV Resolution** 控制整块 layout 8 每一级的边长，可选 16、24、32，默认 16；分页 layout 7 使用独立的 16³ resident window。整块四级总容量分别为 16,384、55,296、131,072 个槽。最细间距仍为 0.25 m，四级依次为 0.25 / 0.5 / 1 / 2 m；增大边长扩大覆盖范围，不增加源 Probe、不改变烘焙，也不恢复 SH2 未保留的 L2 方向细节。
 
 窗口随摄像机位置滚动，纯旋转不改变驻留布局。这是摄像机附近的空间缓存，不按视锥裁掉背面的探针，也不是整个烘焙场景的 Probe 数上限。无效槽不执行矩阵重照明；Inspector 分别报告有效驻留点和总槽容量。更大窗口增加缓存显存与重照明工作量，不承诺仍满足同一 GPU 时间预算。
 
@@ -59,13 +61,13 @@ Surfel 的 `Debug View` 可通过 Feng Render Pipeline 的 `Debug Buffers` → `
 1. 启用 `Feng Render Pipeline` 和 `Feng Magic GI`，将两个插件链接到 `res://addons/`
 2. 添加 `FMagicGIVolume`，设置 `size` 覆盖接收区域，选择 `PRT MagicGI`、`Use CLV` 和 backend 1。当前自由空间布局固定 0.25 m，隐藏不适用的旧表面偏移/自适应设置。
 3. 选择 Bake quality 或自定义 `Bake Samples`、`Bake Bounces` 和 `Bake Distance`，点击 **Bake Free-space CLV PRT**。此按钮完成传输积分、CLV 预插值、压缩资源保存和重载验证，随后保存场景。关闭旧 `chunked_baking` 不会绕过该流程。当前该域保存一个受容量约束的 source page；超限会报错，不会静默降低密度。
-4. Feng Renderer 中启用 **Magic GI**。layout 5 在 Lighting 前准备缓存并在原生 Lighting 中采样；独立 pass 负责发布与可选调试。启用 **Debug Buffers → Magic GI** 可查看当前实际 GI 贡献。
+4. Feng Renderer 中启用 **Magic GI**。layout 7/8 在 Lighting 前准备缓存并在原生 Lighting 中采样；独立 pass 负责发布与可选调试。启用 **Debug Buffers → Magic GI** 可查看当前实际 GI 贡献。
 
 每个 World3D 选择最新有效且启用的 Volume，不混合多个 Volume。快照按世界和视口渲染目标路由。修改布局、静态几何、反照率或烘焙参数后需要重烘；太阳/TOD 与已烘焙发光源的开关、颜色和强度走实时 relight。**Refresh Surface Points** 仅用于旧表面域。
 
 ### Legacy 表面域：分块 Bake 与流送
 
-本节描述旧表面页，不适用于上面的自由空间 layout 5 Bake 按钮。
+本节描述旧表面页，不适用于上面的自由空间 prepared CLV Bake 按钮。
 
 新 `FMagicGIVolume` 默认启用分块 Bake。世界 XZ 平面按原点对齐的 512 m 管理块划分，负坐标使用向下取整；每块内部默认按 32 m 稀疏小页烘焙，并沿 Y 继续分层。超过单页网格、工作量、纹理或驻留预算时会继续细分，空页不保存数据。512 m 是管理边界，不是单个稠密网格，也不限制整个场景的总探针数。
 
@@ -79,15 +81,15 @@ Inspector 的 **Bake Streamed PRT** 重烘当前 Volume，**Bake Selected Block*
 
 新 `FMagicGIVolume` 默认选择 `clv_cache_backend=1`。新的自由空间 generation 在加载线程校验哈希、签名、系数与 HDR 界限后，直接上传已准备的线性算子；不在加载时重建 BVH 或重新做几何插值。旧 baked-SH-only 资源不能启动实时 PRT，需重新 Bake。
 
-实现参考 Tencent/MagicDawn [GDC 2026 公开演讲](https://media.gdcvault.com/gdc2026/Slides/Sheng_Feng_IlluminatingRocosLegacyScalableGlobalIlluminationfromTheorytoPractice.pdf)中的“预插值传输 → CLV block relight → 硬件插值”流程，维护 **4×16³** 驻留 cells。layout 5 的驻留窗口只依赖相机位置：沿相机到 source 域中心的空间方向拟合细级覆盖，避免域外相机把细级窗口留在空白区域。原地旋转不会改变 anchor、级联布局或触发重照明；平移仍按 0.25 m 源格及各级步长滚动。窗口不追随视线扫动，因此同一表面不会仅因转头而混入另一套级联数据。空间滚动只更新 cell 到 prepared operator 的映射。光照或映射改变时，一次 GPU dispatch 重算全部驻留 cells，固定输入不重复派发。当前布局使用 SH9，资源和压缩表示不声称与腾讯的 SH2 或私有实现一致。
+实现参考 Tencent/MagicDawn [GDC 2026 公开演讲](https://media.gdcvault.com/gdc2026/Slides/Sheng_Feng_IlluminatingRocosLegacyScalableGlobalIlluminationfromTheorytoPractice.pdf)中的“预插值传输 → CLV block relight → 硬件插值”流程，维护 **4×16³** 驻留 cells。整块 layout 8 的窗口只依赖相机位置：沿相机到 source 域中心的空间方向拟合细级覆盖，避免域外相机把细级窗口留在空白区域；分页 layout 7 以相机和 GI 半径选择当前 resident pages。原地旋转不会改变整块 anchor 或触发重照明；平移按 0.25 m 源格及各级步长滚动。空间滚动只更新 cell 到 prepared operator 的映射。光照或映射改变时，一次 GPU dispatch 重算全部驻留 cells，固定输入不重复派发。当前 prepared 路径用 SH2 四系数重建漫反射方向响应；它会丢弃原始 source 的 L2 方向变化。
 
-每个 LOD 用七次三线性采样读取全部 SH9 RGB 对应的漫反射二次型；LOD 交界会混合邻级。矩阵乘法保持 FP32，输出为带统一二次幂 HDR 缩放的 RGBA16F，插值后恢复量纲。数据缺少可信算子界限时使用 RGBA32F。没有逐像素邻居循环、距离矩筛选、BVH 或额外全屏 Apply。几何约束在烘焙端处理墙面、重叠 box 交界与球体接触，保留真实遮挡；有效黑值仍替换未遮挡天空漫反射。
+每个 LOD 用四次三线性采样读取四个 RGBA 字段并重建 SH2 L0+L1 漫反射响应；LOD 交界会混合邻级。算子乘法保持 FP32，输出为带统一二次幂 HDR 缩放的 RGBA16F，插值后恢复量纲。数据缺少可信算子界限时使用 RGBA32F。没有逐像素邻居循环、额外采样、额外 pass 或额外全屏 Apply。几何约束在烘焙端处理墙面、重叠 box 交界与球体接触，保留当前 source 对应的遮挡；有效黑值仍替换未遮挡天空漫反射。
 
-`get_magicdawn_runtime_state()` 中 `layout_version=5`、`prt_model=CLV_TRANSFER_MATRIX_RELIGHT`；`dynamic_volume.cache` 给出 `field_format`、`decode_scale`、`relight_revision`、`clipmap_update_count` 和 GPU 字节数。`dynamic_volume` 的 `lease_current`、`publication_token==consumed_token` 与 `renderer_active` 确认当前原生照明消费。`Debug Buffers → Magic GI` 按需生成 sidecar，不改变正常 SceneColor；调试视图有单独成本，不计入关闭调试时的生产预算。
+`get_magicdawn_runtime_state()` 中 prepared CLV 的 `layout_version` 为 7（分页）或 8（整块驻留），使用 schema 2 与四个 SH2 响应字段；`prt_model=CLV_TRANSFER_MATRIX_RELIGHT`。`dynamic_volume.cache` 给出 `field_format`、`decode_scale`、`relight_revision`、`clipmap_update_count` 和 GPU 字节数。`dynamic_volume` 的 `lease_current`、`publication_token==consumed_token` 与 `renderer_active` 确认当前原生照明消费。旧 SH9 prepared generation 会被拒绝并提示重新 Bake。`Debug Buffers → Magic GI` 按需生成 sidecar，不改变正常 SceneColor；调试视图有单独成本，不计入关闭调试时的生产预算。
 
-**性能记录（2026-10-23，白光盒子，RTX 3080 Ti / D3D12 / 1920×1080）**：每阶段预热 120 帧、采样 160 帧，真实关闭原生 GI 为基线，包含 DeferredLighting 增量、NativePrepare 和 MagicGIPass；嵌套 relight 不重复相加。静止总增量中位约 0.227 ms；每帧太阳/发光变化约 0.266 ms，P95 0.281 ms；同时移动相机约 0.275 ms，配对 P95 0.304 ms（按 OFF 中位基线算为 0.342 ms）。后两阶段各 160 次不同 relight revision，均消费当前缓存。单独 relight 约 0.037 ms，不能用它替代总开销。GPU 缓存约 14.22 MiB。正常入口从场景挂入到当前 GI 首次消费测得 684 ms；这是已有导入和驱动缓存的启动，不代表首次 shader 编译耗时。
+**性能记录（2026-10-25，白光盒子，RTX 3080 Ti / D3D12 / 1920×1080）**：SH2 revision 4 保持四字段、0.25 m 最细间距和 4×16³ 驻留窗口。对同一实例交替开启/关闭原生 GI 绑定，各阶段预热后采 96 帧，Deferred Lighting 中位数差分为 0.135 ms（修改前 0.137 ms）；旋转太阳的 95 次有效重光照计时中位数为 0.0143 ms，合计估计约 0.15 ms。整个 Deferred Lighting 仍约 0.98 ms，包含其余 PBR 工作，不能全算作 GI。此处是该设备和场景的差分测量，不是所有帧或设备的耗时上限。
 
-原始未过滤差分仍有 0.606 / 0.674 ms 尖峰，关闭 GI 的 DeferredLighting 也有尖峰。因此 P95 已低于 0.5 ms，但不宣称所有帧或所有设备都严格达标。工程 `Temp/dynamic_clv_preinterpolated_r16_20261023/` 保留原始 timestamps、配对算法、数值 readback 和正常入口报告。
+此次缓存加载就绪约 0.458 秒，修改前约 0.470 秒；GPU 常驻仍为 2,769,180 字节。工程 `Temp/codex_ceiling_dark_patch_20261025/` 的 `footprint_quality_comparison.json` 和 `footprint_validation_{baseline,candidate}/surfacefit_persisted_scene_runtime.json` 保存六个视角的读回对照、独立 4096-ray 表面参考、配对计时和实际加载 generation。统一所有 LOD 的表面目标增加了离线准备工作：复用原始 source 后，此场景准备耗时约 354 秒；这不属于运行时加载或逐帧 GI 耗时。
 
 ### Legacy backend 0：per-probe/pixel PRT
 
@@ -101,15 +103,15 @@ backend 0 保留旧的逐 probe / pixel PRT 查询与照明重建行为，供需
 - backend 0 保留旧的逐 probe / pixel 查询路径；该路径的缓冲与历史 profile 不代表 backend 1 的 CLV block 资源或运行成本。MagicDawn backend 1 的性能应以当前 pass GPU timestamps 计量，并包含 relight、CLV 更新及最终 apply。
 - 受控旧 F6 Cornell 的布点 profile 中，旧全域细候选布局耗时 3,772 ms、生成 47,466 个 raw 候选并最终放置 3,982 个探针；分层布局耗时 1,620 ms、生成 9,683 个 raw 候选并最终放置 4,087 个。相同 r5 质量参数（1,024 rays、2 bounces、3 个发光源）的两次独立 bake 分别为旧布局 207,405 ms / 10,884,614 字节和新布局 163,096 ms / 11,169,794 字节；新布局探针数增加 2.6%。这些是受控 Cornell 跑次记录，不代表其他场景或硬件的普遍耗时比例。
 
-方向 TransferMatrix 使用 SH degree 0–2 的 9 个实正交系数表示低频漫反射；增加空间密度不能恢复锐利镜面反射，也不能替代动态几何光追。
+旧表面 PRT 与其他未迁移后端仍使用 SH degree 0–2 的 9 个实正交系数；prepared free-space CLV schema 2 使用 L0+L1 的 4 个系数。增加空间密度不能恢复 SH2 丢失的 L2 方向变化，也不能恢复锐利镜面反射或替代动态几何光追。
 
 ## 动态光照与自发光
 
 backend 1 的 PRT TransferMatrix 在 Bake 时冻结，运行时输入的光照不是冻结的：方向光、`FengSkyLight` 当前 radiance/天空输入通过 SH 投影并推动 CLV blocks 的 GPU relight，适用于太阳方向与 TOD/Sky 更新。几何、布局或 transfer 本身变化仍要求重烘；新旧 bake 是否有可用方向矩阵由 Inspector 明确报告。backend 0 保持旧的逐 probe / pixel 查询行为。
 
-每次运行时 lighting snapshot 读取同世界可见方向光的当前方向、颜色与强度，并读取 FengSkyLight 发布的当前天空 SH；Volume 的 Sun 可覆盖自动选择。物理模式使用 lux 和相关色温，非物理模式使用引擎归一化能量。layout 5 在输入或 CLV 映射改变时更新全部驻留 cells，dynamic_volume.cache.relight_revision 随成功 dispatch 前进；曝光和接收材质参数不代入传输求解。缓存坐标不变且输入固定时不重复 relight。旧表面域仍使用 relight_lighting_revision 和独立 slab 队列。
+每次运行时 lighting snapshot 读取同世界可见方向光的当前方向、颜色与强度，并读取 FengSkyLight 发布的当前天空 SH；Volume 的 Sun 可覆盖自动选择。物理模式使用 lux 和相关色温，非物理模式使用引擎归一化能量。schema 2 prepared CLV（layout 7 或 8）在输入或映射改变时更新驻留 cells，dynamic_volume.cache.relight_revision 随成功 dispatch 前进；曝光和接收材质参数不代入传输求解。缓存坐标不变且输入固定时不重复 relight。旧表面域仍使用 relight_lighting_revision 和独立 slab 队列。
 
-以下为旧表面域 v6 的兼容行为，layout 5 不执行这些像素查询：结构有效的 v6 Bake（含过期预览）在 Volume 覆盖的 opaque 像素按强度权重替换全局 SkyLight 漫反射；SkyLight 镜面反射、局部反射探针和 Volume 外像素保持不变。透明材质不在本 pass 的替换范围内。过期预览仍替换 SkyLight，不额外叠加未遮挡环境光；几何或材质输入改变后需重新烘焙。候选先通过法线、平面和网格窗口筛选，再对探针中心到真实接收面的直连线段做双面三角形遮挡查询。有墙相隔就拒绝该候选，即使两侧法线相同、墙无厚度、方向距离矩被远处开口平均成无遮挡也一样。v6 以精确几何查询决定可见性，不再叠加粗粒度距离矩造成的墙角误遮挡；旧格式预览仍使用 Chebyshev 距离矩。被遮挡候选不参与归一化。如果像素没有通过邻域/平面筛选的探针候选，pass 保持场景颜色不变；如果有候选但全部被遮挡，贡献为零，仍按 SkyLight 替换权重扣除漫反射 SkyLight。
+以下为旧表面域 v6 的兼容行为，prepared free-space CLV（schema 2，layout 7/8）不执行这些像素查询：结构有效的 v6 Bake（含过期预览）在 Volume 覆盖的 opaque 像素按强度权重替换全局 SkyLight 漫反射；SkyLight 镜面反射、局部反射探针和 Volume 外像素保持不变。透明材质不在本 pass 的替换范围内。过期预览仍替换 SkyLight，不额外叠加未遮挡环境光；几何或材质输入改变后需重新烘焙。候选先通过法线、平面和网格窗口筛选，再对探针中心到真实接收面的直连线段做双面三角形遮挡查询。有墙相隔就拒绝该候选，即使两侧法线相同、墙无厚度、方向距离矩被远处开口平均成无遮挡也一样。v6 以精确几何查询决定可见性，不再叠加粗粒度距离矩造成的墙角误遮挡；旧格式预览仍使用 Chebyshev 距离矩。被遮挡候选不参与归一化。如果像素没有通过邻域/平面筛选的探针候选，pass 保持场景颜色不变；如果有候选但全部被遮挡，贡献为零，仍按 SkyLight 替换权重扣除漫反射 SkyLight。
 
 仅旧表面缓存路径：烘焙与 CLV 填充使用静态几何进行直连遮挡和曲面延续检查，无需硬件光追。运行时像素使用缓存的表面归属、有限三角形深度修正和烘焙距离矩；已证明的同平面邻域直接插值。静态遮挡查询每次最多访问 256 个 BVH 节点，达到预算时保守拒绝。动态几何需重新烘焙；透明表面和 CPU 地形采样未包含的细节不构成静态遮挡。
 
@@ -131,9 +133,9 @@ backend 1 的动态 CLV relight 使用当前支持的远场方向光、`FengSkyL
 
 ## 编辑器预览
 
-当前 free-space CLV PRT 的预览：在 **MagicGIVolume** 上开启 **Show Probes** 显示有效源探针（含 relocation 后的位置），开启 **Show SH Probes** 显示当前重光照的 SH9 漫反射方向响应球。二者可以独立开启；SH 球均匀抽样最多 256 个，数量和状态在 Inspector 中显示。它们使用当前方向光、SkyLight 和自发光输入，SH 系数保留正负号，在球面重构时才做非负截断。
+当前 free-space prepared CLV PRT 的预览：在 **MagicGIVolume** 上开启 **Show Probes** 显示有效 **Source SH2** 探针（含 baked relocation 后的位置），开启 **Show SH Probes** 显示同一组当前重光照系数重构的方向球。二者可以独立开启；SH 球均匀抽样最多 256 个，数量和状态在 Inspector 中显示。为了与运行时算子比较，Source 预览只使用原始 source 矩阵的 incoming/outgoing L0+L1 四系数；不显示 raw SH9。它与运行时 CLV 使用相同的方向光、SkyLight、自发光输入系数和 SH2 解码，球面响应表示漫反射 `E/pi`，最后才对负值做非负截断。
 
-勾选 **Display Probes By Clv** 后改为显示所选编辑器视口实际驻留的 CLV cells，并从 GPU 当前重光照纹理异步读取 SH。**Probe Clv Level** 可选 L0–L3；All Levels 显示级联外壳，隐藏完整位于细级范围内的重叠粗级 cell，单独选择一级则显示其完整有效网格。范围框以青、绿、橙、粉色区分四级；**Probe Clv View** 对应编辑器分屏的第 1–4 个视口。视口没有正在渲染的有效缓存时显示等待状态，不伪造网格。
+勾选 **Display Probes By Clv** 后改为显示所选编辑器视口实际驻留的 **CLV SH2** cells，并从 GPU 当前重光照纹理异步读取 SH。**Probe Clv Level** 可选 L0–L3；All Levels 显示级联外壳，隐藏完整位于细级范围内的重叠粗级 cell，单独选择一级则显示其完整有效网格。范围框以青、绿、橙、粉色区分四级；**Probe Clv View** 对应编辑器分屏的第 1–4 个视口。Source 点在 relocation 后的位置，CLV 点在当前 resident grid 的名义 cell center；两种预览保留各自的实际采样位置和传输数据，因此即使用同一 SH2 解码，点值仍不会逐点相同。视口没有正在渲染的有效缓存时显示等待状态，不伪造网格。
 
 预览按需刷新，变化时最多约每 500 ms 更新一次。源探针求值和 CLV 读回解码在工作线程执行，稳定输入复用快照；两个显示开关关闭或 Volume 退出场景后撤销请求并丢弃迟到结果。调试网格不投射阴影、不参与 GI，也不保存到场景；显示打开时的球体绘制和读回属于额外编辑器调试开销，不计为正常 GI 的性能保证。
 

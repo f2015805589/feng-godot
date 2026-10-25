@@ -83,12 +83,17 @@ public:
 	static constexpr int MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION = 5;
 	static constexpr int MAGIC_GI_DYNAMIC_VOLUME_FIELD_COUNT = 1;
 	static constexpr uint32_t MAGIC_GI_DYNAMIC_VOLUME_PARAMETERS_SIZE_BYTES = 96;
-	// Layouts 4 and 5 retain their 96-byte ABI. Paged prepared volumes append
-	// six origins and the camera/radius after the existing six vec4 lanes.
-	static constexpr int MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION = 6;
+	// Layouts 4, 5 and whole-volume SH2 layout 8 retain their 96-byte ABI.
+	// Paged prepared SH2 layout 7 appends six origins and camera/radius after
+	// the existing six vec4 lanes.
+	static constexpr int MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION = 7;
 	static constexpr uint32_t MAGIC_GI_PAGED_PREPARED_VOLUME_PARAMETERS_SIZE_BYTES = 208;
 	static constexpr int MAGIC_GI_PAGED_PREPARED_VOLUME_MAX_LODS = 10;
-	static constexpr int MAGIC_GI_PAGED_PREPARED_VOLUME_ABI_VERSION = 1;
+	static constexpr int MAGIC_GI_PAGED_PREPARED_VOLUME_FIELD_COUNT = 4;
+	static constexpr int MAGIC_GI_PAGED_PREPARED_VOLUME_ABI_VERSION = 2;
+	static constexpr int MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION = 8;
+	static constexpr uint32_t MAGIC_GI_PREPARED_SH2_VOLUME_PARAMETERS_SIZE_BYTES = 96;
+	static constexpr int MAGIC_GI_PREPARED_SH2_VOLUME_FIELD_COUNT = 4;
 
 	// Borrowed PRT CLV resources for one frame and one view. The native deferred
 	// lighting draw consumes them before FRPPassContext clears the lease.
@@ -412,6 +417,8 @@ public:
 	int get_magic_gi_paged_prepared_parameters_size() const { return MAGIC_GI_PAGED_PREPARED_VOLUME_PARAMETERS_SIZE_BYTES; }
 	int get_magic_gi_paged_prepared_max_lods() const { return MAGIC_GI_PAGED_PREPARED_VOLUME_MAX_LODS; }
 	int get_magic_gi_paged_prepared_abi_version() const { return MAGIC_GI_PAGED_PREPARED_VOLUME_ABI_VERSION; }
+	int get_magic_gi_prepared_sh2_layout_version() const { return MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION; }
+	int get_magic_gi_prepared_sh2_parameters_size() const { return MAGIC_GI_PREPARED_SH2_VOLUME_PARAMETERS_SIZE_BYTES; }
 	int get_magic_gi_clv_layout_version() const;
 	bool supports_magic_gi_clv_resolution(int p_resolution) const;
 	void clear_magic_gi_clv_inputs();

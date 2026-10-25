@@ -262,7 +262,10 @@ static bool _frp_validate_magic_gi_dynamic_volume_input(
 		const FRPPassContext::MagicGIDynamicVolumeViewInput &p_input) {
 	RD *rd = RD::get_singleton();
 	const bool paged_prepared = p_input.layout_version == FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION;
-	const bool preinterpolated = paged_prepared || p_input.layout_version == FRPPassContext::MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION;
+	const bool compact_prepared = paged_prepared ||
+			p_input.layout_version == FRPPassContext::MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION;
+	const bool preinterpolated = compact_prepared ||
+			p_input.layout_version == FRPPassContext::MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION;
 	const uint32_t expected_parameters_size = paged_prepared ?
 			FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_PARAMETERS_SIZE_BYTES : FRPPassContext::MAGIC_GI_DYNAMIC_VOLUME_PARAMETERS_SIZE_BYTES;
 	if (rd == nullptr || p_input.publication_token <= 0 || p_input.frame_token == 0 ||
@@ -310,7 +313,9 @@ static bool _frp_validate_magic_gi_dynamic_volume_input(
 						!(preinterpolated && format.format == RD::DATA_FORMAT_R16G16B16A16_SFLOAT)) ||
 				format.width != uint32_t(p_input.dimensions.x * (preinterpolated ? 1 : p_input.response_resolution + 2)) ||
 				format.height != uint32_t(p_input.dimensions.y * (preinterpolated ? 1 : p_input.response_resolution + 2)) ||
-				format.depth != uint32_t(p_input.dimensions.z * (preinterpolated ? 7 : 1)) ||
+				format.depth != uint32_t(p_input.dimensions.z * (compact_prepared ?
+						FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_FIELD_COUNT :
+						(preinterpolated ? 7 : 1))) ||
 				format.samples != RD::TEXTURE_SAMPLES_1 ||
 				!(format.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT)) {
 			return false;
@@ -3884,7 +3889,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 								magic_gi_dynamic_volume_publication_token > 0;
 						if (magic_gi_dynamic_volume_selected) {
 							const int layout_version = pass_context->get_magic_gi_dynamic_volume_input(0).layout_version;
-							if (layout_version == FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) {
+							if (layout_version == FRPPassContext::MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION) {
+								lighting_mode |= FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
+							} else if (layout_version == FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) {
 								lighting_mode |= FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
 							} else {
 								lighting_mode |= layout_version == FRPPassContext::MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION ? FRP_LIGHTING_MODE_MAGIC_GI_PREINTERPOLATED_VOLUME : FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME;
@@ -4020,7 +4027,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						if (direct_volume_valid) {
 							magic_gi_dynamic_volume_selected = true;
 							const int layout_version = pass_context->get_magic_gi_dynamic_volume_input(0).layout_version;
-							if (layout_version == FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) {
+							if (layout_version == FRPPassContext::MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION) {
+								lighting_mode |= FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
+							} else if (layout_version == FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) {
 								lighting_mode |= FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
 							} else {
 								lighting_mode |= layout_version == FRPPassContext::MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION ? FRP_LIGHTING_MODE_MAGIC_GI_PREINTERPOLATED_VOLUME : FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME;
@@ -4032,8 +4041,9 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						}
 						if (magic_gi_dynamic_volume_selected && !rp_uniform_set.is_valid()) {
 							magic_gi_dynamic_volume_selected = false;
-							// Clear all three GI selector bits, including layout 6's screen bit.
+							// Clear all prepared/dynamic-volume selector bits before fallback.
 							lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
+							lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
 							shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
 							lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
 							rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture, pass_context, false, false, false);
@@ -6997,6 +7007,8 @@ void RenderFRPClustered::_update_shader_quality_settings() {
 }
 
 RenderFRPClustered::RenderFRPClustered() {
+	static_assert(_prepared_sh2_lighting_variants_keep_base_flags_disjoint(),
+			"Prepared SH2 whole/paged shader selectors must stay disjoint for all base lighting flags");
 	singleton = this;
 
 	/* SCENE SHADER */
@@ -7174,11 +7186,17 @@ RenderFRPClustered::RenderFRPClustered() {
 					!(mode & (FRP_LIGHTING_MODE_MAGIC_GI_CLV | FRP_LIGHTING_MODE_MAGIC_GI_BAKED_SH | FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME))) {
 				mode_defines += "\n#define MODE_MAGIC_GI_SCREEN_CACHE\n";
 			}
-			if ((mode & FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME) == FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME &&
+			const PreparedSH2LightingVariant prepared_sh2_variant = _get_prepared_sh2_lighting_variant(mode);
+			if (prepared_sh2_variant == PreparedSH2LightingVariant::PAGED_VOLUME &&
 					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV)) {
 				mode_defines += "\n#define MODE_MAGIC_GI_DYNAMIC_VOLUME\n";
 				mode_defines += "\n#define MAGIC_GI_PREINTERPOLATED_ONLY\n";
 				mode_defines += "\n#define MAGIC_GI_PREPARED_PAGED_ONLY\n";
+			} else if (prepared_sh2_variant == PreparedSH2LightingVariant::WHOLE_VOLUME &&
+					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV)) {
+				mode_defines += "\n#define MODE_MAGIC_GI_DYNAMIC_VOLUME\n";
+				mode_defines += "\n#define MAGIC_GI_PREINTERPOLATED_ONLY\n";
+				mode_defines += "\n#define MAGIC_GI_PREPARED_SH2_ONLY\n";
 			} else if ((mode & FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME) &&
 					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_SCREEN_CACHE) &&
 					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV)) {

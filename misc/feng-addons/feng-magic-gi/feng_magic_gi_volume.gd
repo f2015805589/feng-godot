@@ -15,6 +15,7 @@ const Runtime = preload("feng_magic_gi_runtime.gd")
 const Baker = preload("feng_magic_gi_baker.gd")
 const VolumeSourceBaker = preload("feng_magic_gi_volume_source_baker.gd")
 const VolumeSourceChunk = preload("feng_magic_gi_volume_source_chunk.gd")
+const CLVTransferBuilder = preload("feng_magic_gi_clv_transfer_builder.gd")
 const PreparedArchive = preload("feng_magic_gi_prepared_brick_archive.gd")
 const PagedSourceBaker = preload("feng_magic_gi_paged_source_baker.gd")
 const Placement = preload("feng_magic_gi_placement.gd")
@@ -26,8 +27,8 @@ const Preview = preload("feng_magic_gi_preview.gd")
 const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
 const SurfelSettings = preload("feng_magic_gi_surfel_settings.gd")
 const ZERO_TRANSFER_DIAGNOSTIC := "本次几何间接传输与天空可见性均为零。请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新 Bake。"
-const BAKE_QUALITY_NAMES := ["Draft", "Final", "High"]
-const BAKE_QUALITY_SAMPLES := [256, 1024, 2048]
+const BAKE_QUALITY_NAMES := ["Preview", "Fast", "Balanced", "High quality", "Reference"]
+const BAKE_QUALITY_SAMPLES := [128, 256, 512, 1024, 2048]
 const LAYOUT_IDLE_DEBOUNCE_MSEC := 280
 const PRT_ONLY_PROPERTIES := [
 	"probe_spacing", "surface_offset", "adaptive_placement", "minimum_probe_spacing",
@@ -578,7 +579,11 @@ func directional_transfer_status() -> Dictionary:
 		"storage": "none",
 	}
 	if bake_manifest != null:
-		if not bake_manifest.is_valid():
+		if bake_manifest.transport_domain == "prepared_free_space_bricks_v1" \
+				and bake_manifest.prepared_operator_schema_version != 2:
+			result["status"] = "prepared_clv_sh2_rebake_required"
+			result["message"] = "This prepared CLV cache uses the legacy SH9 operator format and cannot be decoded as SH2. Rebake the prepared CLV generation."
+		elif not bake_manifest.is_valid():
 			result["status"] = "invalid_manifest"
 			result["message"] = "The streamed page manifest is invalid. Rebuild the page generation."
 		else:
@@ -691,6 +696,9 @@ func baked_indirect_status() -> Dictionary:
 func needs_rebake() -> bool:
 	return (bake_manifest != null or bake_data != null) \
 			and (_layout_stale or _layout_dirty \
+			or (bake_manifest != null \
+					and bake_manifest.transport_domain == "prepared_free_space_bricks_v1" \
+					and bake_manifest.prepared_operator_schema_version != 2) \
 			or (_scene_signature_checked and not has_bake()) \
 			or (clv_cache_backend == 1 and bake_manifest == null \
 					and bake_data != null and not has_valid_directional_transfer()))
@@ -702,7 +710,10 @@ func has_legacy_sampler_signature() -> bool:
 func bake_staleness_reasons() -> PackedStringArray:
 	var reasons := PackedStringArray()
 	if bake_manifest != null:
-		if not bake_manifest.is_valid():
+		if bake_manifest.transport_domain == "prepared_free_space_bricks_v1" \
+				and bake_manifest.prepared_operator_schema_version != 2:
+			reasons.append("prepared CLV cache uses the legacy SH9 operator format; rebake to SH2")
+		elif not bake_manifest.is_valid():
 			reasons.append("the streamed page manifest is invalid")
 		elif bake_manifest.bake_settings_signature != _settings_signature_for_manifest(bake_manifest):
 			reasons.append("volume bake settings changed")
@@ -1599,10 +1610,12 @@ func _saved_bake_matches_current() -> bool:
 
 func _settings_signature_for_manifest(manifest: Manifest) -> int:
 	if manifest != null and manifest.transport_domain == PreparedArchive.DOMAIN \
-			and manifest.prepared_bake_algorithm == "multires_independent_transport_v1":
+			and manifest.prepared_bake_algorithm.begins_with("multires_independent_transport"):
 		return PagedSourceBaker.settings_signature(self, {"prepared_levels": manifest.prepared_level_count,
 			"core_axis": manifest.prepared_core_axis})
-	if manifest != null and manifest.transport_domain in [VolumeSourceBaker.TRANSPORT_DOMAIN, PreparedArchive.DOMAIN]:
+	if manifest != null and manifest.transport_domain == PreparedArchive.DOMAIN:
+		return hash([VolumeSourceBaker.settings_signature(self), CLVTransferBuilder.REVISION])
+	if manifest != null and manifest.transport_domain == VolumeSourceBaker.TRANSPORT_DOMAIN:
 		return VolumeSourceBaker.settings_signature(self)
 	return Baker.new()._streamed_settings_signature(self)
 

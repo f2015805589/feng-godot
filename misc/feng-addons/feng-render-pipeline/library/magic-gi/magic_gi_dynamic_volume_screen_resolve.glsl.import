@@ -11,3 +11,4 @@ source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic
 dest_files=["res://.godot/imported/magic_gi_dynamic_volume_screen_resolve.glsl-c3b9aef483c51cbf686318e761480ae3.res"]
 
 [params]
+

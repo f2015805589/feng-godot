@@ -15,7 +15,9 @@ static var _revision := 0
 static func set_request(volume_id: int, enabled: bool, include_sh := true,
 		interval_msec := 500, target_id := 0) -> void:
 	_reap_completed_tasks()
-	if volume_id <= 0:
+	# Object.get_instance_id() is a signed int64 and may be negative; only zero
+	# is reserved as the "no owner" sentinel in this editor-only broker.
+	if volume_id == 0:
 		return
 	_mutex.lock()
 	if not enabled:
@@ -192,27 +194,28 @@ static func _reap_when_done() -> void:
 		if tree == null: return
 		await tree.process_frame
 
-## Pure decoder, also usable by CPU regression tests. response_sh is raw signed
-## incident-radiance SH9, coefficient-major RGB, before cosine convolution/exposure.
+## Pure decoder for the compact prepared SH2 response. response_sh contains
+## four raw signed L0+L1 coefficients, coefficient-major RGB.
 static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dictionary:
 	var dimensions: Vector3i = metadata.get("dimensions", Vector3i.ZERO)
 	var indices: PackedInt32Array = metadata.get("resident_indices", PackedInt32Array())
 	var origins: PackedVector3Array = metadata.get("lod_origins", PackedVector3Array())
 	var steps: PackedFloat32Array = metadata.get("lod_spacings", PackedFloat32Array())
-	var layout_version := int(metadata.get("layout_version", 5))
+	var layout_version := int(metadata.get("layout_version", 0))
 	var lod_count := origins.size()
 	var include_sh := bool(metadata.get("include_sh", true))
 	var half_fields := bool(metadata.get("half_fields", false))
 	var scale := float(metadata.get("decode_scale", 1.0))
 	var cell_count := dimensions.x * dimensions.y * dimensions.z
 	var bytes_per_lane := 2 if half_fields else 4
-	if layout_version not in [5, 6] or (layout_version == 5 and lod_count != 4) \
+	if layout_version not in [7, 8] or int(metadata.get("operator_schema_version", 0)) != 2 \
+			or int(metadata.get("response_field_count", 0)) != 4 \
 			or lod_count < 1 or lod_count > 10 \
 			or dimensions.x <= 0 or dimensions.y != dimensions.x or dimensions.z != dimensions.x * lod_count \
 			or indices.size() != cell_count or steps.size() != lod_count \
 			or not is_finite(scale) or scale <= 0.0:
 		return {"current_available": false, "status": "invalid_clv_metadata"}
-	if include_sh and data.size() != cell_count * 7 * 4 * bytes_per_lane:
+	if include_sh and data.size() != cell_count * 4 * 4 * bytes_per_lane:
 		return {"current_available": false, "status": "invalid_clv_readback_size"}
 	for lod in lod_count:
 		if not origins[lod].is_finite() or not is_finite(steps[lod]) or steps[lod] <= 0.0:
@@ -228,9 +231,9 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 		if source_index >= 0: capacity += 1
 	positions.resize(capacity); spacings.resize(capacity); lods.resize(capacity)
 	cells.resize(capacity); sources.resize(capacity)
-	if include_sh: response.resize(capacity * 27)
+	if include_sh: response.resize(capacity * 12)
 	var packed := PackedFloat32Array()
-	packed.resize(28)
+	packed.resize(16)
 	var count := 0
 	var cells_per_lod := dimensions.x * dimensions.y * dimensions.x
 	for cell in cell_count:
@@ -238,30 +241,28 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 		var lod := cell / cells_per_lod
 		if include_sh:
 			var finite := true
-			for field in 7:
+			for field in 4:
 				var offset := (field * cell_count + cell) * 4 * bytes_per_lane
 				for lane in 4:
 					var value := data.decode_half(offset + lane * 2) if half_fields \
 						else data.decode_float(offset + lane * 4)
 					packed[field * 4 + lane] = value
 					finite = finite and is_finite(value)
-			if not finite or packed[27] <= 0.5: continue
-			for channel in 3:
-				var ex := packed[channel] * scale
-				var ey := packed[8 + channel] * scale
-				var ez := packed[16 + channel] * scale
-				var base := count * 27 + channel
-				response[base] = (ex + ey + ez) / (3.0 * 0.2820947918)
-				response[base + 3] = packed[12 + channel] * scale / 0.325735007933
-				response[base + 6] = packed[20 + channel] * scale / 0.325735007933
-				response[base + 9] = packed[4 + channel] * scale / 0.325735007933
-				response[base + 12] = packed[channel * 4 + 3] * scale / 0.27313710765
-				response[base + 15] = packed[(channel + 3) * 4 + 3] * scale / 0.27313710765
-				response[base + 18] = (2.0 * ez - ex - ey) / (6.0 * 0.078847891325)
-				response[base + 21] = packed[24 + channel] * scale / 0.27313710765
-				response[base + 24] = (ex - ey) / (2.0 * 0.136568553825)
-			for component in 27:
-				finite = finite and is_finite(response[count * 27 + component])
+			if not finite or packed[15] <= 0.5: continue
+			var coefficients := [
+				Vector3(packed[0], packed[1], packed[2]),
+				Vector3(packed[3], packed[4], packed[5]),
+				Vector3(packed[6], packed[7], packed[8]),
+				Vector3(packed[9], packed[10], packed[11]),
+			]
+			for coefficient in 4:
+				var coefficient_vector: Vector3 = coefficients[coefficient]
+				for channel in 3:
+					var value: float = coefficient_vector[channel] * scale
+					response[count * 12 + coefficient * 3 + channel] = value
+					finite = finite and is_finite(value)
+			for component in 12:
+				finite = finite and is_finite(response[count * 12 + component])
 			if not finite: continue
 		var local_cell := cell % cells_per_lod
 		var coordinate := Vector3i(local_cell % dimensions.x,
@@ -274,7 +275,7 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 		count += 1
 	positions.resize(count); spacings.resize(count); lods.resize(count)
 	cells.resize(count); sources.resize(count)
-	if include_sh: response.resize(count * 27)
+	if include_sh: response.resize(count * 12)
 	var levels: Array[Dictionary] = []
 	for lod in lod_count:
 		levels.append({"lod": lod, "origin_world": origins[lod], "spacing": steps[lod],
@@ -291,5 +292,6 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 		"relight_revision": metadata.get("relight_revision", 0),
 		"clipmap_revision": metadata.get("clipmap_revision", 0),
 		"request_msec": metadata.get("request_msec", 0), "include_sh": include_sh,
-		"response_sh_semantics": "raw_signed_world_incident_radiance_sh9_coefficient_major_rgb",
+		"response_sh_semantics": "raw_signed_world_incident_radiance_sh2_l0_l1_coefficient_major_rgb",
+		"response_coefficient_count": 4,
 		"source": "actual_gpu_relit_prepared_clv" if include_sh else "actual_resident_clv_topology"}

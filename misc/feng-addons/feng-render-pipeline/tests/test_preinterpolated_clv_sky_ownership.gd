@@ -1,6 +1,6 @@
 extends SceneTree
 
-# Execute the exact layout-5 sampler and apply implementation on a local GPU.
+# Execute the exact compact SH2 layout-7 sampler and apply implementation on a local GPU.
 # A constant E/pi tensor is independent of the receiver normal. Clearing its
 # x=1 plane leaves 0.75 valid trilinear support at x=0.25, without changing the
 # normalized lighting. Coverage is cache support, not remaining physical Sky.
@@ -142,8 +142,9 @@ func _case(label: String, texture: String, world: Vector3, strength: float,
 		"hit": hit, "coverage": coverage, "replace_sky": replace_sky}
 
 func _shader_source() -> String:
-	var tensor := FileAccess.get_file_as_string(LIBRARY + "magic_gi_sh9_tensor.glslinc")
+	var tensor := FileAccess.get_file_as_string(LIBRARY + "magic_gi_sh4_tensor.glslinc")
 	var sampling := FileAccess.get_file_as_string(LIBRARY + "magic_gi_dynamic_volume_sample.glslinc")
+	sampling = sampling.replace("#include \"magic_gi_sh4_tensor.glslinc\"", "")
 	# Optional mutation control: the unchanged numerical assertions must FAIL
 	# with the former coverage-scaled sky subtraction (two partial-support cases).
 	if OS.get_cmdline_user_args().has("--legacy-coverage-control"):
@@ -174,28 +175,27 @@ void main() {
 
 func _texture(mode: String) -> RID:
 	var data := PackedFloat32Array()
-	data.resize(2 * 2 * 2 * 7 * 4)
-	for field in 7:
+	data.resize(2 * 2 * 2 * 4 * 4)
+	for field in 4:
 		for z in 2:
 			for y in 2:
 				for x in 2:
 					if mode == "empty" or (mode == "partial" and x == 1):
 						continue
 					var index := (((field * 2 + z) * 2 + y) * 2 + x) * 4
-					# Constant polynomial: Ex=Ey=Ez=E/pi; every other lane is zero.
-					# This known fixture is not a CPU reimplementation of the decoder.
-					if mode != "black" and field in [0, 2, 4]:
-						data[index] = INCIDENT.x
-						data[index + 1] = INCIDENT.y
-						data[index + 2] = INCIDENT.z
-					if field == 6:
+					# L0-only fixture: Y00 * C0 reconstructs a constant response.
+					if mode != "black" and field == 0:
+						data[index] = INCIDENT.x / 0.2820947918
+						data[index + 1] = INCIDENT.y / 0.2820947918
+						data[index + 2] = INCIDENT.z / 0.2820947918
+					if field == 3:
 						data[index + 3] = 1.0
 	var format := RDTextureFormat.new()
 	format.texture_type = RenderingDevice.TEXTURE_TYPE_3D
 	format.format = RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
 	format.width = 2
 	format.height = 2
-	format.depth = 14
+	format.depth = 8
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 	return _own(rd.texture_create(format, RDTextureView.new(), [data.to_byte_array()]))
 
@@ -203,10 +203,10 @@ func _parameters() -> PackedByteArray:
 	var data := PackedFloat32Array([
 		0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 8,
 	]).to_byte_array()
-	data.append_array(PackedInt32Array([2, 2, 2, 5]).to_byte_array())
+	data.append_array(PackedInt32Array([2, 2, 2, 7]).to_byte_array())
 	# The first angular_layout lane is a float decode scale carried as int bits.
 	data.append_array(PackedFloat32Array([1.0]).to_byte_array())
-	data.append_array(PackedInt32Array([7, 1, 2]).to_byte_array())
+	data.append_array(PackedInt32Array([4, 1, 2]).to_byte_array())
 	return data
 
 func _owner(strength: float, replace_sky: bool) -> PackedByteArray:

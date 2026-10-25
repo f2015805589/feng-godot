@@ -11,10 +11,11 @@ const Archive = preload("feng_magic_gi_prepared_brick_archive.gd")
 const Manifest = preload("feng_magic_gi_manifest.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const Baker = preload("feng_magic_gi_baker.gd")
-const SOURCE_HALO_CELLS := 6 # 1 output halo + ceil(1.5 + 2.6 + relocation/spacing).
+const SOURCE_HALO_CELLS := 6 # 1 output + ceil(1.5 + 2.6 + relocation/spacing).
 
 static func settings_signature(volume: Node3D, options: Dictionary = {}) -> int:
-	return hash(["multires_prepared_bake_v1", SourceBaker.settings_signature(volume),
+	return hash(["multires_prepared_bake_sh2_v3", SOURCE_HALO_CELLS, Builder.REVISION, Builder.OUTPUT_SCHEMA_VERSION,
+		SourceBaker.settings_signature(volume),
 		int(options.get("prepared_levels", 10)), int(options.get("core_axis", 16)),
 		int(options.get("samples", volume.bake_samples)), int(options.get("bounces", volume.bake_bounces)),
 		float(options.get("trace_distance_m", volume.bake_distance)),
@@ -69,6 +70,16 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	var emitter_ids: PackedStringArray = geometry.emitters.keys.duplicate()
 	var emitter_signatures: PackedInt64Array = geometry.emitters.static_signatures.duplicate()
 	if emitter_ids.size() > 32: return {"ok": false, "error": "paged_emitter_limit_exceeded"}
+	var samples := int(options.get("samples", volume.bake_samples))
+	var moment_rays := int(options.get("moment_rays",
+			maxi(samples, SourceBaker.MIN_MOMENT_RAYS)))
+	if progress.is_valid():
+		progress.call("Preparing free-space sample coordinates", 0, 1, 0, 0)
+	var sampling_cache := SourceBaker.make_sampling_cache(samples, bounces, moment_rays)
+	if not bool(sampling_cache.get("ok", false)):
+		return {"ok": false, "error": "invalid_samples_bounces_or_moment_rays"}
+	if progress.is_valid():
+		progress.call("Preparing free-space sample coordinates", 1, 1, 0, 0)
 	var baked_settings_signature := settings_signature(volume, options)
 	var source_signature := "%x" % hash([geometry_signature, baked_settings_signature, global_origin, global_dimensions, emitter_ids, emitter_signatures])
 	var entries: Array[Dictionary] = []
@@ -76,6 +87,12 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	var maximum_operator_bound := 0.0
 	var completed_tiles := 0
 	var total_tiles := 0
+	var surface_target_cache: Dictionary = {}
+	var surface_target_constraints := 0
+	var surface_target_cache_hits := 0
+	var surface_direct_probes := 0
+	var surface_direct_samples := 0
+	var surface_direct_bake_usec := 0
 	for level in levels:
 		var dims := Vector3i((Vector3(global_dimensions) / float(1 << level)).ceil())
 		total_tiles += ceili(float(dims.x) / core_axis) * ceili(float(dims.y) / core_axis) * ceili(float(dims.z) / core_axis)
@@ -95,6 +112,7 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 					working["source_spacing_m"] = tile.spacing
 					working["source_level"] = level
 					working["global_cell_origin"] = tile.source_origin
+					working["_magic_gi_sampling_cache"] = sampling_cache
 					working["source_bounds_world"] = AABB(global_origin + Vector3(tile.source_origin) * tile.spacing - Vector3.ONE * tile.spacing * 0.5,
 							Vector3(source_dims) * tile.spacing)
 					working["captured_geometry"] = geometry
@@ -103,9 +121,17 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 					if not bool(baked.get("empty", false)):
 						var builder := Builder.new()
 						var prepared: Dictionary = await builder.prepare_region_async(baked.chunk, geometry,
-							tile.output_origin - tile.source_origin, tile.output_dimensions, cancelled, progress)
+							tile.output_origin - tile.source_origin, tile.output_dimensions,
+							cancelled, progress, sampling_cache.coordinates, surface_target_cache, level)
 						if not bool(prepared.get("ok", false)): return prepared
+						var target_stats: Dictionary = prepared.stats
+						surface_target_constraints += int(target_stats.get("surface_target_constraints", 0))
+						surface_target_cache_hits += int(target_stats.get("surface_target_cache_hits", 0))
+						surface_direct_probes += int(target_stats.get("surface_direct_probes", 0))
+						surface_direct_samples += int(target_stats.get("surface_direct_samples", 0))
+						surface_direct_bake_usec += int(target_stats.get("surface_direct_bake_usec", 0))
 						var brick := Brick.new()
+						brick.operator_schema_version = int(prepared.get("operator_schema_version", 0))
 						brick.source_origin_world = global_origin
 						brick.level = level
 						brick.cell_origin = tile.output_origin
@@ -126,6 +152,9 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 						brick.maximum_operator_row_l1 = float(prepared.stats.maximum_operator_row_l1)
 						maximum_operator_bound = maxf(maximum_operator_bound, brick.maximum_operator_row_l1)
 						if _core_has_support(brick):
+							if progress.is_valid():
+								progress.call("Writing prepared CLV page", completed_tiles, total_tiles,
+										level + 1, levels)
 							var saved := Archive.save_page(brick, generation, root)
 							if not bool(saved.get("ok", false)): return saved
 							entries.append(saved.entry)
@@ -147,26 +176,36 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	manifest.page_core_size = core_axis * 0.25 * float(1 << (levels - 1))
 	manifest.bake_geometry_signature = geometry_signature
 	manifest.bake_settings_signature = baked_settings_signature
+	manifest.bake_samples = samples
+	manifest.bake_bounces = bounces
+	manifest.bake_moment_rays = moment_rays
 	manifest.scene_watch_signature = int(options.get("scene_watch_signature", 0))
 	manifest.scene_watch_signature_schema_version = SceneTracker.SIGNATURE_SCHEMA_CURRENT
 	manifest.prepared_source_origin_world = global_origin
 	manifest.prepared_level_count = levels
 	manifest.prepared_core_axis = core_axis
-	manifest.prepared_bake_algorithm = "multires_independent_transport_v1"
+	manifest.prepared_bake_algorithm = "multires_independent_transport_sh2_v3"
 	manifest.prepared_emitter_ids = emitter_ids
 	manifest.prepared_emitter_static_signatures = emitter_signatures
 	manifest.prepared_source_signature = source_signature
 	manifest.prepared_source_transform_world = transform
 	manifest.prepared_source_size_m = size
 	manifest.prepared_maximum_operator_row_l1 = maximum_operator_bound
+	manifest.prepared_operator_schema_version = Builder.OUTPUT_SCHEMA_VERSION
 	manifest.configure(entries)
 	if cancelled.is_valid() and bool(cancelled.call()): return {"ok": false, "error": "cancelled"}
+	if progress.is_valid(): progress.call("Writing prepared CLV manifest", 0, 1, 0, 0)
 	var result := Archive.save_manifest(manifest, root)
 	result["peak_working_source_cells"] = peak_source_cells
 	result["completed_tiles"] = completed_tiles
 	result["generation"] = generation
 	result["geometry_signature"] = geometry_signature
 	result["directional_source_signature"] = source_signature
+	result["surface_target_stats"] = {"constraints": surface_target_constraints,
+		"cache_hits": surface_target_cache_hits, "direct_probes": surface_direct_probes,
+		"direct_samples": surface_direct_samples, "direct_bake_usec": surface_direct_bake_usec,
+		"cache_entries_after_bake": surface_target_cache.size(),
+		"cache_entry_limit": Builder.SURFACE_TARGET_CACHE_LIMIT}
 	return result
 
 static func _core_has_support(brick: Brick) -> bool:

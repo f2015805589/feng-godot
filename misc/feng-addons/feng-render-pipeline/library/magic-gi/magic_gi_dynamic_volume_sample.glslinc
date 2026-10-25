@@ -1,6 +1,8 @@
 #ifndef FRP_MAGIC_GI_DYNAMIC_VOLUME_SAMPLE_GLSLINC
 #define FRP_MAGIC_GI_DYNAMIC_VOLUME_SAMPLE_GLSLINC
 
+#include "magic_gi_sh4_tensor.glslinc"
+
 // Independent live TransferMatrix volume path. This specialization intentionally
 // does not include the layout-9 surface-chart sampler or its per-pixel BVH path.
 // Native lighting resolves this to Godot's scene sampler. The after-GBuffer
@@ -117,7 +119,7 @@ bool frp_magic_gi_dynamic_volume_owner_contains(vec3 world, int view) {
 	if (size_enabled.w <= 0.5) { return false; }
 	vec3 local_position = (frp_magic_gi_dynamic_volume_world_to_local(view) *
 			vec4(world, 1.0)).xyz;
-	return magic_gi_sh9_tensor_finite_vec3(local_position) &&
+	return magic_gi_sh4_finite_vec3(local_position) &&
 			all(lessThanEqual(abs(local_position), size_enabled.xyz * 0.5));
 }
 
@@ -231,17 +233,17 @@ bool frp_magic_gi_dynamic_volume_sample_lod(vec3 world,
 			dimensions_version.x != logical_resolution ||
 			dimensions_version.y != logical_resolution ||
 			dimensions_version.z != logical_resolution * angular_layout.z ||
-			!(origin_spacing.w > 0.0) || !magic_gi_sh9_tensor_finite_vec3(world) ||
-			!magic_gi_sh9_tensor_finite_vec3(geometric_normal_world) ||
-			!magic_gi_sh9_tensor_finite_vec3(shading_normal_world) ||
+			!(origin_spacing.w > 0.0) || !magic_gi_sh4_finite_vec3(world) ||
+			!magic_gi_sh4_finite_vec3(geometric_normal_world) ||
+			!magic_gi_sh4_finite_vec3(shading_normal_world) ||
 			!frp_magic_gi_dynamic_volume_owner_contains(world, view)) {
 		return false;
 	}
 	vec3 geometric_normal = normalize(geometric_normal_world);
 	vec3 shading_normal = normalize(shading_normal_world);
-	if (!magic_gi_sh9_tensor_finite_vec3(geometric_normal) ||
+	if (!magic_gi_sh4_finite_vec3(geometric_normal) ||
 			dot(geometric_normal, geometric_normal) < 0.99 ||
-			!magic_gi_sh9_tensor_finite_vec3(shading_normal) ||
+			!magic_gi_sh4_finite_vec3(shading_normal) ||
 			dot(shading_normal, shading_normal) < 0.99) { return false; }
 	vec3 unwarped_grid = (world - origin_spacing.xyz) / origin_spacing.w;
 	if (any(lessThan(unwarped_grid, vec3(-0.5))) ||
@@ -284,7 +286,7 @@ bool frp_magic_gi_dynamic_volume_sample_lod(vec3 world,
 				+ frp_magic_gi_dynamic_relocation.values[cell_index].xyz;
 		vec4 response = frp_magic_gi_dynamic_volume_fetch_response(cell, shading_normal,
 				dimensions_version.xyz, angular_layout, view);
-		if (!magic_gi_sh9_tensor_finite_vec4(response) || response.a < 0.5) {
+		if (!magic_gi_sh4_finite_vec4(response) || response.a < 0.5) {
 			continue;
 		}
 		// Spatial support is independent of the receiver's oriented hemisphere
@@ -315,7 +317,7 @@ bool frp_magic_gi_dynamic_volume_sample_lod(vec3 world,
 	}
 	coverage = clamp(valid_weight, 0.0, 1.0);
 	front_support = clamp(front_side_weight, 0.0, 1.0);
-	return coverage > 1e-6 && magic_gi_sh9_tensor_finite_vec3(incident);
+	return coverage > 1e-6 && magic_gi_sh4_finite_vec3(incident);
 }
 
 bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
@@ -324,11 +326,13 @@ bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
 	ivec4 dimensions = frp_magic_gi_dynamic_volume_dimensions_version(view);
 	ivec4 layout_info = frp_magic_gi_dynamic_volume_angular_layout(view);
 	incident = vec3(0.0); coverage = 0.0; edge_distance = 0.0;
+	bool schema_valid = dimensions.w == 7 || dimensions.w == 8;
 #ifdef MAGIC_GI_PREPARED_PAGED_ONLY
-	if (!(origin.w > 0.0) || layout_info.y != 7 || dimensions.w != 6) return false;
-#else
-	if (!(origin.w > 0.0) || layout_info.y != 7 || dimensions.w != 5) return false;
+	schema_valid = dimensions.w == 7;
+#elif defined(MAGIC_GI_PREPARED_SH2_ONLY)
+	schema_valid = dimensions.w == 8;
 #endif
+	if (!(origin.w > 0.0) || layout_info.y != 4 || !schema_valid) return false;
 	vec3 grid = (world - origin.xyz) / origin.w;
 	float last = float(layout_info.w - 1);
 	if (any(lessThan(grid, vec3(0.0))) || any(greaterThan(grid, vec3(last)))) return false;
@@ -336,11 +340,11 @@ bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
 	edge_distance = min(edges.x, min(edges.y, edges.z));
 	// Clamp inside this LOD before adding the packed field/LOD Z offsets.
 	grid = clamp(grid, vec3(0.0), vec3(last));
-	vec4 packed[7];
-	for (int field = 0; field < 7; field++) {
+	vec4 packed[4];
+	for (int field = 0; field < 4; field++) {
 		vec3 uv = (grid + vec3(0.5, 0.5,
 			float(lod * layout_info.w + field * dimensions.z) + 0.5)) /
-			vec3(dimensions.xy, dimensions.z * 7);
+			vec3(dimensions.xy, dimensions.z * 4);
 #ifdef USE_MULTIVIEW
 		if (view == 1) {
 			packed[field] = texture(sampler3D(frp_magic_gi_dynamic_volume_response1,
@@ -352,10 +356,10 @@ bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
 				FRP_MAGIC_GI_DYNAMIC_VOLUME_LINEAR_SAMPLER), uv);
 		}
 	}
-	incident = magic_gi_sh9_tensor_decode_e_over_pi(packed, normal_world, coverage);
+	incident = magic_gi_sh4_decode_e_over_pi(packed, normal_world, coverage);
 	float decode_scale = intBitsToFloat(layout_info.x);
 	incident *= decode_scale > 0.0 ? decode_scale : 1.0;
-	return coverage > 0.5 && magic_gi_sh9_tensor_finite_vec3(incident);
+	return coverage > 0.5 && magic_gi_sh4_finite_vec3(incident);
 }
 
 bool frp_magic_gi_dynamic_volume_sample(vec3 world,
@@ -375,7 +379,8 @@ bool frp_magic_gi_dynamic_volume_sample(vec3 world,
 #ifdef MAGIC_GI_PREINTERPOLATED_ONLY
 	{
 #else
-	if (frp_magic_gi_dynamic_volume_dimensions_version(view).w == 5) {
+	if (frp_magic_gi_dynamic_volume_dimensions_version(view).w == 7 ||
+			frp_magic_gi_dynamic_volume_dimensions_version(view).w == 8) {
 #endif
 		if (!frp_magic_gi_dynamic_volume_owner_contains(world, view)) return false;
 		for (int lod = 0; lod < lod_count; lod++) {
@@ -411,7 +416,7 @@ bool frp_magic_gi_dynamic_volume_sample(vec3 world,
 		// that mass changes with surface orientation and caused visible stepping.
 		incident = candidate_incident;
 		coverage = candidate_coverage;
-		return magic_gi_sh9_tensor_finite_vec3(incident);
+		return magic_gi_sh4_finite_vec3(incident);
 	}
 	return false;
 	#endif
@@ -422,7 +427,7 @@ void frp_magic_gi_dynamic_volume_apply(vec3 world, vec3 geometric_normal_world,
 		int view, inout vec3 ambient_light, vec3 global_sky_light_diffuse) {
 	vec4 control = frp_magic_gi_dynamic_volume_owner_control(view);
 	float strength = max(control.x, 0.0);
-	if (!(strength > 0.0) || !magic_gi_sh9_tensor_finite_vec4(control) ||
+	if (!(strength > 0.0) || !magic_gi_sh4_finite_vec4(control) ||
 			!(control.z > 0.0) || !(ao > 0.0) || all(equal(albedo, vec3(0.0))) ||
 			abs(control.w - 4.0) < 0.01) {
 		return;

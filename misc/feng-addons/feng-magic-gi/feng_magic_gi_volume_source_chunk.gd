@@ -7,6 +7,8 @@ extends Resource
 const FORMAT_VERSION_DENSE := 1
 const FORMAT_VERSION_PACKED := 2
 const FORMAT_VERSION_CURRENT := FORMAT_VERSION_PACKED
+const CLV_PREPARATION_SCHEMA_CURRENT := 2
+const CLV_PREPARATION_REVISION_CURRENT := 4
 const SOURCE_SCHEMA_REVISION_CURRENT := 1
 const DIRECTIONAL_DATA_REVISION := 1
 const LAYOUT_REGULAR_CELL_CENTERS_V1 := "regular_cell_centers_v1"
@@ -72,6 +74,9 @@ const RELOCATION_STATUS_RELOCATED := 2
 ## Per row: 27 secondary RGB inputs, 9 achromatic primary-sky inputs, then six
 ## RGB/base-texture inputs per stable emitter. Four world-aligned CLV lattices.
 @export_storage var clv_preparation_revision := 0
+## Schema 2 stores four L0+L1 output coefficients by 16 secondary/sky inputs,
+## followed by six live-emitter inputs per emitter. Zero means unprepared.
+@export_storage var clv_preparation_schema_version := 0
 @export_storage var clv_preparation_signature := ""
 @export_storage var clv_prepared_dimensions := PackedInt32Array()
 @export_storage var clv_prepared_offsets := PackedInt32Array()
@@ -80,7 +85,9 @@ const RELOCATION_STATUS_RELOCATED := 2
 @export_storage var clv_preparation_stats: Dictionary = {}
 
 func has_preinterpolated_clv() -> bool:
-	if clv_preparation_revision != 1 or clv_preparation_signature != directional_source_signature \
+	if clv_preparation_revision != CLV_PREPARATION_REVISION_CURRENT \
+			or clv_preparation_schema_version != CLV_PREPARATION_SCHEMA_CURRENT \
+			or clv_preparation_signature != directional_source_signature \
 			or clv_prepared_dimensions.size() != 12 or clv_prepared_offsets.size() != 4:
 		return false
 	var total := 0
@@ -93,7 +100,19 @@ func has_preinterpolated_clv() -> bool:
 			return false
 		total += expected.x * expected.y * expected.z
 	return clv_prepared_validity.size() == total \
-		and clv_prepared_operators.size() == total * 9 * (36 + emitter_count * 6)
+		and clv_prepared_operators.size() == total * prepared_operator_stride()
+
+func prepared_output_coefficient_count() -> int:
+	return 4
+
+func prepared_input_coefficient_count() -> int:
+	return 4
+
+func prepared_operator_columns() -> int:
+	return prepared_input_coefficient_count() * 4 + emitter_count * 6
+
+func prepared_operator_stride() -> int:
+	return prepared_output_coefficient_count() * prepared_operator_columns()
 
 func cell_count() -> int:
 	if dimensions.x <= 0 or dimensions.y <= 0 or dimensions.z <= 0:
@@ -254,6 +273,7 @@ func _clear_allocation() -> void:
 
 func _clear_clv_preparation() -> void:
 	clv_preparation_revision = 0
+	clv_preparation_schema_version = 0
 	clv_preparation_signature = ""
 	clv_prepared_dimensions.clear()
 	clv_prepared_offsets.clear()
@@ -324,8 +344,7 @@ func is_header_valid(expected_geometry_signature := 0,
 		return false
 	var stored := storage_probe_count()
 	if format_version == FORMAT_VERSION_PACKED:
-		if stored <= 0 or stored > cells or source_storage_indices.size() != cells \
-				or not has_preinterpolated_clv():
+		if stored <= 0 or stored > cells or source_storage_indices.size() != cells:
 			return false
 	elif source_storage_count != 0 or not source_storage_indices.is_empty():
 		return false
@@ -336,8 +355,6 @@ func is_header_valid(expected_geometry_signature := 0,
 			or estimated_payload_bytes() > MAX_PAYLOAD_BYTES:
 		return false
 	if directional_source_signature.is_empty():
-		return false
-	if clv_preparation_revision != 0 and not has_preinterpolated_clv():
 		return false
 	var seen_emitters: Dictionary = {}
 	for emitter_id in emitter_ids:
@@ -352,22 +369,40 @@ func _storage_version_is_valid() -> bool:
 func _spacing_is_valid() -> bool:
 	return is_finite(spacing_m) and absf(spacing_m - CELL_SPACING_M) <= 0.000001
 
-## Full coefficient validation. Call once on a worker during immutable page
-## preparation, never from per-frame admission/status code.
+## Validates the raw SH9 source payload and its logical-to-packed mapping without
+## requiring the optional derived CLV operators to match the current revision.
+## This is used by source-only diagnostics; it never authorizes runtime use of
+## stale prepared operators.
+func is_source_data_valid(expected_geometry_signature := 0,
+		expected_emitter_ids := PackedStringArray(),
+		expected_emitter_static_signatures := PackedInt64Array()) -> bool:
+	return _validate_payload(expected_geometry_signature, expected_emitter_ids,
+		expected_emitter_static_signatures, false)
+
+## Full validity includes current prepared operators whenever a packed source or
+## a nonzero preparation marker claims that derived CLV data is present.
 func is_valid(expected_geometry_signature := 0,
 		expected_emitter_ids := PackedStringArray(),
 		expected_emitter_static_signatures := PackedInt64Array()) -> bool:
+	return _validate_payload(expected_geometry_signature, expected_emitter_ids,
+		expected_emitter_static_signatures, true)
+
+func _validate_payload(expected_geometry_signature: int,
+		expected_emitter_ids: PackedStringArray,
+		expected_emitter_static_signatures: PackedInt64Array,
+		require_current_prepared: bool) -> bool:
 	if not is_header_valid(expected_geometry_signature, expected_emitter_ids,
 			expected_emitter_static_signatures):
 		return false
-	if clv_preparation_revision != 0:
+	if require_current_prepared \
+			and (format_version == FORMAT_VERSION_PACKED or clv_preparation_revision != 0):
 		if not has_preinterpolated_clv():
 			return false
 		var row_bound := float(clv_preparation_stats.get("maximum_operator_row_l1", 0.0))
 		if not is_finite(row_bound) or row_bound < 0.0: return false
 		var row_l1 := 0.0
 		var column := 0
-		var columns := 36 + emitter_count * 6
+		var columns := prepared_operator_columns()
 		for value in clv_prepared_operators:
 			if not is_finite(value): return false
 			if row_bound > 0.0:

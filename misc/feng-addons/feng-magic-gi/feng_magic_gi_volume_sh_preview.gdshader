@@ -11,30 +11,29 @@ uniform vec4 preview_camera_projection[4];
 uniform vec4 preview_camera_size[4];
 uniform vec4 preview_eye_scale;
 
-// Coefficient-major RGB SH9 of live incident radiance. The diffuse basis
-// below reconstructs E/pi exactly as the runtime CLV SH9 tensor shader.
+// Coefficient-major RGB live incident radiance. This free-space PRT preview
+// accepts only the prepared runtime's four L0+L1 coefficients.
 // This data texture is linear radiance, never an sRGB color texture.
 uniform sampler2D response_sh : filter_nearest, repeat_disable;
+uniform int response_coefficient_count = 4;
 uniform float response_strength = 1.0;
 varying flat int preview_response_row;
 varying vec3 preview_world_direction;
 varying float preview_marker_compensate;
 
 vec3 evaluate_response(vec3 n) {
-    float basis[9];
-    basis[0] = 0.2820947918;
-    basis[1] = 0.4886025119 * n.y * (2.0 / 3.0);
-    basis[2] = 0.4886025119 * n.z * (2.0 / 3.0);
-    basis[3] = 0.4886025119 * n.x * (2.0 / 3.0);
-    basis[4] = 1.0925484306 * n.x * n.y * 0.25;
-    basis[5] = 1.0925484306 * n.y * n.z * 0.25;
-    basis[6] = 0.3153915653 * (3.0 * n.z * n.z - 1.0) * 0.25;
-    basis[7] = 1.0925484306 * n.x * n.z * 0.25;
-    basis[8] = 0.5462742153 * (n.x * n.x - n.y * n.y) * 0.25;
-    vec3 response = vec3(0.0);
-    for (int k = 0; k < 9; k++) {
-        response += texelFetch(response_sh, ivec2(k, preview_response_row), 0).rgb * basis[k];
-    }
+	if (response_coefficient_count != 4) {
+		return vec3(0.0);
+	}
+	float basis[4];
+	basis[0] = 0.2820947918;
+	basis[1] = 0.325735007933 * n.y;
+	basis[2] = 0.325735007933 * n.z;
+	basis[3] = 0.325735007933 * n.x;
+	vec3 response = vec3(0.0);
+	for (int k = 0; k < 4; k++) {
+		response += texelFetch(response_sh, ivec2(k, preview_response_row), 0).rgb * basis[k];
+	}
     return max(response * response_strength, vec3(0.0));
 }
 

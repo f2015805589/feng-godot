@@ -4,7 +4,7 @@ extends "magic_gi_preinterpolated_volume_cache.gd"
 ## The cache retains no brick resources or world-sized operator allocation.
 
 const PagedLayout = preload("../../feng-magic-gi/feng_magic_gi_prepared_clip_layout.gd")
-const PAGED_LAYOUT := 6
+const PAGED_LAYOUT_VERSION := 7
 const PARAMETERS_BYTES_PAGED := 208
 const POOL_GRANULARITY := 256
 
@@ -37,13 +37,21 @@ func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
 	emitter_count = int(header.get("emitter_count"))
 	source_signature = String(header.get("directional_source_signature"))
 	domain_bounds_world = header.get("domain_bounds_world")
-	_operator_columns = 36 + emitter_count * 6
+	_operator_schema_version = int(header.get("operator_schema_version"))
+	if _operator_schema_version != 2:
+		_error = "prepared_sh9_cache_requires_sh2_rebake"
+		return false
+	_input_coefficient_count = 4
+	_output_coefficient_count = 4
+	_response_field_count = 4
+	_runtime_layout_version = PAGED_LAYOUT_VERSION
+	_operator_columns = 16 + emitter_count * 6
 	_operator_bound = float(header.get("maximum_operator_row_l1"))
 	_half_fields = is_finite(_operator_bound) and _operator_bound > 0.0
 	response_resolution = 8
 	response_tile_size = 1
 	_radius_m = radius_m
-	if _fixed_gpu_bytes() + 9 * _operator_columns * 4 > gpu_budget_bytes:
+	if _fixed_gpu_bytes() + _output_coefficient_count * _operator_columns * 4 > gpu_budget_bytes:
 		_error = "paged_clv_gpu_budget_exceeded"
 		return false
 	var empty := PackedFloat32Array()
@@ -62,7 +70,7 @@ func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
 		else RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
 	format.width = dimensions.x
 	format.height = dimensions.y
-	format.depth = dimensions.z * 7
+	format.depth = dimensions.z * _response_field_count
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT \
 		| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
 	texture_fields = [rd.texture_create(format, RDTextureView.new(), [])]
@@ -109,7 +117,7 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 	_eviction_clear_calls = 0
 	var desired: Dictionary = {}
 	var bricks: Array[Resource] = []
-	var rows_per_probe := 9 * _operator_columns
+	var rows_per_probe := _output_coefficient_count * _operator_columns
 	var bytes_per_probe := rows_per_probe * 4
 	# Iterate loaded bricks rather than the unbounded source lattice. Halos are
 	# permitted to supply boundary interpolation support; duplicate samples are
@@ -119,6 +127,7 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 			continue
 		var brick: Resource = descriptor.brick
 		if not brick.has_method("is_header_valid") or not brick.is_header_valid() \
+				or int(brick.get("operator_schema_version")) != _operator_schema_version \
 				or String(brick.get("directional_source_signature")) != source_signature \
 				or int(brick.get("geometry_signature")) != int(header.get("geometry_signature")) \
 				or int(brick.get("emitter_count")) != emitter_count \
@@ -284,7 +293,7 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 	return true
 
 func _fixed_gpu_bytes() -> int:
-	return clip_cell_count * (4 + 7 * (8 if _half_fields else 16)) \
+	return clip_cell_count * (4 + _response_field_count * (8 if _half_fields else 16)) \
 		+ maxi(4, emitter_count * 6) * 4 + PARAMETERS_BYTES_PAGED + 28
 
 func _pack_parameters() -> PackedByteArray:
@@ -300,9 +309,9 @@ func _pack_parameters() -> PackedByteArray:
 	bytes.encode_s32(64, dimensions.x)
 	bytes.encode_s32(68, dimensions.y)
 	bytes.encode_s32(72, dimensions.z)
-	bytes.encode_s32(76, PAGED_LAYOUT)
+	bytes.encode_s32(76, _runtime_layout_version)
 	bytes.encode_float(80, _decode_scale)
-	bytes.encode_s32(84, 7)
+	bytes.encode_s32(84, _response_field_count)
 	bytes.encode_s32(88, _resident_lod_count)
 	bytes.encode_s32(92, resolution)
 	for lane in 4: bytes.encode_float(192 + lane * 4, _sphere_bytes.decode_float(lane * 4))
@@ -310,11 +319,16 @@ func _pack_parameters() -> PackedByteArray:
 
 func get_runtime_state() -> Dictionary:
 	var state := super.get_runtime_state()
-	state.merge({"layout_version": PAGED_LAYOUT, "paged_prepared_transfer": true,
+	state.merge({"layout_version": _runtime_layout_version, "paged_prepared_transfer": true,
+		"operator_schema_version": _operator_schema_version,
+		"operator_input_coefficients": _input_coefficient_count,
+		"operator_output_coefficients": _output_coefficient_count,
+		"response_field_count": _response_field_count,
+		"sh_basis": "real_orthonormal_l0_l1_coefficients4",
 		"clipmap_lod_count": _resident_lod_count, "valid_resident_cells": _paged_valid_cells,
 		"gi_radius_m": _radius_m, "loaded_bricks": _loaded_bricks,
 		"resident_operator_slots": _pool_capacity, "gpu_budget_bytes": gpu_budget_bytes,
-		"operator_pool_bytes": _pool_capacity * 9 * _operator_columns * 4,
+		"operator_pool_bytes": _pool_capacity * _output_coefficient_count * _operator_columns * 4,
 		"uploaded_operator_bytes_last_update": _uploaded_bytes,
 		"maximum_uploaded_operator_bytes": _maximum_uploaded_bytes,
 		"requested_upload_budget_bytes": requested_upload_budget_bytes,

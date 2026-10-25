@@ -48,6 +48,10 @@ func set_manifest(manifest: Manifest) -> void:
 	_manifest_token = next_token
 	_failure_warning = ""
 	warning = ""
+	if _manifest != null and _manifest.transport_domain == "prepared_free_space_bricks_v1" \
+			and _manifest.prepared_operator_schema_version != 2:
+		_failure_warning = "Prepared CLV cache uses the legacy SH9 operator schema. Rebake it to SH2 before runtime use."
+		warning = _failure_warning
 	_revision += 1
 	_layout_revision += 1
 	_active_metadata.clear()

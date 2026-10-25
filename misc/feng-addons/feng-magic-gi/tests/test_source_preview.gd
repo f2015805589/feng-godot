@@ -46,13 +46,15 @@ func run() -> void:
 	check(combined.spacings == PackedFloat32Array([0.25, 0.25, 0.25]) \
 			and combined.lods == PackedInt32Array([-1, -1, -1]),
 			"source samples keep their pitch and never masquerade as a resident CLV level")
-	check(combined.response_sh.size() == 3 * 27,
-			"raw output has nine coefficient-major RGB triplets for each valid source")
-	check(bool(black.current_available) and black.response_sh == _zeros(81),
+	check(combined.response_sh.size() == 3 * 12 and combined.response_coefficient_count == 4,
+			"source comparison uses four coefficient-major RGB triplets for SH2 runtime parity")
+	check(combined.response_sh_semantics == "raw_signed_world_incident_radiance_sh2_l0_l1_coefficient_major_rgb",
+			"source preview labels signed SH2 radiance coefficients rather than a raw SH9 view")
+	check(bool(black.current_available) and black.response_sh == _zeros(36),
 			"a valid zero-light source remains available black")
 	for probe in SOURCES.size():
 		var source: int = SOURCES[probe]
-		for outgoing in 9:
+		for outgoing in 4:
 			var expected_transfer := _expected_transfer(source, outgoing)
 			var expected_sky := _expected_sky(source, outgoing)
 			var expected_emission := _expected_emission(source, outgoing)
@@ -67,11 +69,37 @@ func run() -> void:
 					expected_transfer + expected_sky + expected_emission) < 0.0001,
 					label + ": signed source families combine before any display projection")
 	check(_value(transfer_only, 0, 0).y < 0.0 \
-			and _value(sky_only, 0, 8).z < 0.0,
-			"negative SH coefficients survive; raw output is not clamped or cosine-convolved")
+			and _value(sky_only, 0, 0).z < 0.0,
+			"negative SH2 coefficients survive; source output is not clamped or cosine-convolved")
+	var high_band_lighting := lighting.duplicate()
+	var high_band_sky := sky.duplicate()
+	for coefficient in range(4, 9):
+		for channel in 3:
+			high_band_lighting[coefficient * 3 + channel] = 1.0e6
+			high_band_sky[coefficient * 3 + channel] = -1.0e6
+	var high_band_changed := Preview.build(chunk, high_band_lighting, high_band_sky, emitters)
+	check(high_band_changed.response_sh == combined.response_sh,
+			"source preview excludes incoming L2 exactly like the runtime SH2 operator")
+	var high_output_chunk := chunk.duplicate(true) as Chunk
+	var high_storage_count := high_output_chunk.storage_probe_count()
+	for source in high_storage_count:
+		for outgoing in range(4, 9):
+			var transfer_row := source * 243 + outgoing * 27
+			var sky_row := source * 81 + outgoing * 9
+			for incoming in 9:
+				for channel in 3:
+					high_output_chunk.transfer[transfer_row + incoming * 3 + channel] = 1.0e6
+				high_output_chunk.sky[sky_row + incoming] = -1.0e6
+			for emitter in high_output_chunk.emitter_count:
+				var emission_row := (emitter * high_storage_count + source) * 54 + outgoing * 6
+				for channel in 6:
+					high_output_chunk.emission[emission_row + channel] = 1.0e6
+	var high_output_changed := Preview.build(high_output_chunk, lighting, sky, emitters)
+	check(high_output_changed.response_sh == combined.response_sh,
+			"source preview excludes outgoing L2 for transfer, sky, and emitter families")
 	var emission_disabled := Preview.build(chunk, lighting, sky, zero_emitters)
-	check(_value(emission_disabled, 2, 8).is_equal_approx(
-			_expected_transfer(3, 8) + _expected_sky(3, 8)),
+	check(_value(emission_disabled, 2, 3).is_equal_approx(
+			_expected_transfer(3, 3) + _expected_sky(3, 3)),
 			"disabling live emission removes its contribution without changing source transport")
 	check(combined.layout_key == emission_disabled.layout_key \
 			and combined.layout_key == black.layout_key,
@@ -102,7 +130,7 @@ func run() -> void:
 	chunk.transfer[0] = NAN
 	var invalid_transfer := Preview.build(chunk, lighting, sky, emitters)
 	check(not bool(invalid_transfer.current_available) \
-			and invalid_transfer.response_sh == _zeros(81),
+			and invalid_transfer.response_sh == _zeros(36),
 			"non-finite source output rejects the complete response without publishing NaNs")
 	chunk = _fixture()
 	chunk.sky.resize(chunk.sky.size() - 1)
@@ -186,11 +214,15 @@ func _lighting(primary: bool) -> PackedFloat32Array:
 
 func _expected_transfer(source: int, outgoing: int) -> Vector3:
 	var incoming := (outgoing * 2 + source) % 9
+	if incoming >= 4:
+		return Vector3.ZERO
 	var value := float((source + 1) * (incoming + 1))
 	return Vector3(value, -10.0 * value, value)
 
 func _expected_sky(source: int, outgoing: int) -> Vector3:
 	var incoming := (outgoing + source + 3) % 9
+	if incoming >= 4:
+		return Vector3.ZERO
 	var value := float((incoming + 1) * (outgoing + 1)) / 8.0
 	return Vector3(2 * value, 3 * value, -value)
 
@@ -202,7 +234,7 @@ func _expected_emission(source: int, outgoing: int) -> Vector3:
 
 func _value(snapshot: Dictionary, probe: int, outgoing: int) -> Vector3:
 	var values: PackedFloat32Array = snapshot.response_sh
-	var base := probe * 27 + outgoing * 3
+	var base := probe * 12 + outgoing * 3
 	return Vector3(values[base], values[base + 1], values[base + 2])
 
 func _zeros(count: int) -> PackedFloat32Array:

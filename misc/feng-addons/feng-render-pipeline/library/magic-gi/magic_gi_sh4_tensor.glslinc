@@ -1,0 +1,58 @@
+#ifndef MAGIC_GI_SH4_TENSOR_GLSLINC
+#define MAGIC_GI_SH4_TENSOR_GLSLINC
+
+// Compact raw SH2 storage: four RGB coefficients (L0 + L1) occupy three
+// RGBA texels; the fourth texel carries filtered validity in alpha. Coefficient
+// order matches SH9's low band: [Y00, y, z, x].
+const float MAGIC_GI_SH4_Y00 = 0.2820947918;
+const float MAGIC_GI_SH4_L1_E_OVER_PI = 0.325735007933;
+
+bool magic_gi_sh4_finite_vec3(vec3 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+bool magic_gi_sh4_finite_vec4(vec4 value) {
+	return !any(isnan(value)) && !any(isinf(value));
+}
+
+void magic_gi_sh4_pack_raw(const vec3 coefficients[4], float validity,
+		out vec4 packed[4]) {
+	bool valid = validity > 0.5 && !isnan(validity) && !isinf(validity);
+	for (int coefficient = 0; coefficient < 4; coefficient++) {
+		valid = valid && magic_gi_sh4_finite_vec3(coefficients[coefficient]);
+	}
+	if (!valid) {
+		for (int field = 0; field < 4; field++) { packed[field] = vec4(0.0); }
+		return;
+	}
+	packed[0] = vec4(coefficients[0], coefficients[1].r);
+	packed[1] = vec4(coefficients[1].gb, coefficients[2].rg);
+	packed[2] = vec4(coefficients[2].b, coefficients[3]);
+	packed[3] = vec4(0.0, 0.0, 0.0, 1.0);
+}
+
+vec3 magic_gi_sh4_decode_e_over_pi(const vec4 packed[4], vec3 normal_world,
+		out float coverage) {
+	coverage = 0.0;
+	for (int field = 0; field < 4; field++) {
+		if (!magic_gi_sh4_finite_vec4(packed[field])) { return vec3(0.0); }
+	}
+	float filtered_coverage = packed[3].a;
+	if (!(filtered_coverage > 1e-6) || filtered_coverage > 1.000001) { return vec3(0.0); }
+	float normal_length_squared = dot(normal_world, normal_world);
+	if (!(normal_length_squared > 1e-12) || isnan(normal_length_squared)
+			|| isinf(normal_length_squared)) { return vec3(0.0); }
+	vec3 n = normal_world * inversesqrt(normal_length_squared);
+	vec3 c0 = packed[0].rgb;
+	vec3 c1 = vec3(packed[0].a, packed[1].rg);
+	vec3 c2 = vec3(packed[1].ba, packed[2].r);
+	vec3 c3 = packed[2].gba;
+	vec3 result = MAGIC_GI_SH4_Y00 * c0 + MAGIC_GI_SH4_L1_E_OVER_PI
+			* (c1 * n.y + c2 * n.z + c3 * n.x);
+	result /= filtered_coverage;
+	if (!magic_gi_sh4_finite_vec3(result)) { return vec3(0.0); }
+	coverage = clamp(filtered_coverage, 0.0, 1.0);
+	return result;
+}
+
+#endif
