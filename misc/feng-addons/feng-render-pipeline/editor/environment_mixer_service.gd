@@ -3,12 +3,14 @@ extends Node
 ## Scene-scoped service used by the Environment Light Mixer window.
 ##
 ## The service discovers only the authored FRP lighting actors described below.
-## It does not inspect the project pipeline or render volumes. Property editing is
-## delegated to EditorInspector so component resources keep their normal Godot
-## serialization and UndoRedo behavior.
+## Creation also enables the component's required passes on the active pipeline.
+## Property editing stays with EditorInspector; node creation and pipeline setup
+## share one undo action. Render-volume overrides remain independently authored.
 
 signal snapshot_changed(snapshot: Dictionary)
 signal components_created(nodes: Array)
+
+const PipelineSetup = preload("environment_pipeline_setup.gd")
 
 const COMPONENTS: Array[Dictionary] = [
 	{
@@ -228,6 +230,12 @@ func _commit_create_action(p_root: Node, p_nodes: Array[Node]) -> bool:
 	var undo_redo = plugin.get_undo_redo()
 	if undo_redo == null:
 		return false
+	var component_ids: Array = []
+	for node in p_nodes:
+		var definition := component_definition(node)
+		if not definition.is_empty():
+			component_ids.append(definition.id)
+	var pipeline_setup := PipelineSetup.prepare(p_root, p_nodes, component_ids)
 	var labels: PackedStringArray = []
 	for node in p_nodes:
 		labels.append(String(node.name))
@@ -238,6 +246,7 @@ func _commit_create_action(p_root: Node, p_nodes: Array[Node]) -> bool:
 		undo_redo.add_do_method(node, "set_owner", p_root)
 		undo_redo.add_do_reference(node)
 		undo_redo.add_undo_method(p_root, "remove_child", node)
+	PipelineSetup.record(undo_redo, pipeline_setup)
 	undo_redo.commit_action()
 	return true
 

@@ -129,6 +129,7 @@ const SHADOW_DEFAULTS := {
 		emit_changed()
 
 func _init() -> void:
+	super()
 	resource_name = "Shadow Pass"
 
 func _native_pass_id() -> int:

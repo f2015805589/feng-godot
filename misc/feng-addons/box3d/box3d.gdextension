@@ -1,0 +1,12 @@
+[configuration]
+
+entry_symbol = "godot_box3d_main"
+compatibility_minimum = "4.5"
+reloadable = false
+
+[libraries]
+
+windows.debug.x86_64 = "res://addons/box3d/bin/box3d.dll"
+windows.release.x86_64 = "res://addons/box3d/bin/box3d.dll"
+linux.debug.x86_64 = "res://addons/box3d/bin/box3d.so"
+linux.release.x86_64 = "res://addons/box3d/bin/box3d.so"

@@ -25,6 +25,11 @@ func run() -> void:
 	check(RenderingServer.get_rendering_device() == null,
 		"exposure source routing can be checked without a RenderingDevice")
 	var eye_pass := EyeAdaptation.new()
+	check(eye_pass.extend_default_luminance_range,
+		"new Eye Adaptation passes default to the extended EV100 luminance range")
+	var eye_template = load("res://addons/feng-render-pipeline/library/eye-adaptation/eye_adaptation.tres")
+	check(eye_template.extend_default_luminance_range,
+		"the library Eye Adaptation template also defaults to extended EV100")
 	check(eye_pass.exposure_source == EyeAdaptation.EXPOSURE_SOURCE_AUTOMATIC
 		and eye_pass.metering_mode == 0,
 		"new Eye Adaptation passes default to Automatic plus Histogram metering")

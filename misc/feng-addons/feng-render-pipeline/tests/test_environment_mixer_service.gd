@@ -4,6 +4,21 @@ extends SceneTree
 const ServiceScript = preload("res://addons/feng-render-pipeline/editor/environment_mixer_service.gd")
 const WindowScript = preload("res://addons/feng-render-pipeline/editor/environment_mixer_window.gd")
 const BuiltinPassScript = preload("res://addons/feng-render-pipeline/passes/builtin_pass.gd")
+const PipelineSetup = preload("res://addons/feng-render-pipeline/editor/environment_pipeline_setup.gd")
+const RendererScript = preload("res://addons/feng-render-pipeline/renderer.gd")
+
+# Run the same recorded editor operations through a real UndoRedo without
+# starting an interactive EditorNode or touching a user's project history.
+class History extends RefCounted:
+	var undo := UndoRedo.new()
+	func add_do_property(object: Object, property: StringName, value: Variant) -> void:
+		undo.add_do_property(object, property, value)
+	func add_undo_property(object: Object, property: StringName, value: Variant) -> void:
+		undo.add_undo_property(object, property, value)
+	func add_do_method(object: Object, method: StringName) -> void:
+		undo.add_do_method(Callable(object, method))
+	func add_undo_method(object: Object, method: StringName) -> void:
+		undo.add_undo_method(Callable(object, method))
 
 var checks := 0
 var failures := 0
@@ -436,6 +451,87 @@ func _test_card_flow_geometry() -> void:
 	host.free()
 
 
+func _test_environment_pipeline_dependencies() -> void:
+	var renderer := RendererScript.new()
+	var required: Array[StringName] = []
+	required.assign(PipelineSetup.REQUIRED_PASSES[&"volumetric_cloud"])
+	var unrelated := {}
+	for entry in renderer.passes:
+		entry.enabled = false
+		if not required.has(entry.stable_id):
+			unrelated[entry.stable_id] = entry
+	var original_passes := renderer.passes.duplicate()
+	var edit := PipelineSetup.plan_passes(renderer, required)
+	require(not edit.is_empty(), "creating clouds must repair disabled cloud/fog passes")
+	require(renderer.passes == original_passes and not edit.enable[0].enabled,
+			"preparing the creation must not change live resources before the undo action")
+	var history := History.new()
+	history.undo.create_action("Create environment")
+	PipelineSetup.record(history, {"bindings": [], "edits": [edit]})
+	history.undo.commit_action()
+	for entry in renderer.passes:
+		require(entry.enabled == required.has(entry.stable_id),
+				"environment setup must only enable its own required passes: %s" % entry.stable_id)
+	require(PipelineSetup.plan_passes(renderer, required).is_empty(),
+			"repeated environment setup must be idempotent")
+	history.undo.undo()
+	for entry in renderer.passes:
+		require(not entry.enabled, "undo must restore the authored pass states: %s" % entry.stable_id)
+	history.undo.redo()
+	for entry in renderer.passes:
+		if unrelated.has(entry.stable_id):
+			require(entry == unrelated[entry.stable_id] and not entry.enabled,
+					"redo must preserve unrelated pass identity and settings")
+
+	# Removing a pass in the library records a tombstone. Explicitly creating
+	# its component may restore it, but undo must restore the removal too.
+	var remaining := renderer.passes.duplicate()
+	for index in range(remaining.size() - 1, -1, -1):
+		if remaining[index].stable_id == &"library:cloud_trace":
+			remaining.remove_at(index)
+	renderer.passes = remaining
+	renderer._deleted_library_ids.append("library:cloud_trace")
+	renderer._deleted_library.append("cloud/cloud_trace.tres")
+	edit = PipelineSetup.plan_passes(renderer, required)
+	history.undo.create_action("Restore cloud tracing")
+	PipelineSetup.record(history, {"bindings": [], "edits": [edit]})
+	history.undo.commit_action()
+	var ids := []
+	for entry in renderer.passes:
+		ids.append(entry.stable_id)
+	require(ids.count(&"library:cloud_trace") == 1
+			and ids.find(&"library:volumetric_cloud") < ids.find(&"library:height_fog")
+			and ids.find(&"library:height_fog") < ids.find(&"library:cloud_trace")
+			and not renderer._deleted_library_ids.has("library:cloud_trace"),
+			"missing cloud trace must be restored once in dependency order")
+	history.undo.undo()
+	require(renderer.passes == remaining and renderer._deleted_library_ids.has("library:cloud_trace"),
+			"undo must restore a deliberately removed pass and its tombstone")
+	history.undo.free()
+
+	var previous_method: Variant = ProjectSettings.get_setting("rendering/renderer/rendering_method")
+	var previous_pipeline: Variant = ProjectSettings.get_setting("rendering/renderer/compositor", "")
+	ProjectSettings.set_setting("rendering/renderer/rendering_method", "frp")
+	ProjectSettings.set_setting("rendering/renderer/compositor", "")
+	var scene_root := Node3D.new()
+	var environment := WorldEnvironment.new()
+	var created: Array[Node] = [environment]
+	var setup := PipelineSetup.prepare(scene_root, created, [&"sky_atmosphere", &"volumetric_cloud", &"height_fog"])
+	require(created == [environment] and setup.bindings.size() == 1,
+			"a new environment without a project pipeline must receive a scene-owned pipeline")
+	history = History.new()
+	history.undo.create_action("Bind environment pipeline")
+	PipelineSetup.record(history, setup)
+	history.undo.commit_action()
+	require(environment.compositor != null, "new-scene rendering dependencies must actually bind")
+	history.undo.undo()
+	require(environment.compositor == null, "undo must restore the previous compositor")
+	history.undo.free()
+	environment.free()
+	scene_root.free()
+	ProjectSettings.set_setting("rendering/renderer/rendering_method", previous_method)
+	ProjectSettings.set_setting("rendering/renderer/compositor", previous_pipeline)
+
 func run() -> void:
 	print("Environment Mixer test context: Engine.is_editor_hint=%s" % Engine.is_editor_hint())
 	var service = ServiceScript.new()
@@ -450,6 +546,7 @@ func run() -> void:
 	require(not actual_ids.has(&"magic_gi") and not actual_ids.has(&"rtgi")
 			and not actual_ids.has(&"reflect_probe"), "GI and reflection actors must stay outside the environment mixer")
 	_test_minimal_property_names()
+	_test_environment_pipeline_dependencies()
 	_test_directional_shadow_defaults_and_roundtrip()
 	_test_frp_shadow_resolution_setting_storage()
 	_test_directional_shadow_mixer_controls()

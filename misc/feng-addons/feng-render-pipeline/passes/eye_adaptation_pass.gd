@@ -21,7 +21,7 @@ const INTERNAL_METERING_CAMERA_MANUAL := 4
 ## The latter fields are EV100; with UE's default lens attenuation 0.78,
 ## EV100ToLuminance is exactly exp2(EV100).
 @export_group("Eye Adaptation")
-@export var extend_default_luminance_range := false:
+@export var extend_default_luminance_range := true:
 	set(value):
 		extend_default_luminance_range = value
 		emit_changed()

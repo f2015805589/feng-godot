@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 EDITOR = ROOT / "bin/godot.windows.editor.x86_64.exe"
 SOURCE = ROOT / "misc/feng-addons"
 ADDONS = sorted(p.name for p in SOURCE.iterdir() if (p / "plugin.cfg").is_file())
+COMPONENTS = sorted(p.name for p in SOURCE.iterdir() if (p / "addon.cfg").is_file() and p.name not in ADDONS)
+MOUNTS = sorted(ADDONS + COMPONENTS)
 FIXTURES = Path(tempfile.mkdtemp(prefix="feng-addons-test-", dir=ROOT / "bin"))
 TEST_ENV = dict(os.environ, APPDATA=str(FIXTURES / "config"), LOCALAPPDATA=str(FIXTURES / "cache"))
 (FIXTURES / "config").mkdir()
@@ -51,7 +53,7 @@ def start(path, recovery=False):
     return (path / "project.godot").read_text(encoding="utf-8")
 
 
-def check_links(path, names=ADDONS):
+def check_links(path, names=MOUNTS):
     for name in names:
         assert os.path.samefile(path / "addons" / name, SOURCE / name), name
 
@@ -74,7 +76,11 @@ settings = start(fresh)
 check_links(fresh)
 for name in ADDONS:
     assert f"res://addons/{name}/plugin.cfg" in settings
+assert "feng-olv" in COMPONENTS
+for name in COMPONENTS:
+    assert f"res://addons/{name}/plugin.cfg" not in settings
 print("PASS: new project links all addons, including Unicode and shell characters")
+print("PASS: runtime components are linked without registering extra editor plugins")
 
 write_settings(fresh, [])
 settings = start(fresh)
@@ -96,7 +102,7 @@ local_copy.mkdir(parents=True)
 start(conflict)
 assert (local_copy / "local.txt").read_text(encoding="utf-8") == "keep this"
 assert not os.path.samefile(local_copy, SOURCE / ADDONS[0])
-check_links(conflict, ADDONS[1:])
+check_links(conflict, ADDONS[1:] + COMPONENTS)
 print("PASS: conflicting local copies are not overwritten")
 
 recovery = project("recovery")

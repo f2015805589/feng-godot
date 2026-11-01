@@ -42,7 +42,7 @@ call :prepare_dependencies || exit /b 1
 call :normalize_editor_integrity || exit /b 1
 
 echo.
-echo [1/4] Building Windows x86_64 editor with D3D12 and AccessKit...
+echo [1/5] Building Windows x86_64 editor with D3D12 and AccessKit...
 if defined AGILITY_ARG (
     call %PYTHON_CMD% -m SCons platform=windows target=editor arch=x86_64 dev_build=no d3d12=yes accesskit=yes -j%JOBS% "%MESA_ARG%" "%ACCESSKIT_ARG%" "%AGILITY_ARG%"
 ) else (
@@ -56,7 +56,7 @@ if not exist "%REPO_ROOT%\bin\godot.windows.editor.x86_64.exe" (
 call :normalize_editor_integrity || exit /b 1
 
 echo.
-echo [2/4] Building Terrain3D native debug addon...
+echo [2/5] Building Terrain3D native debug addon...
 call %PYTHON_CMD% -m SCons -C "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\native" platform=windows target=template_debug arch=x86_64 -j%JOBS%
 if errorlevel 1 exit /b 1
 if not exist "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\bin\libfeng-idweight-terrain.windows.debug.x86_64.dll" (
@@ -65,7 +65,7 @@ if not exist "%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\bin\libfeng-idw
 )
 
 echo.
-echo [3/4] Building RenderDoc capture native debug addon...
+echo [3/5] Building RenderDoc capture native debug addon...
 rem Terrain3D already built the same shared godot-cpp debug library.
 call %PYTHON_CMD% -m SCons -C "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\native" platform=windows target=template_debug arch=x86_64 build_library=no -j%JOBS%
 if errorlevel 1 exit /b 1
@@ -75,7 +75,7 @@ if not exist "%REPO_ROOT%\misc\feng-addons\feng-renderdoc-capture\bin\libfeng-re
 )
 
 echo.
-echo [4/4] Building NRD native addon...
+echo [4/5] Building NRD native addon...
 set "GODOT_CPP=%REPO_ROOT%\misc\feng-addons\feng-idweight-terrain\native\godot-cpp"
 set "NRD_NATIVE=%REPO_ROOT%\misc\feng-addons\feng-raytracing\native"
 call %PYTHON_CMD% -m SCons -C "%GODOT_CPP%" platform=windows target=template_release arch=x86_64 -j%JOBS%
@@ -90,9 +90,15 @@ if not exist "%NRD_NATIVE%\..\bin\feng_nrd.dll" (
 )
 
 echo.
+echo [5/5] Building Box3D physics backend...
+call %PYTHON_CMD% "%REPO_ROOT%\misc\feng-addons\box3d\native\build.py" --jobs %JOBS%
+if errorlevel 1 exit /b 1
+
+echo.
 echo [DONE] Editor: %REPO_ROOT%\bin\godot.windows.editor.x86_64.exe
 echo [DONE] Native debug DLLs: misc\feng-addons\feng-idweight-terrain\bin and misc\feng-addons\feng-renderdoc-capture\bin
 echo [DONE] NRD: %NRD_NATIVE%\..\bin\feng_nrd.dll
+echo [DONE] Box3D: misc\feng-addons\box3d\bin\box3d.dll
 echo [INFO] GDScript addons use their source files directly. Restart open editors to reload rebuilt DLLs.
 exit /b 0
 

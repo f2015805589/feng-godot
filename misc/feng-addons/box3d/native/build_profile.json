@@ -1,0 +1,17 @@
+{
+  "enabled_classes": [
+    "PhysicsServer3DExtension",
+    "PhysicsServer3DManager",
+    "PhysicsServer3DRenderingServerHandler",
+    "PhysicsDirectBodyState3DExtension",
+    "PhysicsDirectSpaceState3DExtension",
+    "ProjectSettings",
+    "OS",
+    "Engine",
+    "PhysicsServer3DExtensionMotionCollision",
+    "PhysicsServer3DExtensionMotionResult",
+    "PhysicsServer3DExtensionRayResult",
+    "PhysicsServer3DExtensionShapeRestInfo",
+    "PhysicsServer3DExtensionShapeResult"
+  ]
+}

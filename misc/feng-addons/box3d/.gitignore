@@ -1,0 +1,5 @@
+/bin/
+/native/.build/
+/native/bin/
+/tests/.work/
+__pycache__/

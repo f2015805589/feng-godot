@@ -26,6 +26,7 @@ func _initialize() -> void:
 
 func run() -> void:
 	var implementation := ShadowPass.new()
+	require(implementation.native_id == 0, "Fresh Shadow Pass initializes its native execution ID")
 	var entry := BuiltinPass.new(0, "Shadow Precompute")
 	entry.implementation = implementation
 	entry.changed.connect(func(): changes += 1)

@@ -117,7 +117,13 @@ void setup_feng_addons() {
 	source->list_dir_begin();
 	for (String name = source->get_next(); !name.is_empty(); name = source->get_next()) {
 		const String plugin_source = source_dir.path_join(name);
-		if (!source->current_is_dir() || name.begins_with(".") || !FileAccess::exists(plugin_source.path_join("plugin.cfg"))) {
+		if (!source->current_is_dir() || name.begins_with(".")) {
+			continue;
+		}
+		const bool editor_plugin = FileAccess::exists(plugin_source.path_join("plugin.cfg"));
+		// Shared runtime components (for example MagicGI's OLV child) need a
+		// resource path too, but must not register a second EditorPlugin.
+		if (!editor_plugin && !FileAccess::exists(plugin_source.path_join("addon.cfg"))) {
 			continue;
 		}
 		const String addons_dir = project_dir.path_join("addons");
@@ -146,7 +152,7 @@ void setup_feng_addons() {
 			continue;
 		}
 		const String config = "res://addons/" + name + "/plugin.cfg";
-		if (!migrating && !enabled.has(config)) {
+		if (editor_plugin && !migrating && !enabled.has(config)) {
 			enabled.push_back(config);
 			changed = true;
 		}

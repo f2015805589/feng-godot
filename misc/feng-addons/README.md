@@ -1,7 +1,7 @@
 # Source addons
 
 Run the source-built editor from this checkout's `bin/` directory. Before the
-project resource scan, it links each addon directory containing `plugin.cfg`
+project resource scan, it links each addon directory containing `plugin.cfg` or `addon.cfg`
 into the project's `addons/`: directory junctions on Windows, symbolic links on
 other platforms. Windows junctions use the Windows API and need no administrator
 rights or setup script.
@@ -19,6 +19,7 @@ rights or setup script.
 | Magic GI | Surface placement, PRT baking, emitter response and lighting snapshots | FRP consumer; optional SkyLight and terrain geometry |
 | Lightmap MC | CPU surface lightmap collection, baking and display | Native Monte Carlo backend; independent of Magic GI |
 | IDWeight Terrain | Terrain data, VT residency/production and editor tools | Native terrain extension and engine VT hooks |
+| Box3D | Optional 3D physics backend using standard Godot physics nodes | GDExtension PhysicsServer3D; no engine source patch |
 | RenderDoc Capture | Editor frame capture and analyzer launch | Native capture integration |
 | GodotTracy | Profiler setup and launch | Optional engine Tracy singleton |
 
@@ -31,7 +32,9 @@ than adding branches to scheduling or Volume evaluation. See the
 
 New and existing projects receive missing addons. Newly linked plugins are
 added to the enabled-plugin list; later launches preserve enabled/disabled
-choices. Recovery mode skips link creation.
+choices. `addon.cfg` marks a shared runtime component, such as `feng-olv`: it is
+linked without adding an editor plugin. OLV's editor integration belongs to MagicGI.
+Recovery mode skips link creation.
 
 Existing directories and links to other locations are preserved with a warning.
 To replace a conflicting local copy, first save any local changes, then remove
@@ -45,7 +48,7 @@ of runtime addons and native libraries for the destination platform.
 ## Native builds
 
 On Windows, `build-feng-godot.bat` in the repository root builds the x86_64 D3D12
-editor, both native debug extensions, and the NRD extension. Install Python 3.9+
+editor, both native debug extensions, the NRD extension, and Box3D. Install Python 3.9+
 and Visual Studio with the Desktop development with C++ workload,
 a Windows SDK 10.0.22621.0 or newer, and C++ CMake tools (CMake 3.30+).
 The script refreshes PATH, uses SCons from the selected Python (installing it if
@@ -61,6 +64,7 @@ To build the extensions separately:
 scons -C misc/feng-addons/feng-idweight-terrain/native platform=windows target=template_debug arch=x86_64
 scons -C misc/feng-addons/feng-renderdoc-capture/native platform=windows target=template_debug arch=x86_64
 scons -C misc/feng-addons/feng-lightmap-mc/native platform=windows target=template_debug arch=x86_64
+python misc/feng-addons/box3d/native/build.py
 ```
 
 Build Lightmap MC separately when using its CPU baker. On Linux, use
@@ -68,6 +72,11 @@ Build Lightmap MC separately when using its CPU baker. On Linux, use
 library before rebuilding, then restart to load it.
 `native/.gdignore` keeps compiler sources out of the resource scan. Release
 exports also need `target=template_release` libraries for their target platform.
+
+Box3D builds one optimized library for both editor and exported games. Enable it
+per project by selecting `Box3D Physics` under **Physics → 3D → Physics Engine**,
+then restart the editor. Installing/enabling the addon does not change a project's
+physics backend automatically. See [Box3D](box3d/README.md) for compatibility limits.
 
 ## Verification
 

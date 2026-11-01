@@ -153,7 +153,7 @@ FXAA 使用独立源颜色副本读取邻域；Blur 和 Bloom-lite 的缩放输�
 
 ### 曝光与 Bloom
 
-Eye Adaptation 的 `extend_default_luminance_range` 选择传统亮度或 EV100 范围；
+Eye Adaptation 的 `extend_default_luminance_range` 默认开启，使用 EV100 范围；关闭后使用传统亮度范围。
 `pre_exposure` 使用上一帧完成的曝光值编码场景 HDR 颜色。补偿 CurveTexture 的 X 轴
 0–1 对应 -10–20 EV100。启用项目物理光照单位时，FRP 点光、聚光与矩形光使用其 UE 式单位换算。
 

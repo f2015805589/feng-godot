@@ -2228,6 +2228,9 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		Engine::get_singleton()->set_editor_hint(true);
 		Engine::get_singleton()->set_extension_reloading_enabled(true);
 
+		// A new project has no user-data directory yet. The startup lock is
+		// written before the common runtime directory setup below.
+		OS::get_singleton()->ensure_user_data_dir();
 		// Create initialization lock file to detect crashes during startup.
 		OS::get_singleton()->create_lock_file();
 
