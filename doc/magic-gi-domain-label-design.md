@@ -1,483 +1,446 @@
-# Magic GI 域标签（OLV-like）技术设计与分阶段实施
+# Magic GI OLV-like 一键漏光修正：可执行实施计划
 
-**Evidence scope:** 本文只按**文章自报**转述公开文章给出的 OLV 名称与用途（**本文未独立验证其实现**）；腾讯的网络结构、训练流程、编辑器 UI 均未公开，本文不作任何推测性复刻。本文是一份 **OLV-like 自研设计**，不是与腾讯 OLV 的兼容承诺，也不声称与其实现等价或可比。本文所述功能 **当前未实现、未训练、未跑测试**：文内所有 `[现有]` 标记的事实来自本次只读代码核查（引用给到 `path:line`，默认相对仓库根；显式标注为**仓外**的绝对路径除外），所有 `[提议]` 标记的内容均为设计建议，均未在引擎中验证，不构成性能、精度或资源承诺。参考文章中出现的任何量化指标均为文章自报，本文未独立核实其账号官方性，也未复现，故不作为本文任何决策依据。
+> **状态：待执行；本次仅修订计划，不代表功能已经实现。**
+>
+> **代码基线：** `c75f67546bfd8bba2fac4964c51eddbbf046d45d`（2026-10-26 核查）。
+>
+> **最终目标：**模型训练完成后，在 `FMagicGIVolume` 上按一次“AI 漏光修正（OLV）”，完成校验、室内外域推理、标签应用、缓存刷新，并支持 A/B 与撤销。
+>
+> **证据边界：**用户提供的 MagicDawn 原文 3.1–3.4 将 OLV 描述为“基于神经网络优化 Probe 可见性标签，自动划分室内/外区域”。本文据此确定问题形态，不推测其未公开的网络、接收者域映射或训练实现。原文中的修复率、耗时和包体指标均未在本项目复现，不作为本计划验收承诺。
 
 ---
 
-## 1. 背景
+## 0. 先澄清：OLV 不是 Probe 位置回归
 
-### 1.1 公开信息边界
+美术在 PRT/Probe GI 中处理漏光，可能做两类不同工作：
 
-- **文章称（文章自报，本文未独立验证其实现）**：OLV 面向 GI probe 的可见性标签，基于**神经网络优化**，并用于**自动划分室内/外区域**；它是更大 GI 方案（预计算传输 + 运行时重光照）的一部分。原文链接见 §14：<https://zhuanlan.zhihu.com/p/2020903414117201233>。
-- **仍未公开**：网络结构、输入特征、训练数据与训练流程、编辑器/标注 UI、以及任何代码。本文不据此推测其实现，也不把文章描述当作已验证事实。
-- 因此本文不自称 OLV 实现，只在**问题形态**上对齐：把"某个 GI 采样点属于哪个可见性域"变成可人工审核、可学习、可在烘焙前推理的显式数据。
+1. **调整采样位置或密度**：移动 Probe、设置安全偏移、局部加密，解决采样点落入几何、锚点不合理或采样不足。
+2. **标记可见性/可混合域**：用 Volume、Tag 或遮挡区区分室内外，避免插值把墙另一侧的结果混进来。
 
-### 1.2 本项目现状（`[现有]`）
+本计划中的 **OLV 主路线自动化的是第二类**，网络输出是可见性域标签，不是 Probe 坐标。移动 Probe 有时确实能减少漏光，但不能单独保证解决硬件三线性造成的跨域混合；反之，位置完全合理的 Probe 也仍可能需要可见性标签。
 
-- 引擎为本仓库分支 Godot 4.7.3-rc（`version.py:3-6`），渲染侧由自研 FRP 插件承载；Magic GI 的职责与集成边界见 `misc/feng-addons/README.md:19`、`misc/feng-addons/README.md:24-27`。
-- 默认运行时是 **backend 1 = "MagicDawn CLV Block PRT (dynamic)"**，`clv_cache_backend` 默认 1、`use_clv` 默认 true、`clv_cell_size` 默认 0.25 m（`misc/feng-addons/feng-magic-gi/feng_magic_gi_volume.gd:201`、`:210`、`:220`）。
-- 该 backend 的驻留缓存是 **layout 5** 的预插值线性算子（`misc/feng-addons/feng-render-pipeline/passes/magic_gi_preinterpolated_volume_cache.gd:3-6`），项目自述其架构参考腾讯公开的 CLV PRT 流程、但不宣称与其私有代码或 SH2 资源兼容（`misc/feng-addons/feng-magic-gi/README.md:82`、`misc/feng-addons/feng-render-pipeline/README.md:113`）。
-- 项目自测记录（**项目自报，非本文承诺**）见 `misc/feng-addons/feng-magic-gi/README.md:88`。
+### 0.1 按根因选择路线
 
-### 1.3 要解决的问题
+| 主要根因/场景 | 应采用路线 | 是否属于本 OLV v1 |
+| --- | --- | --- |
+| Probe 落入实体、安全偏移不合理、局部采样不足 | 几何约束的 placement / relocation / adaptive density | 否；保留为独立位置优化路线 |
+| 开放世界或建筑室内外分界明显，跨室内外插值漏光 | **OLV 室内外可见性标签 + 插值前门控** | **是，主线** |
+| 多个室内房间互相漏光；所有房间都可能同为 `INTERIOR` | **Depth / 混合可见性方案** | 否；不得用室内外二分类冒充已解决 |
+| 错误 TransferMatrix、错误材质/几何、SH 截断、动态门 | 修复对应数据或重新 Bake | 否 |
+| 已经把多个角点混合后的最终颜色 | post-filter 无法可靠“解混” | 必须改插值前流程 |
 
-layout 5 的接收者按硬件三线性在自由空间 cell 上混合，混色发生在任何按域判断之前。如果相邻 cell 属于不同可见性域（门洞、薄墙、曲面窄缝、非封闭网格），混入的能量在采样之后无法"解混"。本文要定义的是：**在混合之前**知道每个采样点/每个 cell 的域归属，并让该归属可被人工审核、可训练、可复现、可验收。
+用户提供的原文也把 OLV 的适用场景限定为“开放世界、室内室外分界明显”，并指出传统标注/Tag 难以处理多个室内房间，把 Depth 作为另一套方案。因此本计划**收窄此前 region/portal 扩展，不再把它当作 OLV v1 的默认交付**。
+
+### 0.2 推荐执行顺序
+
+```text
+P0 冻结 OLV 标签与渲染契约
+  → P1 无 AI 的 layout 7/8 插值前垂直切片
+  → P2 无 AI 的室内外真实场景端到端闭环
+  → P3 数据集、标签训练与编辑器推理
+  → P4 一键 AI 漏光修正（OLV）
+  → P5 未见场景、性能与发布验收
+```
+
+数据场景准备和人工标注可与 P2 并行；**不要在 P1 之前把主要成本投入模型训练**。位置优化与 Depth 可独立评估，但不阻塞边界清晰的 OLV v1。
+
+### 0.3 已确定的实施决策
+
+| 决策项 | 本计划采用的方向 | 原因 |
+| --- | --- | --- |
+| 网络输出 | `EXTERIOR / INTERIOR / AMBIGUOUS` 标签与独立弃权信号 | 对齐 OLV 的可见性标签问题；不是坐标输出 |
+| 首要学习对象 | `clv_cell` | 当前默认 prepared 路径实际插值的是自由空间 cell |
+| 首要渲染目标 | 新 Bake 默认优先 **layout 7**；**layout 8** 做兼容回归 | 当前 prepared SH2 使用这两个布局，不再是旧 layout 5 |
+| 渲染接入点 | **插值前**逐角裁决 | 硬件混合后的 post-filter 无法恢复各角点贡献 |
+| 训练位置 | 离线 Python/PyTorch | 编辑器按钮不现场训练 |
+| 推理位置 | Godot 编辑器内、按按钮批量执行 | 本自研 v1 不在每帧像素阶段运行神经网络 |
+| 运行时动态适配 | 根据 shading point 查询已固化的标签/接收者域；未知时回退 | 支持移动时的域选择，但不猜测腾讯的运行时实现 |
+| v1 模型 | 固定局部几何特征 + 小 MLP；暂不使用 Transformer | 部署和数值一致性验证最简单 |
+| 运行时输入 | 独立、版本化、带哈希的标签 payload | 不直接读取审核 JSONL；不复用 `validity` 冒充 domain |
+| 低置信/未知接收者域 | `ABSTAIN`，保持旧路径 | 不把缺失标签强行当成室内或室外 |
+| AI 自动应用与 gold | 分离 | 一键应用不阻塞产品流程；只有人工复核样本进入高可信训练集 |
+| 发布策略 | 独立开关，先默认关闭，验收后按 Volume 开放 | 保证旧资源与旧画面可回归 |
+
+---
+
+## 1. 当前代码事实与方案差距
+
+### 1.1 当前生产路径
+
+| 事实 | 代码证据 | 对计划的影响 |
+| --- | --- | --- |
+| Volume 默认 `use_clv=true`、backend 1、0.25 m | [feng_magic_gi_volume.gd:201–227](../misc/feng-addons/feng-magic-gi/feng_magic_gi_volume.gd#L201-L227) | 目标是 MagicDawn prepared CLV，不是旧 surface Probe 查询 |
+| 新 backend-1 Bake 走 free-space source，并发布 prepared manifest | [feng_magic_gi_volume.gd:863–879](../misc/feng-addons/feng-magic-gi/feng_magic_gi_volume.gd#L863-L879)、[feng_magic_gi_volume.gd:930–1018](../misc/feng-addons/feng-magic-gi/feng_magic_gi_volume.gd#L930-L1018) | 新默认链路优先按分页 layout 7 验证 |
+| 整块 prepared cache 是 layout 8、schema 2、4 个响应字段 | [magic_gi_preinterpolated_volume_cache.gd:6–22](../misc/feng-addons/feng-render-pipeline/passes/magic_gi_preinterpolated_volume_cache.gd#L6-L22)、[magic_gi_preinterpolated_volume_cache.gd:64–99](../misc/feng-addons/feng-render-pipeline/passes/magic_gi_preinterpolated_volume_cache.gd#L64-L99) | layout 8 需要上传与采样回归 |
+| 分页 prepared cache 是 layout 7、schema 2、4 个响应字段 | [magic_gi_paged_prepared_volume_cache.gd:1–8](../misc/feng-addons/feng-render-pipeline/passes/magic_gi_paged_prepared_volume_cache.gd#L1-L8)、[magic_gi_paged_prepared_volume_cache.gd:27–76](../misc/feng-addons/feng-render-pipeline/passes/magic_gi_paged_prepared_volume_cache.gd#L27-L76) | 分页 resident、halo 和滚动上传是必测项 |
+| 当前 sampler 只接受 7/8，每 LOD 读取 4 个硬件三线性字段，并处理相邻 LOD 混合 | [magic_gi_dynamic_volume_sample.glslinc:323–401](../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_sample.glslinc#L323-L401) | OLV 标签必须作用于这四个字段的角点来源 |
+| SH2 解码使用 filtered coverage 归一化 | [magic_gi_sh4_tensor.glslinc:34–55](../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh4_tensor.glslinc#L34-L55) | 删角后必须分别定义传输归一化与 support/coverage |
+| prepared `validity` 只表示支持/有效算子；校验只接受 0/1 | [feng_magic_gi_clv_transfer_builder.gd:194–230](../misc/feng-addons/feng-magic-gi/feng_magic_gi_clv_transfer_builder.gd#L194-L230)、[feng_magic_gi_prepared_transfer_brick.gd:114–128](../misc/feng-addons/feng-magic-gi/feng_magic_gi_prepared_transfer_brick.gd#L114-L128) | OLV domain 使用独立数据；缺标签不得把有效 cell 变成 invalid |
+| free-space source 已有受限安全 relocation；状态 2 保存实际偏移 | [feng_magic_gi_volume_source_baker.gd:430–474](../misc/feng-addons/feng-magic-gi/feng_magic_gi_volume_source_baker.gd#L430-L474)、[feng_magic_gi_volume_source_chunk.gd:39–56](../misc/feng-addons/feng-magic-gi/feng_magic_gi_volume_source_chunk.gd#L39-L56) | 位置修正已有基础，但它不是 OLV 标签，也不是任意移动运行时 cell |
+| source 的 Transfer/距离矩从实际 relocation 后的位置积分 | [feng_magic_gi_volume_source_baker.gd:481–529](../misc/feng-addons/feng-magic-gi/feng_magic_gi_volume_source_baker.gd#L481-L529)、[feng_magic_gi_volume_source_chunk.gd:63–71](../misc/feng-addons/feng-magic-gi/feng_magic_gi_volume_source_chunk.gd#L63-L71) | 改变位置后不能只改坐标；必须维护或重算相关传输数据 |
+| layout 7 按全局 `level:x:y:z` 合并 resident 样本与 halo | [magic_gi_paged_prepared_volume_cache.gd:118–174](../misc/feng-addons/feng-render-pipeline/passes/magic_gi_paged_prepared_volume_cache.gd#L118-L174) | 标签身份使用 LOD + 全局格坐标，不能用 brick-local index |
+| 原生采样绑定没有 OLV domain/receiver-domain 数据 | [render_frp_clustered.cpp:5818–5858](../servers/rendering/renderer_rd/frp_clustered/render_frp_clustered.cpp#L5818-L5858) | 需要新增显式 ABI、上传和生命周期 |
+
+### 1.2 位置、OLV 与 Depth 在当前项目中的边界
+
+- 现有 relocation 是 **Bake 期 source 采样点安全偏移**，不是神经网络位置优化，也不是室内外标签。
+- 当前 prepared cell 是 cell-aligned 的几何约束线性算子；随意移动运行时 cell 会破坏布局与算子语义，不属于 OLV v1。
+- source 中保存距离矩不等于默认 prepared 像素路径已经执行 Depth 防漏光；OLV 与 Depth 的上传、绑定和采样应分别验证。
+- legacy/gather 的候选过滤可以作为数学参考，但不是默认 prepared 的后处理；仅在 gather 中接入标签不能宣称修复当前默认路径。
+
+### 1.3 当前没有交付的 OLV 部分
+
+以下均是**待实现**：
+
+- `domain_class` 标签、接收者域映射及其版本化资源；
+- 标签审核、自动应用批次、训练集导出与哈希失效；
+- 训练脚本、模型权重、模型登记、编辑器 MLP 推理；
+- layout 7/8 的插值前门控、原生绑定和完整回归；
+- “AI 漏光修正（OLV）”按钮、A/B、撤销和验收数据。
+
+多房间 Depth/混合方案与神经网络位置优化不是 OLV v1 的隐含交付，见 §6。
 
 ---
 
 ## 2. 目标与非目标
 
-### 2.1 目标（分阶段）
+### 2.1 OLV v1 产品目标
 
-1. 把"域标签"定义成显式、可解释、可序列化的数据契约。
-2. 在编辑器内形成闭环：几何分析 → 标签建议 → overlay 审核 → 人工批准 → 导出数据集。
-3. 用离线训练得到小模型，在编辑器内做轻量推理，产出可被审核的标签建议。
-4. 在渲染侧以**可开关、可回归**的方式验证标签接入不会引入跨域混合。
+针对**静态几何、有效 PRT Bake、室内外分界较明确、可信标签与接收者域**条件下的跨室内外 CLV 插值漏光：
 
-### 2.2 非目标 / v0 硬边界
+1. 用可审核、可学习的数据描述 cell 与接收者的室内外可见性域。
+2. 在编辑器内一键推理并应用可信标签，不改变 Probe/Cell 坐标。
+3. 在 prepared CLV 插值前按域裁决角点，并明确 support、coverage 和 LOD 语义。
+4. 保留实时方向光、天空和已支持发光源的 relight 能力。
+5. 旧路径始终可回退；修正结果可比较、可撤销、可复现。
 
-- **不移动、不新增、不删除任何 Probe**。标签只描述既有采样点；纠标签不等于移动 Probe，也不等于直接修改 GI 结果。
-- **v0/v1 不训练 Transformer**（进入条件见 §8.3）。
-- **不直接修改 layout 5 热路径**。v0 的渲染正确性实验在 legacy/gather 车道完成（§10.1）；layout 5 的插值前方案只做可行性比较（§10.2）。
-- **不支持动态几何**。动态几何仍需重新烘焙；本文先验证静态烘焙 + 标签纠偏（`misc/feng-addons/feng-magic-gi/README.md:114` 记录了现有静态遮挡语义）。
-- 编辑器里的"点按钮"是**几何分析 / 模型推理**，不是现场训练；训练始终离线进行。
+### 2.2 OLV v1 非目标
 
----
-
-## 3. 术语
-
-| 术语 | 含义 | 备注 |
-| --- | --- | --- |
-| domain_class | 采样点的可见性域类别（§6.1） | 主任务输出 |
-| abstain | 推理侧的弃权/置信信号（§6.1） | **不是** `domain_class` 取值 |
-| subject | 带标签的对象：surface Probe 或 layout 5 自由空间 cell | 由 `subject_kind` 区分 |
-| surface Probe | 表面锚定的 PRT 采样点，含位置/法线/安全偏移 | 现有语义，见工程 README |
-| CLV cell | layout 5 的 0.25 m 自由空间格点 | 与 surface Probe **非同一种对象** |
-| teacher | 由几何规则或已有算法产出的标签（silver） | 可批量、可信度有限 |
-| pseudo | 未审核的模型预测 | 必须隔离，不得进入 gold |
-| gold | 人工批准（或人工修正）后的标签 | 唯一高可信真值 |
-| sidecar | 与 bake 资源分离的审核/训练元数据文件 | 不覆盖 bake 产物 |
+- 不承诺消除所有漏光，特别是不承诺解决多个室内房间的互相漏光。
+- 不回归 Probe 位置、密度或安全偏移，不修复错误布点或错误 TransferMatrix。
+- 不把现有 source relocation 改写成 OLV，也不随意移动 prepared runtime cell。
+- 不恢复 SH2 已丢弃的 L2 方向细节，不增加镜面传输。
+- 不支持动态门、动态几何或透明表面语义；变化后按现有规则重新 Bake/分析。
+- 不在游戏运行时训练或执行神经网络；运行时只做轻量数据查询与渲染门控。
+- 不把 gather-only 实验当作 layout 7/8 修复证据。
+- 不采用原文自报的 99%、0.1 ms 或总包体 `Probe 数 × 1 byte` 作为本项目未经验收的承诺。
 
 ---
 
-## 4. 当前架构证据（`[现有]`）
+## 3. 最终“一键”产品契约
 
-### 4.1 默认车道：layout 5 prepared 算子
+### 3.1 按钮前置条件
 
-- 常量与驻留：`PREPARED_LAYOUT := 5`、`_prepared_validity`（每 cell 1 byte）、`_prepared_validity = source.clv_prepared_validity`、驻留筛选 `if _prepared_validity[source_index] == 0: continue`
-  —— `misc/feng-addons/feng-render-pipeline/passes/magic_gi_preinterpolated_volume_cache.gd:6`、`:16`、`:76`、`:179`。
-- 重光照管线创建：`misc/feng-addons/feng-render-pipeline/passes/magic_gi_preinterpolated_volume_cache.gd:126`；shader 源 `:8-9`。
-- 运行时采样入口 `frp_magic_gi_dynamic_volume_sample()` 按 `dimensions_version.w == 5` 分派到 prepared 分支
-  —— `misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_sample.glslinc:361`、`:375-397`（`dimensions.w == 5` 判定见 `:378`）。
-- prepared 采样体 `frp_magic_gi_preinterpolated_sample_lod()`：**布局守卫** `:330`（`origin.w`、`layout_info.y == 7`、`dimensions.w == 5`）；**网格范围检查** `:332-334`；**7 次硬件三线性取值** `:339-354`；SH9 解码 + `coverage > 0.5` 返回 `:355-358`；相邻 LOD 混合 `:385-393`（**未定义**"全拒"路径，见 §10.2）。
-- 结论：该路径**没有**逐 cell 有效性读取、没有距离矩、没有 BVH、没有逐角过滤。这与 `misc/feng-addons/feng-magic-gi/README.md:84`（"没有逐像素邻居循环、距离矩筛选、BVH"）一致。
+按钮位于当前 Volume 的 Inspector；现有入口可复用 [magic_gi_inspector_plugin.gd:12–48](../misc/feng-addons/feng-magic-gi/editor/magic_gi_inspector_plugin.gd#L12-L48)，直接绑定被检查的 Volume，不查找场景中的“第一个 Volume”。
 
-### 4.2 legacy / gather 车道
+点击后先检查：
 
-- 候选级可见性与累加：`misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_gather.glslinc:459-460`、`:534`——每个候选先算可见性，再进入加权累加；被拒候选不参与归一化（语义描述见 `misc/feng-addons/feng-magic-gi/README.md:112`）。
-- probe 可见性函数（Chebyshev 距离矩，且三次方收紧）：`misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_probe_visibility.glslinc:87-101`、`:103-111`；CPU 侧同构实现 `misc/feng-addons/feng-magic-gi/feng_magic_gi_data.gd:1090-1108`（`:1104` 注释即"reduce the remaining light leak"）。
-- 该头文件的 include 归属（用于判定"不属于 layout 5"）：`library/magic-gi/magic_gi_apply.glsl:18`、`magic_gi_apply_compact.glsl:21`、`magic_gi_clv_probe_block_field_fill.glsl:34`、`magic_gi_baked_sh_clv_probe_block_field_fill.glsl:11`。
+- 场景已保存；scene identity 与 Volume scene-relative path 可稳定重建。现有身份辅助见 [feng_magic_gi_scene_tracker.gd:19–45](../misc/feng-addons/feng-magic-gi/feng_magic_gi_scene_tracker.gd#L19-L45)。
+- 当前为受支持的 PRT prepared 路径，存在有效 Bake；Surfel 模式不显示或禁用此按钮。
+- 模型、`subject_kind`、特征 schema、标签 schema 与 OLV 室内外任务匹配。
+- geometry、cell layout、影响标签的 bake config 哈希匹配。
+- cell 标签与接收者域映射可用；仅模型置信度高但接收者域未知时仍不得自动修正。
 
-### 4.3 稠密车道的逐角先例（说明"逐角过滤"在本仓库如何实现）
+任一条件失败：不修改现有 Bake/runtime payload，明确显示原因，不显示“修正成功”。
 
-- 逐 8 角循环并跳过 `frp_magic_gi_dynamic_validity.values[cell_index] == 0u`：`magic_gi_dynamic_volume_sample.glslinc:193-216`（`:209`）与 `:270-311`（`:282`），后者还含接收者半球 sidedness 判定 `:299-302`。
-- 距离矩可见性：`magic_gi_dynamic_volume_sample.glslinc:167-175`、`:177-191`，调用点 `:304-307`。
-- 这两段属于**稠密车道**（`magic_gi_dynamic_volume_cache.gd:11` 的 `LAYOUT_VERSION := 4`），**不是** layout 5。
+### 3.2 一次按钮执行的事务
 
-### 4.4 相关开关的归属（不得混用）
-
-- `native_baked_sh_lighting_enabled`（`:291`）、`approximate_clv_volume_enabled`（`:310`）、`approximate_clv_ready_bit_enabled`（`:313`）、`exact_clv_corner_visibility_enabled`（`:316`）——`misc/feng-addons/feng-render-pipeline/passes/magic_gi_pass.gd:288-325`。
-- 后两者只在 layout 9 / layout 14 测试分支被消费：`magic_gi_pass.gd:6389-6405`，并会强制 full features（`:5947-5948`）与回退 legacy（`:7003-7033`）。
-- layout 9 缓存常量：`misc/feng-addons/feng-render-pipeline/passes/magic_gi_clv_cache.gd:16`；layout 17 baked-SH：`misc/feng-addons/feng-render-pipeline/passes/magic_gi_baked_sh_clv_cache.gd:8`。
-- 因此：**v0 标签实验不得借用 exact/approx 开关**，必须新增独立开关（§10.1）。
-
-### 4.5 bake 端每 cell 字节链（`[现有]`，是标签最自然的挂点）
-
-`misc/feng-addons/feng-magic-gi/feng_magic_gi_clv_transfer_builder.gd`
-
-- `:19` `var _validity := PackedByteArray()`、`:58-59` 分配清零、`:192` `_validity[destination] = 1`、`:84` `_source.clv_prepared_validity = _validity`、`:134` 返回 `{"operators", "validity", "stats"}`。
-- 域判定复用点：`:195-231` `_add_constraint()`，其中 `:201`、`:219` 调用 `_geometry.point_is_inside_or_ambiguous_solid()`；`:200-205` 注释明确"用外部探针顶替会重新引入墙角漏光"。
-- 采样邻域：`:233` `_gather()`、`:245` 法线朝向过滤。
-
-序列化 / 归档 / 资源侧
-
-- `misc/feng-addons/feng-magic-gi/feng_magic_gi_prepared_transfer_brick.gd:21`（`@export_storage var validity := PackedByteArray()`）、`:64`（字节统计）、`:106`（`if validity[cell] > 1: return false` —— 当前只允许 0/1，扩展语义必须放宽此处）、`:111`。
-- `misc/feng-addons/feng-magic-gi/feng_magic_gi_prepared_brick_archive.gd:38`、`:59-66`。
-- `misc/feng-addons/feng-magic-gi/feng_magic_gi_volume_source_chunk.gd:53`（`validity`）、`:78`（`clv_prepared_validity`）、`:95`、`:130-132`、`:178`（字节统计）、`:388`。
-- **关键约束**：prepared 车道的 GPU 上传只有算子数组——`feng_magic_gi_volume_source_chunk.gd:197-198`（`if has_preinterpolated_clv(): return clv_prepared_operators.size() * 4`）。故任何"运行时可读标签"都需要**新增**上传与绑定。
-- 分页：`misc/feng-addons/feng-magic-gi/feng_magic_gi_paged_source_baker.gd:116`、`:176`。
-- 边界张量（另一条 bake 端域/边界分类路径）：`misc/feng-addons/feng-magic-gi/feng_magic_gi_boundary_tensor_builder.gd:4-5`、`:13`（`closed_mesh_boundary_tensor_v1`）、`:16`（0.25）、`:367`（solid 节点无可信点采样）、`:1277`（窄缝）。
-
-### 4.6 surface Probe 与 layout 5 cell 的语义差异
-
-工程自述（**仓外路径**，仅作现状佐证）：PRT probe 保持表面锚定（位置 + 法线 + 安全偏移），而 CLV 是**另一套**三维自由空间格（最细 0.25 m），两者不是同一对象集合——`F:\godot\PROJECT\白光盒子测试场景\README.md:7`。本文不依赖该路径：M1/M4 使用的场景与 fixture 必须是仓内或由用户显式指定的工程（§11.1、§12）。因此：
-
-- `subject_kind=probe` 的标签服务表面采样与 legacy 车道；
-- `subject_kind=clv_cell` 的标签服务 layout 5；
-- **两者不得混在同一列训练数据里当同分布样本。**
-
-### 4.7 现有 vs 提议
-
-| 组件 | 状态 |
-| --- | --- |
-| layout 5 prepared 缓存 / 采样器 / LOD 混合 | `[现有]` |
-| `clv_prepared_validity` 字节链、brick 归档、分页 | `[现有]` |
-| gather 候选级可见性拒绝、Chebyshev 距离矩 | `[现有]` |
-| domain_class 标签语义、sidecar、审核状态机 | `[提议]` |
-| 编辑器 Analyze/Review/Approve/Export 入口 | `[提议]` |
-| 离线训练脚本、模型权重、编辑器推理 | `[提议]` |
-| layout 5 插值前标签过滤 | `[提议]`，未验证 |
-| 任何运行时代码改动 | 本文**不含** |
-
----
-
-## 5. 产品工作流
-
-### 5.1 主流程（`[提议]`）
-
-1. **布置 Probe / 烘焙配置**：沿用现有 Volume 设置（`use_clv`、`clv_cell_size`、`clv_cache_backend`，`feng_magic_gi_volume.gd:201,210,220`）。
-2. **几何分析**：在编辑器内对 scene 做静态几何分析，产出初始 `domain_class`（几何规则，见 §8.2 的 teacher）。
-3. **（后续）AI 建议**：v1 起可对几何分析结果叠加模型推理，输出预测 + 置信度/弃权。
-4. **overlay 可视化**：在编辑器中按域着色显示 probe / cell，标记 `UNSET` 与低置信。
-5. **人工接受 / 修改 / 拒绝**：逐项或批量，记录 reviewer 与时间戳。
-6. **复核**：第二人复核或同一人二次确认（状态机见 §7.4）。
-7. **保存已批准标签**：写入 sidecar，不覆盖 bake 资源。
-8. **导出训练集**：从 gold/silver/pseudo 分层导出（§11.1）。
-9. **离线训练**：Python/PyTorch 训练小模型并导出带版本权重（§9.1）。
-10. **导入模型到编辑器**：登记模型版本与特征 schema（§9.3）。
-11. **编辑器推理**：对当前 scene 建议标签，回到第 4 步进入审核。
-
-### 5.2 追加写与失效规则（`[提议]`）
-
-- **不可变追加**：`dataset.jsonl` 只追加不可变 revision 事件，字段含 `record_id`/`revision`/`supersedes`；任何"生效标签"的变更都产生新 revision，不原地改写旧记录。
-- **唯一生效指向**：`manifest.json` 显式记录每 `subject_id` + 哈希组的 `active_revision`，其值为 `record_id@revision`（§7.3）；**只指向 `review_state=approved` 的 revision**。冲突与重复由 manifest 唯一指向解决，**不靠文件尾部顺序或时间戳猜测**。Approve 产生新 revision；历史 gold 保留作审计，但其哈希组与当前不匹配时**不得**作为当前生效标签。
-- **二次复核与 gold**：沿用上面的 append-only revision，**不新增冲突状态**。`modified` 只是**待复核的工作/历史态**，**不得**置 `gold_flag`；必须在**再次渲染复核**后创建新的 `approved` revision 才可成为 gold，该 revision 记录 `review_round`、`render_evidence_ref` 与 `confirmed_by`/`confirmed_at`（复核人可与最终批准同人，**不要求双人**）。
-- **失效范围**（按来源区分，不搞一刀切）：
-  - `geometry` / `probe_layout` / **影响标签的** `bake_config` 哈希变化 → 当前审核 `stale`，需重审；
-  - `model_version` 变化 → 仅使 `ai_pred`/`pseudo` 失效，**不**使 human gold 失效；
-  - `teacher_version`（几何规则或既有算法版本）变化 → 仅使 silver 失效；
-  - `code_version`（读写该 sidecar 的代码版本）变化 → 不自动作废标签，但必须先重放/回归校验，通过后才改写 `active_revision`。
-
-### 5.3 几何边界情形（`[提议]`）
-
-- 非封闭网格、portal/门洞、薄墙、曲面窄缝：几何或审核语义**明确存在歧义**时标 `AMBIGUOUS`，不强行二分类。
-- 无生效标签或无法判定：`UNSET`，渲染侧回退**既有几何可见性**（§6.1、§6.3、§10），不得当作 `EXTERIOR`，也不得在像素阶段现场跑 NN。
-- 相关现成线索：`feng_magic_gi_boundary_tensor_builder.gd:16`（0.25 对齐）、`:367`、`:1277`；`feng_magic_gi_clv_transfer_builder.gd:200-205`。
-
----
-
-## 6. 标签契约
-
-### 6.1 主输出：`domain_class`（v0/v1）
-
-建议 `uint8` 编码，取值固定为：
-
-| 值 | 名称 | 含义 | 渲染含义 |
-| ---: | --- | --- | --- |
-| 0 | `UNSET` | **无生效标签**（未标注、未审核，或弃权后未采纳任何建议） | 回退既有几何可见性；不启用新域拒绝 |
-| 1 | `EXTERIOR` | 外部（可视为天空可见域） | 仅作混合许可的**先验**，见 §6.3 |
-| 2 | `INTERIOR` | 内部（封闭空间） | 同上；**并非所有 INTERIOR 之间天然可混合** |
-| 3 | `AMBIGUOUS` | 几何或审核语义**明确存在歧义**（不是"暂时没想好"） | v0 未获人工有效决定时按 `UNSET` 处理：不启用新域拒绝 |
-
-**弃权（abstain）不是类别**：模型输出的 `ai_abstain`/`ai_confidence` 是独立的推理侧信号，**不占用** `domain_class` 取值。弃权时保留 `UNSET`，或采纳 teacher 建议并**必须**进入人工审核；渲染一律回退既有几何可见性。**禁止**在回退路径上递归调用同一分类器（否则没有终止条件）。
-
-**受监督类别集合只有 `EXTERIOR`/`INTERIOR`/`AMBIGUOUS`**：`UNSET` 是**存储/生效状态**（无生效标签或弃权流程产生），`abstain` 是独立信号，二者都**不**作为分类 logit，也**不**作为交叉熵目标（§8.2、§11.2）。
-
-### 6.2 `region_id` 的定位
-
-`scene-local region_id` 由**可见性连通性 / portal 派生**，用于区分**互不相通的室内区域**（同一建筑中不同房间、portal 两侧）；它只是场景内派生数据（显示、分区审核、连通域统计），**不得**作为全局训练类别；导出时可作为附加字段，但训练主目标只有 `domain_class`。
-
-### 6.3 接收侧与混合许可（v0 硬约束）
-
-`domain_class` 只是**粗粒度先验**：`INTERIOR` 与 `INTERIOR` 之间也可能被墙隔开（互不相通的房间、portal 两侧）。因此域门控必须**可判定**，且结果为三态：
-
-| 门控结果 | 渲染语义 |
-| --- | --- |
-| `ALLOW` | 放行该候选，但仍**交既有几何可见性**做最终裁决（遮挡/距离矩照旧） |
-| `REJECT` | 在**归一化前置零**：该候选不进入加权累加，因而不进入分母 |
-| `ABSTAIN` | **完全保持既有可见性**（既不放行也不拒绝；**不是**全拒） |
-
-判定规则（**先拓扑、后类别**）：
-
-1. 双方任一为 `UNSET`/`AMBIGUOUS`，**或** `region_id`/portal 拓扑不可信（缺失、哈希不符、无法判定）→ `ABSTAIN`。
-2. 拓扑可信时：
-   - 同 `region_id` 且 `domain_class` 一致 → `ALLOW`；
-   - 同 `region_id` 但 `domain_class` 不一致 → **标记不一致**并 `ABSTAIN`（交人工审核，不在渲染侧强行裁决）；
-   - 异 `region_id`，存在可信 **OPEN** portal 关系 → `ALLOW`（portal 只提供混合许可，最终仍由既有几何可见性/遮挡裁决）；
-   - 异 `region_id`，无开放 portal **或**存在可信 **CLOSED** portal → `REJECT`；
-   - 关系**未知** → `ABSTAIN`。
-
-portal 的"开放/闭合"是**静态 bake 状态**（随几何/布局哈希固化）；**动态**开关门仍属非目标（§2.2）。本矩阵与 §10.2 的 M4 前置、§12 的 M0 表述绑定：只有该矩阵成立时，"混合许可不再需要决策"才为真。
-
-**接收者 domain/region 的来源与 `UNSET` 策略**：
-
-| 接收者 | domain/region 来源 | `UNSET`/`AMBIGUOUS` 策略 |
-| --- | --- | --- |
-| v0 gather 合成 fixture | 由测试**显式注入**接收者域，仅验证候选拒绝的归一化数学 | 不适用（fixture 全量注入） |
-| M1 静态 surface receiver | bake 时用**同一确定性几何规则**求 domain/region，并与 `geometry`/`probe_layout` 哈希绑定 | 不启用新域拒绝，只走既有可见性 |
-| layout 5 自由空间 cell | M4 前必须固定的设计/测试前置（§10.2、§12） | 同上；像素阶段不得现场判定 |
-
-**禁止**：在像素/片元阶段现场运行神经网络判定域。推理只在编辑器/烘焙前（离线）进行，结果以标签 + 哈希固化后随资源发布。
-
-### 6.4 主任务与扩展任务分离
-
-- 主任务：逐 subject 的 `domain_class` 分类（+ 不确定性/弃权）。
-- 扩展任务（未来）：可学习的 **Probe 对 / 边混合权重**（即"这两者之间允许多大程度的混合"）。它与 `domain_class` **不是同一个目标**，必须独立 schema、独立模型头、独立评估，不得混进同一列标签。
-
-### 6.5 `subject_kind`
-
-固定枚举：`probe`（surface Probe）、`clv_cell`（layout 5 自由空间 cell）。每条记录必须且只能属于一种。
-
-**v1 的每个模型契约只允许一种 `subject_kind`，首选 `probe`**：`clv_cell` 使用**独立的特征 schema 与独立模型**（或完全由几何规则派生），**不与 probe 混训**。特征注册与模型注册条目均必须含 `subject_kind` 字段；跨 `subject_kind` 合并训练只能作为未来独立实验，不得默认开启（示例见 §7.3 的说明）。
-
-### 6.6 运行时紧凑标签 vs 训练 sidecar
-
-- 运行时：每 subject 的紧凑标签（文章所称的"约 1 byte/Probe"量级的紧凑表示，**仅为形态参考**），只用于渲染决策。
-- 训练：sidecar 携带完整审核元数据与特征引用；其体积与 1 byte **无关**，不得用紧凑表示反推数据集规模。
-
----
-
-## 7. 编辑器入口与 sidecar 设计
-
-### 7.1 入口（全部为 `[提议]`）
-
-| 入口 | 作用 | 说明 |
-| --- | --- | --- |
-| Analyze | 几何分析 +（v1）模型推理，产出建议标签 | 不写 bake 资源 |
-| Review | overlay 审核：并列显示 `ai_pred`/`confidence`、`teacher_label`、`human_label` | 未审核 AI 标签不得进入 gold |
-| Approve | 把审核结果固化为 `final_label` 并置 `gold_flag` | 记录 reviewer/时间戳 |
-| Export | 按分层导出训练集 | 输出去向由用户指定 |
-
-现有可复用表面（只读参考）：`misc/feng-addons/feng-magic-gi/editor/magic_gi_inspector_plugin.gd`（Inspector 状态文本与运行时状态读取，例如 `:290-302`）、`misc/feng-addons/feng-magic-gi/feng_magic_gi_volume.gd:295`（CLV cell 可视化开关）与 `feng_magic_gi_volume.gd:283-292`（probe/SH 显示开关）。
-
-### 7.2 目录布局（`[提议]`）
-
-与 bake 产物分离，避免覆盖现有资源（现有 bake 输出约定见 `misc/feng-addons/feng-magic-gi/README.md:72`）：
-
-```
-res://magicgi_review/<scene_and_volume_id>/
-  dataset.jsonl                 # 不可变 revision 事件（追加写，§5.2）
-  manifest.json                 # 每 subject + 哈希组的 active_revision = record_id@revision（§5.2、§7.3）
-  features/<subject_kind>.bin   # 原始特征；offset/len 单位为 byte
-  reviewer_notes.md             # 人工说明
-  model/<model_version>.json    # 模型登记（含 subject_kind、版本、schema、哈希）
-res://magicgi_review/export/<scene_and_volume_id>/<split>.jsonl
+```text
+Preflight
+→ 提取/复用当前 clv_cell 几何特征
+→ 编辑器内批量 MLP 推理室内外域
+→ 生成独立 auto-apply correction batch
+→ 高置信且接收者域映射可信的标签进入 runtime payload
+→ 低置信、UNSET、AMBIGUOUS 或未知接收者域保持 ABSTAIN
+→ 校验 payload 与哈希
+→ 上传并刷新受影响缓存
+→ 原生采样 A/B 验证
+→ 报告修正数、跳过数、失败数与性能
 ```
 
-`scene_and_volume_id` 沿用现有 bake 目录命名习惯（`misc/feng-addons/feng-magic-gi/README.md:72`），**同一 scene 的多个 Volume 不得混入同一档案**；记录内同时保留 `scene_id` 与 `volume_id`（§7.3）。
+执行应可取消；失败时保留上一代有效 payload。按钮不重写原始 TransferMatrix，不改变 Probe/Cell 坐标，也不把 sidecar 操作伪造成场景资源修改。
 
-### 7.3 记录 schema（示例，非最终字段名表）
+**运行时移动适配：**标签由编辑器离线固化；shading point 变化时只查询接收者域并执行渲染门控，不重新训练或逐帧运行 MLP。该设计是本项目的部署选择，不是对腾讯 OLV 私有实现的推断。
 
-```json
-{
-  "schema": "magicgi.domain_label.v0",
-  "schema_version": 1,
-  "feature_version": 1,
-  "label_version": 1,
-  "code_version": "magicgi-domain-review@0",
-  "model_version": "mlp-domain-probe-v1",
-  "scene_id": "box_test",
-  "volume_id": "MagicGIVolume",
-  "subject_kind": "clv_cell",
-  "subject_id": "clv:l0:12,7,3",
-  "hashes": {
-    "hash_scheme": "sha256-canonical-v1",
-    "geometry": "<sha256>",
-    "probe_layout": "<sha256>",
-    "bake_config": "<sha256>"
-  },
-  "record_id": "6f1c2a90",
-  "revision": 3,
-  "supersedes": "6f1c2a90@2",
-  "features": {"ref": "features/clv_cell.bin", "offset": 0, "len": 256, "unit": "byte", "recomputable": true},
-  "teacher_version": "geom-teacher-v1",
-  "teacher_label": 2,
-  "ai_pred": 2,
-  "ai_confidence": 0.41,
-  "ai_abstain": false,
-  "human_label": 2,
-  "final_label": 2,
-  "source": "human",
-  "review_state": "approved",
-  "gold_flag": true,
-  "review_round": 2,
-  "render_evidence_ref": "captures/<scene>_<camera>_<config>.json",
-  "confirmed_by": "<id>",
-  "confirmed_at": "<iso8601>",
-  "reviewer": "<id>",
-  "timestamp": "<iso8601>"
-}
+### 3.3 用户可见结果
+
+- `Applied`：实际进入 runtime payload 的 cell 数；
+- `Abstained`：低置信、接收者域未知或数据缺失的数量与原因；
+- `Stale/Rejected`：哈希、schema、模型或资源不匹配数量；
+- `A/B`：旧路径与 OLV 修正路径对比；
+- `Undo`：恢复上一代 runtime payload，不重新训练、不破坏原 Bake。
+
+### 3.4 自动应用与训练真值分离
+
+- AI 自动应用记录为 correction batch/pseudo 应用历史，**不得自动标记为 human gold**。
+- 人工 Review 是低置信处理和数据生产入口，不阻塞高置信的一键流程。
+- 只有带人工审核、渲染证据和确认信息的 approved revision 才能进入 gold。
+- 更换模型只使相关 AI 建议/自动应用批次失效，不删除既有 human gold。
+
+---
+
+## 4. 必须先冻结的 OLV 技术契约
+
+### 4.1 Subject 与稳定身份
+
+v1 模型只服务 `subject_kind=clv_cell`；surface Probe 若后续支持，使用独立 schema 和独立模型。
+
+每个 cell 的持久身份至少包含：
+
+```text
+scene_id / volume_id / lod / global_cell_x,y,z / layout_revision
 ```
-
-> 上例用 `clv_cell` **只为展示 schema 形状**；v1 的训练契约首选 `probe`，`clv_cell` 走独立模型/schema（§6.5）。
 
 要求：
 
-- **版本字段必须逐项出现在每条记录中**（不能只写在本文的要求段）：`feature_version`、`label_version`、`code_version`、`model_version`、`schema_version`，或语义等价的独立字段。
-- **规范哈希 `sha256-canonical-v1`**：对固定字段集按稳定排序、带字段名与长度前缀拼接后取 SHA-256；浮点按 IEEE-754 **float32 位型**、显式小端字节序序列化。v0 只对**明确序列化值**求哈希（不做量化/取整）；未来若改为量化表示，必须同时提升 `feature_version` 与哈希方案版本，否则视为不同标签。
-  - `geometry`：网格内容、世界变换、以及影响标签的材质信息。
-  - `probe_layout`：`subject_kind`、稳定 ID、位置、法线、密度/间距参数。
-  - `bake_config`：**仅**包含影响标签的配置项；其它渲染/性能项不得进入该哈希。
-- **稳定 ID 与空值规则**：`subject_id` 必须能由 `subject_kind` + 布局参数确定性重建（probe：布局序号/格坐标；clv_cell：LOD + 格坐标）。哈希组任一字段缺失或不可计算时，记录必须写 `null` 并把 `review_state` 置 `stale`，**不得**用空串或 `0` 冒充。
-- `scene_id` 与 `volume_id` 必须同时存在，且与 §7.2 的目录命名一致；`features` 的 `offset`/`len` 单位为 **byte**。
-- **revision 身份 = `record_id@revision`**：`supersedes` 指向**同一 `record_id`** 的前一 revision（如 `6f1c2a90@2`）；`manifest.json` 的 `active_revision` 也使用这一对，且**只指向 `approved`**（§5.2）。
-- **二次复核字段**：`review_round`（该 subject 的第几轮渲染复核）、`render_evidence_ref`（复核所用渲染/相机/场景配置引用）、`confirmed_by`/`confirmed_at`（复核确认，可与最终批准同人，不要求双人）。只有这些字段齐备且 `review_state=approved` 的 revision 才可置 `gold_flag`。
+- 分页 halo 与核心格使用同一个全局身份；
+- 同一全局 cell 的重复 halo 标签必须一致；
+- 不使用对象 `instance_id` 或 brick-local index 作为持久身份；
+- scene 中多个 Volume 不得混入同一个审核档案。
 
-### 7.4 分层与状态机
+### 4.2 标签与接收者域
 
-| 层 | 产生方式 | 用途 |
+| 数据 | 含义 | 缺失时行为 |
 | --- | --- | --- |
-| gold | 人工批准/修正 | 唯一高可信真值 |
-| silver | teacher（几何规则或既有算法） | 预训练/对照，权重低于 gold |
-| pseudo | 模型未审核预测 | 隔离存放，**绝不进 gold**，是否参与训练由实验决定 |
+| `UNSET` | 无生效标签；不是训练类别 | `ABSTAIN` |
+| `EXTERIOR` | 外部可见性域 | 与接收者域比较后才决定能否混合 |
+| `INTERIOR` | 内部可见性域；不区分不同房间 | 同上；多房间转 Depth/混合路线 |
+| `AMBIGUOUS` | 几何或审核存在明确歧义 | `ABSTAIN` |
+| `abstain/confidence` | 独立推理信号，不是额外出分类 logit | 按模型登记策略回退 |
+| `receiver_domain` | 当前 shading point 的可信接收者域 | 未知时 `ABSTAIN` |
 
-`review_state ∈ {pending, approved, modified, rejected, stale}`；`stale` 由 §5.2 的哈希变化触发。**当前生效标签由 `manifest.json` 的 `active_revision`（`record_id@revision`）唯一决定，且只指向 `approved`**（§5.2）：只有 `review_state=approved`、`review_round`/`render_evidence_ref`/`confirmed_by`/`confirmed_at` 齐备、且哈希组与当前 human 批准 revision 匹配的条目才构成 gold 真值；`modified` 属待复核工作态，**不得**带 `gold_flag`；历史 revision 仅作审计。
+本项目的 v1 实验门控，**不是腾讯未公开算法细节的断言**：
 
----
+| 条件 | 决策 |
+| --- | --- |
+| receiver/candidate 标签可信且 domain 相同 | `ALLOW` |
+| receiver/candidate 标签可信且 domain 不同 | `REJECT` |
+| 任一方 UNSET/AMBIGUOUS、接收者域未知或哈希不符 | `ABSTAIN` |
 
-## 8. 模型决策
+`REJECT` 必须在插值和归一化前发生；`ABSTAIN` 必须完整走旧行为，不能解释为“全部拒绝”。
 
-### 8.1 候选比较
+两个房间可以同为 `INTERIOR`，所以该门控**不声称解决多房间隔离**。开放门洞、室内外过渡区也必须做专门测试：如果简单二域门控阻断合理传输或造成过黑，应调整接收者域/采用 Depth 混合路线，而不是把失败隐藏为“模型准确率”。
 
-| 方案 | 优势 | 代价/风险 | v1 定位 |
-| --- | --- | --- | --- |
-| 几何规则 | 可解释、零训练、可复现 | 覆盖有限，边界/portal 易错 | teacher + 回退（既有几何可见性） |
-| MLP（固定局部特征） | 训练/部署最简单，编辑器易前向 | 表达能力有限，需要手工特征 | **v1 基线** |
-| DeepSets / GraphSAGE | 天然处理无序射线/邻居集合与 probe 图 | 特征构建与图构建成本高 | M3 备选 |
-| Transformer | 长程、变长全局关系 | 数据/算力/部署成本高；注意力 K 邻居约 O(K²) | v1 明确不用，M3 后按需评估 |
+### 4.3 审核面与运行面分离
 
-### 8.2 v1 基线（可调起点，非事实）
+**审核/训练面：**
 
-- 输入：固定局部几何特征（到最近几何/墙体的距离与方向、射线命中模式统计、法线一致性、所在 cell 与邻近 cell 的占用状态等；**不移动 probe**）。
-- 结构：**2 层、约 128 隐藏单元**的 MLP。
-- 输出：`domain_class` 分布 + **独立**的不确定性/弃权信号（`ai_abstain`/`ai_confidence`，**不是**第 5 个类别）；弃权时保留 `UNSET`，渲染回退既有几何可见性（§6.1、§6.3）。
-- 损失：加权交叉熵，**受监督类别只有 `EXTERIOR`/`INTERIOR`/`AMBIGUOUS`**；`UNSET` **不是** logit，也**不是** CE 目标（它表示"无生效标签"，由无标注或弃权流程产生）；`abstain` 仍是独立信号（§6.1）。类别不平衡在三个受监督类别内处理；人工 gold 权重最高。
-- 每个模型契约只服务一种 `subject_kind`（§6.5）：v1 首选 `probe`。
-- 上述规模是**可调起点**；本文不给出所需样本数、训练时长或成功率。
+- append-only revision 记录 teacher、AI、人工决定、证据和版本；
+- manifest 显式指向 active revision，不能靠 JSONL 最后一行猜测；
+- manifest 原子替换、写后校验及写失败恢复必须有测试；
+- 特征引用使用受约束的相对路径，拒绝绝对路径与 `..`；
+- scene 级 train/val/test 分割信息与数据集一起归档。
 
-### 8.3 Transformer 的进入条件
+**运行面：**
 
-仅当满足以下全部条件时才评估：长程/变长全局关系被实验证明是主要误差来源；gold 数据与算力足以支撑；编辑器侧推理预算可接受。否则不引入。
+- 从已批准或自动应用批次编译独立、紧凑、版本化 payload；
+- 包含 cell domain、接收者域映射、schema 与哈希；
+- 与 `validity`、relocation 分离；无标签时不得删除原有有效算子或改变坐标；
+- 有明确的 archive/load、resident 对齐、分页滚动、释放和撤销生命周期；
+- 原生 shader 不读 JSONL，不跑分类器。
 
----
+“每 cell 一个紧凑标签”可以作为设计目标，但索引、版本、接收者映射和校验仍是额外数据；不得把标签大小等同于总包体大小。
 
-## 9. 训练与推理部署
+### 4.4 P0 必须签出的渲染语义
 
-### 9.1 离线训练（`[提议]`，非现有依赖）
+在写生产 shader 前，用解析 fixture 固定：
 
-- 建议后续用 Python/PyTorch 训练小 MLP，导出**带版本**的权重与特征 schema。
-- 训练真值：仅 **human gold** 作为高可信真值；silver/pseudo 分层使用并单独记录其影响。
-- 必须保留**未见场景**的 gold 测试集（§11.1）。
-- 本仓库现有 Python 测试脚本的组织方式可作参考（`misc/scripts/test_magic_gi.py:18-33`、`:89-99`），但**本文不新增依赖、不改脚本**。
+1. 接收者 domain 的来源、查询精度、哈希和 `UNSET` 区域；
+2. 每个角点的 `ALLOW/REJECT/ABSTAIN` 合成规则；
+3. 被拒绝角点不进入传输归一化分母；
+4. accepted weight 与 support/coverage 的关系，兼容当前 SH2 filtered-coverage 解码；
+5. 全部 `REJECT` 时的返回值、Sky ownership 和过黑风险处理；
+6. 任一角 `ABSTAIN` 时如何保证整个相关路径完全回退；
+7. 细/粗 LOD 分别门控后的混合规则，以及只有一级可用时的行为；
+8. 开放门洞与室内外过渡区的合法传输如何保留；
+9. 除零、非有限值、coverage 越界与非法 payload 的失败行为。
 
-### 9.2 编辑器推理（`[提议]`）
-
-- Godot 编辑器侧做轻量前向（小 MLP 直接前向即可），**v1 避免引入 ONNX 运行时**。
-- 推理结果只作为建议写入 sidecar（`source=ai`、`review_state=pending`），必须经人工批准才成为 gold。
-
-### 9.3 版本化与重跑触发
-
-特征定义、模型结构/权重、schema 任一变化：必须提升 `feature_version` / `label_version` / `model_version` / `schema_version`（或语义等价字段），并重跑渲染回归（§10.4、§11.3）；失效范围按 §5.2 分来源处理。旧 sidecar 不得被静默重解释。
-
----
-
-## 10. 渲染接入
-
-### 10.1 v0 正确性实验：在 gather 候选累加前拒绝（`[提议]`）
-
-- 位置：`misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_gather.glslinc:459-460`（候选可见性计算后、加权累加前）；同文件 `:534` 为另一处累加点。
-- 规则：候选 domain 与接收者 domain 不兼容 → 不进入加权累加，因而**不进入归一化分母**（与 `misc/feng-addons/feng-magic-gi/README.md:112`"被遮挡候选不参与归一化"同构）。
-- 开关：**新增独立开关**（在 `magic_gi_pass.gd:288-325` 的导出一族中新增，默认关闭）。**不得**复用 `approximate_clv_volume_enabled`（`:310`）或 `exact_clv_corner_visibility_enabled`（`:316`），它们属于 layout 9/14 生产分支（`:6389-6405`）。
-- **v0 边界（不夸大）**：本实验只验证三件事——域标签的**接线**、跨域候选被拒后的**归一化数学**（被拒候选不进入分母）、以及开关关闭时的**无回归**。它**不**声称修复 layout 5 的跨域混合，也不作为漏光验收。
-- **新增可判别合成 fixture**：仓内 fixture，含**已知接收者域**、**两个异域候选**与**可手工计算的权重**，使期望输出可解析求出；配套**新增 gather 专用测试**。现有 `test_magic_gi_clv_sampling.gd` 只能作**风格参考**，不构成 gather 车道的既有覆盖（§10.4）。
-
-### 10.2 layout 5：只能在插值前处理（`[提议]`，均未验证）
-
-| 方案 | 做法 | 已知代价/风险 | 状态 |
-| --- | --- | --- | --- |
-| 显式 8 角过滤 | 把 `magic_gi_dynamic_volume_sample.glslinc:339-354` 的 7 次硬件采样换成逐角取值、按 domain 跳过、以接受权重重新归一化 | 约 56 次取值/LOD（**未测**）；**全拒**路径的 LOD 回退语义需 M4 先固定（现有 `:385-393` 只做相邻 LOD 混合，**未定义**"全拒"） | 未验证 |
-| 分域纹理 | 按域分纹理，接收者只采自身域的纹理 | 内存与绑定翻倍；资源生命周期复杂 | 未验证 |
-| nearest / UV 吸附 | 关闭插值或把 UV 吸附到 cell 中心 | 出现接缝/块状 | 未验证 |
-
-可参考的逐角实现先例（不同车道）：`magic_gi_dynamic_volume_sample.glslinc:193-216`（`:209` 跳过无效角）、`:270-311`（`:282`、`:299-302`）。
-
-**M4 设计前置（未固定前不得开工）**：① layout 5 接收者与细胞的 domain/region 从何而来、何时固化；② "全拒"的判定与全拒时的 LOD 回退语义；③ 与 §6.3 **三态门控矩阵（ALLOW/REJECT/ABSTAIN）** 的一致性——含 portal 开放/闭合的静态判定如何进入哈希，以及 `ABSTAIN` 分支如何保证"完全保持既有可见性"。
-
-**新增可复现混合 fixture**：构造已知 cell 域分布的 mini 场景，断言 (a) post-gate 无法消除已混入的跨域能量（证明 post-filter 不充分）、(b) 全拒与 LOD 回退符合 ① 的固定语义。该 fixture 与 §10.1 的 gather fixture **分开**，结论不得互相冒充。
-
-### 10.3 为什么 post-filter 不充分
-
-`magic_gi_dynamic_volume_sample.glslinc:339-354` 的硬件三线性输出为 Σwᵢcᵢ；若角 i 属异域，其 cᵢ 错误，而 wᵢ 在采样后不可得。`:355-358` 的 `coverage > 0.5` 只能整段接受/拒绝，**无法解混**。因此"在 layout 5 采样返回值上按域拒绝"不是充分方案；插值前处理或分域采样才是。
-
-### 10.4 验证用例（`[现有]` 测试，本文**未执行**）
-
-- 采样/混合与 LOD：`misc/feng-addons/feng-render-pipeline/tests/test_preinterpolated_clv_sky_ownership.gd:35-49`（编译生产 sampler）、`:145-146`、`:164-168`（调用 `frp_magic_gi_dynamic_volume_sample`）。
-- 拒绝语义**风格**参考（**不是** gather 覆盖）：`misc/feng-addons/feng-render-pipeline/tests/test_magic_gi_clv_sampling.gd:1266`（zero CLV coverage）、`:1416`（exactly-zero-weight corner）。
-- 支持/认证语义：`misc/feng-addons/feng-render-pipeline/tests/test_magic_gi_clv_visibility_support.gd:74`、`:113`。
-- 序列化往返：`misc/feng-addons/feng-magic-gi/tests/test_source_archive.gd:33-40`、`misc/feng-addons/feng-magic-gi/tests/test_prepared_brick_archive.gd:35-45`。
-- 烘焙集成：`misc/feng-addons/feng-magic-gi/tests/test_volume_free_space_bake_integration.gd:2`、`:78`。
-- 无 GPU 的 CPU 契约：`misc/feng-addons/feng-render-pipeline/tests/test_paged_clv_layout.gd:2-3`、`:153`。
-- 高成本真实工程验收（1920×1080、真实场景）：`misc/feng-addons/feng-render-pipeline/tests/test_magicdawn_clv_prt_contract.gd:5-12`。
+这些项目未冻结前，P1 只能做实验 fixture，不能进入默认生产路径。
 
 ---
 
-## 11. 数据集与验收
+## 5. 分阶段执行任务
 
-### 11.1 划分
+### P0：当前基线与可测试契约
 
-- 按 **scene / level** 划分 train/val/test；**不得**把同一场景的 probe/cell 随机拆到不同集合。
-- **M1 必须至少建立两个场景**：一个开发场景 + 一个**独立留出的验收场景**（几何不同）；只有开发场景不足以进入 M2。
-- **M2 入口条件**：能按 scene 形成 train/val/test 三个**互不相交**集合；数量不足时先补场景。允许先以**流程冒烟**方式跑通全链路，但不得声称统计泛化。
-- 另留"未见几何类型"集合（例如某类门洞/薄墙）只出现在 test。
-- 记录每个 split 的 scene 列表与哈希，随数据集版本一起归档。
+**入口：**本计划评审通过。
 
-### 11.2 指标（不设无依据阈值）
+**任务：**
 
-- 分类侧**分别报告**：① 三分类（`EXTERIOR`/`INTERIOR`/`AMBIGUOUS`）各类 precision/recall 与混淆矩阵；② 缺标注覆盖率（`UNSET` 占比，**不并入分类指标**）；③ 弃权率（`abstain`）；④ 按场景分组的方差。
-- 渲染侧（工具与口径在 §11.3 的观测量中固定）：可见漏光、局部过黑、门洞/薄墙传光、relight 稳定性（光照变化后是否跳变），以及 GPU 时间、显存/内存增量与烘焙成本变化。
-- **阈值待测量后确定**；本文不给数值、不构成性能承诺。
+- [ ] 以 layout 7/8、SH2 schema 2、4 fields 更新所有相关设计引用。
+- [ ] 冻结 §4 的身份、室内外标签、接收者域、coverage、全拒、ABSTAIN 和 LOD 语义。
+- [ ] 画出 review sidecar → runtime compiler → payload → resident → native sampler 的数据所有权图。
+- [ ] 定义 feature/model/schema/hash 版本及失效矩阵。
+- [ ] 写出可手算的 2×2×2 室内外 fixture，另含开放门洞/过渡区用例。
+- [ ] 明确多房间、位置问题和 Depth 问题不属于 OLV v1 的隐形验收范围。
 
-### 11.3 测试清单（`[提议]` 新增 + `[现有]` 基础）
+**交付物：**冻结后的契约、fixture 数值说明、测试矩阵。
 
-| 类型 | 内容 | 基础 |
+**退出标准：**不再需要边写 shader 边决定标签、接收者域或归一化语义。
+
+### P1：无 AI 的 GPU 渲染垂直切片
+
+**入口：**P0 完成。
+
+**目标：**先证明“当前 prepared sampler 能在插值前正确处理室内外域”，不证明 AI。
+
+**任务：**
+
+- [ ] 参考现有 [test_preinterpolated_clv_sky_ownership.gd](../misc/feng-addons/feng-render-pipeline/tests/test_preinterpolated_clv_sky_ownership.gd)，新增独立 OLV fixture 与测试。
+- [ ] 手工注入 cell 标签和接收者域；不依赖 Bake、模型或人工 UI。
+- [ ] 在实验开关后实现逐角读取与 P0 定义的门控。
+- [ ] 保留 post-gate 对照，证明已混合能量不能靠最终 domain/coverage 解混。
+- [ ] 测试拒绝后的传输归一化、support/coverage、全拒和 LOD。
+- [ ] 测试开放门洞/过渡区，检查是否误删合理传输或产生过黑。
+- [ ] 用两个同为 INTERIOR 的房间记录 OLV 能力边界，不把该反例包装成已解决。
+- [ ] 测试开关关闭和 `ABSTAIN` 与旧结果一致；测试无 NaN/Inf。
+
+**建议新增测试：**`misc/feng-addons/feng-render-pipeline/tests/test_magic_gi_olv_preinterpolation.gd`。
+
+**退出标准：**layout 7/8 共享采样数学的解析 fixture 通过，且适用边界明确；只声称“数学与契约可行”。
+
+**成本预警：**朴素方案是每 LOD `8 角 × 4 fields = 32` 次取值，另加标签读取；这是待测实现成本，不是性能结论。
+
+### P2：无 AI 的真实场景端到端闭环
+
+**入口：**P1 通过。
+
+**目标：**用确定性几何 teacher 打通室内外标签数据链，再引入学习模型。
+
+**任务：**
+
+- [ ] 建立一个仓内开发场景，覆盖清晰室内外边界、薄墙、曲面、窄缝、开放门洞和歧义区域。
+- [ ] 实现室内外几何 teacher 与接收者域生成；不确定时输出 `ABSTAIN`。
+- [ ] 保留现有 source relocation 与传输语义，不在 OLV 操作中移动采样点。
+- [ ] 实现标签 overlay、Review/Approve、sidecar、manifest、哈希失效与导出。
+- [ ] 实现独立 runtime compiler/payload；完成序列化往返和损坏输入拒绝。
+- [ ] 接入 archive/load、layout 7 resident 上传、原生 ABI/binding 和缓存刷新。
+- [ ] 对分页 halo、重复全局 cell、滚动 resident、预算释放做一致性测试。
+- [ ] layout 7 完成真实场景 A/B；layout 8 完成上传和采样 smoke。
+- [ ] 增加独立开关；关闭时不改变现有结果，旧资源无需自动迁移。
+- [ ] 在 Inspector 提供“分析/应用已批准 OLV 标签”，此阶段不命名为“AI 自动修复”。
+
+**退出标准：**真实场景的人工室内外标签能影响默认 layout 7 插值前采样；已知跨域用例按契约减少，开放门洞没有未解释的过黑。
+
+### P3：数据集、训练、导出与编辑器推理
+
+**入口：**P1 已证明渲染数学；P2 的数据生产接口可用。模型最终接入必须等 P2 运行时链路通过。
+
+**任务：**
+
+- [ ] 至少形成几何不同的 train/val/test 三个 scene 集合，严格按 scene 隔离。
+- [ ] 另留只出现在 test 的未见几何类型；记录 scene 列表、哈希和数据集版本。
+- [ ] 导出固定版本局部几何特征；teacher/silver、pseudo、human gold 分层保存。
+- [ ] 以小 MLP 为基线，2 层约 128 hidden units 只作为可调起点。
+- [ ] 受监督 logits 只有 EXTERIOR/INTERIOR/AMBIGUOUS；UNSET 与 abstain 不作为 CE 类别。
+- [ ] 分别报告各类 precision/recall、混淆矩阵、覆盖率、弃权率和按场景分组结果。
+- [ ] 在验证集上选择置信/弃权策略；测试集只用于最终评估。
+- [ ] 导出带版本、schema、subject_kind、哈希的模型包。
+- [ ] Godot 编辑器实现同一 MLP 前向；v1 优先避免 ONNX 运行时。
+- [ ] 用固定权重和样本做 Python/GDScript 数值一致性测试。
+- [ ] 保留一套合成数据流程冒烟，但不得把冒烟结果宣称为泛化。
+
+**建议工具目录：**`misc/scripts/magicgi_olv/`，包含训练、评估、导出和推理一致性检查。
+
+**退出标准：**模型在未见场景 gold 上得到可复现评估，编辑器前向一致，弃权可生效；不以同场景随机拆 cell 的结果充当泛化。
+
+### P4：一键 AI 漏光修正（OLV）
+
+**入口：**P2、P3 均通过，且模型包登记完整。
+
+**任务：**
+
+- [ ] 在 Volume Inspector 增加“AI 漏光修正（OLV）”和进度/取消状态。
+- [ ] 实现 §3 的 preflight、推理、auto-apply、payload 校验、上传与刷新事务。
+- [ ] 高置信且接收者域映射可信者自动应用；其余明确跳过，不为了覆盖率强行分类。
+- [ ] 自动应用批次与 human gold 分离，模型更换只失效对应 AI 数据。
+- [ ] 增加 A/B、Undo、失败诊断和修改数量统计。
+- [ ] 验证取消、写失败、哈希过期、模型不匹配时旧 Bake/payload 保留。
+- [ ] 验证选择节点、状态 Timer 和 Inspector 刷新不会隐式写 sidecar；只有显式操作才写。
+- [ ] 验证多 Volume、未保存场景、切节点和关场景没有串数据或 stale callback。
+
+**退出标准：**训练完成后用户只需一次按钮即可完成受控 OLV 修正；无模型、无有效 Bake 或低置信时不会伪造成功。
+
+### P5：验收、性能与发布
+
+**任务：**
+
+- [ ] 在未见场景测试室内外漏光、局部过黑、薄墙、曲面、窄缝和非封闭网格。
+- [ ] 专门检查开放门洞与过渡区，防止把合理光照一并拒绝。
+- [ ] 多次改变太阳/TOD/支持的发光输入，检查 relight 后标签仍稳定。
+- [ ] 测试旧资源、开关关闭、ABSTAIN、模型缺失和 stale hash 回归。
+- [ ] 测试分页滚动、halo、resident 重映射、多个 Volume 和撤销恢复。
+- [ ] 测量完整 GPU 成本，包括原生 Lighting 中的采样；同时记录显存、CPU、推理和上传成本。
+- [ ] 与当前旧路径做同设备、同场景、同视角、同光照的配对测量。
+- [ ] 多房间用 Depth/混合路线单独评估，不计入 OLV v1 的“已修复”统计。
+- [ ] 先默认关闭；验收后按 Volume 开放，保留一键回退。
+
+**发布门槛：**正确性、回退和未见场景验收优先于模型平均准确率；任何性能承诺必须来自实际测量。
+
+---
+
+## 6. 独立路线：位置优化与 Depth
+
+### 6.1 Probe 位置/密度优化（不是 OLV 标签模型）
+
+只有当诊断证明主要问题是采样位置或密度时才进入：
+
+- [ ] 先以现有几何 relocation、安全间距和自适应布局为基线。
+- [ ] 评估候选位置是否满足实体外、OBB、净空、表面侧和稳定 ID 约束。
+- [ ] 位置变化后重新计算或验证 TransferMatrix、天空/发光传输、距离矩与 prepared 算子。
+- [ ] 对比“原布局”“几何 relocation”“候选位置优化”的最终图像与传输误差，而不只看 Probe 可视化。
+- [ ] 如未来研究 NN 位置偏移，使用独立模型、特征、目标和版本；不得与 OLV 标签输出混为一谈。
+
+**为什么不一上来让 NN 移 Probe：**位置与传输积分耦合，移动后可能需要重新 Bake；它不能保证解决跨域插值，还会引入墙面穿越、稳定身份和过黑风险。它可以是一键“重新布局并重烘”的另一项功能，但不是原文所述 OLV 的必然要求。
+
+### 6.2 Depth / 混合可见性（多房间优先评估）
+
+当需求包含多个室内房间或更一般的遮挡关系时：
+
+- [ ] 独立设计每 Probe/Cell 的 DistanceMap/Depth 数据、稀疏存储和 streaming。
+- [ ] 根据 shading point 与候选 Probe 的遮挡关系计算权重，而不是只比较室内外 Tag。
+- [ ] 验证默认 prepared layout 7/8 的实际数据上传与原生绑定，不把 source 中有距离矩当成运行时已接入。
+- [ ] 测量 DistanceMap、间接索引、额外采样和显存成本。
+- [ ] 与 OLV 在同一场景做 A/B：OLV 负责室内外粗域，Depth 负责更细遮挡时，再评估混合路线。
+
+原文对 Depth 的通用性描述同样是文章自报；本项目仍需独立验证，不承诺无场景限制。
+
+---
+
+## 7. 最终完成定义（Definition of Done）
+
+只有同时满足以下条件，才能宣称“训练后一键 OLV 漏光修正”已交付：
+
+- [ ] 默认 layout 7 的真实渲染链路消费室内外标签，且发生在插值前；layout 8 的支持范围明确并通过对应测试。
+- [ ] 用户不需要逐 cell 审核高置信结果，只需按一次按钮。
+- [ ] 低置信/未知接收者域会安全弃权，不静默套用错误标签。
+- [ ] 训练不出现在按钮或每帧渲染中；运行时不读取审核 JSONL。
+- [ ] 自动应用不会污染 human gold；数据按 scene 无泄漏划分。
+- [ ] 原 Bake 与 Probe/Cell 坐标不被 OLV 操作破坏，A/B、Undo、取消与失败恢复可用。
+- [ ] 旧路径回归、开放门洞、coverage/全拒/LOD、分页和 relight 测试通过。
+- [ ] 未见场景的室内外漏光与过黑结果、性能和资源成本有归档证据。
+- [ ] 多房间没有被计入 OLV 已解决范围；如有该需求，Depth/混合路线单独验收。
+
+---
+
+## 8. 可行性与主要风险
+
+| 项目 | 当前判断 | 风险控制 |
 | --- | --- | --- |
-| 单元 | 标签枚举编解码、哈希失效、状态机迁移 | 新增 |
-| 序列化 | sidecar 往返字节一致、schema 版本拒绝 | 参考 `test_source_archive.gd:33-40` |
-| 审核状态 | 未审核 AI 标签不得置 gold；stale 阻断导出 | 新增 |
-| 数据集污染防护 | 同场景跨 split 检测；pseudo 混入 gold 检测 | 新增 |
-| GPU gather（**新增**） | 合成 fixture：已知接收者域 + 两个异域候选 + 手工可算权重；断言被拒候选**不进入归一化分母**，且开关关闭时无回归 | 风格参考 `test_magic_gi_clv_sampling.gd:1266`（**非**既有 gather 覆盖） |
-| layout 5 混合（**新增**） | 可复现混合 fixture：证明 post-gate 不充分；全拒与 LOD 回退按 §10.2 固定语义 | 参考 `test_preinterpolated_clv_sky_ownership.gd:35-49` |
-| 渲染观测量（**新增**） | 漏光/过黑/门洞传光/relight 稳定，以及 GPU 时间与内存的观测记录 | 新增 |
+| 编辑器一键标签推理、应用、A/B、撤销 | 工程上可行 | 独立事务、版本化 payload、保留上一代结果 |
+| 静态几何、室内外分界清晰的特定跨域插值漏光 | 有条件可行 | P1 先证明数学，P2 再证明真实链路 |
+| 让 NN 直接移动 Probe 来替代 OLV | 不是同一任务，且通常需要重算传输 | 独立位置路线；先几何基线，后评估是否有学习价值 |
+| 多个室内房间互相漏光 | OLV 室内外标签不充分 | Depth/混合可见性，不计入 OLV v1 成功率 |
+| 模型泛化 | 未证实 | scene 隔离、未见几何测试、弃权与人工 gold |
+| 性能与显存 | 未测量 | 逐角实验先测成本，再考虑合并读取、紧凑标签或其他优化 |
+| 错误标签导致过黑/传光 | 真实风险 | 接收者域校验、开放门洞测试、ABSTAIN、A/B、Undo |
+
+**最大项目风险不是 MLP 是否足够大，也不是能否回归一个坐标，而是室内外标签与接收者域能否在当前 layout 7/8 的插值前正确落地。**因此 P1/P2 是一键 AI 之前不可跳过的门槛。
 
 ---
 
-## 12. 分阶段里程碑
+## 9. 参考资料
 
-| 阶段 | 入口条件 | 交付物 | 退出标准 |
-| --- | --- | --- | --- |
-| **M0** 文档 | 本文评审通过 | 本文件 | 标签语义、数据归属、模型基线、审核闭环与**混合许可（§6.3）**不再需要新决策——该表述**仅当 §6.3 三态门控矩阵（含 portal 静态开放/闭合判定）成立时为真** |
-| **M1** 几何 + 审核 + 导出（无 NN） | M0 冻结 | 几何 teacher、overlay 审核入口、sidecar 与 manifest、状态机、**开发场景 + 独立留出验收场景** | 在开发场景完成"分析→审核→批准→导出"，gold 可追溯且哈希绑定；无运行时代码改动 |
-| **M2** MLP 训练 / 导入 / 推理 | M1 交付，且能按 scene 形成 train/val/test **三个互不相交集合**（不足先补场景） | Python 训练脚本、带版本权重、编辑器前向、pseudo 隔离、含 `subject_kind` 的模型登记 | 在未见场景 gold 上可复现评估（允许先流程冒烟，不声称泛化）；弃权时回退既有可见性生效 |
-| **M3** 按需图模型 | M2 误差分析证明局部特征不足 | DeepSets/GraphSAGE 实验结论（含是否评估 Transformer） | 结论有数据支撑，或明确不做 |
-| **M4** layout 5 优化 | M2/M3 标签质量稳定，且 §10.2 的三项设计前置已固定 | 基于**仓内 fixture** 的方案实测对比与开关化实现（不依赖仓外路径） | 关闭开关时回归一致；跨域混合按 §10.2 固定语义消除，且成本已测 |
-
----
-
-## 13. 风险与开放问题
-
-- 域标签不能修复错误的 probe 布局；布局变化须重审（§5.2）。
-- v0 对 `UNSET`/`AMBIGUOUS` **一律不启用新域拒绝**，因此不会因标签缺失而改变现有画面；代价是 v0 也不可能"修好"layout 5（§10.1）。
-- 多室内域场景中 `region_id` 的派生质量决定混合许可质量（§6.2、§6.3）：连通性判错会表现为跨房间传光。
-- layout 5 插值前方案的成本（取址次数、内存、绑定）尚未测量（§10.2）；"全拒"语义尚未定义。
-- silver/pseudo 的权重策略会显著影响结果，需实验隔离。
-- 人工审核成本与一致性（多人标注一致性）尚无数据。
-- 动态几何、透明表面、地形细节不在本文范围（现状限制见 `misc/feng-addons/feng-magic-gi/README.md:114`）。
-
----
-
-## 14. 引用
-
-- 公开文章（OLV 名称/用途）：<https://zhuanlan.zhihu.com/p/2020903414117201233>。**该文及转载中的任何量化指标均为文章自报，本文未独立核实其账号官方性，也未复现。**
-- GDC 2026 公开演讲 PDF（CLV PRT"预插值传输 → CLV block relight → 硬件插值"流程）：<https://media.gdcvault.com/gdc2026/Slides/Sheng_Feng_IlluminatingRocosLegacyScalableGlobalIlluminationfromTheorytoPractice.pdf>。项目自述对该流程的参考关系见 `misc/feng-addons/feng-magic-gi/README.md:82`。
-- 仓库内证据：本文 `path:line` 默认相对仓库根 `F:\godot\feng-godot`；唯一**仓外**引用已在 §4.6 显式标注为仓外。
-- 文档约定先例：`doc/frp-source-audit-20261007.md:1`、`:7`（H1 与 **Evidence scope** 体例）。
+- OLV 与 Depth 的公开说明（文章自报，本文未独立复现）：<https://zhuanlan.zhihu.com/p/2020903414117201233>。
+- GDC 2026 CLV PRT 公开流程：<https://media.gdcvault.com/gdc2026/Slides/Sheng_Feng_IlluminatingRocosLegacyScalableGlobalIlluminationfromTheorytoPractice.pdf>。
+- 当前 Magic GI 使用与数据契约：[feng-magic-gi/README.md](../misc/feng-addons/feng-magic-gi/README.md)。

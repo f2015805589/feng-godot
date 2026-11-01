@@ -253,7 +253,7 @@ private:
 	} cloud_capture_lighting_cache;
 
 	void _update_render_base_uniform_set();
-	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID(), RID p_environment_radiance_texture = RID(), const Ref<FRPPassContext> &p_cloud_context = Ref<FRPPassContext>(), bool p_magic_gi_baked_sh = false, bool p_magic_gi_screen_cache = false, bool p_magic_gi_dynamic_volume = false, bool p_magic_gi_dynamic_screen_cache = false);
+	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false, RID p_lighting_shader = RID(), RID p_environment_radiance_texture = RID(), const Ref<FRPPassContext> &p_cloud_context = Ref<FRPPassContext>(), bool p_magic_gi_baked_sh = false, bool p_magic_gi_screen_cache = false, bool p_magic_gi_dynamic_volume = false, bool p_magic_gi_dynamic_screen_cache = false, bool p_magic_gi_dynamic_volume_olv = false);
 
 	struct BestFitNormal {
 		FrpBestFitNormalShaderRD shader;
@@ -305,11 +305,15 @@ private:
 		// Reuse the existing 256|64 prepared-volume selector for the compact
 		// whole-volume SH2 ABI. The serialized layout discriminator remains 8.
 		FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME = 320,
+		// Reserved CLV+SH2 selector for OLV-gated whole-volume SH2.
+		FRP_LIGHTING_MODE_MAGIC_GI_OLV_PREPARED_SH2_VOLUME = 352,
 		// Combined 128|256 selects the compact dynamic-volume screen-cache
 		// consumer while preserving existing mode count and the direct fallback.
 		FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE = 384,
 		// 256|128|64 selects paged prepared SH2's 208-byte parameter ABI.
 		FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME = 448,
+		// Reserved CLV+screen-cache+SH2 selector for OLV-gated paged SH2.
+		FRP_LIGHTING_MODE_MAGIC_GI_OLV_PAGED_PREPARED_VOLUME = 480,
 		FRP_LIGHTING_MODE_MAX = 512
 	};
 

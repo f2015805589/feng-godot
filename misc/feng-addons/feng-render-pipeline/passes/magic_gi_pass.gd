@@ -158,21 +158,25 @@ const CLV_BLOCK_CHART_LAYOUT_VERSION := 13
 const CLV_BLOCK_CHART_COLUMN_COUNT := 72
 const CLV_INTERNAL_LAYOUT14_B_APPLY_SHADER_PATH := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply_b14.glsl"
 
-enum CLVDebugView { OFF, CASCADE_LEVELS, CACHE_VALIDITY, CELLS, RECONSTRUCTED_LIGHTING, REJECTION_REASONS }
+enum CLVDebugView { OFF, CASCADE_LEVELS, CACHE_VALIDITY, CELLS, RECONSTRUCTED_LIGHTING, REJECTION_REASONS, OLV_DOMAINS }
 
-## Choose Magic GI in Debug Buffers to view the native layout-9 CLV sample. The
-## diagnostic mirror is dispatched only while that buffer is requested and reads
-## the same already-relit cache as deferred lighting; it never runs a PRT fallback.
-@export_enum("Off", "Cascade Levels", "Cache Validity", "Cells", "Reconstructed Lighting", "Rejection Reasons")
+@export_group("MagicGI Debug（调试）")
+## 先在 Debug Buffers 选择“MagicGI（调试）”，再选择这里的诊断视图。
+## OLV 视图使用 GBuffer 深度/法线重建当前网格表面 world position；它不
+## 创建 Probe 球，也不显示独立的 OLV 几何。OLV 标签和最终 CLV 消费共用
+## 同一份 generation-matched label atlas。
+@export_enum("关闭", "级联层级", "缓存有效性", "单元格", "重建光照", "拒绝原因", "OLV 室内/室外（网格表面）")
 var clv_debug_view: int = CLVDebugView.OFF:
 	set(value):
-		var next := clampi(value, CLVDebugView.OFF, CLVDebugView.REJECTION_REASONS)
+		var next := clampi(value, CLVDebugView.OFF, CLVDebugView.OLV_DOMAINS)
 		if clv_debug_view == next:
 			return
 		clv_debug_view = next
 		emit_changed()
 
-@export var clv_debug_view_status := "CLV debug mirror is idle until Debug Buffers → Magic GI requests it."
+@export var clv_debug_view_status := "MagicGI 调试镜像空闲；请先在 Debug Buffers 选择“MagicGI（调试）”。"
+
+@export_group("")
 
 func _validate_property(property: Dictionary) -> void:
 	var property_name := String(property.get("name", ""))
@@ -391,6 +395,10 @@ var _native_prepare_diagnostics_enabled := false
 var _last_native_prepare_rejection := "not_started"
 var _last_native_prepare_frame := -1
 var _last_native_prepare_owner_diagnostic := ""
+var _native_olv_binding_cache_key := ""
+var _native_olv_binding_cache: Dictionary = {}
+var _native_olv_binding_validation_calls := 0
+var _native_olv_binding_cache_hits := 0
 var _last_prt_pass_cpu_usec := 0
 var _last_frame_pre_exposure := 1.0
 var _last_frame_scene_exposure_normalization := 1.0
@@ -2086,11 +2094,18 @@ func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> vo
 		var lease_current := current_frame_token == expected_frame_token \
 				and ctx != null and ctx.has_method("has_magic_gi_dynamic_volume_input") \
 				and bool(ctx.call("has_magic_gi_dynamic_volume_input", 0))
+		var olv_input_present := ctx != null \
+				and ctx.has_method("has_magic_gi_dynamic_volume_olv_input") \
+				and bool(ctx.call("has_magic_gi_dynamic_volume_olv_input", 0))
 		var consumed_token := int(ctx.call("get_magic_gi_dynamic_volume_consumed_token")) \
 				if ctx != null and ctx.has_method("get_magic_gi_dynamic_volume_consumed_token") else 0
 		var direct_volume_consumed := lease_current and consumed_token == expected_token \
 				and ctx.has_method("is_magic_gi_dynamic_volume_lighting_active") \
 				and bool(ctx.call("is_magic_gi_dynamic_volume_lighting_active"))
+		var olv_lighting_active := lease_current and consumed_token == expected_token \
+				and olv_input_present \
+				and ctx.has_method("is_magic_gi_dynamic_volume_olv_lighting_active") \
+				and bool(ctx.call("is_magic_gi_dynamic_volume_olv_lighting_active"))
 		var screen_state: Dictionary = _dynamic_volume_screen_runtime_state
 		var screen_lease_current: bool = lease_current \
 				and current_frame_token == int(screen_state.get("frame_token", -1)) \
@@ -2113,6 +2128,14 @@ func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> vo
 		_dynamic_volume_runtime_state["renderer_frame_token"] = current_frame_token
 		_dynamic_volume_runtime_state["lease_current"] = lease_current
 		_dynamic_volume_runtime_state["consumed_token"] = consumed_token
+		_dynamic_volume_runtime_state["olv_input_present"] = olv_input_present \
+				and lease_current and consumed_token == expected_token
+		_dynamic_volume_runtime_state["olv_renderer_active"] = olv_lighting_active
+		_dynamic_volume_runtime_state["olv_frame"] = Engine.get_frames_drawn()
+		_dynamic_volume_runtime_state["olv_frame_token"] = current_frame_token
+		_dynamic_volume_runtime_state["olv_publication_token"] = expected_token
+		_dynamic_volume_runtime_state["olv_layout_version"] = int(
+				_dynamic_volume_runtime_state.get("bridge_layout_version", 0))
 		_dynamic_volume_runtime_state["screen_cache_lease_current"] = screen_lease_current
 		_dynamic_volume_runtime_state["screen_cache_renderer_active_raw"] = screen_active_raw
 		_dynamic_volume_runtime_state["screen_cache_frame_token"] = int(
@@ -2505,6 +2528,129 @@ func _publish_preinterpolated_editor_snapshot(ctx: FRPPassContext, snapshot: Dic
 	if error != OK:
 		CLVEditorSnapshot.fail(request, "clv_readback_queue_failed_%d" % error)
 
+func _native_olv_resource_revision(resource: Resource, method_name: String) -> int:
+	if resource != null and resource.has_method(method_name):
+		return int(resource.call(method_name))
+	return 0
+
+func _cached_native_olv_prepared(source: Resource,
+		expected_olv_binding_signature := "") -> bool:
+	return bool(source.call("has_preinterpolated_clv", expected_olv_binding_signature))
+
+func _native_olv_prepared_check_stats(source: Resource) -> Dictionary:
+	if source != null and source.has_method("get_clv_preparation_check_stats"):
+		return source.call("get_clv_preparation_check_stats")
+	return {}
+
+func _make_native_olv_binding_cache_key(manifest: Resource, labels: Resource,
+		source: Resource, context: Dictionary, payload_override: Resource = null) -> String:
+	var payload_value: Variant = payload_override if payload_override != null else source.get("olv_probe_domain_payload")
+	var payload: Resource = payload_value if payload_value is Resource else null
+	var payload_cache_key := String(payload.call("get_runtime_cache_key")) \
+			if payload != null and payload.has_method("get_runtime_cache_key") \
+			else "%d|%s|%s" % [
+				_native_olv_resource_revision(payload, "get_runtime_revision"),
+				str(payload.get("payload_sha256")) if payload != null else "",
+				str(payload.get("header_sha256")) if payload != null else ""]
+	var fields := PackedStringArray([
+		str(manifest.get_instance_id()),
+		str(bool(manifest.get("prepared_olv_filter_enabled"))),
+		str(manifest.get("scene_identity")), str(manifest.get("volume_identity")),
+		str(labels.get_instance_id()),
+		str(_native_olv_resource_revision(labels, "get_validation_revision")),
+		str(labels.get("schema_version")), str(labels.get("subject_kind")),
+		str(labels.get("scene_id")), str(labels.get("volume_id")),
+		str(labels.get("layout_revision")), str(labels.get("geometry_signature")),
+		str(labels.get("layout_signature")), str(labels.get("labels_hash")),
+		str(int(labels.get("cell_labels").size())),
+		str(int(labels.get("receiver_labels").size())),
+		str(source.get_instance_id()), str(source.get("origin_world")),
+		str(source.get("spacing_m")), str(source.get("geometry_signature")),
+		str(source.get("directional_source_signature")),
+		str(source.get("clv_preparation_revision")),
+		str(source.get("clv_preparation_signature")),
+		str(source.get("clv_preparation_olv_binding_signature")),
+		str(payload.get_instance_id()) if payload != null else "0",
+		payload_cache_key,
+		str(context.get("scene_id", "")), str(context.get("volume_id", "")),
+		str(context.get("layout_revision", -1)),
+		str(context.get("layout_signature", "")),
+		str(context.get("labels_hash", "")),
+		str(context.get("grid_origin_world", "")),
+		str(context.get("base_cell_spacing_m", ""))])
+	return "|".join(fields)
+
+func _store_native_olv_binding_cache(cache_key: String,
+		binding: Dictionary) -> Dictionary:
+	_native_olv_binding_cache_key = cache_key
+	_native_olv_binding_cache = binding
+	return binding
+
+func _validated_native_olv_binding(snapshot: Dictionary, source: Resource) -> Dictionary:
+	var managed: Dictionary = snapshot.get("olv_binding", {})
+	var independent := bool(managed.get("managed", false))
+	if independent and not bool(managed.get("enabled", false)): return {}
+	var manifest_value: Variant = snapshot.get("manifest")
+	if not manifest_value is Resource \
+			or (not independent and not bool(manifest_value.get("prepared_olv_filter_enabled"))) \
+			or source == null:
+		return {}
+	var manifest: Resource = manifest_value
+	var labels_value: Variant = managed.get("label_set") if independent else manifest.get("prepared_olv_label_set")
+	var context_value: Variant = managed.get("context") if independent else manifest.get("prepared_olv_context")
+	if not labels_value is Resource or not context_value is Dictionary:
+		return {}
+	var labels: Resource = labels_value
+	var context: Dictionary = context_value
+	var payload: Resource = managed.get("payload") if independent else null
+	var cache_key := _make_native_olv_binding_cache_key(manifest, labels, source, context, payload) + str(independent)
+	if cache_key == _native_olv_binding_cache_key:
+		_native_olv_binding_cache_hits += 1
+		return _native_olv_binding_cache
+	_native_olv_binding_validation_calls += 1
+	if not labels.has_method("validate") or not labels.has_method("matches_bake"):
+		return _store_native_olv_binding_cache(cache_key, {})
+	var validation: Dictionary = labels.call("validate")
+	if not bool(validation.get("ok", false)):
+		return _store_native_olv_binding_cache(cache_key, {})
+	var scene_id := String(context.get("scene_id", ""))
+	var volume_id := String(context.get("volume_id", ""))
+	var layout_revision := int(context.get("layout_revision", -1))
+	var layout_signature := String(context.get("layout_signature", ""))
+	var labels_hash := String(labels.get("labels_hash"))
+	if independent:
+		if payload == null or not bool(managed.get("source_binding_valid",false)) \
+				or int(managed.get("manifest_instance_id",0)) != manifest.get_instance_id() \
+				or int(payload.get("source_geometry_signature")) != int(source.get("geometry_signature")):
+			return _store_native_olv_binding_cache(cache_key, {})
+		# A paged header intentionally lacks source probe positions. Their exact
+		# payload binding is validated once against the retained chunk on the
+		# main thread; this render-thread cache verifies the same GI generation.
+		if not source.has_method("is_paged_prepared_source") \
+				and not bool(payload.call("validate_for_source",source,labels_hash).get("ok",false)):
+			return _store_native_olv_binding_cache(cache_key, {})
+	var origin_value: Variant = source.get("origin_world")
+	var spacing := float(source.get("spacing_m"))
+	var context_origin: Variant = context.get("grid_origin_world")
+	if scene_id.is_empty() or volume_id.is_empty() or layout_revision < 0 \
+			or layout_signature.is_empty() or labels_hash.is_empty() \
+			or String(context.get("labels_hash", "")) != labels_hash \
+			or String(manifest.get("scene_identity")) != scene_id \
+			or String(manifest.get("volume_identity")) != volume_id \
+			or not origin_value is Vector3 or not context_origin is Vector3 \
+			or Vector3(origin_value).distance_to(Vector3(context_origin)) > 0.0001 \
+			or absf(float(context.get("base_cell_spacing_m", 0.0)) - spacing) > 0.000001 \
+			or absf(spacing - 0.25) > 0.000001 \
+			or not bool(labels.call("matches_bake", scene_id, volume_id,
+				layout_revision, int(source.get("geometry_signature")), layout_signature)):
+		return _store_native_olv_binding_cache(cache_key, {})
+	var binding_signature := JSON.stringify([
+		scene_id, volume_id, layout_revision, layout_signature, labels_hash],
+		"", true, true).sha256_text()
+	var binding := {"label_set": labels, "context": context.duplicate(true),
+		"labels_hash": labels_hash, "binding_signature": binding_signature, "independent": independent}
+	return _store_native_olv_binding_cache(cache_key, binding)
+
 func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		buffers: RenderSceneBuffersRD, snapshot: Dictionary,
 		resolved_parameters: Variant, replacement_requested: bool) -> void:
@@ -2590,7 +2736,14 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 	else:
 		camera_forward = Vector3.FORWARD
 	var page_key := str(snapshot.get("free_space_source_page_key", cache_key))
-	var use_prepared: bool = source.has_method("has_preinterpolated_clv") and source.has_preinterpolated_clv()
+	var use_prepared: bool = source.has_method("has_preinterpolated_clv") \
+			and _cached_native_olv_prepared(source)
+	var olv_binding := _validated_native_olv_binding(snapshot, source) \
+		if use_prepared and view_count == 1 else {}
+	if not olv_binding.is_empty():
+		var binding_signature := String(olv_binding.get("binding_signature", ""))
+		if not bool(olv_binding.get("independent", false)) and not _cached_native_olv_prepared(source, binding_signature):
+			olv_binding = {}
 	var selected_prepared_resolution := _effective_prepared_clv_resolution()
 	if use_prepared and not paged \
 			and (not ctx.has_method("get_magic_gi_prepared_sh2_layout_version") \
@@ -2606,6 +2759,8 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		dynamic_volume_response_resolution]
 	if use_prepared:
 		cache_identity += ":prepared%d" % selected_prepared_resolution
+	var requested_olv_hash := String(olv_binding.get("labels_hash", ""))
+	cache_identity += ":olv:%s" % requested_olv_hash
 	var gi_radius_m := float(snapshot.get("gi_radius_m", 512.0))
 	var gpu_budget_bytes := int(snapshot.get("gpu_budget_bytes", 128 * 1024 * 1024))
 	if paged:
@@ -2627,10 +2782,12 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 			new_cache.gpu_budget_bytes = gpu_budget_bytes
 			new_cache.requested_upload_budget_bytes = int(snapshot.get("streaming_budget", {}).get("upload_bytes_per_frame", 0))
 			created = new_cache.create_paged(rd, source, snapshot.get("prepared_transfer_pages", []),
-				int(snapshot.get("prepared_pages_revision", 0)), camera_world, gi_radius_m)
+				int(snapshot.get("prepared_pages_revision", 0)), camera_world, gi_radius_m,
+				olv_binding.get("label_set"), olv_binding.get("context", {}))
 		else:
 			created = new_cache.create(rd, source, validated,
-				dynamic_volume_response_resolution, camera_world, camera_forward)
+				dynamic_volume_response_resolution, camera_world, camera_forward,
+			olv_binding.get("label_set"), olv_binding.get("context", {}))
 		if not created:
 			if new_cache.has_method("owned_rids"):
 				_free_rids(rd, new_cache.call("owned_rids"))
@@ -2688,6 +2845,8 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		owner_ubos.append(_magicdawn_native_owner_ubos[view])
 	var token := _next_magicdawn_publication_token()
 	var frame_token := int(ctx.call("get_frame_token"))
+	var bridge_layout_version := int(cache.get_runtime_state().get("layout_version",
+			DynamicVolumeCache.LAYOUT_VERSION))
 	if owner_ok and frame_token > 0:
 		var fields: Array = cache.get_field_textures()
 		var moments: RID = cache.get_moments_texture()
@@ -2698,7 +2857,7 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 				DynamicVolumeCache.LAYOUT_VERSION))
 		# Use the bridge discriminator reported by the engine; the SH payload schema
 		# remains explicit in the cache UBO and its operator-schema metadata.
-		var bridge_layout_version := cache_layout_version
+		bridge_layout_version = cache_layout_version
 		if bool(cache_runtime_state.get("paged_prepared_transfer", false)):
 			bridge_layout_version = int(ctx.call("get_magic_gi_paged_prepared_layout_version"))
 		elif bool(cache_runtime_state.get("preinterpolated_transfer", false)):
@@ -2710,6 +2869,13 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 					cache.spacing_m, cache.response_resolution,
 					bridge_layout_version, token, frame_token)
 			owner_ok = owner_ok and bool(ctx.call("has_magic_gi_dynamic_volume_input", view))
+		if owner_ok and not olv_binding.is_empty() and cache.has_method("has_olv_binding") \
+				and bool(cache.call("has_olv_binding")):
+			var olv_resources: Dictionary = cache.call("get_olv_binding")
+			if ctx.has_method("set_magic_gi_dynamic_volume_olv_input"):
+				ctx.call("set_magic_gi_dynamic_volume_olv_input", 0,
+					olv_resources.label_atlas, olv_resources.label_parameters)
+				owner_ok = bool(ctx.call("has_magic_gi_dynamic_volume_olv_input", 0))
 		if not owner_ok:
 			ctx.call("clear_magic_gi_dynamic_volume_inputs")
 			_dynamic_volume_runtime_state["status"] = "volume_lease_rejected"
@@ -2728,10 +2894,18 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		_replacement_request_prepared = replacement_requested
 		_dynamic_volume_publication_token = token
 		var published_cache_state: Dictionary = cache.get_runtime_state()
+		var prepared_check_stats := _native_olv_prepared_check_stats(source)
 		_dynamic_volume_runtime_state = {
 			"status": "published_waiting_for_renderer",
 			"frame": Engine.get_frames_drawn(), "frame_token": frame_token,
 			"publication_token": token, "cache_identity": cache_identity,
+			"bridge_layout_version": bridge_layout_version,
+			"olv_requested": not olv_binding.is_empty(),
+			"olv_labels_hash": String(olv_binding.get("labels_hash", "")),
+			"olv_validation_calls": _native_olv_binding_validation_calls,
+			"olv_validation_cache_hits": _native_olv_binding_cache_hits,
+			"olv_prepared_check_calls": int(prepared_check_stats.get("calls", 0)),
+			"olv_prepared_check_cache_hits": int(prepared_check_stats.get("cache_hits", 0)),
 			"source_validated": validated, "source_instance_id": source.get_instance_id(),
 			"source_signature": source_signature, "active": false,
 			"owner_control_w_published": float(_magicdawn_receiver_qa_mode),

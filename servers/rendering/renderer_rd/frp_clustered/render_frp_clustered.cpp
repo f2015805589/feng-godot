@@ -311,13 +311,30 @@ static bool _frp_validate_magic_gi_dynamic_volume_input(
 		if (format.texture_type != RD::TEXTURE_TYPE_3D ||
 				(format.format != RD::DATA_FORMAT_R32G32B32A32_SFLOAT &&
 						!(preinterpolated && format.format == RD::DATA_FORMAT_R16G16B16A16_SFLOAT)) ||
-				format.width != uint32_t(p_input.dimensions.x * (preinterpolated ? 1 : p_input.response_resolution + 2)) ||
+				format.width != uint32_t(p_input.dimensions.x * (preinterpolated ? (p_input.olv_enabled ? 2 : 1) : p_input.response_resolution + 2)) ||
 				format.height != uint32_t(p_input.dimensions.y * (preinterpolated ? 1 : p_input.response_resolution + 2)) ||
 				format.depth != uint32_t(p_input.dimensions.z * (compact_prepared ?
 						FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_FIELD_COUNT :
 						(preinterpolated ? 7 : 1))) ||
 				format.samples != RD::TEXTURE_SAMPLES_1 ||
 				!(format.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT)) {
+			return false;
+		}
+	}
+	if (p_input.olv_enabled) {
+		if (!compact_prepared || !p_input.olv_label_atlas.is_valid() ||
+				!p_input.olv_label_parameters.is_valid() ||
+				!rd->texture_is_valid(p_input.olv_label_atlas)) {
+			return false;
+		}
+		const RD::TextureFormat labels = rd->texture_get_format(p_input.olv_label_atlas);
+		if (labels.texture_type != RD::TEXTURE_TYPE_3D ||
+				labels.format != RD::DATA_FORMAT_R8_UNORM ||
+				labels.width != uint32_t(p_input.dimensions.x * 2) ||
+				labels.height != uint32_t(p_input.dimensions.y * 2) ||
+				labels.depth != uint32_t(p_input.dimensions.z * 2) ||
+				labels.samples != RD::TEXTURE_SAMPLES_1 ||
+				!(labels.usage_bits & RD::TEXTURE_USAGE_SAMPLING_BIT)) {
 			return false;
 		}
 	}
@@ -3803,6 +3820,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						bool magic_gi_dynamic_screen_cache_selected = false;
 						bool magic_gi_dynamic_volume_requested = false;
 						bool magic_gi_dynamic_volume_selected = false;
+						bool magic_gi_dynamic_volume_olv_selected = false;
 						int64_t magic_gi_baked_sh_publication_token = 0;
 						int64_t magic_gi_dynamic_volume_publication_token = 0;
 						bool magic_gi_general_queue_selected = false;
@@ -3837,6 +3855,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 									pass_context->get_magic_gi_dynamic_screen_cache_input(0);
 							magic_gi_dynamic_screen_cache_selected =
 									source.layout_version != FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION &&
+								!source.olv_enabled &&
 									_frp_validate_magic_gi_dynamic_volume_input(source) &&
 									_frp_validate_magic_gi_dynamic_screen_cache_input(
 											screen, rb->get_internal_size());
@@ -3888,11 +3907,19 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						magic_gi_dynamic_volume_selected = magic_gi_dynamic_volume_selected &&
 								magic_gi_dynamic_volume_publication_token > 0;
 						if (magic_gi_dynamic_volume_selected) {
-							const int layout_version = pass_context->get_magic_gi_dynamic_volume_input(0).layout_version;
+							const FRPPassContext::MagicGIDynamicVolumeViewInput input =
+									pass_context->get_magic_gi_dynamic_volume_input(0);
+							const int layout_version = input.layout_version;
+							magic_gi_dynamic_volume_olv_selected = volume_view_count == 1 &&
+									pass_context->has_magic_gi_dynamic_volume_olv_input(0);
 							if (layout_version == FRPPassContext::MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION) {
-								lighting_mode |= FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
+								lighting_mode |= magic_gi_dynamic_volume_olv_selected ?
+										FRP_LIGHTING_MODE_MAGIC_GI_OLV_PREPARED_SH2_VOLUME :
+										FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
 							} else if (layout_version == FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) {
-								lighting_mode |= FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
+								lighting_mode |= magic_gi_dynamic_volume_olv_selected ?
+										FRP_LIGHTING_MODE_MAGIC_GI_OLV_PAGED_PREPARED_VOLUME :
+										FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
 							} else {
 								lighting_mode |= layout_version == FRPPassContext::MAGIC_GI_PREINTERPOLATED_VOLUME_LAYOUT_VERSION ? FRP_LIGHTING_MODE_MAGIC_GI_PREINTERPOLATED_VOLUME : FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME;
 							}
@@ -4014,7 +4041,7 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						RID shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
 						// Descriptor layouts include shader-stage visibility, not just binding types.
 						RID lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
-						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture, pass_context, magic_gi_baked_sh_selected, magic_gi_screen_cache_selected, magic_gi_dynamic_volume_selected, magic_gi_dynamic_screen_cache_selected);
+						rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture, pass_context, magic_gi_baked_sh_selected, magic_gi_screen_cache_selected, magic_gi_dynamic_volume_selected, magic_gi_dynamic_screen_cache_selected, magic_gi_dynamic_volume_olv_selected);
 						if (magic_gi_dynamic_screen_cache_selected && !rp_uniform_set.is_valid()) {
 							// If the transient screen lease is malformed, use the already
 							// validated live volume directly for this frame.
@@ -4040,13 +4067,40 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 						}
 						}
 						if (magic_gi_dynamic_volume_selected && !rp_uniform_set.is_valid()) {
-							magic_gi_dynamic_volume_selected = false;
-							// Clear all prepared/dynamic-volume selector bits before fallback.
-							lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
-							lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
-							shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
-							lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
-							rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture, pass_context, false, false, false);
+							// An OLV descriptor can fail independently of its already-validated
+							// prepared-volume descriptor. Retry the same prepared layout without
+							// binding the label atlas before dropping GI for this frame.
+							if (magic_gi_dynamic_volume_olv_selected && pass_context.is_valid()) {
+								const int layout_version = pass_context->get_magic_gi_dynamic_volume_input(0).layout_version;
+								int prepared_selector = 0;
+								if (layout_version == FRPPassContext::MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION) {
+									prepared_selector = FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
+								} else if (layout_version == FRPPassContext::MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION) {
+									prepared_selector = FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
+								}
+								if (prepared_selector != 0) {
+									lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_CLV;
+									lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
+									lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
+									lighting_mode |= prepared_selector;
+									magic_gi_dynamic_volume_olv_selected = false;
+									shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
+									lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
+									rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture, pass_context, false, false, true, false, false);
+								}
+							}
+							if (!rp_uniform_set.is_valid()) {
+								magic_gi_dynamic_volume_selected = false;
+								magic_gi_dynamic_volume_olv_selected = false;
+								// Clear every prepared/dynamic selector (including OLV's CLV
+								// discriminator bit) before the ordinary deferred fallback.
+								lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_CLV;
+								lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PAGED_PREPARED_VOLUME;
+								lighting_mode &= ~FRP_LIGHTING_MODE_MAGIC_GI_PREPARED_SH2_VOLUME;
+								shader = frp_lighting.shader.version_get_shader(frp_lighting.shader_version, lighting_mode);
+								lighting_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, SCENE_UNIFORM_SET, render_base_uniforms);
+								rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true, shader, environment_radiance_texture, pass_context, false, false, false);
+							}
 						}
 		if (magic_gi_screen_cache_selected && !rp_uniform_set.is_valid()) {
 			// A screen-cache descriptor failure must not leave an invalid set bound.
@@ -4117,6 +4171,8 @@ void RenderFRPClustered::_render_scene(RenderDataRD *p_render_data, const Color 
 								pass_context->set_magic_gi_dynamic_volume_lighting_consumed_token(
 										magic_gi_dynamic_volume_publication_token);
 							}
+							pass_context->set_magic_gi_dynamic_volume_olv_lighting_active(
+									magic_gi_dynamic_volume_olv_selected && magic_gi_dynamic_volume_selected && lighting_draw_valid);
 							if (magic_gi_general_queue_selected && lighting_draw_valid) {
 								// The addon source-only consumer follows this completed producer draw.
 								RD::get_singleton()->draw_command_insert_ordering_barrier();
@@ -5363,7 +5419,7 @@ void RenderFRPClustered::_update_render_base_uniform_set() {
 	}
 }
 
-RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas, RID p_lighting_shader, RID p_environment_radiance_texture, const Ref<FRPPassContext> &p_cloud_context, bool p_magic_gi_baked_sh, bool p_magic_gi_screen_cache, bool p_magic_gi_dynamic_volume, bool p_magic_gi_dynamic_screen_cache) {
+RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas, RID p_lighting_shader, RID p_environment_radiance_texture, const Ref<FRPPassContext> &p_cloud_context, bool p_magic_gi_baked_sh, bool p_magic_gi_screen_cache, bool p_magic_gi_dynamic_volume, bool p_magic_gi_dynamic_screen_cache, bool p_magic_gi_dynamic_volume_olv) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
@@ -5856,6 +5912,24 @@ RID RenderFRPClustered::_setup_render_pass_uniform_set(RenderListType p_render_l
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 			u.append_id(index == 1 ? shared_input.relocation_offsets : shared_input.source_validity);
 			uniforms.push_back(u);
+		}
+		if (p_magic_gi_dynamic_volume_olv) {
+			if (p_cloud_context.is_null() ||
+					!p_cloud_context->has_magic_gi_dynamic_volume_olv_input(0)) {
+				return RID();
+			}
+			const FRPPassContext::MagicGIDynamicVolumeViewInput olv_input =
+					p_cloud_context->get_magic_gi_dynamic_volume_input(0);
+				RD::Uniform labels;
+				labels.binding = 90;
+				labels.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+				labels.append_id(olv_input.olv_label_atlas);
+				uniforms.push_back(labels);
+				RD::Uniform metadata;
+				metadata.binding = 91;
+				metadata.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+				metadata.append_id(olv_input.olv_label_parameters);
+				uniforms.push_back(metadata);
 		}
 	} else if (p_cloud_context.is_valid() && rb.is_valid() && p_magic_gi_baked_sh) {
 		const int baked_sh_view_count = MIN(int(rb->get_view_count()), 2);
@@ -7158,6 +7232,11 @@ RenderFRPClustered::RenderFRPClustered() {
 		modes.resize(FRP_LIGHTING_MODE_MAX);
 		for (int mode = 0; mode < FRP_LIGHTING_MODE_MAX; mode++) {
 			String mode_defines = defines;
+			const PreparedSH2LightingVariant prepared_sh2_variant = _get_prepared_sh2_lighting_variant(mode);
+			const int selector_without_standard_flags = mode & ~31;
+			const bool olv_prepared_variant = selector_without_standard_flags ==
+					FRP_LIGHTING_MODE_MAGIC_GI_OLV_PREPARED_SH2_VOLUME ||
+					selector_without_standard_flags == FRP_LIGHTING_MODE_MAGIC_GI_OLV_PAGED_PREPARED_VOLUME;
 			if (mode & 1) {
 				mode_defines += "\n#define MODE_SEPARATE_SPECULAR\n";
 			}
@@ -7173,7 +7252,7 @@ RenderFRPClustered::RenderFRPClustered() {
 			if (mode & FRP_LIGHTING_MODE_REFLECTION_COMPONENTS) {
 				mode_defines += "\n#define MODE_REFLECTION_COMPONENTS\n";
 			}
-			if (mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV) {
+			if ((mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV) && !olv_prepared_variant) {
 				mode_defines += "\n#define MODE_MAGIC_GI_CLV\n";
 			}
 			if ((mode & FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_SCREEN_CACHE) ==
@@ -7186,17 +7265,22 @@ RenderFRPClustered::RenderFRPClustered() {
 					!(mode & (FRP_LIGHTING_MODE_MAGIC_GI_CLV | FRP_LIGHTING_MODE_MAGIC_GI_BAKED_SH | FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME))) {
 				mode_defines += "\n#define MODE_MAGIC_GI_SCREEN_CACHE\n";
 			}
-			const PreparedSH2LightingVariant prepared_sh2_variant = _get_prepared_sh2_lighting_variant(mode);
 			if (prepared_sh2_variant == PreparedSH2LightingVariant::PAGED_VOLUME &&
-					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV)) {
+					(!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV) || olv_prepared_variant)) {
 				mode_defines += "\n#define MODE_MAGIC_GI_DYNAMIC_VOLUME\n";
 				mode_defines += "\n#define MAGIC_GI_PREINTERPOLATED_ONLY\n";
 				mode_defines += "\n#define MAGIC_GI_PREPARED_PAGED_ONLY\n";
+				if (olv_prepared_variant) {
+					mode_defines += "\n#define MAGIC_GI_OLV_GATE\n";
+				}
 			} else if (prepared_sh2_variant == PreparedSH2LightingVariant::WHOLE_VOLUME &&
-					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV)) {
+					(!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV) || olv_prepared_variant)) {
 				mode_defines += "\n#define MODE_MAGIC_GI_DYNAMIC_VOLUME\n";
 				mode_defines += "\n#define MAGIC_GI_PREINTERPOLATED_ONLY\n";
 				mode_defines += "\n#define MAGIC_GI_PREPARED_SH2_ONLY\n";
+				if (olv_prepared_variant) {
+					mode_defines += "\n#define MAGIC_GI_OLV_GATE\n";
+				}
 			} else if ((mode & FRP_LIGHTING_MODE_MAGIC_GI_DYNAMIC_VOLUME) &&
 					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_SCREEN_CACHE) &&
 					!(mode & FRP_LIGHTING_MODE_MAGIC_GI_CLV)) {

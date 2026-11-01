@@ -1,0 +1,5 @@
+{
+  "sha256": "95cfda71c079b45745d35a1fcd489c0f9707452a1961534e788dcf1d3bc8a850",
+  "exam_manifest_sha256": "ac5b9dc532043572d51206233760f7c404a3a79d4a57c976105659de16af1ac9",
+  "usage": "benchmark_only_never_training"
+}

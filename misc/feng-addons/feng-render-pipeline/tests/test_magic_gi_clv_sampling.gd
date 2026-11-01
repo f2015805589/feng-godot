@@ -700,13 +700,13 @@ func _test_debug_view_parameter() -> void:
 	var gi_pass := MagicGIPass.new()
 	check(gi_pass.clv_debug_view == 0,
 			"CLV diagnostics must default to Off.")
-	for view in 5:
+	for view in 7:
 		gi_pass.clv_debug_view = view
 		var bytes := gi_pass._parameter_bytes()
 		check(int(round(bytes.decode_float(12))) == view,
 				"CLV debug view must be encoded in the spare push-constant lane.")
 	gi_pass.clv_debug_view = 99
-	check(gi_pass.clv_debug_view == 4 and int(round(gi_pass._parameter_bytes().decode_float(12))) == 4,
+	check(gi_pass.clv_debug_view == 6 and int(round(gi_pass._parameter_bytes().decode_float(12))) == 6,
 			"CLV debug view values must clamp to the supported enum range.")
 	gi_pass._last_clv_cache_backend = 1
 	var debug_property := {"name": "clv_debug_view", "usage": PROPERTY_USAGE_DEFAULT}

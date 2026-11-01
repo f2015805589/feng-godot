@@ -55,7 +55,7 @@ static func _slice(source: Chunk, level: int, core: Vector3i,
 	brick.emitter_ids = source.emitter_ids
 	brick.emitter_static_signatures = source.emitter_static_signatures
 	brick.geometry_signature = source.geometry_signature
-	brick.directional_source_signature = source.directional_source_signature
+	brick.directional_source_signature = source.clv_preparation_signature
 	brick.maximum_operator_row_l1 = float(source.clv_preparation_stats.get("maximum_operator_row_l1", 0.0))
 	brick.probe_count = brick.cell_count()
 	var stride := brick.operator_stride()
@@ -134,7 +134,7 @@ static func save_source(source: Chunk, template: Manifest, generation: String,
 	manifest.prepared_level_count = int(result.level_count)
 	manifest.prepared_emitter_ids = source.emitter_ids
 	manifest.prepared_emitter_static_signatures = source.emitter_static_signatures
-	manifest.prepared_source_signature = source.directional_source_signature
+	manifest.prepared_source_signature = source.clv_preparation_signature
 	manifest.prepared_operator_schema_version = source.clv_preparation_schema_version
 	manifest.prepared_source_transform_world = source.source_transform_world
 	manifest.prepared_source_size_m = source.source_size_m

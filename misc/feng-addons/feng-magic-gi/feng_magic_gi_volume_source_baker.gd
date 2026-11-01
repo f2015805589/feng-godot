@@ -15,6 +15,10 @@ const Baker = preload("feng_magic_gi_baker.gd")
 const Page = preload("feng_magic_gi_page.gd")
 const Manifest = preload("feng_magic_gi_manifest.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
+const OLVProbePayload = preload("feng_magic_gi_olv_probe_domain_payload.gd")
+const OLVDomain = preload("feng_magic_gi_olv_domain.gd")
+const OLVLabelSet = preload("feng_magic_gi_olv_label_set.gd")
+const OLVInferenceRunner = preload("feng_magic_gi_olv_inference_runner.gd")
 const MIN_MOMENT_RAYS := 256
 const DEFAULT_WORK_BUDGET_PER_BATCH := 8000000
 const DEFAULT_MAX_RELOCATION_M := 0.05
@@ -22,6 +26,7 @@ const MAX_BAKE_SAMPLES := 65536
 const MAX_BAKE_BOUNCES := 8
 const MAX_MOMENT_RAYS := 65536
 const TRANSPORT_DOMAIN := "regular_free_space_clv_v1"
+const OLV_R4_CAPTURE_GROW_M := 8.1875
 
 func bake_paged_async(volume: Node3D, generation: String, output_root: String,
 		options: Dictionary = {}, progress := Callable(), cancelled := Callable()) -> Dictionary:
@@ -90,7 +95,10 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 		return _failure("The .25m free-space grid exceeds the supported per-axis extent.")
 	# A path may advance one maximum-distance segment at every bounce; collecting
 	# only one segment around the volume would silently omit farther indirect hits.
-	var collection_bounds := source_bounds_world.grow(trace_distance * float(bounces + 1))
+	var collection_grow := trace_distance * float(bounces + 1)
+	if bool(options.get("olv_inference_requested", false)):
+		collection_grow = maxf(collection_grow, OLV_R4_CAPTURE_GROW_M)
+	var collection_bounds := source_bounds_world.grow(collection_grow)
 	var geometry: RefCounted = options.get("captured_geometry") if multires else null
 	if geometry == null: geometry = Placement.new()
 	if not (multires and options.has("captured_geometry")) \
@@ -122,6 +130,20 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	source.emitter_count = emitter_ids.size()
 	source.emitter_static_signatures = emitter_signatures
 	source.geometry_signature = geometry_signature_for(geometry)
+	source.geometry_triangles_sha256 = OLVProbePayload.sha256_bytes(geometry.faces.to_byte_array())
+	source.global_cell_origin = options.get("global_cell_origin", Vector3i.ZERO) \
+			if multires else Vector3i.ZERO
+	source.source_lod = int(options.get("source_level", 0)) if multires else 0
+	if bool(options.get("olv_inference_requested", false)) and not multires:
+		var layout_context := make_olv_layout_context(volume, source.geometry_signature,
+				source_bounds_world.position + Vector3.ONE * (Chunk.CELL_SPACING_M * 0.5),
+				dimensions, 4)
+		if layout_context.is_empty():
+			return _failure("Could not bind the OLV classifier to the free-space CLV layout.")
+		options["olv_layout_context"] = layout_context
+	var olv_payload: Resource = options.get("olv_probe_domain_payload")
+	if olv_payload != null:
+		source.olv_probe_domain_payload = olv_payload
 	source.directional_source_signature = source.make_directional_source_signature()
 	if not _classify_cells(source, volume, geometry, progress, cancelled):
 		return _failure("Free-space cell classification was cancelled or failed.")
@@ -214,17 +236,43 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	if not source.is_valid(source.geometry_signature, source.emitter_ids,
 			source.emitter_static_signatures):
 		return _failure("The completed free-space source chunk failed structural validation.")
+	var olv_domain_filter: Dictionary = options.get("olv_domain_filter", {})
+	var olv_label_set: Resource
+	var olv_layout_context: Dictionary = options.get("olv_layout_context", {})
+	if bool(options.get("olv_inference_requested", false)):
+		var olv_result: Dictionary = await _infer_olv_for_source(source, geometry,
+				options, progress, cancelled)
+		if not bool(olv_result.get("ok", false)):
+			return _failure("OLV inference failed; the previous generation remains active: " +
+				String(olv_result.get("error", "unknown_inference_error")))
+		olv_domain_filter = olv_result.get("domain_filter", {})
+		olv_label_set = olv_result.get("label_set") as Resource
+		olv_layout_context = olv_result.get("layout_context", {})
+	elif bool(options.get("olv_reuse_requested", false)):
+		var reuse_result := _reuse_olv_for_source(source, options)
+		if not bool(reuse_result.get("ok", false)):
+			return _failure("The existing OLV cache no longer matches the freshly classified source; the previous generation remains active. Run the independent OLV update. " +
+				String(reuse_result.get("error", "cache_binding_mismatch")))
+		olv_domain_filter = reuse_result.get("domain_filter", {})
+		olv_label_set = reuse_result.get("label_set") as Resource
+		olv_layout_context = reuse_result.get("layout_context", {})
 	if multires:
 		return {"ok": true, "chunk": source, "empty": false,
-			"geometry_signature": source.geometry_signature, "valid_cells": valid_indices.size()}
+			"geometry_signature": source.geometry_signature, "valid_cells": valid_indices.size(),
+			"olv_domain_filter": olv_domain_filter, "olv_label_set": olv_label_set,
+			"olv_layout_context": olv_layout_context}
 	var clv_builder_script := load("res://addons/feng-magic-gi/feng_magic_gi_clv_transfer_builder.gd") as Script
 	if clv_builder_script == null:
 		return _failure("The CLV transfer preinterpolator is unavailable.")
 	var clv_builder: RefCounted = clv_builder_script.new()
 	var clv_result: Dictionary = await clv_builder.prepare_async(source, geometry,
-		cancelled, progress, coordinates, {})
+		cancelled, progress, coordinates, {}, olv_domain_filter)
 	if not bool(clv_result.get("ok", false)):
 		return _failure("CLV transfer preparation failed: " + str(clv_result.get("error", "invalid_output")))
+	if bool(options.get("olv_inference_requested", false)) \
+			and not bool(clv_result.get("stats", {}).get("olv_filter_enabled", false)):
+		return _failure("OLV was requested, but the prepared CLV filter did not validate: " +
+			String(clv_result.get("stats", {}).get("olv_filter_disable_reason", "unknown")))
 	# Keep every valid baked probe and all prepared operators exactly. Packing
 	# removes only the zero payloads of invalid grid slots, after preparation.
 	if progress.is_valid():
@@ -267,6 +315,191 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 		"batches": batch_count,
 		"geometry_signature": source.geometry_signature,
 		"directional_source_signature": source.directional_source_signature,
+		"olv_domain_filter": olv_domain_filter,
+		"olv_label_set": olv_label_set,
+		"olv_layout_context": olv_layout_context,
+		"olv_filter_stats": clv_result.get("stats", {}),
+	}
+
+static func can_reuse_inferred_olv(source: Chunk) -> bool:
+	var payload: Resource = source.olv_probe_domain_payload if source != null else null
+	return payload != null \
+		and String(payload.model_sha256) == OLVInferenceRunner.EXPECTED_MODEL_BUNDLE_SHA256 \
+		and String(payload.feature_schema_id) == OLVInferenceRunner.EXPECTED_FEATURE_SCHEMA_ID \
+		and String(payload.feature_schema_sha256) == OLVInferenceRunner.EXPECTED_FEATURE_SCHEMA_SHA256 \
+		and String(payload.decision_policy_id) == OLVInferenceRunner.EXPECTED_DECISION_POLICY_ID \
+		and bool(payload.validate_for_source(source).get("ok", false))
+
+
+static func _retained_olv_metadata(source: Chunk, context: Dictionary) -> Dictionary:
+	var payload: Resource = source.olv_probe_domain_payload
+	var metadata := {}
+	for key in ["model_sha256", "feature_schema_id", "feature_schema_sha256", "decision_policy_id",
+			"geometry_triangles_sha256", "supported_probe_spacing_m", "supported_target_cell_spacings_m",
+			"feature_context_extent_m", "supported_feature_context_extents_m"]:
+		metadata[key] = payload.get(key)
+	for key in ["scene_id", "volume_id", "layout_revision", "target_layout_signature"]:
+		metadata[key] = context[key]
+	metadata["target_label_set_sha256"] = ""
+	var positions := PackedVector3Array()
+	positions.resize(source.probe_count)
+	for index in source.probe_count: positions[index] = source.cell_position(index)
+	metadata["source_probe_positions"] = positions
+	return metadata
+
+
+func _infer_olv_for_source(source: Chunk, geometry: RefCounted,
+		options: Dictionary, progress: Callable, cancelled: Callable) -> Dictionary:
+	var runner: RefCounted = options.get("olv_runner")
+	var reuse := bool(options.get("reuse_olv_payload", false)) \
+		and can_reuse_inferred_olv(source)
+	if not reuse and (runner == null or not runner.has_method("infer_source")):
+		return _failure("OLV one-click bake has no running offline inference worker.")
+	var layout_context: Dictionary = options.get("olv_layout_context", {})
+	for key in ["scene_id", "volume_id", "layout_revision", "target_layout_signature",
+			"grid_origin_world", "base_cell_spacing_m"]:
+		if not layout_context.has(key):
+			return _failure("OLV target layout binding is missing: " + key)
+	if progress.is_valid():
+		progress.call("绑定已保存的 OLV 标签" if reuse else "OLV Transformer 离线推理", 0, source.probe_count, 0, 0)
+	var inferred: Dictionary
+	if reuse:
+		if OLVProbePayload.sha256_bytes(geometry.faces.to_byte_array()) != source.geometry_triangles_sha256:
+			return _failure("Saved OLV labels do not match captured geometry.")
+		inferred = {"ok": true, "labels": source.olv_probe_domain_payload.labels.duplicate(),
+			"metadata": _retained_olv_metadata(source, layout_context),
+			"result": {"reused_exact_probe_labels": true, "neural_forward_calls": 0}}
+	else:
+		inferred = await runner.infer_source(source, geometry, layout_context, progress, cancelled)
+	if not bool(inferred.get("ok", false)):
+		return inferred
+	return bind_olv_result(source, inferred, layout_context,
+		1 if bool(options.get("multires_working_chunk", false)) else 4)
+
+
+func bind_olv_result(source: Chunk, inferred: Dictionary, layout_context: Dictionary,
+		target_lod_count := 4) -> Dictionary:
+	var labels: PackedByteArray = inferred.labels
+	var label_set := OLVLabelSet.new()
+	var configure_labels: Dictionary = label_set.configure(String(layout_context.scene_id),
+		String(layout_context.volume_id), int(layout_context.layout_revision),
+		source.geometry_signature, String(layout_context.target_layout_signature))
+	if not bool(configure_labels.get("ok", false)):
+		return _failure("Could not bind inferred OLV labels to the active bake: " +
+			String(configure_labels.get("error", "label_set_configure_failed")))
+	label_set.receiver_labels_complete = true
+	var last_lod := mini(OLVDomain.MAX_LOD + 1, source.source_lod + target_lod_count)
+	for logical_index in source.probe_count:
+		var label := int(labels[logical_index])
+		if not source.cell_is_valid(logical_index) or not OLVDomain.is_supervised_label(label):
+			continue
+		var local_cell: Vector3i = source.cell_coordinates(logical_index)
+		for target_lod in range(source.source_lod, last_lod):
+			var stride := 1 << (target_lod - source.source_lod)
+			if local_cell.x % stride != 0 or local_cell.y % stride != 0 \
+					or local_cell.z % stride != 0:
+				continue
+			var global_cell: Vector3i = source.global_cell_origin + Vector3i(
+				local_cell.x / stride, local_cell.y / stride, local_cell.z / stride)
+			var identity := OLVDomain.cell_identity(String(layout_context.scene_id),
+				String(layout_context.volume_id), target_lod, global_cell,
+				int(layout_context.layout_revision))
+			var inserted: Dictionary = label_set.set_cell_label(identity, label)
+			if not bool(inserted.get("ok", false)):
+				return _failure("Could not map inferred source probe to CLV cell identity: " +
+					String(inserted.get("error", "label_mapping_failed")))
+			# A relocated probe owns its actual world anchor, not the solid cell
+			# it escaped from. Keep its source label for transport partitioning,
+			# but do not use it to classify a receiver at the former grid point.
+			if source.relocation_offset_m[logical_index].length_squared() <= 0.0000000001:
+				var receiver_inserted: Dictionary = label_set.set_receiver_label(identity, label)
+				if not bool(receiver_inserted.get("ok", false)):
+					return _failure("Could not bind logical OLV receiver anchor.")
+	label_set.refresh_labels_hash()
+	var payload_metadata: Dictionary = inferred.get("metadata", {}).duplicate(true)
+	payload_metadata["target_label_set_sha256"] = String(label_set.labels_hash)
+	var payload: Resource = OLVProbePayload.new()
+	var payload_result: Dictionary = payload.configure_for_source(source, labels,
+		payload_metadata)
+	if not bool(payload_result.get("ok", false)):
+		return _failure("Inferred OLV probe payload failed exact source binding: " +
+			String(payload_result.get("error", "payload_configuration_failed")))
+	source.olv_probe_domain_payload = payload
+	var filter_context := layout_context.duplicate(true)
+	filter_context["layout_signature"] = String(layout_context.target_layout_signature)
+	filter_context["label_set"] = label_set
+	return {"ok": true, "domain_filter": filter_context,
+		"label_set": label_set, "layout_context": filter_context,
+		"inference_result": inferred.get("result", {})}
+
+
+func _reuse_olv_for_source(source: Chunk, options: Dictionary) -> Dictionary:
+	var context_value: Variant = options.get("olv_layout_context", {})
+	var context: Dictionary = context_value if context_value is Dictionary else {}
+	var labels: Resource = options.get("olv_label_set") as Resource
+	var payload: Resource = options.get("olv_probe_domain_payload") as Resource
+	if labels == null or payload == null or context.is_empty() \
+			or not labels.has_method("validate") or not labels.has_method("matches_bake") \
+			or not payload.has_method("validate_for_source"):
+		return _failure("The active generation did not retain a validated OLV source payload and label set.")
+	var label_validation: Dictionary = labels.validate()
+	if not bool(label_validation.get("ok", false)):
+		return _failure("The active OLV label set is invalid: " + String(label_validation.get("error", "unknown")))
+	var expected_layout_signature := String(context.get("target_layout_signature", ""))
+	if expected_layout_signature.is_empty() \
+			or String(context.get("layout_signature", "")) != expected_layout_signature \
+			or not labels.matches_bake(String(context.get("scene_id", "")),
+				String(context.get("volume_id", "")), int(context.get("layout_revision", -1)),
+				source.geometry_signature, expected_layout_signature):
+		return _failure("The active OLV target layout does not match this source geometry/layout.")
+	var payload_validation: Dictionary = payload.validate_for_source(source,
+			String(labels.get("labels_hash")))
+	if not bool(payload_validation.get("ok", false)):
+		return _failure("The active OLV source payload binding failed: " +
+			String(payload_validation.get("error", "unknown")))
+	source.olv_probe_domain_payload = payload
+	var filter_context := context.duplicate(true)
+	filter_context["layout_signature"] = expected_layout_signature
+	filter_context["label_set"] = labels
+	return {"ok": true, "domain_filter": filter_context,
+		"label_set": labels, "layout_context": filter_context}
+
+## Create the generation-wide target lattice binding shared by all source tiles.
+## `grid_origin_world` is the center of target cell (0,0,0), matching the
+## builder's exact source-to-CLV anchor check.
+static func make_olv_layout_context(volume: Node3D, geometry_signature: int,
+		grid_origin_world: Vector3, global_dimensions: Vector3i,
+		prepared_levels: int, revision_override := -1) -> Dictionary:
+	if not is_instance_valid(volume) or not volume.has_method("layout_revision") \
+			or not grid_origin_world.is_finite() or global_dimensions.x <= 0 \
+			or global_dimensions.y <= 0 or global_dimensions.z <= 0:
+		return {}
+	var scene_id := SceneTracker.scene_identity(volume)
+	var volume_id := SceneTracker.scene_relative_path(volume)
+	var revision := maxi(0, int(volume.call("layout_revision"))) if revision_override < 0 \
+			else revision_override
+	if scene_id.is_empty() or volume_id.is_empty():
+		return {}
+	var signature_payload := {
+		"schema": "feng_magic_gi_olv_clv_layout_binding_v1",
+		"scene_id": scene_id,
+		"volume_id": volume_id,
+		"layout_revision": revision,
+		"geometry_signature": geometry_signature,
+		"grid_origin_world": [grid_origin_world.x, grid_origin_world.y, grid_origin_world.z],
+		"global_dimensions": [global_dimensions.x, global_dimensions.y, global_dimensions.z],
+		"base_cell_spacing_m": Chunk.CELL_SPACING_M,
+		"prepared_levels": prepared_levels,
+	}
+	var layout_signature := JSON.stringify(signature_payload, "", true, true).sha256_text()
+	return {
+		"scene_id": scene_id,
+		"volume_id": volume_id,
+		"layout_revision": revision,
+		"target_layout_signature": layout_signature,
+		"layout_signature": layout_signature,
+		"grid_origin_world": grid_origin_world,
+		"base_cell_spacing_m": Chunk.CELL_SPACING_M,
 	}
 
 ## Attach a completed chunk to a source-only immutable page. The chunk has already
@@ -285,7 +518,7 @@ static func populate_page(page: Resource, chunk: Resource,
 	page.support_bounds = chunk.domain_bounds_world
 	page.probe_count = chunk.probe_count
 	page.geometry_signature = chunk.geometry_signature
-	page.settings_signature = hash([chunk.directional_source_signature,
+	page.settings_signature = hash([chunk.make_clv_preparation_signature(),
 		chunk.bake_samples, chunk.bake_bounces, chunk.trace_distance_m,
 		chunk.moment_rays])
 	page.data = null
@@ -417,15 +650,33 @@ static func geometry_signature_for(geometry: RefCounted) -> int:
 
 ## Source-domain bake signature. Surface-placement and paging controls do not
 ## affect this fixed .25 m regular grid and therefore must not stale its data.
-static func settings_signature(volume: Node3D) -> int:
+static func settings_signature(volume: Node3D, olv_enabled: Variant = null,
+		stored_olv_model_sha256 := "") -> int:
 	if not is_instance_valid(volume) or not volume is Volume:
 		return 0
 	var moment_rays := maxi(int(volume.bake_samples), MIN_MOMENT_RAYS)
+	var include_olv_binding := current_olv_signature_binding(volume) \
+			if olv_enabled == null else bool(olv_enabled)
+	var olv_model_binding := (OLVInferenceRunner.EXPECTED_MODEL_BUNDLE_SHA256 \
+		if stored_olv_model_sha256.is_empty() else stored_olv_model_sha256) if include_olv_binding else ""
 	return hash([TRANSPORT_DOMAIN, Chunk.SOURCE_SCHEMA_REVISION_CURRENT,
 		Chunk.CELL_SPACING_M, volume.global_transform, volume.size,
 		volume.bake_samples, volume.bake_bounces, volume.bake_distance,
 		volume.terrain_reflectance, volume.fallback_material_reflectance,
+		olv_model_binding,
 		volume.clv_cell_size, moment_rays, DEFAULT_MAX_RELOCATION_M])
+
+static func current_olv_signature_binding(volume: Node3D) -> bool:
+	if not is_instance_valid(volume):
+		return false
+	if volume.has_method("is_baking") and bool(volume.call("is_baking")):
+		return (volume.has_method("is_olv_bake_requested") \
+				and bool(volume.call("is_olv_bake_requested"))) \
+			or (volume.has_method("is_olv_cache_reuse_requested") \
+				and bool(volume.call("is_olv_cache_reuse_requested")))
+	var active_manifest: Resource = volume.get("bake_manifest") as Resource
+	return active_manifest != null and is_instance_valid(active_manifest) \
+			and bool(active_manifest.get("prepared_olv_filter_enabled"))
 
 func _classify_cells(source: Chunk, volume: Node3D, geometry: RefCounted,
 		progress: Callable, cancelled: Callable) -> bool:

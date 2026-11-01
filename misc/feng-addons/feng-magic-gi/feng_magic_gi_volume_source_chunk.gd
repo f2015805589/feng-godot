@@ -8,7 +8,7 @@ const FORMAT_VERSION_DENSE := 1
 const FORMAT_VERSION_PACKED := 2
 const FORMAT_VERSION_CURRENT := FORMAT_VERSION_PACKED
 const CLV_PREPARATION_SCHEMA_CURRENT := 2
-const CLV_PREPARATION_REVISION_CURRENT := 4
+const CLV_PREPARATION_REVISION_CURRENT := 5
 const SOURCE_SCHEMA_REVISION_CURRENT := 1
 const DIRECTIONAL_DATA_REVISION := 1
 const LAYOUT_REGULAR_CELL_CENTERS_V1 := "regular_cell_centers_v1"
@@ -30,7 +30,16 @@ const RELOCATION_STATUS_RELOCATED := 2
 @export_storage var directional_data_revision := DIRECTIONAL_DATA_REVISION
 @export_storage var layout := LAYOUT_REGULAR_CELL_CENTERS_V1
 @export_storage var geometry_signature := 0
+## Exact SHA-256 of the ordered world-space triangle vertices used to classify
+## this source. The legacy integer geometry_signature remains the transport
+## bake key; OLV payload validation requires this stronger geometry identity.
+@export_storage var geometry_triangles_sha256 := ""
 @export_storage var directional_source_signature := ""
+## Global OLV lattice coordinate for this chunk and its source LOD. Dense
+## standalone grids use (0,0,0)/LOD0; bounded multires chunks record their tile
+## origin so labels never get inferred from a brick-local array index.
+@export_storage var global_cell_origin := Vector3i.ZERO
+@export_storage var source_lod := 0
 @export_storage var emitter_ids := PackedStringArray()
 @export_storage var emitter_static_signatures := PackedInt64Array()
 @export_storage var emitter_count := 0
@@ -83,11 +92,60 @@ const RELOCATION_STATUS_RELOCATED := 2
 @export_storage var clv_prepared_validity := PackedByteArray()
 @export_storage var clv_prepared_operators := PackedFloat32Array()
 @export_storage var clv_preparation_stats: Dictionary = {}
+## Optional validated offline classifier payload. Prepared labels are uploaded
+## with CLV responses for domain filtering before runtime interpolation. The
+## classifier itself only runs during an explicit offline OLV update.
+@export_storage var olv_probe_domain_payload: Resource
+## Domain-label assets bound to the current CLV operators. This is kept
+## separate from the raw transport signature so labels cannot invalidate PRT.
+@export_storage var clv_preparation_olv_binding_signature := ""
+var _clv_preparation_check_cache: Dictionary = {}
+var _clv_preparation_check_calls := 0
+var _clv_preparation_check_cache_hits := 0
 
-func has_preinterpolated_clv() -> bool:
+func has_preinterpolated_clv(expected_olv_binding_signature := "") -> bool:
+	var cache_key := _clv_preparation_check_key(expected_olv_binding_signature)
+	if _clv_preparation_check_cache.has(cache_key):
+		_clv_preparation_check_cache_hits += 1
+		return bool(_clv_preparation_check_cache[cache_key])
+	_clv_preparation_check_calls += 1
+	var result := _has_preinterpolated_clv_uncached(expected_olv_binding_signature)
+	if _clv_preparation_check_cache.size() >= 8:
+		_clv_preparation_check_cache.clear()
+	_clv_preparation_check_cache[cache_key] = result
+	return result
+
+func get_clv_preparation_check_stats() -> Dictionary:
+	return {"calls": _clv_preparation_check_calls,
+		"cache_hits": _clv_preparation_check_cache_hits,
+		"entries": _clv_preparation_check_cache.size()}
+
+func _clv_preparation_check_key(expected_olv_binding_signature: String) -> String:
+	var payload: Resource = olv_probe_domain_payload
+	var payload_cache_key := String(payload.call("get_runtime_cache_key")) \
+			if payload != null and payload.has_method("get_runtime_cache_key") \
+			else "%d|%s|%s" % [
+				int(payload.call("get_runtime_revision")) \
+					if payload != null and payload.has_method("get_runtime_revision") else 0,
+				String(payload.get("payload_sha256")) if payload != null else "",
+				String(payload.get("header_sha256")) if payload != null else ""]
+	var payload_id := payload.get_instance_id() if payload != null else 0
+	return "%d|%d|%s|%s|%s|%s|%s|%s|%d|%d|%d|%d|%s|%d|%d|%s" % [
+		clv_preparation_revision, clv_preparation_schema_version,
+		String(clv_preparation_signature), String(directional_source_signature),
+		String(clv_preparation_olv_binding_signature),
+		str(dimensions), str(clv_prepared_dimensions),
+		str(clv_prepared_offsets), clv_prepared_validity.size(),
+		clv_prepared_operators.size(), prepared_operator_stride(),
+		payload_id, payload_cache_key, emitter_count, probe_count,
+		expected_olv_binding_signature]
+
+func _has_preinterpolated_clv_uncached(expected_olv_binding_signature: String) -> bool:
 	if clv_preparation_revision != CLV_PREPARATION_REVISION_CURRENT \
 			or clv_preparation_schema_version != CLV_PREPARATION_SCHEMA_CURRENT \
-			or clv_preparation_signature != directional_source_signature \
+			or clv_preparation_signature != make_clv_preparation_signature() \
+			or (not expected_olv_binding_signature.is_empty() \
+				and clv_preparation_olv_binding_signature != expected_olv_binding_signature) \
 			or clv_prepared_dimensions.size() != 12 or clv_prepared_offsets.size() != 4:
 		return false
 	var total := 0
@@ -101,6 +159,19 @@ func has_preinterpolated_clv() -> bool:
 		total += expected.x * expected.y * expected.z
 	return clv_prepared_validity.size() == total \
 		and clv_prepared_operators.size() == total * prepared_operator_stride()
+
+func make_clv_preparation_signature() -> String:
+	if olv_probe_domain_payload == null \
+			and clv_preparation_olv_binding_signature.is_empty():
+		return directional_source_signature
+	var payload_header := String(olv_probe_domain_payload.call("binding_sha256")) \
+			if olv_probe_domain_payload != null \
+				and olv_probe_domain_payload.has_method("binding_sha256") else "unsupported_payload"
+	var payload_bytes := String(olv_probe_domain_payload.get("payload_sha256")) \
+			if olv_probe_domain_payload != null else ""
+	var binding := [directional_source_signature, payload_header, payload_bytes,
+		clv_preparation_olv_binding_signature, "clv-olv-binding-v1"]
+	return JSON.stringify(binding, "", true, true).sha256_text()
 
 func prepared_output_coefficient_count() -> int:
 	return 4
@@ -192,7 +263,9 @@ func estimated_payload_bytes() -> int:
 		return 0
 	var stored := storage_probe_count()
 	var float_count := stored * (243 + 81 + emitter_count * 54 + MOMENT_TEXELS_PER_CELL * MOMENT_CHANNELS)
-	return float_count * 4 + cells * 13 + source_storage_indices.size() * 4 \
+	var olv_bytes := int(olv_probe_domain_payload.labels.size()) \
+			if olv_probe_domain_payload != null and olv_probe_domain_payload.get("labels") is PackedByteArray else 0
+	return float_count * 4 + cells * 13 + source_storage_indices.size() * 4 + olv_bytes \
 		+ clv_prepared_operators.size() * 4 \
 		+ clv_prepared_validity.size() + (clv_prepared_dimensions.size() + clv_prepared_offsets.size()) * 4
 
@@ -224,6 +297,10 @@ func allocate(cell_dimensions: Vector3i, source_ids: PackedStringArray) -> bool:
 	source_storage_indices.clear()
 	source_archive_stats.clear()
 	_clear_clv_preparation()
+	geometry_triangles_sha256 = ""
+	global_cell_origin = Vector3i.ZERO
+	source_lod = 0
+	olv_probe_domain_payload = null
 	validity.clear()
 	relocation_offset_m.clear()
 	transfer.clear()
@@ -272,9 +349,13 @@ func _clear_allocation() -> void:
 	receiver_visibility_moments.clear()
 
 func _clear_clv_preparation() -> void:
+	_clv_preparation_check_cache.clear()
+	_clv_preparation_check_calls = 0
+	_clv_preparation_check_cache_hits = 0
 	clv_preparation_revision = 0
 	clv_preparation_schema_version = 0
 	clv_preparation_signature = ""
+	clv_preparation_olv_binding_signature = ""
 	clv_prepared_dimensions.clear()
 	clv_prepared_offsets.clear()
 	clv_prepared_validity.clear()

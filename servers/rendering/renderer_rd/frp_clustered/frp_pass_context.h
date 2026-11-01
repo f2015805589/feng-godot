@@ -168,6 +168,12 @@ public:
 		RID receiver_moment_atlas;
 		RID relocation_offsets;
 		RID source_validity;
+		// Optional immutable OLV labels for the exact resident CLV cell lattice.
+		// They are present only for an explicitly validated OLV publication; the
+		// ordinary SH2 path does not declare or bind these descriptors.
+		RID olv_label_atlas;
+		RID olv_label_parameters;
+		bool olv_enabled = false;
 		Vector3i dimensions;
 		Vector3 origin_world;
 		float spacing_m = 0.0f;
@@ -246,6 +252,9 @@ private:
 	int64_t magic_gi_baked_sh_consumed_token = 0;
 	bool magic_gi_dynamic_volume_lighting_active = false;
 	int64_t magic_gi_dynamic_volume_consumed_token = 0;
+	// True only after an OLV prepared-volume selector, descriptor, and native
+	// deferred-lighting draw have all succeeded in this frame.
+	bool magic_gi_dynamic_volume_olv_lighting_active = false;
 	bool magic_gi_general_queue_active = false;
 	int magic_gi_general_queue_runtime_msaa = -1;
 	int magic_gi_general_queue_runtime_view_count = 0;
@@ -407,12 +416,17 @@ public:
 			Vector3 p_origin_world, float p_spacing_m, int p_response_resolution,
 			int p_layout_version,
 			int64_t p_publication_token, uint64_t p_frame_token);
+	void set_magic_gi_dynamic_volume_olv_input(int p_view, RID p_label_atlas,
+			RID p_label_parameters);
 	bool has_magic_gi_dynamic_volume_input(int p_view) const;
+	bool has_magic_gi_dynamic_volume_olv_input(int p_view) const;
 	MagicGIDynamicVolumeViewInput get_magic_gi_dynamic_volume_input(int p_view) const;
 	void clear_magic_gi_dynamic_volume_inputs();
 	void set_magic_gi_dynamic_volume_lighting_consumed_token(int64_t p_publication_token);
 	bool is_magic_gi_dynamic_volume_lighting_active() const { return magic_gi_dynamic_volume_lighting_active; }
 	int64_t get_magic_gi_dynamic_volume_consumed_token() const { return magic_gi_dynamic_volume_consumed_token; }
+	void set_magic_gi_dynamic_volume_olv_lighting_active(bool p_active);
+	bool is_magic_gi_dynamic_volume_olv_lighting_active() const { return magic_gi_dynamic_volume_olv_lighting_active; }
 	int get_magic_gi_paged_prepared_layout_version() const { return MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION; }
 	int get_magic_gi_paged_prepared_parameters_size() const { return MAGIC_GI_PAGED_PREPARED_VOLUME_PARAMETERS_SIZE_BYTES; }
 	int get_magic_gi_paged_prepared_max_lods() const { return MAGIC_GI_PAGED_PREPARED_VOLUME_MAX_LODS; }

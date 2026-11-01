@@ -1,7 +1,9 @@
 #ifndef FRP_MAGIC_GI_DYNAMIC_VOLUME_SAMPLE_GLSLINC
 #define FRP_MAGIC_GI_DYNAMIC_VOLUME_SAMPLE_GLSLINC
 
+#ifndef MAGIC_GI_SH4_TENSOR_GLSLINC
 #include "magic_gi_sh4_tensor.glslinc"
+#endif
 
 // Independent live TransferMatrix volume path. This specialization intentionally
 // does not include the layout-9 surface-chart sampler or its per-pixel BVH path.
@@ -320,12 +322,230 @@ bool frp_magic_gi_dynamic_volume_sample_lod(vec3 world,
 	return coverage > 1e-6 && magic_gi_sh4_finite_vec3(incident);
 }
 
-bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
-		int view, int lod, out vec3 incident, out float coverage, out float edge_distance) {
+#ifdef MAGIC_GI_OLV_GATE
+// OLV categorical indoor/outdoor gate, applied before SH interpolation.
+// Prepared-volume variants bind a generation-validated label atlas and its
+// layout metadata; the add-on publishes labels with the corresponding prepared
+// transfer generation. Every declaration stays behind MAGIC_GI_OLV_GATE, so
+// variants without the OLV selector keep the previous source path and bindings.
+//
+// Label payload ABI
+// -----------------
+// Each R8 texel stores only its categorical class: 0 unavailable, 1 exterior,
+// 2 interior. Lighting is held in two independent X-adjacent SH atlases, each
+// extended by one texel at domain boundaries before hardware interpolation.
+// The label window has a halo independent of the smaller SH response window.
+// label_meta.w records its side; label_meta.z records the total layer depth.
+// label_meta.z is only the payload's DECLARED depth, never a measurement: the
+// uploader must keep it equal to the allocated label atlas depth, because an
+// out-of-range texel fetch has no clamp-to-edge fallback. The gate refuses any
+// payload whose declared depth is too small, and the fixture asserts that the
+// declared depth equals the allocated depth it actually binds.
+// The payload is keyed to the response atlas it describes: a stale or foreign
+// payload abstains instead of deleting transfer.
+const int MAGIC_GI_OLV_LABEL_UNSET = 0;
+const int MAGIC_GI_OLV_LABEL_EXTERIOR = 1;
+const int MAGIC_GI_OLV_LABEL_INTERIOR = 2;
+const int MAGIC_GI_OLV_LABEL_SCHEMA = 1;
+// An accepted corner weight at or below this is no support at all. Such a
+// sample reports a miss rather than a black "hit", because a hit also takes
+// sky ownership in frp_magic_gi_dynamic_volume_apply.
+const float MAGIC_GI_OLV_MIN_ACCEPTED = 1e-6;
+
+// Categorical labels use exact texel fetches; each partition's SH volume uses
+// hardware trilinear filtering. Filtering labels would invent unlabelled domains.
+#ifndef FRP_MAGIC_GI_OLV_LABEL_SAMPLER
+#define FRP_MAGIC_GI_OLV_LABEL_SAMPLER SAMPLER_NEAREST_CLAMP
+#endif
+
+layout(set = 1, binding = 90) uniform texture3D frp_magic_gi_olv_label_atlas;
+layout(set = 1, binding = 91, std140) uniform FRPMagicGIDynamicVolumeOLVLabels0 {
+	// Physical atlas dimensions and layout version of the response volume this
+	// payload was compiled for. All four lanes must match.
+	ivec4 label_dimensions_version;
+	// x: label schema, y: payload enabled, z: label atlas depth, w: label side.
+	ivec4 label_meta;
+} frp_magic_gi_olv_labels0;
+
+bool frp_magic_gi_olv_label_trusted(int label) {
+	return label == MAGIC_GI_OLV_LABEL_EXTERIOR ||
+			label == MAGIC_GI_OLV_LABEL_INTERIOR;
+}
+
+// Payload guards, split into three independently probeable predicates so a
+// missing conjunct cannot hide behind another one.
+bool frp_magic_gi_olv_payload_schema_ok() {
+	return (frp_magic_gi_olv_labels0.label_meta.x == MAGIC_GI_OLV_LABEL_SCHEMA ||
+			frp_magic_gi_olv_labels0.label_meta.x == 2) &&
+			frp_magic_gi_olv_labels0.label_meta.y == 1;
+}
+
+// The payload must describe the exact response atlas it was compiled for,
+// including the layout version lane, or its labels cannot be trusted.
+bool frp_magic_gi_olv_payload_identity_ok(ivec4 dimensions) {
+	return all(equal(frp_magic_gi_olv_labels0.label_dimensions_version, dimensions));
+}
+
+// Both atlases must be deep enough for every (lod, cell) the gate addresses.
+bool frp_magic_gi_olv_payload_depth_ok(ivec4 dimensions, ivec4 layout_info) {
+	if (layout_info.w <= 0 || layout_info.z <= 0) { return false; }
+	if (layout_info.w > dimensions.x || layout_info.w > dimensions.y) { return false; }
+	if (dimensions.z < layout_info.w * layout_info.z) { return false; }
+	int side = max(layout_info.w, frp_magic_gi_olv_labels0.label_meta.w);
+	return frp_magic_gi_olv_labels0.label_meta.z >= side * layout_info.z;
+}
+
+bool frp_magic_gi_olv_payload_matches(ivec4 dimensions, ivec4 layout_info) {
+	return frp_magic_gi_olv_payload_schema_ok() &&
+			frp_magic_gi_olv_payload_identity_ok(dimensions) &&
+			frp_magic_gi_olv_payload_depth_ok(dimensions, layout_info);
+}
+
+// Fetch one labelled cell by exact texel coordinate. Out-of-range cells clamp
+// exactly like the response taps, and the declared depth bounds the layer.
+int frp_magic_gi_olv_label_fetch_raw(ivec3 cell, int lod, int resolution,
+		ivec4 dimensions) {
+	int side = max(resolution, frp_magic_gi_olv_labels0.label_meta.w);
+	int halo = (side - resolution) / 2;
+	ivec3 clamped = clamp(cell + ivec3(halo), ivec3(0), ivec3(side - 1));
+	int z_index = lod * side + clamped.z;
+	if (z_index < 0 || z_index >= frp_magic_gi_olv_labels0.label_meta.z) {
+		return MAGIC_GI_OLV_LABEL_UNSET;
+	}
+	float value = texelFetch(sampler3D(frp_magic_gi_olv_label_atlas,
+			FRP_MAGIC_GI_OLV_LABEL_SAMPLER), ivec3(clamped.xy, z_index), 0).r;
+	// The bound atlas is R8_UNORM: texels are finite and nonnegative.
+	return int(value * 255.0 + 0.5);
+}
+
+int frp_magic_gi_olv_label_fetch(ivec3 cell, int lod, int resolution, ivec4 dimensions) {
+	int value = frp_magic_gi_olv_label_fetch_raw(cell, lod, resolution, dimensions);
+	return frp_magic_gi_olv_labels0.label_meta.x == 2 ? (value & 3) : value;
+}
+
+int frp_magic_gi_olv_receiver_label_fetch(ivec3 cell, int lod, int resolution, ivec4 dimensions) {
+	int value = frp_magic_gi_olv_label_fetch_raw(cell, lod, resolution, dimensions);
+	return frp_magic_gi_olv_labels0.label_meta.x == 2 ? ((value >> 2) & 3) : value;
+}
+
+// A surface owns the free space on its geometric-normal side. Looking up
+// the unshifted closest grid point can select a probe across a thin wall.
+ivec3 frp_magic_gi_olv_receiver_cell(vec3 grid, vec3 geometric_normal, int resolution) {
+	vec3 bias = dot(geometric_normal, geometric_normal) > 1e-8 ? normalize(geometric_normal) * 0.5 : vec3(0.0);
+	return clamp(ivec3(floor(grid + bias + vec3(0.5))), ivec3(0), ivec3(resolution - 1));
+}
+
+// A receiver has one categorical domain, independent of the lighting LOD.
+// The label halo retains fine source labels even outside the SH window.
+// The caller validates the shared payload once before entering the LOD loop.
+int frp_magic_gi_olv_receiver_label_world(vec3 world, vec3 geometric_normal, int view, int lod) {
+	if (view != 0) { return MAGIC_GI_OLV_LABEL_UNSET; }
+	vec4 origin = frp_magic_gi_dynamic_volume_origin_spacing(view, lod);
+	ivec4 dimensions = frp_magic_gi_dynamic_volume_dimensions_version(view);
+	ivec4 layout_info = frp_magic_gi_dynamic_volume_angular_layout(view);
+	if (!(origin.w > 0.0) || lod < 0 || lod >= layout_info.z) {
+		return MAGIC_GI_OLV_LABEL_UNSET;
+	}
+	int side = max(layout_info.w, frp_magic_gi_olv_labels0.label_meta.w);
+	int halo = (side - layout_info.w) / 2;
+	vec3 grid = (world - origin.xyz) / origin.w;
+	vec3 label_grid = grid + vec3(halo);
+	if (!magic_gi_sh4_finite_vec3(grid)
+			|| any(lessThan(label_grid, vec3(-0.5)))
+			|| any(greaterThan(label_grid, vec3(side) - vec3(0.5)))) {
+		return MAGIC_GI_OLV_LABEL_UNSET;
+	}
+	ivec3 cell = frp_magic_gi_olv_receiver_cell(label_grid, geometric_normal, side) - ivec3(halo);
+	int label = frp_magic_gi_olv_receiver_label_fetch(cell, lod, layout_info.w, dimensions);
+	if (dot(vec3(cell) - grid, geometric_normal) >= -1e-4 && frp_magic_gi_olv_label_trusted(label)) {
+		return label;
+	}
+	// An invalid grid anchor is not an outdoor label. Select one nearest
+	// labelled corner on the visible side, with no vote or label interpolation.
+	float nearest_distance = 1e20;
+	int nearest_label = MAGIC_GI_OLV_LABEL_UNSET;
+	ivec3 base = ivec3(floor(label_grid));
+	for (int z = 0; z < 2; z++) for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
+		ivec3 candidate = clamp(base + ivec3(x,y,z), ivec3(0), ivec3(side - 1)) - ivec3(halo);
+		vec3 delta = vec3(candidate) - grid;
+		if (dot(delta, geometric_normal) < -1e-4) { continue; }
+		int candidate_label = frp_magic_gi_olv_receiver_label_fetch(candidate, lod, layout_info.w, dimensions);
+		float distance_squared = dot(delta, delta);
+		if (frp_magic_gi_olv_label_trusted(candidate_label) && distance_squared < nearest_distance) {
+			nearest_distance = distance_squared;
+			nearest_label = candidate_label;
+		}
+	}
+	return nearest_label;
+}
+
+int frp_magic_gi_olv_receiver_domain(vec3 world, vec3 geometric_normal, int view) {
+	if (view != 0) { return MAGIC_GI_OLV_LABEL_UNSET; }
+	ivec4 layout_info = frp_magic_gi_dynamic_volume_angular_layout(view);
+	ivec4 dimensions = frp_magic_gi_dynamic_volume_dimensions_version(view);
+	if (!frp_magic_gi_olv_payload_matches(dimensions, layout_info)) { return MAGIC_GI_OLV_LABEL_UNSET; }
+	for (int lod = 0; lod < clamp(layout_info.z, 0, 10); lod++) {
+		int label = frp_magic_gi_olv_receiver_label_world(world, geometric_normal, view, lod);
+		if (frp_magic_gi_olv_label_trusted(label)) { return label; }
+#if defined(FRP_MAGIC_GI_OLV_VISIBLE_RAY) || defined(MAGIC_GI_PREPARED_PAGED_ONLY)
+		if (lod == 0 && frp_magic_gi_olv_labels0.label_meta.x == 2) {
+			// Relocated source labels cannot classify their former grid points.
+			// Before trying coarser cells across a contact, use the visible
+			// camera ray's nearby free space. Source partitioning is unchanged.
+			#ifdef FRP_MAGIC_GI_OLV_VISIBLE_RAY
+			vec3 to_camera = FRP_MAGIC_GI_OLV_VISIBLE_RAY(world, view);
+			#else
+			vec3 to_camera = frp_magic_gi_paged_camera_radius(view).xyz - world;
+			#endif
+			float distance_squared = dot(to_camera, to_camera);
+			if (distance_squared > 1e-8) {
+				float reciprocal_distance = inversesqrt(distance_squared);
+				vec3 direction = to_camera * reciprocal_distance;
+				float offset = 0.25 * min(frp_magic_gi_dynamic_volume_origin_spacing(view, 0).w,
+						distance_squared * reciprocal_distance);
+				label = frp_magic_gi_olv_receiver_label_world(world + direction * offset, direction, view, 0);
+				if (frp_magic_gi_olv_label_trusted(label)) { return label; }
+			}
+		}
+#endif
+	}
+	return MAGIC_GI_OLV_LABEL_UNSET;
+}
+
+// The mapping pass admits only source operators with this partition label,
+// and dilates each partition independently. A pixel selects ONE volume and
+// interpolates SH normally; no categorical values or foreign-domain SH mix.
+// 0 = unavailable/stale payload, 1 = sample, 2 = no matching support.
+int frp_magic_gi_olv_gate_sample(vec3 grid, int view, int lod, ivec4 dimensions,
+        ivec4 layout_info, vec3 normal_world, int required_domain,
+        out vec3 incident, out float coverage, out int receiver_label_out) {
+    incident = vec3(0.0);
+    coverage = 0.0;
+    receiver_label_out = MAGIC_GI_OLV_LABEL_UNSET;
+    if (view != 0 || !frp_magic_gi_olv_payload_matches(dimensions, layout_info)) return 0;
+    if (lod < 0 || lod >= layout_info.z || !frp_magic_gi_olv_label_trusted(required_domain)) return 2;
+    receiver_label_out = required_domain;
+    vec4 packed[4];
+    for (int field = 0; field < 4; field++) {
+        vec3 texel = grid + vec3(0.5 + float((required_domain - 1) * layout_info.w),
+                0.5, float(lod * layout_info.w + field * dimensions.z) + 0.5);
+        vec3 uv = texel / vec3(dimensions.x * 2, dimensions.y, dimensions.z * 4);
+        packed[field] = texture(sampler3D(frp_magic_gi_dynamic_volume_response0,
+                FRP_MAGIC_GI_DYNAMIC_VOLUME_LINEAR_SAMPLER), uv);
+    }
+    incident = magic_gi_sh4_decode_e_over_pi(packed, normal_world, coverage);
+    return coverage > MAGIC_GI_OLV_MIN_ACCEPTED && magic_gi_sh4_finite_vec3(incident) ? 1 : 2;
+}
+#endif // MAGIC_GI_OLV_GATE
+
+bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world, int receiver_domain,
+		int view, int lod, out vec3 incident, out float coverage, out float edge_distance,
+		out int olv_domain) {
 	vec4 origin = frp_magic_gi_dynamic_volume_origin_spacing(view, lod);
 	ivec4 dimensions = frp_magic_gi_dynamic_volume_dimensions_version(view);
 	ivec4 layout_info = frp_magic_gi_dynamic_volume_angular_layout(view);
 	incident = vec3(0.0); coverage = 0.0; edge_distance = 0.0;
+	olv_domain = 0;
 	bool schema_valid = dimensions.w == 7 || dimensions.w == 8;
 #ifdef MAGIC_GI_PREPARED_PAGED_ONLY
 	schema_valid = dimensions.w == 7;
@@ -340,6 +560,28 @@ bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
 	edge_distance = min(edges.x, min(edges.y, edges.z));
 	// Clamp inside this LOD before adding the packed field/LOD Z offsets.
 	grid = clamp(grid, vec3(0.0), vec3(last));
+#ifdef MAGIC_GI_OLV_GATE
+	{
+		// Select one partition before hardware filtering. A missing payload
+		// retains the unpartitioned path used when OLV is disabled.
+		int olv_result = frp_magic_gi_olv_gate_sample(grid, view, lod, dimensions,
+				layout_info, normal_world, receiver_domain, incident, coverage, olv_domain);
+		if (olv_result == 2) {
+			incident = vec3(0.0);
+			coverage = 0.0;
+			olv_domain = 0;
+			return false;
+		}
+		if (olv_result == 1) {
+			float olv_decode_scale = intBitsToFloat(layout_info.x);
+			incident *= olv_decode_scale > 0.0 ? olv_decode_scale : 1.0;
+			// The gate normalized the surviving support already. Discarding it
+			// below 50% creates black wall bands exactly where OLV rejects leaks.
+			return coverage > MAGIC_GI_OLV_MIN_ACCEPTED && magic_gi_sh4_finite_vec3(incident);
+		}
+		olv_domain = 0;
+	}
+#endif
 	vec4 packed[4];
 	for (int field = 0; field < 4; field++) {
 		vec3 uv = (grid + vec3(0.5, 0.5,
@@ -360,6 +602,18 @@ bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
 	float decode_scale = intBitsToFloat(layout_info.x);
 	incident *= decode_scale > 0.0 ? decode_scale : 1.0;
 	return coverage > 0.5 && magic_gi_sh4_finite_vec3(incident);
+}
+
+// Diagnostics and older call sites have one normal; native PBR supplies both.
+bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world,
+		int view, int lod, out vec3 incident, out float coverage, out float edge_distance,
+		out int olv_domain) {
+	int receiver_domain = 0;
+#ifdef MAGIC_GI_OLV_GATE
+	receiver_domain = frp_magic_gi_olv_receiver_domain(world, normal_world, view);
+#endif
+	return frp_magic_gi_preinterpolated_sample_lod(world, normal_world, receiver_domain,
+		view, lod, incident, coverage, edge_distance, olv_domain);
 }
 
 bool frp_magic_gi_dynamic_volume_sample(vec3 world,
@@ -383,14 +637,22 @@ bool frp_magic_gi_dynamic_volume_sample(vec3 world,
 			frp_magic_gi_dynamic_volume_dimensions_version(view).w == 8) {
 #endif
 		if (!frp_magic_gi_dynamic_volume_owner_contains(world, view)) return false;
+		int receiver_domain = 0;
+#ifdef MAGIC_GI_OLV_GATE
+		receiver_domain = frp_magic_gi_olv_receiver_domain(world, geometric_normal_world, view);
+#endif
 		for (int lod = 0; lod < lod_count; lod++) {
 			float edge;
-			if (!frp_magic_gi_preinterpolated_sample_lod(world, shading_normal_world,
-				view, lod, incident, coverage, edge)) continue;
+			int fine_domain = 0;
+			if (!frp_magic_gi_preinterpolated_sample_lod(world, shading_normal_world, receiver_domain,
+				view, lod, incident, coverage, edge, fine_domain)) continue;
 			if (edge < 1.0 && lod + 1 < lod_count) {
 				vec3 coarse; float coarse_coverage; float coarse_edge;
-				if (frp_magic_gi_preinterpolated_sample_lod(world, shading_normal_world,
-					view, lod + 1, coarse, coarse_coverage, coarse_edge)) {
+				int coarse_domain = 0;
+				if (frp_magic_gi_preinterpolated_sample_lod(world, shading_normal_world, receiver_domain,
+					view, lod + 1, coarse, coarse_coverage, coarse_edge, coarse_domain) &&
+						((fine_domain == 0 && coarse_domain == 0) ||
+							(fine_domain != 0 && fine_domain == coarse_domain))) {
 					float blend = smoothstep(0.0, 1.0, edge);
 					incident = mix(coarse, incident, blend);
 					coverage = mix(coarse_coverage, coverage, blend);

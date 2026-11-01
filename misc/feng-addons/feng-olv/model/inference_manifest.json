@@ -1,0 +1,379 @@
+{
+  "architecture": {
+    "attention_heads": 2,
+    "encoder_layers": 3,
+    "feedforward_width": 380,
+    "input_channels": 26,
+    "model_width": 64,
+    "parameter_count": 200052,
+    "pooling": "class_query"
+  },
+  "candidate_id": "pathology200k-fresh-step-64000",
+  "candidate_status": "locked_independent_development_choice",
+  "checkpoint_cumulative_updates": 64000,
+  "checkpoint_phase": "train",
+  "checkpoint_selection": "maximum_development_macro_f1; no benchmark or test selection",
+  "checkpoint_step": 64000,
+  "class_id_order": [
+    1,
+    2
+  ],
+  "class_names": {
+    "1": "EXTERIOR",
+    "2": "INTERIOR"
+  },
+  "feature_contract": {
+    "feature_contract_document_sha256": "c13e9ab78c57ab52010a589c09ebb07726372c3a363245b6e80c4eed2425f383",
+    "max_range_m": 8,
+    "origin_offsets_full_extent": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.375,
+        0.0
+      ],
+      [
+        -0.375,
+        -0.375,
+        0.375
+      ],
+      [
+        0.375,
+        -0.375,
+        -0.375
+      ]
+    ],
+    "schema_id": "feng_magic_gi_olv_surface_patch_horizon16_center4origin_ray_geometry_v2",
+    "shape_per_probe": [
+      64,
+      26
+    ]
+  },
+  "feature_contract_extension": {
+    "base_feature_schema_id": "feng_magic_gi_olv_octa8_center4origin_ray_geometry_v2",
+    "directions_sha256": "7db4fbaaf1088a4edb2c27766e68bd664348065617b2f10992e7b40d4ef1eed8",
+    "metadata_semantics": "two signed box-axis distances plus true physical coplanar patch footprint distance in the dominant-normal axis; center facing normal XYZ",
+    "ray_layout": "surface_patch_horizon16_v2",
+    "rays_per_probe": 256,
+    "replaces_metadata_columns": [
+      3,
+      4,
+      5,
+      8,
+      9,
+      10,
+      13,
+      14,
+      15,
+      18,
+      19,
+      20,
+      23,
+      24,
+      25
+    ],
+    "shape": [
+      64,
+      26
+    ]
+  },
+  "format": "feng_magic_gi_olv_r5_offline_model_bundle_v1",
+  "inference_policy_id": "olv_binary2000_center_single_view_argmax_v2",
+  "inference_rule": "Single model, center plus three offsets geometry, single view softmax argmax [1,2]. Invalid source slots remain 0.",
+  "inherited_weight_updates": 0,
+  "initialization": "random_from_seed",
+  "model_input_transform": "surface_origin_residual_v1",
+  "normalizer_file": "normalizer.json",
+  "normalizer_sha256": "6e82054a9228998725e0fe0de2a61db31f692af772c26df2ed14e53fa077e3d8",
+  "ray_layout": "surface_patch_horizon16_v2",
+  "schema_version": 1,
+  "seeds": [
+    {
+      "seed": 20261651,
+      "checkpoint_file": "model.pt",
+      "checkpoint_sha256": "493b09bb5d3ff0471f38f186ef502f8ff4c833cb5b0205b9a608281ee83c3121"
+    }
+  ],
+  "training_protocol_sha256": "06981a1e818ad4ca79af6579d17a0794ec619616bb45a3fdca4ac431c1058271",
+  "training_rows": 200000,
+  "training_stage": "fresh_supervised_pretraining",
+  "validation": {
+    "accuracy": 0.9727839627959414,
+    "by_origin_group": {
+      "general": {
+        "by_view": [
+          {
+            "accuracy": 0.9549278846153846,
+            "confusion_matrix": [
+              [
+                3231,
+                97
+              ],
+              [
+                203,
+                3125
+              ]
+            ],
+            "correct": 6356,
+            "cross_entropy": 0.2776496708393097,
+            "exterior_predicted_interior": 97,
+            "interior_predicted_exterior": 203,
+            "macro_f1": 0.9549164504832799,
+            "rows": 6656
+          },
+          {
+            "accuracy": 0.9564302884615384,
+            "confusion_matrix": [
+              [
+                3233,
+                95
+              ],
+              [
+                195,
+                3133
+              ]
+            ],
+            "correct": 6366,
+            "cross_entropy": 0.27183276414871216,
+            "exterior_predicted_interior": 95,
+            "interior_predicted_exterior": 195,
+            "macro_f1": 0.9564204516104096,
+            "rows": 6656
+          },
+          {
+            "accuracy": 0.9567307692307693,
+            "confusion_matrix": [
+              [
+                3227,
+                101
+              ],
+              [
+                187,
+                3141
+              ]
+            ],
+            "correct": 6368,
+            "cross_entropy": 0.280423641204834,
+            "exterior_predicted_interior": 101,
+            "interior_predicted_exterior": 187,
+            "macro_f1": 0.9567235444951501,
+            "rows": 6656
+          },
+          {
+            "accuracy": 0.9538762019230769,
+            "confusion_matrix": [
+              [
+                3220,
+                108
+              ],
+              [
+                199,
+                3129
+              ]
+            ],
+            "correct": 6349,
+            "cross_entropy": 0.2703690230846405,
+            "exterior_predicted_interior": 108,
+            "interior_predicted_exterior": 199,
+            "macro_f1": 0.9538675788432556,
+            "rows": 6656
+          }
+        ],
+        "paired_macro_f1": 0.9554820733802023,
+        "rotation_disagreements": 358
+      },
+      "hard": {
+        "by_view": [
+          {
+            "accuracy": 0.9748,
+            "confusion_matrix": [
+              [
+                17121,
+                379
+              ],
+              [
+                503,
+                16997
+              ]
+            ],
+            "correct": 34118,
+            "cross_entropy": 0.10850254446268082,
+            "exterior_predicted_interior": 379,
+            "interior_predicted_exterior": 503,
+            "macro_f1": 0.974799683689744,
+            "rows": 35000
+          },
+          {
+            "accuracy": 0.9757714285714286,
+            "confusion_matrix": [
+              [
+                17149,
+                351
+              ],
+              [
+                497,
+                17003
+              ]
+            ],
+            "correct": 34152,
+            "cross_entropy": 0.10511841624975204,
+            "exterior_predicted_interior": 351,
+            "interior_predicted_exterior": 497,
+            "macro_f1": 0.975771006967171,
+            "rows": 35000
+          },
+          {
+            "accuracy": 0.9752571428571428,
+            "confusion_matrix": [
+              [
+                17148,
+                352
+              ],
+              [
+                514,
+                16986
+              ]
+            ],
+            "correct": 34134,
+            "cross_entropy": 0.10992854833602905,
+            "exterior_predicted_interior": 352,
+            "interior_predicted_exterior": 514,
+            "macro_f1": 0.9752566127628941,
+            "rows": 35000
+          },
+          {
+            "accuracy": 0.9756571428571429,
+            "confusion_matrix": [
+              [
+                17175,
+                325
+              ],
+              [
+                527,
+                16973
+              ]
+            ],
+            "correct": 34148,
+            "cross_entropy": 0.10460811108350754,
+            "exterior_predicted_interior": 325,
+            "interior_predicted_exterior": 527,
+            "macro_f1": 0.9756563319844656,
+            "rows": 35000
+          }
+        ],
+        "paired_macro_f1": 0.9753709234793326,
+        "rotation_disagreements": 1362
+      },
+      "prior": {
+        "by_view": [
+          {
+            "accuracy": 0.9989130434782608,
+            "confusion_matrix": [
+              [
+                459,
+                1
+              ],
+              [
+                0,
+                460
+              ]
+            ],
+            "correct": 919,
+            "cross_entropy": 0.0038180870469659567,
+            "exterior_predicted_interior": 1,
+            "interior_predicted_exterior": 0,
+            "macro_f1": 0.998913042194048,
+            "rows": 920
+          },
+          {
+            "accuracy": 1.0,
+            "confusion_matrix": [
+              [
+                460,
+                0
+              ],
+              [
+                0,
+                460
+              ]
+            ],
+            "correct": 920,
+            "cross_entropy": 0.0007696340908296406,
+            "exterior_predicted_interior": 0,
+            "interior_predicted_exterior": 0,
+            "macro_f1": 1.0,
+            "rows": 920
+          },
+          {
+            "accuracy": 1.0,
+            "confusion_matrix": [
+              [
+                460,
+                0
+              ],
+              [
+                0,
+                460
+              ]
+            ],
+            "correct": 920,
+            "cross_entropy": 8.24450544314459e-05,
+            "exterior_predicted_interior": 0,
+            "interior_predicted_exterior": 0,
+            "macro_f1": 1.0,
+            "rows": 920
+          },
+          {
+            "accuracy": 0.9989130434782608,
+            "confusion_matrix": [
+              [
+                460,
+                0
+              ],
+              [
+                1,
+                459
+              ]
+            ],
+            "correct": 919,
+            "cross_entropy": 0.004175704903900623,
+            "exterior_predicted_interior": 0,
+            "interior_predicted_exterior": 1,
+            "macro_f1": 0.998913042194048,
+            "rows": 920
+          }
+        ],
+        "paired_macro_f1": 0.9994565217391305,
+        "rotation_disagreements": 2
+      }
+    },
+    "confusion_matrix": [
+      [
+        83343,
+        1809
+      ],
+      [
+        2826,
+        82326
+      ]
+    ],
+    "correct": 165669,
+    "cross_entropy": 0.13104264438152313,
+    "exterior_predicted_interior": 1809,
+    "general_quality_score": 0.9554820733802023,
+    "general_regression_guard_passed": true,
+    "general_rotation_disagreements": 358,
+    "hard_quality_score": 0.9753709234793326,
+    "interior_predicted_exterior": 2826,
+    "macro_f1": 0.9727829922131513,
+    "rows": 170304,
+    "selection_cross_entropy": 0.1406452789902687,
+    "selection_objective": "minimum_cross_entropy_with_f1_floors",
+    "selection_quality_score": -0.1406452789902687,
+    "selection_split": "validation only"
+  }
+}

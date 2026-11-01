@@ -10,7 +10,7 @@ const DEBUG_OUTPUT: StringName = &"debug_buffers"
 const GI_OUTPUT: StringName = &"magic_gi"
 const MagicGIDebugRequest = preload("magic_gi_debug_request.gd")
 
-@export_enum("Diffuse (Albedo)", "Normal (View Space)", "AO", "Roughness", "Metallic", "Motion Vectors", "Magic GI") var buffer: int = Buffer.DIFFUSE:
+@export_enum("Diffuse (Albedo)", "Normal (View Space)", "AO", "Roughness", "Metallic", "Motion Vectors", "MagicGI（调试）") var buffer: int = Buffer.DIFFUSE:
 	set(value):
 		var next := clampi(value, 0, Buffer.MAGIC_GI)
 		if buffer == next:

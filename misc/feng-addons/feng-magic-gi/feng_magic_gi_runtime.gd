@@ -705,6 +705,7 @@ static func _publish() -> void:
 				streamed_snapshot["magicdawn_selected"] = prepared_ready and volume.use_clv and volume.clv_cache_backend == 1
 				streamed_snapshot["free_space_source_status"] = "ready_paged_prepared" if prepared_ready else "loading_prepared_bricks"
 				streamed_snapshot["free_space_source_ready"] = prepared_ready
+			streamed_snapshot["olv_binding"] = volume.olv_runtime_binding()
 			result.append(streamed_snapshot)
 			continue
 		if data == null:

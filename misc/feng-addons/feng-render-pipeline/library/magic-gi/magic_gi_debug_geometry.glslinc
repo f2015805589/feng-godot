@@ -1,0 +1,24 @@
+// Reconstruct a visible geometric normal from depth. Domain selection must
+// not follow the normal map stored in the shading-normal GBuffer.
+vec3 magic_gi_debug_neighbor_world(ivec2 pixel, vec3 fallback) {
+	pixel = clamp(pixel, ivec2(0), pc.size - ivec2(1));
+	float depth = texelFetch(depth_buffer, pixel, 0).r;
+	vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.size);
+	vec4 view = frame.inverse_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+	if (!(depth > 0.0) || abs(view.w) < 1e-8) { return fallback; }
+	return (frame.view_to_world * vec4(view.xyz / view.w, 1.0)).xyz;
+}
+
+vec3 magic_gi_debug_geometric_normal(ivec2 pixel, vec3 world, vec3 shading_normal) {
+	vec3 dx_forward = magic_gi_debug_neighbor_world(pixel + ivec2(1,0), world) - world;
+	vec3 dx_backward = world - magic_gi_debug_neighbor_world(pixel - ivec2(1,0), world);
+	vec3 dy_forward = magic_gi_debug_neighbor_world(pixel + ivec2(0,1), world) - world;
+	vec3 dy_backward = world - magic_gi_debug_neighbor_world(pixel - ivec2(0,1), world);
+	vec3 dx = dot(dx_forward, dx_forward) < dot(dx_backward, dx_backward) ? dx_forward : dx_backward;
+	vec3 dy = dot(dy_forward, dy_forward) < dot(dy_backward, dy_backward) ? dy_forward : dy_backward;
+	vec3 normal = cross(dx, dy);
+	float length_squared = dot(normal, normal);
+	if (!(length_squared > 1e-12)) { return shading_normal; }
+	normal *= inversesqrt(length_squared);
+	return dot(normal, shading_normal) < 0.0 ? -normal : normal;
+}

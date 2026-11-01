@@ -339,7 +339,11 @@ void main() {
 	// hemisphere. Keep normal maps for SH response evaluation only.
 	#ifdef MAGIC_GI_PREINTERPOLATED_ONLY
 	// Geometry-conditioned linear operators were prepared by the baker.
+	#ifdef MAGIC_GI_OLV_GATE
+	magic_gi_need_geometric_normal = abs(magic_gi_early_owner_control.w - 4.0) >= 0.01;
+	#else
 	magic_gi_need_geometric_normal = false;
+	#endif
 	#else
 	magic_gi_need_geometric_normal = abs(magic_gi_early_owner_control.w - 4.0) >= 0.01;
 	#endif

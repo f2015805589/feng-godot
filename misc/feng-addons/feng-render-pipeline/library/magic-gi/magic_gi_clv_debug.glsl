@@ -61,6 +61,7 @@ const int CLV_DEBUG_CACHE_VALIDITY = 2;
 const int CLV_DEBUG_CELLS = 3;
 const int CLV_DEBUG_RECONSTRUCTED_LIGHTING = 4;
 const int CLV_DEBUG_REJECTION_REASONS = 5;
+const int CLV_DEBUG_OLV_DOMAINS = 6;
 
 const int CLV_DEBUG_REJECT_NONE = 0;
 const int CLV_DEBUG_REJECT_OWNER_BOUNDS = 1;
@@ -294,6 +295,12 @@ void main() {
 				: clv_debug_cell_color(world, selected_level);
 	} else if (pc.debug_view == CLV_DEBUG_RECONSTRUCTED_LIGHTING) {
 		output_color = incident;
+	} else if (pc.debug_view == CLV_DEBUG_OLV_DOMAINS) {
+		// The legacy layout-9 mirror has no generation-matched OLV label atlas.
+		// Keep the selector visible but fail closed instead of coloring by mesh
+		// names or pretending that a binding count proves domain classification.
+		output_color = vec3(0.0);
+		output_alpha = 1.0;
 	}
 
 	if (pc.debug_view == CLV_DEBUG_OFF) {

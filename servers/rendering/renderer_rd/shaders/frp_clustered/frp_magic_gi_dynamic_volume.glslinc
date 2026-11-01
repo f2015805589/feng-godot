@@ -3,6 +3,18 @@
 
 // Keep this native wrapper deliberately thin. The runtime compute resolve
 // includes the same sampler body from the add-on resource tree.
+vec3 frp_magic_gi_olv_visible_ray(vec3 world, int view) {
+#ifdef USE_MULTIVIEW
+	bool perspective = abs(scene_data_block.data.inv_projection_matrix_view[view][2][3]) > 1e-6;
+	vec3 eye = scene_data_block.data.eye_offset[view].xyz;
+#else
+	bool perspective = abs(scene_data_block.data.inv_projection_matrix[2][3]) > 1e-6;
+	vec3 eye = vec3(0.0);
+#endif
+	return perspective ? frp_cloud_world_position(eye, scene_data_block.data) - world :
+			transpose(mat3(scene_data_block.data.inv_view_matrix)) * vec3(0.0, 0.0, 1.0);
+}
+#define FRP_MAGIC_GI_OLV_VISIBLE_RAY(world, view) frp_magic_gi_olv_visible_ray(world, view)
 #include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh9_tensor.glslinc"
 #include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_sample.glslinc"
 

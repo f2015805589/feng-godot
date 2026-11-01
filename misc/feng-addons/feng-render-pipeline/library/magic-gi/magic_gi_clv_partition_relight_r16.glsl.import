@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cr4k8kfgqh6sf"
+path="res://.godot/imported/magic_gi_clv_partition_relight_r16.glsl-458f53b7e7c71052e26f91fd9b7bbc87.res"
+
+[deps]
+
+source_file="res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_partition_relight_r16.glsl"
+dest_files=["res://.godot/imported/magic_gi_clv_partition_relight_r16.glsl-458f53b7e7c71052e26f91fd9b7bbc87.res"]
+
+[params]
+

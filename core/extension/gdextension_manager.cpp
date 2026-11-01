@@ -31,6 +31,7 @@
 #include "gdextension_manager.h"
 
 #include "core/config/engine.h"
+#include "core/config/project_settings.h"
 #include "core/extension/gdextension_function_loader.h"
 #include "core/extension/gdextension_library_loader.h"
 #include "core/extension/gdextension_special_compat_hashes.h"
@@ -385,19 +386,40 @@ bool GDExtensionManager::ensure_extensions_loaded(const HashSet<String> &p_exten
 	}
 
 	String extension_list_config_file = GDExtension::get_extension_list_config_file();
+	String extension_list_config_global_path = ProjectSettings::get_singleton()->globalize_path(extension_list_config_file);
 	if (p_extensions.size()) {
 		if (extensions_added.size() || extensions_removed.size()) {
 			// Extensions were added or removed.
-			Ref<FileAccess> f = FileAccess::open(extension_list_config_file, FileAccess::WRITE);
-			for (const String &E : p_extensions) {
-				f->store_line(E);
+			Error open_error = OK;
+			Ref<FileAccess> f = FileAccess::open(extension_list_config_file, FileAccess::WRITE, &open_error);
+			if (f.is_null()) {
+				String open_error_text = open_error == OK ? "Unknown file access error" : error_names[open_error];
+				ERR_PRINT(vformat("Could not write GDExtension list '%s': %s. Extensions will still be loaded for this session, but the list change was not persisted.", extension_list_config_global_path, open_error_text));
+			} else {
+				for (const String &E : p_extensions) {
+					if (!f->store_line(E)) {
+						Error write_error = f->get_error();
+						if (write_error == OK) {
+							write_error = ERR_FILE_CANT_WRITE;
+						}
+						ERR_PRINT(vformat("Could not finish writing GDExtension list '%s': %s. Extensions will still be loaded for this session, but the list may be incomplete.", extension_list_config_global_path, error_names[write_error]));
+						break;
+					}
+				}
 			}
 		}
 	} else {
 		if (loaded_extensions.size() || FileAccess::exists(extension_list_config_file)) {
 			// Extensions were removed.
 			Ref<DirAccess> da = DirAccess::create(DirAccess::ACCESS_RESOURCES);
-			da->remove(extension_list_config_file);
+			if (da.is_null()) {
+				ERR_PRINT(vformat("Could not remove GDExtension list '%s': could not create resource directory access. The stale list may be read again on the next editor launch.", extension_list_config_global_path));
+			} else {
+				Error remove_error = da->remove(extension_list_config_file);
+				if (remove_error != OK) {
+					ERR_PRINT(vformat("Could not remove GDExtension list '%s': %s. The stale list may be read again on the next editor launch.", extension_list_config_global_path, error_names[remove_error]));
+				}
+			}
 		}
 	}
 

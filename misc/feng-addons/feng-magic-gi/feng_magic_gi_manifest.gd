@@ -32,6 +32,13 @@ const MAX_INDEXED_BLOCKS := 262144
 @export_storage var prepared_bake_algorithm := ""
 ## Optional old source page path used only by explicit source-Probe diagnostics.
 @export_storage var prepared_debug_source_path := ""
+## Editor-only OLV label provenance for the exact labels used while preparing
+## immutable CLV operators. The Resource is kept once on the generation manifest
+## rather than copied into every page.
+@export_storage var prepared_olv_label_set: Resource
+@export_storage var prepared_olv_context: Dictionary = {}
+@export_storage var prepared_olv_filter_enabled := false
+@export_storage var prepared_olv_filter_stats: Dictionary = {}
 @export_storage var world_bounds := AABB()
 @export_storage var management_block_size := DEFAULT_MANAGEMENT_BLOCK_SIZE
 @export_storage var page_core_size := 32.0

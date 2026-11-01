@@ -80,6 +80,21 @@ func run() -> void:
 		var bad: PackedByteArray = fixture.data.slice(0, 8)
 		check(not Broker.decode_snapshot(bad, fixture.metadata).current_available,
 			"truncated readback rejected")
+		var partitioned := make_partition_fixture(half_fields)
+		var partition_result := Broker.decode_snapshot(partitioned.data, partitioned.metadata)
+		check(partition_result.current_available and partition_result.positions == result.positions,
+			"OLV CLV preview preserves real grid positions")
+		check(partition_result.response_sh == result.response_sh,
+			"OLV CLV preview reads each probe's partition, never the adjacent foreign SH slab")
+		var encoded_labels: PackedByteArray = partitioned.metadata.olv_labels.duplicate()
+		for index in encoded_labels.size():
+			var label := int(encoded_labels[index])
+			encoded_labels[index] = label | ((label if index%2==0 else 0)<<2)
+		partitioned.metadata["olv_labels"] = encoded_labels
+		partitioned.metadata["olv_label_encoding"] = 2
+		var encoded_result := Broker.decode_snapshot(partitioned.data, partitioned.metadata)
+		check(encoded_result.current_available and encoded_result.response_sh == result.response_sh,
+			"packed receiver validity cannot hide or recolor the source probe SH preview")
 
 	var fixture := make_fixture(false)
 	Broker.set_request(VOLUME_ID, true, true, 500, TARGET_ID)
@@ -112,3 +127,35 @@ func run() -> void:
 	check(Broker.get_snapshot(VOLUME_ID).is_empty(), "cancelled callback cannot republish")
 	print("[CLV_EDITOR_SNAPSHOT_CPU] checks=", checks, " failures=", failures)
 	quit(0 if failures == 0 else 1)
+
+func make_partition_fixture(half_fields: bool) -> Dictionary:
+	var fixture := make_fixture(half_fields)
+	var width := 2 if half_fields else 4
+	var data := PackedByteArray()
+	data.resize(fixture.data.size()*2)
+	var labels := PackedByteArray()
+	labels.resize(4*4*4*4)
+	for index in RESIDENT_CELLS.size():
+		var cell: int = RESIDENT_CELLS[index]
+		var lod := cell/8
+		var coordinate := Vector3i(cell%2,(cell/2)%2,(cell/4)%2)
+		var domain := 1+index%2
+		var label_cell := coordinate+Vector3i.ONE
+		labels[((lod*4+label_cell.z)*4+label_cell.y)*4+label_cell.x] = domain
+		var physical := (cell/2)*4+coordinate.x+(domain-1)*2
+		var foreign := (cell/2)*4+coordinate.x+(2-domain)*2
+		for field in 4:
+			for lane in 4:
+				var value: float = fixture.data.decode_half(((field*32+cell)*4+lane)*width) if half_fields \
+					else fixture.data.decode_float(((field*32+cell)*4+lane)*width)
+				var destination := ((field*64+physical)*4+lane)*width
+				var other := ((field*64+foreign)*4+lane)*width
+				if half_fields:
+					data.encode_half(destination,value); data.encode_half(other,999.0)
+				else:
+					data.encode_float(destination,value); data.encode_float(other,999.0)
+	fixture.data=data
+	fixture.metadata["response_partition_count"]=2
+	fixture.metadata["olv_label_side"]=4
+	fixture.metadata["olv_labels"]=labels
+	return fixture

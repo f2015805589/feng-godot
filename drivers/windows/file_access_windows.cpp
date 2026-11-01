@@ -44,6 +44,7 @@
 #include <tchar.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cwchar>
 
 #ifdef _MSC_VER
@@ -215,16 +216,34 @@ Error FileAccessWindows::open_internal(const String &p_path, int p_mode_flags) {
 		path = tmpfile;
 	}
 
+	errno = 0;
+#ifdef _MSC_VER
+	_set_doserrno(0);
+#endif
+	SetLastError(ERROR_SUCCESS);
 	f = _wfsopen((LPCWSTR)(path.utf16().get_data()), mode_string, is_backup_save_enabled() ? ((p_mode_flags == READ) ? _SH_DENYWR : _SH_DENYRW) : _SH_DENYNO);
 
 	if (f == nullptr) {
-		switch (errno) {
+		const int open_errno = errno;
+		const DWORD open_win32_error = GetLastError();
+#ifdef _MSC_VER
+		unsigned long open_dos_error = 0;
+		_get_doserrno(&open_dos_error);
+#endif
+		switch (open_errno) {
 			case ENOENT: {
 				last_error = ERR_FILE_NOT_FOUND;
 			} break;
 			default: {
 				last_error = ERR_FILE_CANT_OPEN;
 			} break;
+		}
+		String error_detail = vformat("errno=%d, GetLastError=%d", open_errno, (int)open_win32_error);
+#ifdef _MSC_VER
+		error_detail += ", _doserrno=" + String::num_uint64(open_dos_error);
+#endif
+		if (p_mode_flags != READ || open_errno != ENOENT) {
+			ERR_PRINT(vformat("FileAccessWindows: could not open '%s' (%s).", path, error_detail));
 		}
 		return last_error;
 	} else {

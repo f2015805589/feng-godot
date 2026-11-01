@@ -44,8 +44,8 @@ func run() -> void:
 	var limited_selection := Builder.rank_independent_constraint_indices(four_independent_bases, 2)
 	check(limited_selection == PackedInt32Array([0, 1]),
 		"a tighter rank cap still preserves nearest-first ordering")
-	check(Builder.REVISION == 4,
-		"the all-level direct footprint revision invalidates stale prepared operators")
+	check(Builder.REVISION >= 5,
+		"the connected-surface preparation revision invalidates stale cross-wall fits")
 	_finish()
 
 func _basis(normal: Vector3) -> PackedFloat64Array:

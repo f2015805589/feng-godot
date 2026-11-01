@@ -1090,6 +1090,7 @@ void FRPPassContext::set_magic_gi_dynamic_volume_input(int p_view, const Array &
 		int64_t p_publication_token, uint64_t p_frame_token) {
 	magic_gi_dynamic_volume_lighting_active = false;
 	magic_gi_dynamic_volume_consumed_token = 0;
+	magic_gi_dynamic_volume_olv_lighting_active = false;
 	if (p_view < 0 || p_view >= 2) {
 		clear_magic_gi_dynamic_volume_inputs();
 		ERR_FAIL_INDEX(p_view, 2);
@@ -1146,6 +1147,28 @@ void FRPPassContext::set_magic_gi_dynamic_volume_input(int p_view, const Array &
 	magic_gi_dynamic_volume_inputs[p_view] = input;
 }
 
+void FRPPassContext::set_magic_gi_dynamic_volume_olv_input(int p_view,
+		RID p_label_atlas, RID p_label_parameters) {
+	if (p_view < 0 || p_view >= 2) {
+		clear_magic_gi_dynamic_volume_inputs();
+		ERR_FAIL_INDEX(p_view, 2);
+	}
+	MagicGIDynamicVolumeViewInput &input = magic_gi_dynamic_volume_inputs[p_view];
+	input.olv_enabled = false;
+	input.olv_label_atlas = RID();
+	input.olv_label_parameters = RID();
+	ERR_FAIL_COND_MSG(!has_magic_gi_dynamic_volume_input(p_view),
+			"OLV labels require the current dynamic-volume lease.");
+	ERR_FAIL_COND_MSG(input.layout_version != MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION &&
+			input.layout_version != MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION,
+			"OLV labels require a prepared SH2 volume layout.");
+	ERR_FAIL_COND_MSG(!p_label_atlas.is_valid() || !p_label_parameters.is_valid(),
+			"OLV labels require valid atlas and metadata resources.");
+	input.olv_label_atlas = p_label_atlas;
+	input.olv_label_parameters = p_label_parameters;
+	input.olv_enabled = true;
+}
+
 bool FRPPassContext::has_magic_gi_dynamic_volume_input(int p_view) const {
 	if (p_view < 0 || p_view >= 2) {
 		return false;
@@ -1176,6 +1199,17 @@ bool FRPPassContext::has_magic_gi_dynamic_volume_input(int p_view) const {
 	return true;
 }
 
+bool FRPPassContext::has_magic_gi_dynamic_volume_olv_input(int p_view) const {
+	if (!has_magic_gi_dynamic_volume_input(p_view)) {
+		return false;
+	}
+	const MagicGIDynamicVolumeViewInput &input = magic_gi_dynamic_volume_inputs[p_view];
+	return input.olv_enabled && input.olv_label_atlas.is_valid() &&
+			input.olv_label_parameters.is_valid() &&
+			(input.layout_version == MAGIC_GI_PREPARED_SH2_VOLUME_LAYOUT_VERSION ||
+					input.layout_version == MAGIC_GI_PAGED_PREPARED_VOLUME_LAYOUT_VERSION);
+}
+
 FRPPassContext::MagicGIDynamicVolumeViewInput FRPPassContext::get_magic_gi_dynamic_volume_input(int p_view) const {
 	ERR_FAIL_INDEX_V(p_view, 2, MagicGIDynamicVolumeViewInput());
 	return magic_gi_dynamic_volume_inputs[p_view];
@@ -1188,9 +1222,11 @@ void FRPPassContext::clear_magic_gi_dynamic_volume_inputs() {
 	}
 	magic_gi_dynamic_volume_lighting_active = false;
 	magic_gi_dynamic_volume_consumed_token = 0;
+	magic_gi_dynamic_volume_olv_lighting_active = false;
 }
 
 void FRPPassContext::set_magic_gi_dynamic_volume_lighting_consumed_token(int64_t p_publication_token) {
+	magic_gi_dynamic_volume_olv_lighting_active = false;
 	const int view_count = get_view_count();
 	bool valid = p_publication_token > 0 && view_count > 0 && view_count <= 2;
 	for (int view = 0; valid && view < view_count; view++) {
@@ -1206,6 +1242,13 @@ void FRPPassContext::set_magic_gi_dynamic_volume_lighting_consumed_token(int64_t
 	}
 	magic_gi_dynamic_volume_lighting_active = valid;
 	magic_gi_dynamic_volume_consumed_token = valid ? p_publication_token : 0;
+}
+
+void FRPPassContext::set_magic_gi_dynamic_volume_olv_lighting_active(bool p_active) {
+	magic_gi_dynamic_volume_olv_lighting_active = p_active &&
+			magic_gi_dynamic_volume_lighting_active && get_view_count() == 1 &&
+			has_magic_gi_dynamic_volume_olv_input(0) &&
+			magic_gi_dynamic_volume_inputs[1].publication_token == 0;
 }
 
 int FRPPassContext::get_magic_gi_clv_layout_version() const {
@@ -1333,10 +1376,13 @@ void FRPPassContext::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_magic_gi_baked_sh_lighting_active"), &FRPPassContext::is_magic_gi_baked_sh_lighting_active);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_baked_sh_consumed_token"), &FRPPassContext::get_magic_gi_baked_sh_consumed_token);
 	ClassDB::bind_method(D_METHOD("set_magic_gi_dynamic_volume_input", "view", "fields", "volume_parameters", "owner_parameters", "dimensions", "receiver_moment_atlas", "relocation_offsets", "source_validity", "origin_world", "spacing_m", "response_resolution", "layout_version", "publication_token", "frame_token"), &FRPPassContext::set_magic_gi_dynamic_volume_input);
+	ClassDB::bind_method(D_METHOD("set_magic_gi_dynamic_volume_olv_input", "view", "label_atlas", "label_parameters"), &FRPPassContext::set_magic_gi_dynamic_volume_olv_input);
 	ClassDB::bind_method(D_METHOD("has_magic_gi_dynamic_volume_input", "view"), &FRPPassContext::has_magic_gi_dynamic_volume_input);
+	ClassDB::bind_method(D_METHOD("has_magic_gi_dynamic_volume_olv_input", "view"), &FRPPassContext::has_magic_gi_dynamic_volume_olv_input);
 	ClassDB::bind_method(D_METHOD("clear_magic_gi_dynamic_volume_inputs"), &FRPPassContext::clear_magic_gi_dynamic_volume_inputs);
 	ClassDB::bind_method(D_METHOD("is_magic_gi_dynamic_volume_lighting_active"), &FRPPassContext::is_magic_gi_dynamic_volume_lighting_active);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_dynamic_volume_consumed_token"), &FRPPassContext::get_magic_gi_dynamic_volume_consumed_token);
+	ClassDB::bind_method(D_METHOD("is_magic_gi_dynamic_volume_olv_lighting_active"), &FRPPassContext::is_magic_gi_dynamic_volume_olv_lighting_active);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_layout_version"), &FRPPassContext::get_magic_gi_paged_prepared_layout_version);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_parameters_size"), &FRPPassContext::get_magic_gi_paged_prepared_parameters_size);
 	ClassDB::bind_method(D_METHOD("get_magic_gi_paged_prepared_max_lods"), &FRPPassContext::get_magic_gi_paged_prepared_max_lods);

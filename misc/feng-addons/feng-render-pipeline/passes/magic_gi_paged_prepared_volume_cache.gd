@@ -25,7 +25,8 @@ var _maximum_uploaded_bytes := 0
 var _eviction_clear_calls := 0
 
 func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
-		pages_revision: int, camera_world: Vector3, radius_m := 512.0) -> bool:
+		pages_revision: int, camera_world: Vector3, radius_m := 512.0,
+		olv_label_set: Resource = null, olv_context: Dictionary = {}) -> bool:
 	var layout := PagedLayout.build(header, camera_world, resolution, radius_m)
 	if rd == null or not layout.get("valid", false):
 		_error = "paged_clv_invalid_header_or_layout"
@@ -45,6 +46,10 @@ func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
 	_output_coefficient_count = 4
 	_response_field_count = 4
 	_runtime_layout_version = PAGED_LAYOUT_VERSION
+	if olv_label_set != null and not _configure_olv(rd, olv_label_set, olv_context,
+			int(header.get("geometry_signature")), Vector3(header.get("origin_world")),
+			float(header.get("spacing_m")), dimensions, _resident_lod_count):
+		_clear_olv_binding(rd)
 	_operator_columns = 16 + emitter_count * 6
 	_operator_bound = float(header.get("maximum_operator_row_l1"))
 	_half_fields = is_finite(_operator_bound) and _operator_bound > 0.0
@@ -68,7 +73,7 @@ func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
 	format.texture_type = RenderingDevice.TEXTURE_TYPE_3D
 	format.format = RenderingDevice.DATA_FORMAT_R16G16B16A16_SFLOAT if _half_fields \
 		else RenderingDevice.DATA_FORMAT_R32G32B32A32_SFLOAT
-	format.width = dimensions.x
+	format.width = dimensions.x * _response_partition_count()
 	format.height = dimensions.y
 	format.depth = dimensions.z * _response_field_count
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT \
@@ -82,7 +87,7 @@ func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
 	dummy.depth = 1
 	dummy.usage_bits = RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
 	moment_texture = rd.texture_create(dummy, RDTextureView.new(), [PackedFloat32Array([0, 0]).to_byte_array()])
-	_shader_resource = load(PREPARED_SHADER_R16 if _half_fields else PREPARED_SHADER) as RDShaderFile
+	_shader_resource = load(_prepared_relight_shader_path()) as RDShaderFile
 	if _shader_resource == null or not _shader_resource.base_error.is_empty():
 		_error = "paged_clv_relight_shader_unavailable"
 		return false
@@ -115,6 +120,7 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 		return true
 	_uploaded_bytes = 0
 	_eviction_clear_calls = 0
+	_disable_olv_gate(rd)
 	var desired: Dictionary = {}
 	var bricks: Array[Resource] = []
 	var rows_per_probe := _output_coefficient_count * _operator_columns
@@ -281,6 +287,9 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 		if rd.buffer_update(parameters, 0, parameter_bytes.size(), parameter_bytes) != OK: return false
 	else:
 		parameters = rd.uniform_buffer_create(parameter_bytes.size(), parameter_bytes)
+	if not _upload_olv_labels(rd, _build_resident_olv_labels()):
+		_error = "paged_clv_partition_upload_failed"
+		return false
 	origin_world = _lod_layouts[0].origin_world
 	spacing_m = _lod_layouts[0].spacing_m
 	_clipmap_state = layout.state
@@ -293,8 +302,9 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 	return true
 
 func _fixed_gpu_bytes() -> int:
-	return clip_cell_count * (4 + _response_field_count * (8 if _half_fields else 16)) \
-		+ maxi(4, emitter_count * 6) * 4 + PARAMETERS_BYTES_PAGED + 28
+	return clip_cell_count * (4 + _response_partition_count() * _response_field_count * (8 if _half_fields else 16)) \
+		+ maxi(4, emitter_count * 6) * 4 + PARAMETERS_BYTES_PAGED + 28 \
+		+ (_olv_label_resolution * _olv_label_resolution * _olv_label_resolution * _olv_label_lod_count + clip_cell_count * 64 + 32 if _olv_label_atlas.is_valid() else 0)
 
 func _pack_parameters() -> PackedByteArray:
 	var bytes := PackedByteArray()

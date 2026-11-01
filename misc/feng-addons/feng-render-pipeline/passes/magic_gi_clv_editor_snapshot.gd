@@ -207,6 +207,10 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 	var half_fields := bool(metadata.get("half_fields", false))
 	var scale := float(metadata.get("decode_scale", 1.0))
 	var cell_count := dimensions.x * dimensions.y * dimensions.z
+	var partitions := int(metadata.get("response_partition_count", 1))
+	var labels: PackedByteArray = metadata.get("olv_labels", PackedByteArray())
+	var label_side := int(metadata.get("olv_label_side", 0))
+	var label_encoding := int(metadata.get("olv_label_encoding", 1))
 	var bytes_per_lane := 2 if half_fields else 4
 	if layout_version not in [7, 8] or int(metadata.get("operator_schema_version", 0)) != 2 \
 			or int(metadata.get("response_field_count", 0)) != 4 \
@@ -215,7 +219,10 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 			or indices.size() != cell_count or steps.size() != lod_count \
 			or not is_finite(scale) or scale <= 0.0:
 		return {"current_available": false, "status": "invalid_clv_metadata"}
-	if include_sh and data.size() != cell_count * 4 * 4 * bytes_per_lane:
+	if label_encoding not in [1, 2] or partitions not in [1, 2] or (partitions == 2 and (label_side < dimensions.x \
+			or labels.size() != label_side * label_side * label_side * lod_count)):
+		return {"current_available": false, "status": "invalid_clv_partition_metadata"}
+	if include_sh and data.size() != cell_count * partitions * 4 * 4 * bytes_per_lane:
 		return {"current_available": false, "status": "invalid_clv_readback_size"}
 	for lod in lod_count:
 		if not origins[lod].is_finite() or not is_finite(steps[lod]) or steps[lod] <= 0.0:
@@ -239,10 +246,20 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 	for cell in cell_count:
 		if indices[cell] < 0: continue
 		var lod := cell / cells_per_lod
+		var coordinate := Vector3i(cell % dimensions.x,
+			(cell / dimensions.x) % dimensions.y, (cell / (dimensions.x * dimensions.y)) % dimensions.x)
+		var domain := 1
+		if partitions == 2:
+			var halo := (label_side - dimensions.x) / 2
+			var label_cell := coordinate + Vector3i.ONE * halo
+			domain = int(labels[((lod * label_side + label_cell.z) * label_side + label_cell.y) * label_side + label_cell.x])
+			if label_encoding == 2: domain &= 3
+			if domain not in [1, 2]: continue
+		var physical_cell := (cell / dimensions.x) * (dimensions.x * partitions) + coordinate.x + (domain - 1) * dimensions.x
 		if include_sh:
 			var finite := true
 			for field in 4:
-				var offset := (field * cell_count + cell) * 4 * bytes_per_lane
+				var offset := (field * cell_count * partitions + physical_cell) * 4 * bytes_per_lane
 				for lane in 4:
 					var value := data.decode_half(offset + lane * 2) if half_fields \
 						else data.decode_float(offset + lane * 4)
@@ -264,9 +281,6 @@ static func decode_snapshot(data: PackedByteArray, metadata: Dictionary) -> Dict
 			for component in 12:
 				finite = finite and is_finite(response[count * 12 + component])
 			if not finite: continue
-		var local_cell := cell % cells_per_lod
-		var coordinate := Vector3i(local_cell % dimensions.x,
-			(local_cell / dimensions.x) % dimensions.y, local_cell / (dimensions.x * dimensions.y))
 		positions[count] = origins[lod] + Vector3(coordinate) * steps[lod]
 		spacings[count] = steps[lod]
 		lods[count] = lod

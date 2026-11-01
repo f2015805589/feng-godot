@@ -1,0 +1,72 @@
+{
+  "format": "feng_olv_production_dataset_v1",
+  "training_subjects": 200000,
+  "classes": {
+    "1": "室外",
+    "2": "室内"
+  },
+  "production_checkpoint": 64000,
+  "model_sha256": "493b09bb5d3ff0471f38f186ef502f8ff4c833cb5b0205b9a608281ee83c3121",
+  "source_dataset_manifest_sha256": "4d09b10ed446ceb0c5de95239687f5ada051e880355ef9c399608f30255844c2",
+  "hard_quality_recipe": {
+    "general_validation_floor": 0.95,
+    "hard_validation_f1_floor": 0.93,
+    "hard_validation_rows": 35000,
+    "joint_selection_weights": {
+      "general": 0.2,
+      "hard": 0.8
+    },
+    "replay_mass": {
+      "hard": 0.6,
+      "ordinary": 0.2,
+      "retained": 0.2
+    },
+    "selection_objective": "minimum_cross_entropy_with_f1_floors",
+    "training_precision": "FP32",
+    "training_stage": "fresh_supervised_pretraining_only"
+  },
+  "views_are_correlated": true,
+  "benchmark_never_training": true,
+  "files": {
+    "hard_validation.npz": {
+      "sha256": "a608ea592252e6dcf5d237bb65b29f7f48e03dc2fa991e2a3104d5cee7d4a1eb",
+      "bytes": 89533577
+    },
+    "test.npz": {
+      "sha256": "4f756e533a90b069c348c046e40a48a906537de21874f627989d2565974ac414",
+      "bytes": 71594377
+    },
+    "train.npz": {
+      "sha256": "f8367d99c4b1202b5f707af0d9f7799f310d3e57a6857f0cb68347419e6ab05e",
+      "bytes": 564207483
+    },
+    "train_views.npz": {
+      "sha256": "9212e04858ddc2690795b83bef4d90396cbeda144bb05986371337b84efd9a0a",
+      "bytes": 858174638
+    },
+    "validation.npz": {
+      "sha256": "3f2a7436a689edc64f9e15cffc688ab0366a0cbedbe5a9bfc5c15f51e7f95b60",
+      "bytes": 19772480
+    },
+    "benchmark/features_surface_patch_horizon16_v2.npy": {
+      "sha256": "95cfda71c079b45745d35a1fcd489c0f9707452a1961534e788dcf1d3bc8a850",
+      "bytes": 153354368
+    },
+    "benchmark/features_surface_patch_horizon16_v2.seal.json": {
+      "sha256": "ef171aa627b2e0c614e47a6795b2dde3a80e5012c1bb3caa625fb75632e14608",
+      "bytes": 226
+    },
+    "benchmark/geometry.npz": {
+      "sha256": "c5727a98c1436f53ef8c2dfe6fc9d97bbae0a78eaa75fba4233290ff16b5c45d",
+      "bytes": 4907008
+    },
+    "benchmark/manifest.json": {
+      "sha256": "ac5b9dc532043572d51206233760f7c404a3a79d4a57c976105659de16af1ac9",
+      "bytes": 14345
+    },
+    "benchmark/subjects.npz": {
+      "sha256": "bbadba95413d2646a56844cc2d3fbb63ed6d5929837732d8e291cce0d9f9699a",
+      "bytes": 623327
+    }
+  }
+}

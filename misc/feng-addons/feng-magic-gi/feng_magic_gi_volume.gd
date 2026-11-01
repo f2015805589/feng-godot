@@ -14,6 +14,8 @@ signal surface_refresh_completed(generation: int, success: bool)
 const Runtime = preload("feng_magic_gi_runtime.gd")
 const Baker = preload("feng_magic_gi_baker.gd")
 const VolumeSourceBaker = preload("feng_magic_gi_volume_source_baker.gd")
+const OLVInferenceRunner = preload("feng_magic_gi_olv_inference_runner.gd")
+const OLVProbePayload = preload("feng_magic_gi_olv_probe_domain_payload.gd")
 const VolumeSourceChunk = preload("feng_magic_gi_volume_source_chunk.gd")
 const CLVTransferBuilder = preload("feng_magic_gi_clv_transfer_builder.gd")
 const PreparedArchive = preload("feng_magic_gi_prepared_brick_archive.gd")
@@ -22,6 +24,7 @@ const Placement = preload("feng_magic_gi_placement.gd")
 const Viz = preload("feng_magic_gi_viz.gd")
 const Data = preload("feng_magic_gi_data.gd")
 const Manifest = preload("feng_magic_gi_manifest.gd")
+const Page = preload("feng_magic_gi_page.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const Preview = preload("feng_magic_gi_preview.gd")
 const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
@@ -182,21 +185,21 @@ class SurfaceRefreshRequest:
 @export_range(1, 4, 1) var bake_bounces := 2:
 	set(value):
 		bake_bounces = clampi(value, 1, 8)
-		_settings_changed()
+		_settings_changed(true, false)
 @export_range(1.0, 128.0, 1.0, "suffix:m") var bake_distance := 32.0:
 	set(value):
 		bake_distance = clampf(value, 1.0, 4096.0)
-		_settings_changed()
+		_settings_changed(true, false)
 ## Terrain3D has no general CPU material evaluation; this scalar supplies its diffuse albedo.
 @export_range(0.0, 1.0, 0.01) var terrain_reflectance := 0.5:
 	set(value):
 		terrain_reflectance = clampf(value, 0.0, 1.0)
-		_settings_changed()
+		_settings_changed(true, false)
 ## Used for missing or CPU-unsupported materials, including ShaderMaterial.
 @export_range(0.0, 1.0, 0.01) var fallback_material_reflectance := 0.5:
 	set(value):
 		fallback_material_reflectance = clampf(value, 0.0, 1.0)
-		_settings_changed()
+		_settings_changed(true, false)
 @export_range(0.0, 8.0, 0.01) var gi_strength := 1.0
 @export_group("Runtime Cache")
 @export var use_clv := true:
@@ -205,7 +208,7 @@ class SurfaceRefreshRequest:
 			return
 		use_clv = value
 		notify_property_list_changed()
-		_settings_changed(false)
+		_settings_changed(false, false)
 ## Backend 1 relights resident CLV blocks from the baked directional TransferMatrix.
 ## Baked total-indirect SH is not a dynamic relighting input.
 @export_enum("Legacy per-probe/pixel PRT", "MagicDawn CLV Block PRT (dynamic)") var clv_cache_backend := 1:
@@ -224,7 +227,7 @@ class SurfaceRefreshRequest:
 		if is_equal_approx(clv_cell_size, next):
 			return
 		clv_cell_size = next
-		_settings_changed(false)
+		_settings_changed(false, true)
 @export_range(32, 512, 32) var clv_cells_per_frame := 256:
 	set(value):
 		clv_cells_per_frame = clampi(value, 32, 512)
@@ -236,19 +239,19 @@ class SurfaceRefreshRequest:
 		if chunked_baking == value:
 			return
 		chunked_baking = value
-		_settings_changed()
+		_settings_changed(true, false)
 @export_range(128.0, 1024.0, 128.0, "suffix:m") var management_block_size := 512.0:
 	set(value):
 		management_block_size = clampf(value, 128.0, 1024.0)
-		_settings_changed()
+		_settings_changed(true, false)
 @export_range(8.0, 64.0, 8.0, "suffix:m") var core_page_size := 32.0:
 	set(value):
 		core_page_size = clampf(value, 8.0, 64.0)
-		_settings_changed()
+		_settings_changed(true, false)
 @export_dir var bake_output_directory := "":
 	set(value):
 		bake_output_directory = value.strip_edges().trim_suffix("/")
-		_settings_changed(false)
+		_settings_changed(false, false)
 @export_group("Page Streaming")
 ## Camera-centered spherical loading and shading cutoff for paged CLV PRT.
 ## The intersecting boundary brick retains its one-cell interpolation halo.
@@ -355,7 +358,8 @@ class SurfaceRefreshRequest:
 		if not is_surfel_mode():
 			_restore_prt_probe_layout()
 		if is_inside_tree() and not _bake_assigning_manifest:
-			_settings_changed()
+			# A different immutable bake generation does not change the target lattice.
+			_settings_changed(false, false)
 			_schedule_saved_source_validation(true)
 
 var cpu_resident_budget_bytes: int:
@@ -387,7 +391,7 @@ var _layout_queued := false
 var _layout_dirty := false
 var _layout_stale := false
 var _layout_refresh_deadline_msec := 0
-var _layout_epoch := 0
+@export_storage var _layout_epoch := 0
 var _probe_layout_revision := 0
 var _preview_revision := 0
 var _data_change_revision := 0
@@ -415,6 +419,8 @@ var _bake_assigning_manifest := false
 var _streamed_bake_completed_pages := 0
 var _streamed_bake_total_pages := 0
 var _free_space_bake_stage := ""
+var _olv_bake_requested := false
+var _olv_cache_reuse_requested := false
 var _bake_generation := 0
 var _next_geometry_check := 0
 var _quick_scene_signature := 0
@@ -800,6 +806,12 @@ func has_free_space_source_generation() -> bool:
 func is_baking() -> bool:
 	return _baking or _bake_start_pending
 
+func is_olv_bake_requested() -> bool:
+	return _olv_bake_requested
+
+func is_olv_cache_reuse_requested() -> bool:
+	return _olv_cache_reuse_requested
+
 func is_bake_cancel_requested() -> bool:
 	return _bake_cancel_requested or _refresh_cancel_requested
 
@@ -874,7 +886,13 @@ func bake() -> bool:
 	_layout_dirty = false
 	_layout_refresh_deadline_msec = 0
 	if uses_free_space_clv_bake():
-		return await _bake_free_space_source_generation()
+		_olv_cache_reuse_requested = not _olv_bake_requested \
+				and bake_manifest != null and is_instance_valid(bake_manifest) \
+				and bool(bake_manifest.prepared_olv_filter_enabled) and has_bake() \
+				and get_olv_controller() == null
+		var free_space_success: bool = await _bake_free_space_source_generation()
+		_olv_cache_reuse_requested = false
+		return free_space_success
 	if chunked_baking:
 		return await _bake_streamed_generation(Vector2i(2147483647, 2147483647))
 	_baking = true
@@ -906,12 +924,44 @@ func bake() -> bool:
 	_restore_prt_probe_layout()
 	_clear_candidate_layout()
 	_layout_dirty = false
-	_layout_epoch += 1
 	_preview_revision += 1
 	_refresh_viz()
 	Runtime.publish(self)
 	update_configuration_warnings()
 	return has_bake()
+
+## Independently refresh OLV labels from a retained, validated free-space source.
+## This does not retrace source transport or rebuild relocation; it only captures
+## matching geometry, runs the offline classifier, and prepares/publishes CLV.
+func get_olv_controller() -> Node:
+	for child in get_children():
+		if child.has_method("runtime_binding") and child.has_method("update_labels"): return child
+	return null
+
+func ensure_olv_controller() -> Node:
+	var node := get_olv_controller()
+	if node != null: return node
+	var script: GDScript = load("res://addons/feng-olv/feng_olv_volume.gd")
+	node = script.new()
+	node.name = "OLV"
+	add_child(node)
+	var scene := SceneTracker.scene_root(self)
+	if scene != null and scene != node: node.owner = scene
+	if has_free_space_source_generation(): node.call("import_existing_labels")
+	return node
+
+func olv_runtime_binding() -> Dictionary:
+	var node := get_olv_controller()
+	return node.call("runtime_binding") if node != null else {}
+
+func olv_data_changed() -> void:
+	_preview_revision += 1
+	Runtime.publish(self)
+
+## Kept as a small integration adapter; OLV owns its own data and updates.
+func bake_with_olv() -> bool:
+	if not uses_free_space_clv_bake() or not is_inside_tree() or is_baking(): return false
+	return await ensure_olv_controller().call("update_labels")
 
 func bake_chunk(chunk_x: int, chunk_z: int) -> bool:
 	if is_surfel_mode() or uses_free_space_clv_bake() or not chunked_baking \
@@ -950,6 +1000,9 @@ func _bake_free_space_source_generation() -> bool:
 	var source_dims := Vector3i((world_bounds.size / 0.25).ceil())
 	var bounded_multires := source_dims.x > 256 or source_dims.y > 256 or source_dims.z > 256 \
 		or float(source_dims.x) * source_dims.y * source_dims.z > 32768.0
+	if _olv_cache_reuse_requested and bounded_multires:
+		_finish_free_space_bake(false, "The active OLV cache is bound to a regular source; paged per-tile cache reuse is unsupported. The previous generation remains active.")
+		return false
 	var settings_signature := PagedSourceBaker.settings_signature(self) if bounded_multires \
 		else VolumeSourceBaker.settings_signature(self)
 	var progress := Callable(self, "_on_free_space_bake_progress")
@@ -957,11 +1010,36 @@ func _bake_free_space_source_generation() -> bool:
 	var source_baker := VolumeSourceBaker.new()
 	var generation_id := "prepared_%d_%d" % [Time.get_ticks_usec(), get_instance_id()]
 	var result: Dictionary
+	var bake_options := {"scene_watch_signature": scene_watch_signature,
+		"olv_inference_requested": _olv_bake_requested,
+		"olv_reuse_requested": _olv_cache_reuse_requested}
+	if _olv_cache_reuse_requested:
+		var active_olv_cache := _load_active_olv_cache()
+		if not bool(active_olv_cache.get("ok", false)):
+			_finish_free_space_bake(false, "The active OLV cache cannot be safely reused: " +
+				String(active_olv_cache.get("error", "missing_cache")))
+			return false
+		bake_options.merge(active_olv_cache.options, true)
+	var olv_runner: RefCounted
+	if _olv_bake_requested:
+		_free_space_bake_stage = "加载 OLV 离线模型"
+		bake_status_changed.emit()
+		var runner_result: Dictionary = await OLVInferenceRunner.begin_bake(progress, cancelled)
+		if not bool(runner_result.get("ok", false)):
+			_finish_free_space_bake(false, String(runner_result.get("error", "Could not start OLV offline inference.")))
+			return false
+		olv_runner = runner_result.get("runner") as RefCounted
+		if olv_runner == null:
+			_finish_free_space_bake(false, "OLV offline inference worker returned no session.")
+			return false
+		bake_options["olv_runner"] = olv_runner
 	if bounded_multires:
 		result = await source_baker.bake_paged_async(self, generation_id, output_root,
-			{"scene_watch_signature": scene_watch_signature}, progress, cancelled)
+			bake_options, progress, cancelled)
 	else:
-		result = await source_baker.bake_async(self, {}, progress, cancelled)
+		result = await source_baker.bake_async(self, bake_options, progress, cancelled)
+	if olv_runner != null:
+		await olv_runner.call("close")
 	if not is_instance_valid(self):
 		return false
 	if generation != _bake_generation or _bake_cancel_requested:
@@ -970,6 +1048,11 @@ func _bake_free_space_source_generation() -> bool:
 	if not bool(result.get("ok", false)):
 		_finish_free_space_bake(false, String(result.get("error", "Free-space CLV PRT source bake failed.")))
 		return false
+	if _olv_bake_requested or _olv_cache_reuse_requested:
+		var olv_context: Dictionary = result.get("olv_layout_context", {})
+		if olv_context.is_empty() or int(olv_context.get("layout_revision", -1)) != layout_revision():
+			_finish_free_space_bake(false, "OLV target layout changed during inference or cache reuse; the previous generation remains active.")
+			return false
 	var chunk := result.get("chunk") as VolumeSourceChunk
 	if not bounded_multires and (chunk == null or not chunk.is_valid(chunk.geometry_signature,
 			chunk.emitter_ids, chunk.emitter_static_signatures)):
@@ -993,6 +1076,30 @@ func _bake_free_space_source_generation() -> bool:
 			generation_id + "_source", output_root, settings_signature, scene_watch_signature, cancelled)
 		if source_saved.has("error"):
 			_finish_free_space_bake(false, String(source_saved.error))
+			return false
+		var result_olv_labels: Resource = result.get("olv_label_set") as Resource
+		var result_olv_context: Dictionary = result.get("olv_layout_context", {})
+		var result_olv_stats: Dictionary = result.get("olv_filter_stats", {})
+		result_olv_stats = result_olv_stats.duplicate(true)
+		if _olv_cache_reuse_requested:
+			result_olv_stats["olv_operation_mode"] = "ordinary_transport_bake_reused_existing_labels"
+			if bool(bake_options.get("olv_layout_revision_recovered_from_legacy_scene", false)):
+				result_olv_stats["olv_layout_revision_recovered_from_legacy_scene"] = true
+		if result_olv_labels != null:
+			if not bool(result_olv_labels.validate().get("ok", false)) \
+					or not bool(result_olv_stats.get("olv_filter_enabled", false)):
+				_finish_free_space_bake(false, "OLV labels did not validate for the completed CLV bake; the previous generation remains active.")
+				return false
+			var source_manifest := source_saved.get("manifest") as Manifest
+			if source_manifest == null:
+				_finish_free_space_bake(false, "Could not attach OLV provenance to the saved source manifest.")
+				return false
+			source_manifest.prepared_olv_filter_enabled = true
+			source_manifest.prepared_olv_label_set = result_olv_labels
+			source_manifest.prepared_olv_context = _manifest_olv_context(result_olv_context, result_olv_labels)
+			source_manifest.prepared_olv_filter_stats = result_olv_stats.duplicate(true)
+		elif _olv_bake_requested or _olv_cache_reuse_requested:
+			_finish_free_space_bake(false, "OLV was requested or reusable cache was present, but the completed CLV bake did not consume validated OLV labels.")
 			return false
 		saved = PreparedArchive.save_source(chunk, source_saved.manifest, generation_id,
 			output_root, 16, cancelled)
@@ -1031,7 +1138,8 @@ func _bake_free_space_source_generation() -> bool:
 	_layout_dirty = false
 	_layout_refresh_deadline_msec = 0
 	_clear_candidate_layout()
-	_layout_epoch += 1
+	# Layout revisions advance from layout invalidation only. A new bake or OLV
+	# label generation does not change the target lattice by itself.
 	_preview_revision += 1
 	_preview_layout_match_key = ""
 	_free_space_bake_stage = "Complete"
@@ -1041,6 +1149,142 @@ func _bake_free_space_source_generation() -> bool:
 	update_configuration_warnings()
 	bake_status_changed.emit()
 	return has_bake()
+
+func _manifest_olv_context(context: Dictionary, labels: Resource) -> Dictionary:
+	return {
+		"scene_id": String(context.get("scene_id", "")),
+		"volume_id": String(context.get("volume_id", "")),
+		"layout_revision": int(context.get("layout_revision", -1)),
+		"layout_signature": String(context.get("layout_signature",
+			context.get("target_layout_signature", ""))),
+		"grid_origin_world": Vector3(context.get("grid_origin_world", Vector3.ZERO)),
+		"base_cell_spacing_m": float(context.get("base_cell_spacing_m", 0.0)),
+		"labels_hash": String(labels.get("labels_hash")) if labels != null else "",
+	}
+
+
+func _load_active_source_page() -> Dictionary:
+	if bake_manifest == null or not is_instance_valid(bake_manifest) \
+			or not bake_manifest.is_valid() \
+			or bake_manifest.transport_domain not in [VolumeSourceBaker.TRANSPORT_DOMAIN,
+				PreparedArchive.DOMAIN]:
+		return {"ok": false, "error": "No valid free-space source generation is active; run a regular free-space source Bake first."}
+	var source_path := String(bake_manifest.prepared_debug_source_path)
+	if source_path.is_empty() and bake_manifest.transport_domain == VolumeSourceBaker.TRANSPORT_DOMAIN \
+			and bake_manifest.page_entries.size() == 1:
+		source_path = String(bake_manifest.page_entries[0].get("resource_path", ""))
+	if source_path.is_empty():
+		return {"ok": false, "error": "The active generation did not retain its source probe page; run a regular free-space source Bake first."}
+	# Generation paths are immutable; share the retained source with the OLV
+	# adapter instead of loading a second copy of its transfer arrays.
+	var page := ResourceLoader.load(source_path, "", ResourceLoader.CACHE_MODE_REUSE) as Page
+	if page == null or not page.is_source_data_valid():
+		return {"ok": false, "error": "The retained source page is missing, invalid, or has no usable transport samples."}
+	var source := page.free_space_volume_source as VolumeSourceChunk
+	if source == null or source.spacing_m != VolumeSourceChunk.CELL_SPACING_M \
+			or source.source_lod != 0 or source.probe_count > OLVProbePayload.MAX_PROBES:
+		return {"ok": false, "error": "Independent OLV update currently needs one retained regular .25 m source page within the source payload limit; the active source page must be retained."}
+	if source.geometry_signature != bake_manifest.bake_geometry_signature \
+			or source.source_transform_world.origin.distance_to(global_transform.origin) > 0.0001 \
+			or source.source_size_m.distance_to(size) > 0.0001:
+		return {"ok": false, "error": "The retained source page belongs to a different Volume transform, size, or geometry generation."}
+	for axis in 3:
+		if source.source_transform_world.basis[axis].distance_to(global_transform.basis[axis]) > 0.0001:
+			return {"ok": false, "error": "The retained source transform no longer matches the current Volume."}
+	if source.source_bounds_world.position.distance_to((global_transform * AABB(-size * 0.5, size)).position) > 0.0001 \
+			or source.source_bounds_world.size.distance_to((global_transform * AABB(-size * 0.5, size)).size) > 0.0001:
+		return {"ok": false, "error": "The retained source world bounds no longer match the current Volume."}
+	return {"ok": true, "page": page, "source": source, "source_path": source_path}
+
+
+func _load_active_olv_cache() -> Dictionary:
+	if bake_manifest == null or not is_instance_valid(bake_manifest) \
+			or not bool(bake_manifest.prepared_olv_filter_enabled):
+		return {"ok": false, "error": "The active generation has no OLV cache to reuse."}
+	var loaded := _load_active_source_page()
+	if not bool(loaded.get("ok", false)):
+		return loaded
+	var source: VolumeSourceChunk = loaded.source
+	var labels: Resource = bake_manifest.prepared_olv_label_set
+	var context: Dictionary = bake_manifest.prepared_olv_context.duplicate(true)
+	var payload: Resource = source.olv_probe_domain_payload
+	if labels == null or not labels.has_method("validate") \
+			or not labels.has_method("matches_bake") or payload == null \
+			or not payload.has_method("validate_for_source"):
+		return {"ok": false, "error": "The active OLV label set or source-probe payload is missing."}
+	var labels_result: Dictionary = labels.validate()
+	if not bool(labels_result.get("ok", false)) \
+			or String(context.get("labels_hash", "")) != String(labels.get("labels_hash")):
+		return {"ok": false, "error": "The active OLV label-set hash does not match its saved manifest binding."}
+	var revision_recovery := _recover_legacy_olv_layout_revision(source, labels, context)
+	if not bool(revision_recovery.get("ok", false)):
+		return {"ok": false, "error": String(revision_recovery.get("error",
+			"The active OLV layout revision cannot be proven; run an independent OLV update."))}
+	var layout_signature := String(context.get("layout_signature", ""))
+	if layout_signature.is_empty() or int(context.get("layout_revision", -1)) != layout_revision() \
+			or String(context.get("scene_id", "")) != SceneTracker.scene_identity(self) \
+			or String(context.get("volume_id", "")) != SceneTracker.scene_relative_path(self) \
+			or not bool(labels.matches_bake(String(context.scene_id), String(context.volume_id),
+				int(context.layout_revision), source.geometry_signature, layout_signature)):
+		return {"ok": false, "error": "The active OLV label set belongs to a different scene, volume, revision, or source geometry."}
+	var payload_result: Dictionary = payload.validate_for_source(source, String(labels.get("labels_hash")))
+	if not bool(payload_result.get("ok", false)):
+		return {"ok": false, "error": "The active OLV payload failed source validation: " +
+			String(payload_result.get("error", "unknown"))}
+	context["target_layout_signature"] = layout_signature
+	context["label_set"] = labels
+	return {"ok": true, "options": {"olv_probe_domain_payload": payload,
+		"olv_label_set": labels, "olv_layout_context": context,
+		"olv_layout_revision_recovered_from_legacy_scene":
+			bool(revision_recovery.get("recovered", false))}}
+
+
+func _recover_legacy_olv_layout_revision(source: VolumeSourceChunk, labels: Resource,
+		context: Dictionary) -> Dictionary:
+	if source == null or labels == null or not use_clv \
+			or absf(clv_cell_size - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
+		return {"ok": false,
+			"error": "The active OLV cache is unsupported for the current CLV mode or cell spacing."}
+	var expected_bounds := global_transform * AABB(-size * 0.5, size)
+	if source.source_transform_world.origin.distance_to(global_transform.origin) > 0.0001 \
+			or source.source_size_m.distance_to(size) > 0.0001 \
+			or source.source_bounds_world.position.distance_to(expected_bounds.position) > 0.0001 \
+			or source.source_bounds_world.size.distance_to(expected_bounds.size) > 0.0001:
+		return {"ok": false,
+			"error": "The active OLV source transform or bounds no longer match the current Volume."}
+	for axis in 3:
+		if source.source_transform_world.basis[axis].distance_to(global_transform.basis[axis]) > 0.0001:
+			return {"ok": false,
+				"error": "The active OLV source transform or bounds no longer match the current Volume."}
+	var stored_revision := int(labels.get("layout_revision"))
+	if stored_revision < 0 or int(context.get("layout_revision", -1)) != stored_revision:
+		return {"ok": false,
+			"error": "The active OLV manifest and LabelSet have different target-layout revisions."}
+	var context_signature := String(context.get("layout_signature", ""))
+	if context_signature.is_empty() or not context.has("grid_origin_world") \
+			or String(labels.get("layout_signature")) != context_signature \
+			or Vector3(context.get("grid_origin_world", Vector3.ZERO)).distance_to(source.origin_world) > 0.0001 \
+			or absf(float(context.get("base_cell_spacing_m", 0.0)) - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
+		return {"ok": false,
+			"error": "The saved OLV binding does not match its retained source lattice; run an independent OLV update."}
+	if String(context.get("scene_id", "")) != SceneTracker.scene_identity(self) \
+			or String(context.get("volume_id", "")) != SceneTracker.scene_relative_path(self):
+		return {"ok": false, "error": "The active OLV cache belongs to a different scene or Volume."}
+	var expected_context := VolumeSourceBaker.make_olv_layout_context(self,
+		source.geometry_signature, source.origin_world, source.dimensions, 4, stored_revision)
+	if expected_context.is_empty() \
+			or String(expected_context.get("target_layout_signature", "")) != context_signature:
+		return {"ok": false,
+			"error": "The current scene and retained source cannot reproduce the saved OLV layout signature; run an independent OLV update."}
+	var recovered := layout_revision() != stored_revision
+	if recovered:
+		# Older scene files did not serialize the runtime epoch. Restore it only
+		# after reproducing the complete sealed layout from scene, Volume, source,
+		# grid origin, dimensions, spacing, and LabelSet revision.
+		_layout_epoch = stored_revision
+	return {"ok": true, "recovered": recovered}
+
+
 
 func _on_free_space_bake_progress(stage: String, completed: int, total: int,
 		_batch: int, _batch_count: int) -> void:
@@ -1153,8 +1397,9 @@ func _schedule_layout_settle() -> void:
 	_layout_refresh_deadline_msec = Time.get_ticks_msec() + LAYOUT_IDLE_DEBOUNCE_MSEC
 	_layout_queued = true
 
-func _mark_layout_stale(schedule_settle := true) -> void:
-	_layout_epoch += 1
+func _mark_layout_stale(schedule_settle := true, target_layout_changed := true) -> void:
+	if target_layout_changed:
+		_layout_epoch += 1
 	_candidate_layout_current = false
 	_candidate_viz_generation += 1
 	if _candidate_layout_ready:
@@ -1515,22 +1760,24 @@ func _upgrade_matching_visibility_bake(placement: Placement) -> void:
 	_bake_assigning_data = false
 	_scene_signature_checked = true # The setter invalidates this cached check.
 
-func _settings_changed(rebuild := true) -> void:
+func _settings_changed(rebuild := true, target_layout_changed := true) -> void:
 	_bake_generation += 1
 	_scene_signature_checked = false
 	if is_surfel_mode():
-		_mark_layout_stale(false)
+		_mark_layout_stale(false, target_layout_changed)
 		Runtime.publish(self)
 		return
 	if rebuild:
-		_mark_layout_stale()
+		_mark_layout_stale(true, target_layout_changed)
 	else:
+		if target_layout_changed:
+			_layout_epoch += 1
 		_schedule_layout_settle()
 
 func _sample_quality_changed() -> void:
 	# Ray count affects the bake but not the surface layout/signature.
 	_bake_generation += 1
-	_mark_layout_stale()
+	_mark_layout_stale(true, false)
 
 func _invalidate_data_cache() -> void:
 	_validity_checked = false
@@ -1608,15 +1855,37 @@ func _saved_bake_matches_current() -> bool:
 	return _legacy_watch_baseline_signature > 0 \
 			and _legacy_watch_baseline_signature == _current_watch_signature
 
+var _saved_olv_model_bindings: Dictionary = {}
+func _saved_olv_model_binding(manifest: Manifest) -> String:
+	if not manifest.prepared_olv_filter_enabled: return ""
+	var path := String(manifest.prepared_debug_source_path)
+	if _saved_olv_model_bindings.has(path): return _saved_olv_model_bindings[path]
+	var controller := get_olv_controller()
+	var sidecar: Resource = controller.get("data") if controller != null else null
+	if sidecar != null and sidecar.has_method("matches_manifest") \
+			and bool(sidecar.call("matches_manifest",manifest)):
+		var saved_binding := String(sidecar.get("gi_bake_model_sha256"))
+		if not saved_binding.is_empty():
+			_saved_olv_model_bindings[path] = saved_binding
+			return saved_binding
+	var page := load(path) as Page if not path.is_empty() else null
+	var source: Resource = page.free_space_volume_source if page != null else null
+	var binding := String(source.olv_probe_domain_payload.model_sha256) if source != null and source.olv_probe_domain_payload != null else ""
+	_saved_olv_model_bindings[path] = binding
+	return binding
+
 func _settings_signature_for_manifest(manifest: Manifest) -> int:
 	if manifest != null and manifest.transport_domain == PreparedArchive.DOMAIN \
 			and manifest.prepared_bake_algorithm.begins_with("multires_independent_transport"):
 		return PagedSourceBaker.settings_signature(self, {"prepared_levels": manifest.prepared_level_count,
-			"core_axis": manifest.prepared_core_axis})
+			"core_axis": manifest.prepared_core_axis,
+			"olv_inference_requested": bool(manifest.prepared_olv_filter_enabled)})
 	if manifest != null and manifest.transport_domain == PreparedArchive.DOMAIN:
-		return hash([VolumeSourceBaker.settings_signature(self), CLVTransferBuilder.REVISION])
+		return hash([VolumeSourceBaker.settings_signature(self,
+			bool(manifest.prepared_olv_filter_enabled), _saved_olv_model_binding(manifest)), CLVTransferBuilder.REVISION])
 	if manifest != null and manifest.transport_domain == VolumeSourceBaker.TRANSPORT_DOMAIN:
-		return VolumeSourceBaker.settings_signature(self)
+		return VolumeSourceBaker.settings_signature(self,
+			bool(manifest.prepared_olv_filter_enabled), _saved_olv_model_binding(manifest))
 	return Baker.new()._streamed_settings_signature(self)
 
 func _set_probe_layout_from_data(data: Data) -> void:
@@ -1797,4 +2066,4 @@ func _update_preview_if_changed() -> void:
 func _sync_preview_exposure_request() -> void:
 	if is_inside_tree() and Engine.is_editor_hint():
 		Runtime.set_preview_requested(self,
-				not is_surfel_mode() and (show_probes or show_sh_probes))
+			not is_surfel_mode() and (show_probes or show_sh_probes))

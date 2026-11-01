@@ -1,6 +1,11 @@
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer Operators { float values[]; } operators;
+#ifdef CLV_PARTITION_INPUT
+layout(set = 0, binding = 1, std430) readonly buffer Indices { ivec4 values[]; } indices;
+layout(set = 0, binding = 5, std430) readonly buffer Weights { vec4 values[]; } weights;
+#else
 layout(set = 0, binding = 1, std430) readonly buffer Indices { int values[]; } indices;
+#endif
 layout(set = 0, binding = 2, std430) readonly buffer Emitters { float values[]; } emitters;
 layout(set = 0, binding = 3, std140) uniform GIParams {
 	mat4 inverse_projection; mat4 world_to_grid; mat4 view_to_world;
@@ -25,23 +30,34 @@ vec3 coefficient(vec4 blocks[7], int index) {
 void main() {
 	int cell = int(gl_GlobalInvocationID.x);
 	if (cell >= config.cell_count) return;
-	int source = indices.values[cell];
-	bool valid = source >= 0 && source < config.source_count;
+#ifdef CLV_PARTITION_INPUT
+	ivec4 sources = indices.values[cell];
+	vec4 source_weights = weights.values[cell];
+	int source_count = 4;
+#else
+	ivec4 sources = ivec4(indices.values[cell], -1, -1, -1);
+	vec4 source_weights = vec4(1.0, 0.0, 0.0, 0.0);
+	int source_count = 1;
+#endif
+	bool valid = sources.x >= 0 && sources.x < config.source_count;
 	vec3 sh[4];
 	for (int outgoing = 0; outgoing < 4; outgoing++) {
 		vec3 value = vec3(0.0);
-		if (valid) {
+		for (int neighbor = 0; neighbor < source_count; neighbor++) {
+			int source = sources[neighbor];
+			float source_weight = source_weights[neighbor];
+			if (!valid || source < 0 || source >= config.source_count || !(source_weight > 0.0)) continue;
 			int row = (source * 4 + outgoing) * config.columns;
 			for (int incoming = 0; incoming < 4; incoming++) {
 				int k = row + incoming * 3;
-				value += vec3(operators.values[k], operators.values[k + 1], operators.values[k + 2]) * (coefficient(params.lighting_sh, incoming) * config.output_scale);
-				value += operators.values[row + 12 + incoming] * (coefficient(params.sky_lighting_sh, incoming) * config.output_scale);
+				value += vec3(operators.values[k], operators.values[k + 1], operators.values[k + 2]) * (coefficient(params.lighting_sh, incoming) * config.output_scale * source_weight);
+				value += operators.values[row + 12 + incoming] * (coefficient(params.sky_lighting_sh, incoming) * config.output_scale * source_weight);
 			}
 			for (int e = 0; e < config.emitter_count; e++) {
 				int k = row + 16 + e * 6;
 				for (int c = 0; c < 3; c++) {
-					value[c] += operators.values[k + c] * (emitters.values[e * 6 + c] * config.output_scale)
-						+ operators.values[k + 3 + c] * (emitters.values[e * 6 + 3 + c] * config.output_scale);
+					value[c] += operators.values[k + c] * (emitters.values[e * 6 + c] * config.output_scale * source_weight)
+						+ operators.values[k + 3 + c] * (emitters.values[e * 6 + 3 + c] * config.output_scale * source_weight);
 				}
 			}
 		}

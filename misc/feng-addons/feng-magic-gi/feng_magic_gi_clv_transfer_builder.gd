@@ -8,8 +8,9 @@ const Boundary = preload("feng_magic_gi_boundary_tensor_builder.gd")
 const Data = preload("feng_magic_gi_data.gd")
 const DirectionalBaker = preload("feng_magic_gi_directional_baker.gd")
 const DirectionalData = preload("feng_magic_gi_directional_data.gd")
+const OLVDomain = preload("feng_magic_gi_olv_domain.gd")
 const LEVELS := 4
-const REVISION := 4
+const REVISION := 5
 const SUPPORT_RADIUS := 0.65
 const MAX_NEIGHBORS := 12
 const OUTPUT_SCHEMA_VERSION := 2
@@ -36,11 +37,46 @@ var _surface_coordinates_by_count: Dictionary = {}
 var _surface_target_cache: Dictionary = {}
 var _surface_target_cache_order: Array[String] = []
 var _preparation_error := ""
+var _olv_domain_context: Dictionary = {}
+var _olv_label_set: Resource
+var _olv_probe_payload: Resource
+var _olv_filter_enabled := false
+var _olv_binding_signature := ""
+var _active_target_domain_label := 0
+var _active_target_lod := 0
+var _active_target_global_cell := Vector3i.ZERO
+var _active_target_spacing_m := 0.0
+
+## Independent OLV changes categorical labels, not physical transport. The
+## caller validates the preparation before replacing its label payload; reuse
+## those exact operators and bind the new labels for the runtime sampler.
+func rebind_prepared_olv(source: Resource, context: Dictionary,
+		previous_preparation_signature: String) -> Dictionary:
+	if source == null or previous_preparation_signature.is_empty() \
+			or String(source.clv_preparation_signature) != previous_preparation_signature:
+		return {"ok": false, "error": "prepared_transfer_changed_during_olv"}
+	_source = source
+	# Preserve the proven operator bound: dropping it would select RGBA32F
+	# instead of the existing half-float cache and increase runtime bandwidth.
+	_stats = source.clv_preparation_stats.duplicate(true)
+	_configure_olv_domain_filter(source, context)
+	if not _olv_filter_enabled:
+		return {"ok": false, "error": "invalid_new_olv_binding", "stats": _stats}
+	source.clv_preparation_olv_binding_signature = _olv_binding_signature
+	source.clv_preparation_signature = source.make_clv_preparation_signature()
+	_stats["olv_operator_reused"] = true
+	_stats["olv_filter_stage"] = "runtime_preinterpolation"
+	_stats["surface_direct_probes"] = 0
+	_stats["surface_direct_samples"] = 0
+	_stats["surface_direct_bake_usec"] = 0
+	source.clv_preparation_stats = _stats.duplicate(true)
+	return {"ok": bool(source.has_preinterpolated_clv(_olv_binding_signature)), "stats": _stats}
 
 func prepare_async(source: Resource, geometry: RefCounted,
 		cancelled := Callable(), progress := Callable(),
 		surface_coordinates: Array[PackedFloat64Array] = [],
-		surface_target_cache: Dictionary = {}) -> Dictionary:
+		surface_target_cache: Dictionary = {},
+		olv_domain_context: Dictionary = {}) -> Dictionary:
 	if source == null or geometry == null or not source.is_source_data_valid() or not geometry.bvh_ready:
 		return {"ok": false, "error": "invalid_clv_transfer_preparation_input"}
 	_source = source
@@ -67,7 +103,15 @@ func prepare_async(source: Resource, geometry: RefCounted,
 		"maximum_operator_row_l1": 0.0, "surface_target_constraints": 0,
 		"surface_target_cache_hits": 0, "surface_direct_probes": 0,
 		"surface_direct_samples": 0,
-		"surface_direct_bake_usec": 0}
+		"surface_direct_bake_usec": 0,
+		"olv_abstain_unknown_target_count": 0,
+		"olv_abstain_ambiguous_target_count": 0,
+		"olv_abstain_unsupported_spacing_count": 0,
+		"olv_abstain_unknown_candidate_count": 0,
+		"olv_abstain_ambiguous_candidate_count": 0,
+		"olv_abstain_unknown_candidate_query_count": 0,
+		"olv_abstain_ambiguous_candidate_query_count": 0}
+	_configure_olv_domain_filter(source, olv_domain_context)
 	for record in geometry.get("_occlusion_volumes"):
 		var solid := {"faces": record.faces, "bounds": record.world_aabb, "bvh": record.bvh}
 		var pairs: Array[Dictionary] = Boundary._build_axis_face_pairs(solid)
@@ -101,6 +145,7 @@ func prepare_async(source: Resource, geometry: RefCounted,
 					var source_cell := Vector3i(x, y, z) * stride
 					var world: Vector3 = source.origin_world + Vector3(source_cell) * source.spacing_m
 					var destination := _offsets[level] + (z * dims.y + y) * dims.x + x
+					_active_target_lod = source.source_lod + level
 					_prepare_cell(world, step, source.cell_index(source_cell), destination)
 					if not _preparation_error.is_empty():
 						return {"ok": false, "error": _preparation_error, "stats": _stats.duplicate(true)}
@@ -120,7 +165,8 @@ func prepare_async(source: Resource, geometry: RefCounted,
 	_source.clv_prepared_offsets = _offsets
 	_source.clv_prepared_validity = _validity
 	_source.clv_prepared_operators = _prepared
-	_source.clv_preparation_signature = source.directional_source_signature
+	_source.clv_preparation_olv_binding_signature = _olv_binding_signature
+	_source.clv_preparation_signature = source.make_clv_preparation_signature()
 	_source.clv_preparation_stats = _stats.duplicate(true)
 	_matrix_cache.clear()
 	return {"ok": source.has_preinterpolated_clv(), "stats": _stats}
@@ -132,7 +178,8 @@ func prepare_region_async(source: Resource, geometry: RefCounted,
 		first_cell: Vector3i, dimensions: Vector3i,
 		cancelled := Callable(), progress := Callable(),
 		surface_coordinates: Array[PackedFloat64Array] = [],
-		surface_target_cache: Dictionary = {}, source_level := -1) -> Dictionary:
+		surface_target_cache: Dictionary = {}, source_level := -1,
+		olv_domain_context: Dictionary = {}) -> Dictionary:
 	if source == null or geometry == null or not source.is_source_data_valid() or not geometry.bvh_ready:
 		return {"ok": false, "error": "invalid_multires_prepare_source"}
 	for axis in 3:
@@ -162,7 +209,15 @@ func prepare_region_async(source: Resource, geometry: RefCounted,
 		"maximum_operator_row_l1": 0.0, "surface_target_constraints": 0,
 		"surface_target_cache_hits": 0, "surface_direct_probes": 0,
 		"surface_direct_samples": 0,
-		"surface_direct_bake_usec": 0}
+		"surface_direct_bake_usec": 0,
+		"olv_abstain_unknown_target_count": 0,
+		"olv_abstain_ambiguous_target_count": 0,
+		"olv_abstain_unsupported_spacing_count": 0,
+		"olv_abstain_unknown_candidate_count": 0,
+		"olv_abstain_ambiguous_candidate_count": 0,
+		"olv_abstain_unknown_candidate_query_count": 0,
+		"olv_abstain_ambiguous_candidate_query_count": 0}
+	_configure_olv_domain_filter(source, olv_domain_context)
 	for record in geometry.get("_occlusion_volumes"):
 		var solid := {"faces": record.faces, "bounds": record.world_aabb, "bvh": record.bvh}
 		solid["box"] = Boundary._is_full_axis_aligned_box(solid, Boundary._build_axis_face_pairs(solid))
@@ -180,6 +235,7 @@ func prepare_region_async(source: Resource, geometry: RefCounted,
 				if cancelled.is_valid() and bool(cancelled.call()): return {"ok": false, "error": "cancelled"}
 				var source_cell := first_cell + Vector3i(x, y, z)
 				var destination := (z * dimensions.y + y) * dimensions.x + x
+				_active_target_lod = source_level
 				_prepare_cell(source.origin_world + Vector3(source_cell) * source.spacing_m,
 						source.spacing_m, source.cell_index(source_cell), destination)
 				if not _preparation_error.is_empty():
@@ -193,7 +249,14 @@ func prepare_region_async(source: Resource, geometry: RefCounted,
 
 func _prepare_cell(world: Vector3, step: float, source_index: int, destination: int) -> void:
 	_stats.cells += 1
-	var selected := _collect_constraints(world, step)
+	_activate_olv_target(source_index, world, step)
+	# A relocated source belongs to the free space at its actual position. A
+	# surface constraint must be reachable from that side before its lighting is
+	# fitted into this texel; filtering texel labels later cannot undo a fit that
+	# already combined indoor and outdoor surfaces.
+	var anchor: Vector3 = _source.cell_position(source_index) \
+			if _source.cell_is_valid(source_index) else Vector3(INF, INF, INF)
+	var selected := _collect_constraints(world, step, anchor)
 	var base := PackedFloat32Array()
 	if _source.cell_is_valid(source_index):
 		base = _source_matrix(source_index).duplicate()
@@ -229,9 +292,12 @@ func _prepare_cell(world: Vector3, step: float, source_index: int, destination: 
 	_validity[destination] = 1
 	_stats.supported += 1
 
-func _collect_constraints(world: Vector3, step: float) -> Array[Dictionary]:
+func _collect_constraints(world: Vector3, step: float,
+		free_anchor := Vector3(INF, INF, INF)) -> Array[Dictionary]:
 	var constraints: Array[Dictionary] = []
 	var radius := step * 1.5
+	if not free_anchor.is_finite() and not _geometry.point_is_inside_or_ambiguous_solid(world):
+		free_anchor = world
 	for solid in _solids:
 		var bounds: AABB = solid.bounds
 		if Boundary._point_aabb_distance_squared(world, bounds) > radius * radius:
@@ -247,12 +313,22 @@ func _collect_constraints(world: Vector3, step: float) -> Array[Dictionary]:
 						if tangent != axis:
 							var margin := minf(0.02, bounds.size[tangent] * 0.1)
 							point[tangent] = clampf(point[tangent], bounds.position[tangent] + margin, bounds.end[tangent] - margin)
-					_add_constraint(constraints, world, point, normal, radius, bounds)
+					_add_constraint(constraints, world, point, normal, radius, bounds, free_anchor)
 		else:
 			var nearest: Dictionary = Boundary._nearest_triangle(world, solid.faces, step)
 			if not nearest.is_empty():
-				_add_constraint(constraints, world, nearest.point, nearest.normal, radius)
+				_add_constraint(constraints, world, nearest.point, nearest.normal, radius, AABB(), free_anchor)
 	constraints.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return a.distance < b.distance)
+	if not free_anchor.is_finite() and not constraints.is_empty():
+		# An invalid grid center inside a slab may still provide an extrapolation
+		# texel for the unlabelled path. Give it ONE connected surface side, never
+		# a fit assembled from both sides of that slab. OLV excludes its unset label.
+		free_anchor = constraints[0].surface_point + constraints[0].normal * SURFACE_SAMPLE_OFFSET_M
+		var connected: Array[Dictionary] = []
+		for constraint in constraints:
+			if _constraint_reachable(free_anchor, constraint.surface_point, constraint.normal):
+				connected.append(constraint)
+		constraints = connected
 	var unique_constraints: Array[Dictionary] = []
 	for constraint in constraints:
 		var duplicate := false
@@ -315,7 +391,8 @@ static func rank_independent_constraint_indices(bases: Array[PackedFloat64Array]
 	return result
 
 func _add_constraint(constraints: Array[Dictionary], world: Vector3,
-		point: Vector3, normal: Vector3, radius: float, face_bounds := AABB()) -> void:
+		point: Vector3, normal: Vector3, radius: float, face_bounds := AABB(),
+		free_anchor := Vector3(INF, INF, INF)) -> void:
 	var distance := world.distance_to(point)
 	if distance > radius or normal.length_squared() < 0.5:
 		return
@@ -346,12 +423,26 @@ func _add_constraint(constraints: Array[Dictionary], world: Vector3,
 		if not found: return
 		query = point + normal * 0.008
 		distance = world.distance_to(point)
+	if free_anchor.is_finite() and not _constraint_reachable(free_anchor, point, normal):
+		return
 	var gathered := _gather(query, point, normal)
 	if gathered.is_empty():
 		return
 	constraints.append({"normal": normal, "distance": distance,
 		"basis": _irradiance_basis(normal), "matrix": gathered,
 		"surface_point": point, "face_bounds": face_bounds})
+
+func _constraint_reachable(anchor: Vector3, point: Vector3, normal: Vector3) -> bool:
+	if normal.dot(anchor - point) < -0.00001:
+		_stats["constraint_backface_rejections"] = int(_stats.get("constraint_backface_rejections", 0)) + 1
+		return false
+	# Sidedness alone cannot distinguish two rooms with the same indoor label,
+	# or a foreground wall blocking an otherwise front-facing surface. This is
+	# strictly offline geometry work, not a runtime or relighting query.
+	if not _geometry.bvh.intersect_segment(anchor, point + normal * SURFACE_SAMPLE_OFFSET_M).is_empty():
+		_stats["constraint_occlusion_rejections"] = int(_stats.get("constraint_occlusion_rejections", 0)) + 1
+		return false
+	return true
 
 func _bake_surface_footprint_target(constraint: Dictionary, step: float) -> Dictionary:
 	var point: Vector3 = constraint.surface_point
@@ -522,8 +613,58 @@ func _gather(query: Vector3, surface: Vector3, normal: Vector3) -> PackedFloat32
 					continue
 				var distance := query.distance_to(position)
 				if distance < _support_radius:
-					candidates.append({"index": index, "position": position, "distance": distance})
+					var candidate := {"index": index, "position": position, "distance": distance}
+					if _olv_filter_enabled:
+						candidate["domain_label"] = int(_olv_probe_payload.label_for_logical_probe(index))
+					candidates.append(candidate)
 	candidates.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return a.distance < b.distance)
+	if _olv_filter_enabled and not candidates.is_empty():
+		if _active_target_domain_label == OLVDomain.LABEL_UNSET:
+			_stats["olv_filter_abstain_count"] = int(_stats.get("olv_filter_abstain_count", 0)) + 1
+			_stats["olv_abstain_unknown_target_count"] = int(
+				_stats.get("olv_abstain_unknown_target_count", 0)) + 1
+		elif _active_target_domain_label == OLVDomain.LABEL_AMBIGUOUS:
+			_stats["olv_filter_abstain_count"] = int(_stats.get("olv_filter_abstain_count", 0)) + 1
+			_stats["olv_abstain_ambiguous_target_count"] = int(
+				_stats.get("olv_abstain_ambiguous_target_count", 0)) + 1
+		elif not _target_spacing_is_supported(_active_target_spacing_m):
+			_stats["olv_filter_abstain_count"] = int(_stats.get("olv_filter_abstain_count", 0)) + 1
+			_stats["olv_abstain_unsupported_spacing_count"] = int(
+				_stats.get("olv_abstain_unsupported_spacing_count", 0)) + 1
+		else:
+			var unknown_candidates := 0
+			var ambiguous_candidates := 0
+			for candidate in candidates:
+				match int(candidate.domain_label):
+					OLVDomain.LABEL_UNSET: unknown_candidates += 1
+					OLVDomain.LABEL_AMBIGUOUS: ambiguous_candidates += 1
+			if unknown_candidates == 0 and ambiguous_candidates == 0:
+				var filtered: Array[Dictionary] = []
+				for candidate in candidates:
+					if int(candidate.domain_label) == _active_target_domain_label:
+						filtered.append(candidate)
+					else:
+						_stats["olv_filtered_candidate_count"] = int(
+							_stats.get("olv_filtered_candidate_count", 0)) + 1
+				candidates = filtered
+				_stats["olv_filter_applied_count"] = int(_stats.get("olv_filter_applied_count", 0)) + 1
+			else:
+				# Unknown or mixed candidates force the whole query onto the original
+				# candidate set. Abstain is a legacy fallback, never reject-all.
+				_stats["olv_filter_abstain_count"] = int(_stats.get("olv_filter_abstain_count", 0)) + 1
+				_stats["olv_abstain_unknown_candidate_count"] = int(
+					_stats.get("olv_abstain_unknown_candidate_count", 0)) + unknown_candidates
+				_stats["olv_abstain_ambiguous_candidate_count"] = int(
+					_stats.get("olv_abstain_ambiguous_candidate_count", 0)) + ambiguous_candidates
+				# Candidate counters above are occurrences, not query totals. Keep
+				# disjoint per-query reasons so all abstains can be reconciled. If a
+				# query contains both kinds, unknown takes precedence in this summary.
+				if unknown_candidates > 0:
+					_stats["olv_abstain_unknown_candidate_query_count"] = int(
+						_stats.get("olv_abstain_unknown_candidate_query_count", 0)) + 1
+				elif ambiguous_candidates > 0:
+					_stats["olv_abstain_ambiguous_candidate_query_count"] = int(
+						_stats.get("olv_abstain_ambiguous_candidate_query_count", 0)) + 1
 	var values := PackedFloat32Array()
 	values.resize(_output_coefficients * _columns)
 	values.fill(0.0)
@@ -547,6 +688,113 @@ func _gather(query: Vector3, surface: Vector3, normal: Vector3) -> PackedFloat32
 	for scalar in values.size():
 		values[scalar] /= weight_sum
 	return values
+
+
+func _configure_olv_domain_filter(source: Resource, context: Dictionary) -> void:
+	_olv_domain_context = context.duplicate()
+	_olv_label_set = null
+	_olv_probe_payload = null
+	_olv_filter_enabled = false
+	_olv_binding_signature = ""
+	_active_target_domain_label = OLVDomain.LABEL_UNSET
+	_active_target_global_cell = Vector3i.ZERO
+	_active_target_spacing_m = 0.0
+	var stats := {"olv_filter_enabled": false, "olv_filter_disable_reason": "not_requested",
+		"olv_filter_applied_count": 0, "olv_filter_abstain_count": 0,
+		"olv_filtered_candidate_count": 0,
+		"olv_abstain_unknown_target_count": 0,
+		"olv_abstain_ambiguous_target_count": 0,
+		"olv_abstain_unsupported_spacing_count": 0,
+		"olv_abstain_unknown_candidate_count": 0,
+		"olv_abstain_ambiguous_candidate_count": 0,
+		"olv_abstain_unknown_candidate_query_count": 0,
+		"olv_abstain_ambiguous_candidate_query_count": 0}
+	if not context.is_empty():
+		var labels: Resource = context.get("label_set")
+		var payload: Resource = source.olv_probe_domain_payload
+		_olv_label_set = labels
+		_olv_probe_payload = payload
+		var binding_fields := [String(context.get("scene_id", "")),
+			String(context.get("volume_id", "")), int(context.get("layout_revision", -1)),
+			String(context.get("layout_signature", "")),
+			String(labels.get("labels_hash")) if labels != null else ""]
+		_olv_binding_signature = JSON.stringify(binding_fields, "", true, true).sha256_text()
+		var reason := _validate_olv_domain_context(source, context, labels, payload)
+		_olv_filter_enabled = reason.is_empty()
+		stats["olv_filter_enabled"] = _olv_filter_enabled
+		stats["olv_filter_disable_reason"] = "" if _olv_filter_enabled else reason
+	_stats.merge(stats, true)
+
+
+func _validate_olv_domain_context(source: Resource, context: Dictionary,
+		labels: Resource, payload: Resource) -> String:
+	if labels == null or not labels.has_method("validate") \
+			or payload == null or not payload.has_method("validate_for_source"):
+		return "validated_label_set_and_probe_payload_required"
+	var required := ["scene_id", "volume_id", "layout_revision", "layout_signature",
+		"grid_origin_world", "base_cell_spacing_m"]
+	for key in required:
+		if not context.has(key): return "domain_context_missing:" + key
+	var label_result: Dictionary = labels.validate()
+	if not bool(label_result.get("ok", false)):
+		return "invalid_label_set:" + String(label_result.get("error", "unknown"))
+	var scene_id := String(context.scene_id)
+	var volume_id := String(context.volume_id)
+	var revision := int(context.layout_revision)
+	var layout_signature := String(context.layout_signature)
+	if not labels.matches_bake(scene_id, volume_id, revision,
+			source.geometry_signature, layout_signature):
+		return "label_set_binding_mismatch"
+	if String(payload.scene_id) != scene_id or String(payload.volume_id) != volume_id \
+			or int(payload.layout_revision) != revision \
+			or String(payload.target_layout_signature) != layout_signature:
+		return "probe_payload_target_layout_mismatch"
+	var payload_validation: Dictionary = payload.validate_for_source(source,
+			String(labels.labels_hash))
+	if not bool(payload_validation.get("ok", false)):
+		return "invalid_probe_payload:" + String(payload_validation.get("error", "unknown"))
+	if not context.grid_origin_world is Vector3 \
+			or not Vector3(context.grid_origin_world).is_finite() \
+			or not is_finite(float(context.base_cell_spacing_m)) \
+			or absf(float(context.base_cell_spacing_m) - 0.25) > 0.000001:
+		return "target_grid_binding_invalid_or_unsupported_scale"
+	return ""
+
+
+func _activate_olv_target(source_index: int, world: Vector3, target_spacing: float) -> void:
+	_active_target_domain_label = OLVDomain.LABEL_UNSET
+	_active_target_spacing_m = target_spacing
+	if not _olv_filter_enabled or source_index < 0:
+		return
+	var source_lod := int(_source.source_lod)
+	if _active_target_lod < source_lod:
+		return
+	var stride := 1 << (_active_target_lod - source_lod)
+	var local_cell: Vector3i = _source.cell_coordinates(source_index)
+	if local_cell.x % stride != 0 or local_cell.y % stride != 0 or local_cell.z % stride != 0:
+		return
+	var global_cell: Vector3i = _source.global_cell_origin + Vector3i(
+			local_cell.x / stride, local_cell.y / stride, local_cell.z / stride)
+	var expected_world: Vector3 = Vector3(_olv_domain_context.grid_origin_world) \
+			+ Vector3(global_cell) * float(_olv_domain_context.base_cell_spacing_m) \
+			* float(1 << _active_target_lod)
+	if expected_world.distance_to(world) > 0.0001:
+		return
+	_active_target_global_cell = global_cell
+	var identity := OLVDomain.cell_identity(String(_olv_domain_context.scene_id),
+		String(_olv_domain_context.volume_id), _active_target_lod,
+		global_cell, int(_olv_domain_context.layout_revision))
+	_active_target_domain_label = int(_olv_label_set.get_cell_label(identity))
+
+
+func _target_spacing_is_supported(target_spacing: float) -> bool:
+	if _olv_probe_payload == null:
+		return false
+	var supported: PackedFloat32Array = _olv_probe_payload.supported_target_cell_spacings_m
+	for spacing in supported:
+		if absf(float(spacing) - target_spacing) <= 0.000001:
+			return true
+	return false
 
 func _source_matrix(index: int) -> PackedFloat32Array:
 	if _matrix_cache.has(index):

@@ -17,6 +17,9 @@ extends Resource
 @export_storage var maximum_operator_row_l1 := 0.0
 @export_storage var operator_schema_version := 0
 @export_storage var clv_prepared_dimensions := PackedInt32Array()
+## The OLV generation binding that was consumed while preparing this source.
+## An empty value is retained for generations baked before OLV was enabled.
+@export_storage var olv_binding_signature := ""
 
 func is_header_valid() -> bool:
 	if spacing_m != 0.25 or prepared_level_count < 1 or prepared_level_count > 10 \
@@ -41,8 +44,9 @@ func is_header_valid() -> bool:
 func is_valid() -> bool:
 	return is_header_valid()
 
-func has_preinterpolated_clv() -> bool:
-	return is_header_valid()
+func has_preinterpolated_clv(expected_olv_binding_signature := "") -> bool:
+	return is_header_valid() and (expected_olv_binding_signature.is_empty() \
+			or olv_binding_signature == expected_olv_binding_signature)
 
 func is_paged_prepared_source() -> bool:
 	return true
@@ -64,6 +68,21 @@ static func from_manifest(manifest: Resource) -> Resource:
 	result.geometry_signature = manifest.bake_geometry_signature
 	result.maximum_operator_row_l1 = manifest.prepared_maximum_operator_row_l1
 	result.operator_schema_version = int(manifest.get("prepared_operator_schema_version"))
+	var olv_context_value: Variant = manifest.get("prepared_olv_context")
+	if bool(manifest.get("prepared_olv_filter_enabled")) \
+			and olv_context_value is Dictionary:
+		var olv_context: Dictionary = olv_context_value
+		var olv_scene_id := String(olv_context.get("scene_id", ""))
+		var olv_volume_id := String(olv_context.get("volume_id", ""))
+		var olv_layout_revision := int(olv_context.get("layout_revision", -1))
+		var olv_layout_signature := String(olv_context.get("layout_signature", ""))
+		var olv_labels_hash := String(olv_context.get("labels_hash", ""))
+		if not olv_scene_id.is_empty() and not olv_volume_id.is_empty() \
+				and olv_layout_revision >= 0 and not olv_layout_signature.is_empty() \
+				and not olv_labels_hash.is_empty():
+			result.olv_binding_signature = JSON.stringify([
+				olv_scene_id, olv_volume_id, olv_layout_revision,
+				olv_layout_signature, olv_labels_hash], "", true, true).sha256_text()
 	for level in result.prepared_level_count:
 		var dims := Vector3i((Vector3(result.dimensions) / float(1 << level)).ceil())
 		result.clv_prepared_dimensions.append_array(PackedInt32Array([dims.x, dims.y, dims.z]))

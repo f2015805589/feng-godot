@@ -11,15 +11,34 @@ const Archive = preload("feng_magic_gi_prepared_brick_archive.gd")
 const Manifest = preload("feng_magic_gi_manifest.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const Baker = preload("feng_magic_gi_baker.gd")
+const OLVDomain = preload("feng_magic_gi_olv_domain.gd")
+const OLVLabelSet = preload("feng_magic_gi_olv_label_set.gd")
+const OLVInferenceRunner = preload("feng_magic_gi_olv_inference_runner.gd")
 const SOURCE_HALO_CELLS := 6 # 1 output + ceil(1.5 + 2.6 + relocation/spacing).
 
 static func settings_signature(volume: Node3D, options: Dictionary = {}) -> int:
+	var olv_inference_requested := bool(options.get("olv_inference_requested",
+		SourceBaker.current_olv_signature_binding(volume)))
+	var olv_context: Dictionary = options.get("olv_domain_filter", {})
+	var olv_labels: Resource = olv_context.get("label_set")
+	var olv_payload: Resource = options.get("olv_probe_domain_payload")
+	var olv_binding := [
+		String(olv_labels.get("labels_hash")) if olv_labels != null else "",
+		String(olv_payload.get("header_sha256")) if olv_payload != null else "",
+		String(olv_payload.get("payload_sha256")) if olv_payload != null else "",
+		String(olv_context.get("scene_id", "")), String(olv_context.get("volume_id", "")),
+		int(olv_context.get("layout_revision", -1)), String(olv_context.get("layout_signature", "")),
+		Vector3(olv_context.get("grid_origin_world", Vector3.ZERO)),
+		float(olv_context.get("base_cell_spacing_m", 0.0))]
 	return hash(["multires_prepared_bake_sh2_v3", SOURCE_HALO_CELLS, Builder.REVISION, Builder.OUTPUT_SCHEMA_VERSION,
-		SourceBaker.settings_signature(volume),
+		SourceBaker.settings_signature(volume, olv_inference_requested),
 		int(options.get("prepared_levels", 10)), int(options.get("core_axis", 16)),
 		int(options.get("samples", volume.bake_samples)), int(options.get("bounces", volume.bake_bounces)),
 		float(options.get("trace_distance_m", volume.bake_distance)),
-		int(options.get("moment_rays", maxi(int(options.get("samples", volume.bake_samples)), 256)))])
+		int(options.get("moment_rays", maxi(int(options.get("samples", volume.bake_samples)), 256))),
+		olv_binding,
+		olv_inference_requested,
+		OLVInferenceRunner.EXPECTED_MODEL_BUNDLE_SHA256 if olv_inference_requested else ""])
 
 static func tile_layout(global_dimensions: Vector3i, level: int,
 		core_origin: Vector3i, core_axis := 16) -> Dictionary:
@@ -57,6 +76,7 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	var global_origin := domain.position + Vector3.ONE * 0.125
 	var trace_distance := float(options.get("trace_distance_m", volume.bake_distance))
 	var bounces := int(options.get("bounces", volume.bake_bounces))
+	var olv_inference_requested := bool(options.get("olv_inference_requested", false))
 	var root := output_root.path_join("generation_" + generation)
 	if DirAccess.dir_exists_absolute(ProjectSettings.globalize_path(root)):
 		return {"ok": false, "error": "generation_already_exists"}
@@ -64,9 +84,27 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 		return {"ok": false, "error": "generation_directory_failed"}
 	if progress.is_valid(): progress.call("Capturing paged transport geometry", 0, 1, 0, 0)
 	var geometry := Placement.new()
-	if not geometry.collect(volume, true, true, true, false, domain.grow(trace_distance * float(bounces + 1))):
+	var collection_grow := trace_distance * float(bounces + 1)
+	if olv_inference_requested:
+		collection_grow = maxf(collection_grow, SourceBaker.OLV_R4_CAPTURE_GROW_M)
+	if not geometry.collect(volume, true, true, true, false, domain.grow(collection_grow)):
 		return {"ok": false, "error": "paged_geometry_capture_failed: " + geometry.error_message}
 	var geometry_signature := SourceBaker.geometry_signature_for(geometry)
+	var olv_layout_context: Dictionary
+	var aggregate_olv_labels: Resource
+	if olv_inference_requested:
+		olv_layout_context = SourceBaker.make_olv_layout_context(volume,
+			geometry_signature, global_origin, global_dimensions, levels)
+		if olv_layout_context.is_empty():
+			return {"ok": false, "error": "could_not_bind_olv_to_paged_clv_layout"}
+		aggregate_olv_labels = OLVLabelSet.new()
+		var label_configure: Dictionary = aggregate_olv_labels.configure(
+			String(olv_layout_context.scene_id), String(olv_layout_context.volume_id),
+			int(olv_layout_context.layout_revision), geometry_signature,
+			String(olv_layout_context.target_layout_signature))
+		if not bool(label_configure.get("ok", false)):
+			return {"ok": false, "error": "could_not_initialize_olv_label_set:" +
+				String(label_configure.get("error", "unknown"))}
 	var emitter_ids: PackedStringArray = geometry.emitters.keys.duplicate()
 	var emitter_signatures: PackedInt64Array = geometry.emitters.static_signatures.duplicate()
 	if emitter_ids.size() > 32: return {"ok": false, "error": "paged_emitter_limit_exceeded"}
@@ -93,6 +131,9 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	var surface_direct_probes := 0
 	var surface_direct_samples := 0
 	var surface_direct_bake_usec := 0
+	var olv_preparation_tiles := 0
+	var olv_enabled_tiles := 0
+	var olv_disable_reasons: Dictionary = {}
 	for level in levels:
 		var dims := Vector3i((Vector3(global_dimensions) / float(1 << level)).ceil())
 		total_tiles += ceili(float(dims.x) / core_axis) * ceili(float(dims.y) / core_axis) * ceili(float(dims.z) / core_axis)
@@ -116,15 +157,37 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 					working["source_bounds_world"] = AABB(global_origin + Vector3(tile.source_origin) * tile.spacing - Vector3.ONE * tile.spacing * 0.5,
 							Vector3(source_dims) * tile.spacing)
 					working["captured_geometry"] = geometry
+					if olv_inference_requested:
+						working["olv_layout_context"] = olv_layout_context
 					var baked: Dictionary = await SourceBaker.new().bake_async(volume, working, progress, cancelled)
 					if not bool(baked.get("ok", false)): return baked
 					if not bool(baked.get("empty", false)):
+						var tile_olv_context: Dictionary = baked.get("olv_domain_filter", {})
+						if olv_inference_requested:
+							var tile_labels: Resource = baked.get("olv_label_set")
+							if tile_labels == null or not bool(tile_labels.validate().get("ok", false)):
+								return {"ok": false, "error": "paged_tile_olv_label_set_invalid"}
+							var merged_labels: Dictionary = _merge_tile_olv_labels(aggregate_olv_labels,
+									tile_labels)
+							if not bool(merged_labels.get("ok", false)):
+								return {"ok": false, "error": "paged_tile_olv_label_merge_failed:" +
+									String(merged_labels.get("error", "unknown"))}
 						var builder := Builder.new()
 						var prepared: Dictionary = await builder.prepare_region_async(baked.chunk, geometry,
 							tile.output_origin - tile.source_origin, tile.output_dimensions,
-							cancelled, progress, sampling_cache.coordinates, surface_target_cache, level)
+							cancelled, progress, sampling_cache.coordinates, surface_target_cache, level,
+							tile_olv_context if olv_inference_requested else options.get("olv_domain_filter", {}))
 						if not bool(prepared.get("ok", false)): return prepared
 						var target_stats: Dictionary = prepared.stats
+						if olv_inference_requested and not bool(target_stats.get("olv_filter_enabled", false)):
+							return {"ok": false, "error": "paged_tile_olv_filter_not_enabled:" +
+								String(target_stats.get("olv_filter_disable_reason", "unknown"))}
+						olv_preparation_tiles += 1
+						if bool(target_stats.get("olv_filter_enabled", false)):
+							olv_enabled_tiles += 1
+						else:
+							var disable_reason := String(target_stats.get("olv_filter_disable_reason", "unknown"))
+							olv_disable_reasons[disable_reason] = int(olv_disable_reasons.get(disable_reason, 0)) + 1
 						surface_target_constraints += int(target_stats.get("surface_target_constraints", 0))
 						surface_target_cache_hits += int(target_stats.get("surface_target_cache_hits", 0))
 						surface_direct_probes += int(target_stats.get("surface_direct_probes", 0))
@@ -188,6 +251,37 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	manifest.prepared_emitter_ids = emitter_ids
 	manifest.prepared_emitter_static_signatures = emitter_signatures
 	manifest.prepared_source_signature = source_signature
+	var olv_context: Dictionary = olv_layout_context if olv_inference_requested \
+		else options.get("olv_domain_filter", {})
+	var olv_labels: Resource = aggregate_olv_labels if olv_inference_requested \
+		else olv_context.get("label_set")
+	manifest.prepared_olv_filter_enabled = olv_preparation_tiles > 0 \
+			and olv_enabled_tiles == olv_preparation_tiles
+	if olv_inference_requested and not manifest.prepared_olv_filter_enabled:
+		return {"ok": false, "error": "not_every_prepared_tile_consumed_the_olv_filter"}
+	if olv_inference_requested and olv_labels != null:
+		olv_labels.refresh_labels_hash()
+	if manifest.prepared_olv_filter_enabled and olv_labels != null \
+			and olv_labels.has_method("validate") \
+			and bool(olv_labels.validate().get("ok", false)):
+		manifest.prepared_olv_label_set = olv_labels
+		manifest.prepared_olv_context = {
+			"scene_id": String(olv_context.get("scene_id", "")),
+			"volume_id": String(olv_context.get("volume_id", "")),
+			"layout_revision": int(olv_context.get("layout_revision", -1)),
+			"layout_signature": String(olv_context.get("layout_signature", "")),
+			"grid_origin_world": Vector3(olv_context.get("grid_origin_world", Vector3.ZERO)),
+			"base_cell_spacing_m": float(olv_context.get("base_cell_spacing_m", 0.0)),
+			"labels_hash": String(olv_labels.get("labels_hash")),
+		}
+	else:
+		manifest.prepared_olv_label_set = null
+		manifest.prepared_olv_context = {}
+	manifest.prepared_olv_filter_stats = {
+		"prepared_tiles": olv_preparation_tiles,
+		"enabled_tiles": olv_enabled_tiles,
+		"disable_reasons": olv_disable_reasons.duplicate(),
+	}
 	manifest.prepared_source_transform_world = transform
 	manifest.prepared_source_size_m = size
 	manifest.prepared_maximum_operator_row_l1 = maximum_operator_bound
@@ -201,12 +295,36 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	result["generation"] = generation
 	result["geometry_signature"] = geometry_signature
 	result["directional_source_signature"] = source_signature
+	result["olv_layout_context"] = olv_layout_context
+	result["olv_label_set"] = olv_labels if olv_inference_requested else null
 	result["surface_target_stats"] = {"constraints": surface_target_constraints,
 		"cache_hits": surface_target_cache_hits, "direct_probes": surface_direct_probes,
 		"direct_samples": surface_direct_samples, "direct_bake_usec": surface_direct_bake_usec,
 		"cache_entries_after_bake": surface_target_cache.size(),
 		"cache_entry_limit": Builder.SURFACE_TARGET_CACHE_LIMIT}
 	return result
+
+static func _merge_tile_olv_labels(target: Resource, source: Resource) -> Dictionary:
+	if target == null or source == null or not target.has_method("merge_cell_labels"):
+		return {"ok": false, "error": "label_set_resource_missing"}
+	var complete: bool = bool(source.receiver_labels_complete) \
+		and (target.cell_labels.is_empty() or bool(target.receiver_labels_complete))
+	var records: Array = []
+	for key: String in source.cell_labels:
+		var identity := OLVDomain.parse_identity_key(key)
+		if identity.is_empty():
+			return {"ok": false, "error": "tile_label_identity_not_canonical"}
+		records.append({"identity": identity, "label": int(source.cell_labels[key])})
+	var merged: Dictionary = target.merge_cell_labels(records)
+	if not bool(merged.get("ok", false)): return merged
+	var receivers: Array = []
+	for key: String in source.receiver_labels:
+		var identity := OLVDomain.parse_identity_key(key)
+		if identity.is_empty(): return {"ok": false, "error": "receiver_identity_not_canonical"}
+		receivers.append({"identity": identity, "label": int(source.receiver_labels[key])})
+	merged = target.merge_receiver_labels(receivers)
+	if bool(merged.get("ok", false)): target.receiver_labels_complete = complete
+	return merged
 
 static func _core_has_support(brick: Brick) -> bool:
 	for z in brick.core_dimensions.z:

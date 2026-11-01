@@ -1,5 +1,7 @@
 #[compute]
+// OLV atlas ABI 2: lighting-source and logical-receiver domains share one R8 texel.
 #version 450
+// OLV debug uses the same independent partition atlas as native lighting.
 #extension GL_GOOGLE_include_directive : require
 // Diagnostic only. Includes the current HDR decode scale used by native PBR.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -18,15 +20,30 @@ layout(set = 0, binding = 5, std140) uniform Frame {
 	vec4 sky_sh[7];
 } frame;
 layout(set = 0, binding = 6) uniform sampler2D diffuse_ao_buffer;
+layout(set = 1, binding = 61) uniform sampler nearest_sampler;
 layout(set = 1, binding = 62) uniform sampler linear_sampler;
+#define SAMPLER_NEAREST_CLAMP nearest_sampler
 #define FRP_MAGIC_GI_DYNAMIC_VOLUME_LINEAR_SAMPLER linear_sampler
+#define MAGIC_GI_OLV_GATE
+#define FRP_MAGIC_GI_OLV_VISIBLE_RAY(world, view) (abs(frame.inverse_projection[2][3]) > 1e-6 ? frame.view_to_world[3].xyz - (world) : frame.view_to_world[2].xyz)
 #include "magic_gi_sh9_tensor.glslinc"
+#include "magic_gi_sh4_tensor.glslinc"
 #include "magic_gi_dynamic_volume_sample.glslinc"
 layout(push_constant, std430) uniform Push {
 	ivec2 size;
 	int mode;
 	float pre_exposure;
 } pc;
+
+const int MAGIC_GI_DEBUG_OLV_DOMAINS = 6;
+#include "magic_gi_debug_geometry.glslinc"
+
+// Categorical classes only. Empty source support is unclassified background.
+vec3 magic_gi_debug_olv_color(int label) {
+	if (label == 1) { return vec3(1.0, 0.42, 0.08); } // exterior
+	if (label == 2) { return vec3(0.08, 0.62, 1.0); } // interior
+	return vec3(0.0);
+}
 
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -41,15 +58,26 @@ void main() {
 	vec3 world = (frame.view_to_world * vec4(view_position.xyz / view_position.w, 1.0)).xyz;
 	vec3 normal = normalize(mat3(frame.view_to_world) *
 		(texelFetch(normal_buffer, pixel, 0).xyz * 2.0 - 1.0));
+	vec3 geometric_normal = magic_gi_debug_geometric_normal(pixel, world, normal);
+	if (pc.mode == MAGIC_GI_DEBUG_OLV_DOMAINS) {
+		int label = frp_magic_gi_olv_receiver_domain(world, geometric_normal, 0);
+		vec3 color = magic_gi_debug_olv_color(label);
+		if (!frp_magic_gi_dynamic_volume_owner_contains(world, 0)) {
+			color = vec3(0.0);
+		}
+		imageStore(gi_output, pixel, vec4(color, 1.0));
+		return;
+	}
 	vec3 incident; float coverage;
-	bool supported = frp_magic_gi_dynamic_volume_sample(world, normal, normal, 0, incident, coverage);
+	bool supported = frp_magic_gi_dynamic_volume_sample(world, geometric_normal, normal, 0, incident, coverage);
 	vec3 color = supported ? max(incident, vec3(0.0)) : vec3(0.0);
 	if (pc.mode == 1 || pc.mode == 3) {
 		int selected = -1;
 		for (int lod = 0; lod < 4 && supported; lod++) {
 			vec3 unused_incident; float unused_coverage; float edge;
+			int unused_domain;
 			if (frp_magic_gi_preinterpolated_sample_lod(world, normal, 0, lod,
-					unused_incident, unused_coverage, edge)) { selected = lod; break; }
+					unused_incident, unused_coverage, edge, unused_domain)) { selected = lod; break; }
 		}
 		vec3 palette[4] = vec3[](vec3(0.1, 0.85, 0.2), vec3(1.0, 0.5, 0.05),
 			vec3(0.15, 0.4, 1.0), vec3(0.75, 0.2, 0.9));

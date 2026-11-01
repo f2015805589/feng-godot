@@ -39,6 +39,7 @@ call :find_scons || exit /b 1
 call :setup_msvc || exit /b 1
 call :find_cmake || exit /b 1
 call :prepare_dependencies || exit /b 1
+call :normalize_editor_integrity || exit /b 1
 
 echo.
 echo [1/4] Building Windows x86_64 editor with D3D12 and AccessKit...
@@ -52,6 +53,7 @@ if not exist "%REPO_ROOT%\bin\godot.windows.editor.x86_64.exe" (
     echo [ERROR] Editor executable is missing after SCons completed.
     exit /b 1
 )
+call :normalize_editor_integrity || exit /b 1
 
 echo.
 echo [2/4] Building Terrain3D native debug addon...
@@ -92,6 +94,32 @@ echo [DONE] Editor: %REPO_ROOT%\bin\godot.windows.editor.x86_64.exe
 echo [DONE] Native debug DLLs: misc\feng-addons\feng-idweight-terrain\bin and misc\feng-addons\feng-renderdoc-capture\bin
 echo [DONE] NRD: %NRD_NATIVE%\..\bin\feng_nrd.dll
 echo [INFO] GDScript addons use their source files directly. Restart open editors to reload rebuilt DLLs.
+exit /b 0
+
+:normalize_editor_integrity
+rem A Low label inherited from a sandboxed checkout also lowers the editor process.
+rem Windows then blocks writes to normal project folders and AppData caches.
+rem Normalize the output directory before building as well, including after bin
+rem was deleted. Preserve DACLs and leave repository/project permissions alone.
+if not exist "%REPO_ROOT%\bin" mkdir "%REPO_ROOT%\bin"
+if not exist "%REPO_ROOT%\bin" exit /b 1
+icacls "%REPO_ROOT%\bin" /setintegritylevel "(OI)(CI)M" >nul
+if errorlevel 1 (
+    echo [ERROR] Cannot restore the Windows integrity label on bin.
+    echo [ERROR] Use a Windows terminal with permission to update this output directory.
+    exit /b 1
+)
+echo [INFO] Restoring normal Windows integrity labels on the editor launchers...
+for %%E in (godot.windows.editor.x86_64.exe godot.windows.editor.x86_64.console.exe) do (
+    if exist "%REPO_ROOT%\bin\%%E" (
+        icacls "%REPO_ROOT%\bin\%%E" /setintegritylevel M >nul
+        if errorlevel 1 (
+            echo [ERROR] Cannot restore the Windows integrity label on %%E.
+            echo [ERROR] Run the build from a normal Windows terminal with permission to update these files.
+            exit /b 1
+        )
+    )
+)
 exit /b 0
 
 :find_python
