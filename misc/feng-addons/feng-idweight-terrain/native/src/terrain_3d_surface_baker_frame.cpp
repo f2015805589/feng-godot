@@ -19,6 +19,7 @@
 #include "terrain_3d.h"
 #include "terrain_3d_surface_baker.h"
 #include "terrain_3d_surface_baker_internal.h"
+#include "rd_gpu_copy.h"
 
 #include "logger.h"
 
@@ -266,18 +267,71 @@ bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs
 	// the readbacks for the pages produced below are then requested from this same
 	// recording, which is what makes a page compressed by the frame that produced it.
 	_flush_encodes(p_generation);
+	auto flush_batch = [&]() -> bool {
+		// An invalidation has no scratch texels to clear: the reused layer may
+		// already belong to a different page in this batch.
+		if (scratch) {
+			compute_jobs.erase(std::remove_if(compute_jobs.begin(), compute_jobs.end(),
+					[](const PendingJob &job) { return job.kind == PENDING_INVALIDATE; }), compute_jobs.end());
+		}
+		if (!compute_jobs.empty()) {
+			const std::vector<PendingJob> original_jobs = compute_jobs;
+			if (!_record_jobs(compute_jobs, p_generation, p_page_size, p_border, p_stored_size, p_material_count)) {
+				std::lock_guard<std::mutex> lock(_mutex);
+				if (_generation == p_generation) {
+					for (const PendingJob &job : original_jobs) {
+						_pending.emplace(job.slot, job);
+						if (scratch) { _hold_encode_page(job.staging_layer, 0); }
+					}
+					_invalidate_all = _invalidate_all || p_invalidate_all;
+				}
+				return false;
+			}
+			for (const PendingJob &job : compute_jobs) {
+				const bool baked = job.kind == PENDING_BAKE;
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					if (baked) { ++_baked_pages; } else { ++_invalidated_pages; }
+				}
+				if (baked && _tier_uses_sampled(job.tier)) { _encode_pending[size_t(job.slot)] = 1; }
+				_set_ready(job.slot, baked, p_generation, p_material_version, job.sequence);
+			}
+			compute_jobs.clear();
+		}
+		_request_encodes();
+		return true;
+	};
+	const bool reuse_scratch = scratch && FengRDGpuCopy::available(_rd);
+	int neural_updates = 0;
 	for (PendingJob &job : p_jobs) {
 		if (job.generation != p_generation || job.slot < 0 || job.slot >= p_page_count) {
+			continue;
+		}
+		if (_neural_direct_tier(job.tier) && job.kind != PENDING_INVALIDATE) {
+			if (job.kind == PENDING_NEURAL) {
+				const bool registered = _decode_neural_page(job);
+				if (!registered) { _neural_decoder->call("invalidate_slot", job.slot); }
+				_set_ready(job.slot, registered, p_generation, p_material_version, job.sequence);
+			} else {
+				_neural_decoder->call("invalidate_slot", job.slot);
+				// This page is drawable from the live source material. Leaving it
+				// pending makes the demand planner retry the same unbaked page forever.
+				_set_ready(job.slot, true, p_generation, p_material_version, job.sequence);
+			}
+			// Unbaked/stale pages use the source material in this variant.
+			// No decoded layer is allocated or silently sampled out of bounds.
 			continue;
 		}
 		if (job.kind == PENDING_INVALIDATE && (cleared_all || scratch ||
 				_rd->texture_clear(_resources.output_params_rd, Color(0, 0, 0, 0), 0, 1, job.slot, 1) == OK)) {
 			_set_ready(job.slot, false, p_generation, p_material_version, job.sequence);
+			if (_neural_direct && _neural_decoder.is_valid()) { _neural_decoder->call("invalidate_slot", job.slot); }
 			{ std::lock_guard<std::mutex> lock(_mutex); ++_invalidated_pages; }
 			continue;
 		}
 		if (job.kind != PENDING_INVALIDATE) {
-			if (_frame_page_updates >= _page_budget.load()) {
+			if (_frame_page_updates >= _page_budget.load() ||
+					(job.kind == PENDING_NEURAL && neural_updates >= _neural_page_budget)) {
 				{ std::lock_guard<std::mutex> lock(_mutex); _pending.emplace(job.slot, job); }
 				// A reused slot must not expose its previous material while deferred.
 				PendingJob invalid = job;
@@ -291,7 +345,13 @@ bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs
 			// The layer this page is shaded into: the slot under page-sized staging, a ring
 			// page under the scratch regime - and a ring page that is held until this page's
 			// block readbacks arrive, because the half-float content only exists that long.
-			const int layer = _take_staging_layer(job.slot);
+			int layer = _take_staging_layer(job.slot);
+			if (layer < 0 && reuse_scratch) {
+				// Resource barriers order the next writes after this batch's
+				// encode and copy. Keep the full page budget with only 8 layers.
+				if (!flush_batch()) { return false; }
+				layer = _take_staging_layer(job.slot);
+			}
 			if (layer < 0) {
 				// Every ring page is waiting on readbacks. Defer the page exactly as the
 				// budget does, so a later frame produces it with a layer of its own.
@@ -300,6 +360,17 @@ bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs
 			}
 			job.staging_layer = layer;
 			++_frame_page_updates;
+		}
+		if (job.kind == PENDING_NEURAL) {
+			if (_decode_neural_page(job)) {
+				++neural_updates;
+				if (_tier_uses_sampled(job.tier)) { _encode_pending[size_t(job.slot)] = 1; }
+				_set_ready(job.slot, true, p_generation, p_material_version, job.sequence);
+			} else {
+				_set_ready(job.slot, false, p_generation, p_material_version, job.sequence);
+				if (scratch) { _hold_encode_page(job.staging_layer, 0); }
+			}
+			continue;
 		}
 		if (job.kind == PENDING_CACHED || job.kind == PENDING_CELL) {
 			if (job.kind == PENDING_CELL ? _copy_cell_page(job, p_cell_store) : _upload_cached_page(job)) {
@@ -317,6 +388,7 @@ bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs
 				}
 				_set_ready(job.slot, true, p_generation, p_material_version, job.sequence);
 			} else {
+				if (scratch) { _hold_encode_page(job.staging_layer, 0); }
 				{
 					std::lock_guard<std::mutex> lock(_mutex);
 					_invalidated_pages++;
@@ -330,51 +402,26 @@ bool Terrain3DSurfaceBaker::_dispatch_frame_jobs(std::vector<PendingJob> &p_jobs
 			compute_jobs.push_back(job);
 		}
 	}
-	// A pure invalidation has nothing to shade under the scratch regime: its only effect is
-	// the readiness clear above, and dispatching it would write zeros into whichever scratch
-	// layer the shader named, which may belong to a page whose encode is still in flight.
-	if (scratch) {
-		compute_jobs.erase(std::remove_if(compute_jobs.begin(), compute_jobs.end(),
-								   [](const PendingJob &p_job) { return p_job.kind == PENDING_INVALIDATE; }),
-				compute_jobs.end());
-	}
-	if (!compute_jobs.empty()) {
-		std::vector<PendingJob> original_jobs = compute_jobs;
-		if (!_record_jobs(compute_jobs, p_generation, p_page_size, p_border, p_stored_size, p_material_count)) {
+	if (_neural_direct && _neural_decoder.is_valid()) {
+		Projection view;
+		Vector2 view_size;
+		float anisotropy;
+		bool update;
+		{
 			std::lock_guard<std::mutex> lock(_mutex);
-			if (_generation == p_generation) {
-				for (const PendingJob &job : original_jobs) {
-					_pending.emplace(job.slot, job);
-				}
-				_invalidate_all = _invalidate_all || p_invalidate_all;
-			}
-			return false;
+			update = _neural_view_dirty;
+			view = _neural_view;
+			view_size = _neural_view_size;
+			anisotropy = _neural_anisotropy;
+			_neural_view_dirty = false;
 		}
-		for (const PendingJob &job : compute_jobs) {
-			if (job.kind == PENDING_BAKE) {
-				{
-					std::lock_guard<std::mutex> lock(_mutex);
-					_baked_pages++;
-				}
-				// The bake dispatch is recorded just above, so the encoder dispatch requested
-				// below reads the staging layer this same recording wrote.
-				if (_tier_uses_sampled(job.tier) && job.slot >= 0 && job.slot < int(_encode_pending.size())) {
-					_encode_pending[size_t(job.slot)] = 1;
-				}
-				_set_ready(job.slot, true, p_generation, p_material_version, job.sequence);
-			} else {
-				{
-					std::lock_guard<std::mutex> lock(_mutex);
-					_invalidated_pages++;
-				}
-				_set_ready(job.slot, false, p_generation, p_material_version, job.sequence);
-			}
-		}
+		if (update) { _neural_decoder->call("update_view", view, view_size, anisotropy); }
+		const Dictionary report = _neural_decoder->call("flush_pages");
+		std::lock_guard<std::mutex> lock(_mutex);
+		_neural_gpu_bytes = int64_t(report.get("gpu_bytes", 0));
+		_neural_runtime_stats = report;
 	}
-	// Every page produced by this callback (bake or cell copy) is read back here, in the
-	// same recording that wrote it.
-	_request_encodes();
-	return true;
+	return flush_batch();
 }
 
 ///////////////////////////
@@ -773,6 +820,9 @@ void Terrain3DSurfaceBaker::render_pending(const Ref<RefCounted> &p_keep_alive) 
 		_invalidate_all = _invalidate_all || invalidate_all;
 		return;
 	}
+	Array retired_neural;
+	{ std::lock_guard<std::mutex> lock(_mutex); retired_neural = _retired_neural_decoders; _retired_neural_decoders = Array(); }
+	_dispose_neural_decoders(retired_neural);
 	_retire_acknowledged_bundles();
 	if (!_ensure_resources(generation, page_count, stored_size,
 				material_albedo, material_normal, material_bytes)) {
@@ -1134,6 +1184,14 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 		stats[prefix + String("_params_encoded")] = info.get("params_encoded", false);
 	}
 	stats["encode_pending"] = int64_t(std::count(_encode_pending.begin(), _encode_pending.end(), uint8_t(1)));
+	stats["neural_decodes"] = int64_t(_neural_decodes);
+	stats["neural_direct_sampling"] = _neural_direct;
+	stats["neural_runtime"] = _neural_runtime_stats.duplicate();
+	stats["neural_dispatches"] = _neural_direct ? int64_t(_neural_runtime_stats.get("cache_decodes", 0)) : int64_t(_neural_decodes);
+	stats["neural_gpu_bytes"] = int64_t(_neural_gpu_bytes);
+	stats["neural_catalog_pages"] = _neural_entries.size();
+	stats["neural_missing_or_stale"] = int64_t(_neural_misses);
+	stats["neural_failed_pages"] = _neural_failed_entries.size();
 	// The half-float pool's shape: page sized while a tier samples it by slot, the encoder
 	// ring once every tier is compressed. `staging_bytes` is what the pool costs - the
 	// three RGBA16F outputs at 8 bytes per texel plus the R16/R32F sources at 6 - and
@@ -1141,7 +1199,7 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 	// compression settings move: the pool plus one compressed copy per tier that resolved.
 	stats["staging_layers"] = _staging_layers;
 	stats["staging_scratch"] = _staging_is_scratch();
-	const int64_t staging_bytes = int64_t(_staging_layers) * _stored_size * _stored_size * 30;
+	const int64_t staging_bytes = _all_neural_direct() ? 60 : int64_t(_staging_layers) * _stored_size * _stored_size * 30;
 	stats["staging_bytes"] = staging_bytes;
 	int64_t compressed_bytes = 0;
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
@@ -1150,6 +1208,8 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 		const String tier_key = tier == TIER_SVT ? String("svt_") : String("avt_");
 		stats[tier_key + String("bytes")] = tier_bytes;
 	}
+	stats["sampled_arrays_shared"] = _resources.sampled[0].albedo_rd.is_valid() &&
+			_resources.sampled[0].albedo_rd == _resources.sampled[1].albedo_rd;
 	stats["compressed_bytes"] = compressed_bytes;
 	stats["material_bytes"] = staging_bytes + compressed_bytes;
 	// Pool occupancy per tier: the slots whose content was produced for that tier, and how
@@ -1195,7 +1255,7 @@ Dictionary Terrain3DSurfaceBaker::get_stats() const {
 
 int64_t Terrain3DSurfaceBaker::get_material_bytes() const {
 	std::lock_guard<std::mutex> lock(_mutex);
-	int64_t total = int64_t(_staging_layers) * _stored_size * _stored_size * 30;
+	int64_t total = _all_neural_direct() ? 60 : int64_t(_staging_layers) * _stored_size * _stored_size * 30;
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		total += _tier_sampled_bytes(tier);
 	}
@@ -1217,8 +1277,10 @@ int Terrain3DSurfaceBaker::get_pending_page_count() const {
 ///////////////////////////
 
 void Terrain3DSurfaceBaker::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("configure", "page_size", "border", "page_count"),
-			&Terrain3DSurfaceBaker::configure);
+	ClassDB::bind_method(D_METHOD("configure", "page_size", "border", "page_count", "ring_only"), &Terrain3DSurfaceBaker::configure, DEFVAL(false));
+	ClassDB::bind_method(D_METHOD("set_neural_codec", "snapshot"), &Terrain3DSurfaceBaker::set_neural_codec);
+	ClassDB::bind_method(D_METHOD("queue_neural_page", "slot", "rect", "tier", "source_signature"), &Terrain3DSurfaceBaker::queue_neural_page);
+	ClassDB::bind_static_method("Terrain3DSurfaceBaker", D_METHOD("neural_page_key", "rect", "size", "border", "tier"), &Terrain3DSurfaceBaker::neural_page_key);
 	ClassDB::bind_method(D_METHOD("set_tier_compression", "tier", "mode"),
 			&Terrain3DSurfaceBaker::set_tier_compression);
 	ClassDB::bind_method(D_METHOD("set_tier_normal_compression", "tier", "mode"),

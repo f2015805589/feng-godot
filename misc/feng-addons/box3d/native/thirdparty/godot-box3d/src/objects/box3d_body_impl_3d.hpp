@@ -75,15 +75,15 @@ public:
 
 	BodyDampMode get_linear_damp_mode() const { return linear_damp_mode; }
 
-	void set_linear_damp_mode(BodyDampMode p_mode) { linear_damp_mode = p_mode; }
+	void set_linear_damp_mode(BodyDampMode p_mode) { linear_damp_mode = p_mode; environment_valid = false; }
 
 	real_t get_bounce() const { return bounce; }
 
-	void set_bounce(real_t p_bounce) { bounce = p_bounce; }
+	void set_bounce(real_t p_bounce);
 
 	real_t get_friction() const { return friction; }
 
-	void set_friction(real_t p_friction) { friction = p_friction; }
+	void set_friction(real_t p_friction);
 
 	real_t get_angular_damping() const { return angular_damping; }
 
@@ -91,7 +91,7 @@ public:
 
 	BodyDampMode get_angular_damp_mode() const { return angular_damp_mode; }
 
-	void set_angular_damp_mode(BodyDampMode p_mode) { angular_damp_mode = p_mode; }
+	void set_angular_damp_mode(BodyDampMode p_mode) { angular_damp_mode = p_mode; environment_valid = false; }
 
 	real_t get_gravity_scale() const { return gravity_scale; }
 
@@ -160,19 +160,18 @@ public:
 	// Called before b3World_Step to apply transient and constant force accumulators when
 	// standard force integration is enabled, then clear the transient accumulators.
 	void pre_step();
+	void apply_environment(float p_linear, float p_angular, float p_gravity);
+	void apply_default_environment(float p_linear, float p_angular);
 
 	bool needs_state_sync() const { return state_sync_pending; }
 
 	void set_needs_state_sync(bool p_needed) { state_sync_pending = p_needed; }
 
-	void set_state_sync_callback(const Callable& p_callable) { state_sync_callback = p_callable; }
+	void set_state_sync_callback(const Callable& p_callable);
 
 	const Callable& get_state_sync_callback() const { return state_sync_callback; }
 
-	void set_force_integration_callback(const Callable& p_callable, const Variant& p_userdata) {
-		force_integration_callback = p_callable;
-		force_integration_userdata = p_userdata;
-	}
+	void set_force_integration_callback(const Callable& p_callable, const Variant& p_userdata);
 
 	const Callable& get_force_integration_callback() const { return force_integration_callback; }
 
@@ -180,7 +179,7 @@ public:
 
 	int32_t get_max_contacts_reported() const { return max_contacts_reported; }
 
-	void set_max_contacts_reported(int32_t p_count) { max_contacts_reported = p_count; }
+	void set_max_contacts_reported(int32_t p_count);
 
 	// Bodies this one is excepted from colliding with, keyed by RID.
 	HashMap<RID, Box3DFilterJointImpl3D*>& get_collision_exceptions() { return collision_exceptions; }
@@ -202,12 +201,17 @@ protected:
 	void _shapes_changed() override { _refresh_mass_data(); }
 
 private:
+	bool default_environment = false;
+	float default_linear = 0, default_angular = 0;
 	void _update_motion_locks();
 
 	void _sync_force_integration_settings();
 
 	void _refresh_mass_data();
+	void _refresh_shape_material();
 
+	bool environment_valid = false;
+	float environment_linear = 0, environment_angular = 0, environment_gravity = 1;
 	BodyMode mode = PhysicsServer3D::BODY_MODE_RIGID;
 
 	real_t collision_priority = 1.0;

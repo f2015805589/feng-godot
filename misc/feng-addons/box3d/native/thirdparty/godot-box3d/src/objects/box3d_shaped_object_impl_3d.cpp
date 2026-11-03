@@ -44,7 +44,9 @@ b3ShapeId create_box3d_shape(
 	def.isSensor = p_is_sensor;
 	// A concave shape may be a sensor, but never a sensor visitor (Box3D can't proxy it).
 	def.enableSensorEvents = p_is_sensor || !is_concave;
-	def.enableContactEvents = !p_is_sensor;
+	// Godot contact monitors read the manifolds via b3Body_GetContactData.
+	// The native begin/end arrays have no consumer in this adapter.
+	def.enableContactEvents = false;
 	def.density = 1.0f;
 	def.baseMaterial = b3DefaultSurfaceMaterial();
 	def.baseMaterial.friction = p_friction;
@@ -180,6 +182,14 @@ b3ShapeId create_box3d_shape(
 
 Box3DShapedObjectImpl3D::~Box3DShapedObjectImpl3D() {
 	_destroy_body_id();
+	clear_shapes();
+}
+
+bool Box3DShapedObjectImpl3D::_uses_shape(const Box3DShapeImpl3D* p_shape) const {
+	for (const auto& instance : shapes) {
+		if (instance.get_shape() == p_shape) { return true; }
+	}
+	return false;
 }
 
 Transform3D Box3DShapedObjectImpl3D::get_transform() const {
@@ -198,6 +208,7 @@ void Box3DShapedObjectImpl3D::set_transform(const Transform3D& p_transform) {
 }
 
 void Box3DShapedObjectImpl3D::add_shape(Box3DShapeImpl3D* p_shape, const Transform3D& p_transform, bool p_disabled) {
+	p_shape->add_owner(this);
 	Box3DShapeInstance3D instance(p_shape, p_transform);
 	instance.set_disabled(p_disabled);
 	instance.set_index((uint32_t)shapes.size());
@@ -219,8 +230,10 @@ void Box3DShapedObjectImpl3D::remove_shape(const Box3DShapeImpl3D* p_shape) {
 
 void Box3DShapedObjectImpl3D::remove_shape(int32_t p_index) {
 	ERR_FAIL_INDEX(p_index, (int32_t)shapes.size());
+	Box3DShapeImpl3D* previous = shapes[p_index].get_shape();
 	_destroy_shape_instance(shapes[p_index]);
 	shapes.remove_at(p_index);
+	if (!_uses_shape(previous)) { previous->remove_owner(this); }
 	for (uint32_t i = p_index; i < shapes.size(); i++) {
 		shapes[i].set_index(i);
 	}
@@ -229,8 +242,11 @@ void Box3DShapedObjectImpl3D::remove_shape(int32_t p_index) {
 
 void Box3DShapedObjectImpl3D::set_shape(int32_t p_index, Box3DShapeImpl3D* p_shape) {
 	ERR_FAIL_INDEX(p_index, (int32_t)shapes.size());
+	Box3DShapeImpl3D* previous = shapes[p_index].get_shape();
 	_destroy_shape_instance(shapes[p_index]);
 	shapes[p_index].set_shape(p_shape);
+	if (!_uses_shape(previous)) { previous->remove_owner(this); }
+	p_shape->add_owner(this);
 	if (has_body_id()) {
 		_create_shape_instance(shapes[p_index]);
 	}
@@ -240,6 +256,7 @@ void Box3DShapedObjectImpl3D::set_shape(int32_t p_index, Box3DShapeImpl3D* p_sha
 void Box3DShapedObjectImpl3D::clear_shapes() {
 	for (int32_t i = (int32_t)shapes.size() - 1; i >= 0; i--) {
 		_destroy_shape_instance(shapes[i]);
+		shapes[i].get_shape()->remove_owner(this);
 	}
 	shapes.clear();
 	_shapes_changed();
@@ -325,6 +342,31 @@ void Box3DShapedObjectImpl3D::set_space(Box3DSpace3D* p_space) {
 	if (space != nullptr) {
 		body_id = _create_body_id(space->get_world_id());
 		rebuild_shapes();
+	}
+}
+
+void Box3DShapedObjectImpl3D::set_collision_layer(uint32_t p_layer) {
+	if (collision_layer == p_layer) {
+		return;
+	}
+	collision_layer = p_layer;
+	_refresh_collision_filter();
+}
+
+void Box3DShapedObjectImpl3D::set_collision_mask(uint32_t p_mask) {
+	if (collision_mask == p_mask) {
+		return;
+	}
+	collision_mask = p_mask;
+	_refresh_collision_filter();
+}
+
+void Box3DShapedObjectImpl3D::_refresh_collision_filter() {
+	const b3Filter filter = godot_to_b3_filter(collision_layer, collision_mask);
+	for (auto& instance : shapes) {
+		if (instance.has_shape_id()) {
+			b3Shape_SetFilter(instance.get_shape_id(), filter, true);
+		}
 	}
 }
 

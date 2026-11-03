@@ -200,6 +200,8 @@ void Terrain3D::_setup_mouse_picking() {
 
 	_mouse_quad = memnew(MeshInstance3D);
 	_mouse_quad->set_name("MouseQuad");
+	// Picking helper in a private viewport, not scene geometry or an RTGI occluder.
+	_mouse_quad->set_meta("_frp_exclude_from_rtgi", true);
 	_mouse_cam->add_child(_mouse_quad, true);
 	Ref<QuadMesh> quad;
 	quad.instantiate();

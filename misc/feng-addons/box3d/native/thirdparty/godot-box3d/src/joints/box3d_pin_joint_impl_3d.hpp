@@ -21,8 +21,8 @@ protected:
 	b3JointId _create_joint_id(b3WorldId p_world_id, b3BodyId p_body_a, b3BodyId p_body_b, b3Transform p_local_frame_a, b3Transform p_local_frame_b) override;
 
 private:
-	// PinJointParam::DAMPING/BIAS map best-effort to hertz/dampingRatio; IMPULSE_CLAMP has
-	// no Box3D equivalent (no-op + WARN_PRINT_ONCE).
+	// Godot's linear BIAS/DAMPING and IMPULSE_CLAMP have no Box3D equivalent.
+	// Keep the API values; warn when nondefault values request unsupported tuning.
 	real_t damping = 1.0;
 	real_t bias = 0.3;
 	real_t impulse_clamp = 0.0;

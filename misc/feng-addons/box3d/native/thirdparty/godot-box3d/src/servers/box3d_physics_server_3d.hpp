@@ -8,6 +8,7 @@
 
 using namespace godot;
 
+class Box3DSoftBody3D;
 class Box3DAreaImpl3D;
 class Box3DBodyImpl3D;
 class Box3DJointImpl3D;
@@ -209,7 +210,7 @@ public:
 	void _joint_disable_collisions_between_bodies(const RID& p_joint, bool p_disable) override;
 	bool _joint_is_disabled_collisions_between_bodies(const RID& p_joint) const override;
 
-	// --- Soft bodies (non-goal: return invalid RID / no-op) ---
+	// --- Soft bodies: XPBD meshes coupled to the Box3D rigid world ---
 	RID _soft_body_create() override;
 	void _soft_body_set_shrinking_factor(const RID& p_body, float p_shrinking_factor) override;
 	float _soft_body_get_shrinking_factor(const RID& p_body) const override;
@@ -246,6 +247,10 @@ public:
 	void _soft_body_remove_all_pinned_points(const RID& p_body) override;
 	void _soft_body_pin_point(const RID& p_body, int32_t p_point_index, bool p_pin) override;
 	bool _soft_body_is_point_pinned(const RID& p_body, int32_t p_point_index) const override;
+	void _soft_body_apply_point_impulse(const RID& p_body, int32_t p_point_index, const Vector3& p_impulse) override;
+	void _soft_body_apply_point_force(const RID& p_body, int32_t p_point_index, const Vector3& p_force) override;
+	void _soft_body_apply_central_impulse(const RID& p_body, const Vector3& p_impulse) override;
+	void _soft_body_apply_central_force(const RID& p_body, const Vector3& p_force) override;
 
 	void _free_rid(const RID& p_rid) override;
 
@@ -260,7 +265,12 @@ public:
 	int32_t _get_process_info(PhysicsServer3D::ProcessInfo p_process_info) override;
 
 protected:
-	static void _bind_methods() {}
+	static void _bind_methods();
+
+public:
+	Dictionary soft_body_configure(const RID &p_body, const Dictionary &p_options);
+	Dictionary soft_body_get_statistics(const RID &p_body) const;
+	int soft_body_cut(const RID &p_body, const Vector3 &p_from, const Vector3 &p_to, float p_radius);
 
 private:
 	Box3DShapedObjectImpl3D* _get_shaped_object(const RID& p_rid) const;
@@ -275,6 +285,7 @@ private:
 
 	RID_PtrOwner<Box3DSpace3D> space_owner;
 	RID_PtrOwner<Box3DBodyImpl3D> body_owner;
+	RID_PtrOwner<Box3DSoftBody3D> soft_body_owner;
 	RID_PtrOwner<Box3DAreaImpl3D> area_owner;
 	RID_PtrOwner<Box3DShapeImpl3D> shape_owner;
 	RID_PtrOwner<Box3DJointImpl3D> joint_owner;

@@ -68,6 +68,8 @@ static func snapshot_for_target(target: RID) -> Dictionary:
 	var value: Dictionary = _published_by_target.get(target.get_id(), {})
 	var result := value.duplicate(false)
 	_published_mutex.unlock()
+	if result.is_empty():
+		return {"valid": false, "pending": true, "reason": "scene_snapshot_pending"}
 	return result
 
 static func clear_target(target: RID, reason := "inactive") -> void:

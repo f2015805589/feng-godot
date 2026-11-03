@@ -21,11 +21,19 @@ set(BOX3D_PROFILE OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/box3d)
 
 file(GLOB_RECURSE ADAPTER_SOURCES CONFIGURE_DEPENDS "thirdparty/godot-box3d/src/*.cpp")
-add_library(feng-box3d SHARED ${ADAPTER_SOURCES})
-target_include_directories(feng-box3d PRIVATE thirdparty/godot-box3d/src)
+add_library(feng-box3d SHARED ${ADAPTER_SOURCES} soft_tasks.c physics_stress_batch.cpp)
+set_source_files_properties(soft_tasks.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+target_include_directories(feng-box3d PRIVATE thirdparty/godot-box3d/src thirdparty/box3d/src ${CMAKE_CURRENT_SOURCE_DIR})
 target_precompile_headers(feng-box3d PRIVATE thirdparty/godot-box3d/src/precompiled.hpp)
 target_link_libraries(feng-box3d PRIVATE box3d::box3d godot-cpp)
 target_compile_features(feng-box3d PRIVATE cxx_std_17)
+# Inline the rigid solver's small cross-file helpers in release builds without
+# changing floating-point precision or the number of solver iterations.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT FENG_BOX3D_IPO_SUPPORTED LANGUAGES C CXX)
+if(FENG_BOX3D_IPO_SUPPORTED)
+    set_property(TARGET box3d feng-box3d PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()
 if(MSVC)
     target_compile_options(feng-box3d PRIVATE /utf-8)
 endif()
@@ -35,11 +43,17 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(feng-box3d PRIVATE -Wl,--exclude-libs,ALL)
 endif()
+set(FENG_BOX3D_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../bin" CACHE PATH "Plugin output directory")
 set_target_properties(feng-box3d PROPERTIES
     PREFIX ""
     OUTPUT_NAME "box3d"
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
-    RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_CURRENT_SOURCE_DIR}/../bin>"
-    LIBRARY_OUTPUT_DIRECTORY "$<1:${CMAKE_CURRENT_SOURCE_DIR}/../bin>"
+    RUNTIME_OUTPUT_DIRECTORY "$<1:${FENG_BOX3D_OUTPUT_DIRECTORY}>"
+    LIBRARY_OUTPUT_DIRECTORY "$<1:${FENG_BOX3D_OUTPUT_DIRECTORY}>"
 )
+
+# Opt-in regression executable stays in the ignored build directory, never bin/.
+add_executable(box3d-physics-issues EXCLUDE_FROM_ALL ../tests/native_physics_issues.c soft_tasks.c)
+target_include_directories(box3d-physics-issues PRIVATE thirdparty/box3d/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(box3d-physics-issues PRIVATE box3d::box3d)

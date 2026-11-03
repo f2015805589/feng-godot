@@ -53,7 +53,8 @@ public:
 		uint64_t last_use = 0;
 	};
 
-	// Creates the channel arrays. `p_resolution` is the side of one cell at mip 0 and
+	// Configures capacity; channel arrays are allocated on the first published cell.
+	// `p_resolution` is the side of one cell at mip 0 and
 	// therefore the level count; a cell baked at another resolution is refused rather
 	// than silently resampled.
 	void initialize(godot::RenderingDevice *p_rd, int p_layer_capacity, int p_resolution);
@@ -95,6 +96,7 @@ protected:
 	static void _bind_methods();
 
 private:
+	bool _ensure_arrays();
 	int _acquire_layer(const godot::Vector2i &p_cell, godot::Vector2i *r_evicted);
 	void _release_layer(int p_layer);
 

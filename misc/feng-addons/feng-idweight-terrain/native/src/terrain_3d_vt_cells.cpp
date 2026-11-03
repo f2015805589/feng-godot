@@ -41,6 +41,17 @@ void Terrain3DCellStore::initialize(RenderingDevice *p_rd, int p_layer_capacity,
 	while ((_resolution >> (_level_count - 1)) > 1) {
 		_level_count++;
 	}
+	_free_layers.reserve(size_t(_layers));
+	for (int layer = _layers - 1; layer >= 0; --layer) {
+		_free_layers.push_back(layer);
+	}
+}
+
+bool Terrain3DCellStore::_ensure_arrays() {
+	if (_channel_rd[0].is_valid() && _channel_rd[1].is_valid() && _channel_rd[2].is_valid()) {
+		return true;
+	}
+	if (!is_initialized()) { return false; }
 	const uint64_t usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
@@ -60,17 +71,16 @@ void Terrain3DCellStore::initialize(RenderingDevice *p_rd, int p_layer_capacity,
 		TypedArray<PackedByteArray> data;
 		_channel_rd[channel] = _rd->texture_create(format, view, data);
 		if (!_channel_rd[channel].is_valid()) {
-			clear();
-			return;
+			for (RID &texture : _channel_rd) {
+				if (texture.is_valid()) { _rd->free_rid(texture); texture = RID(); }
+			}
+			return false;
 		}
 	}
 	_rd->set_resource_name(_channel_rd[0], "SVT Cell Albedo Height (layer = cell)");
 	_rd->set_resource_name(_channel_rd[1], "SVT Cell Normal Roughness (layer = cell)");
 	_rd->set_resource_name(_channel_rd[2], "SVT Cell Parameters (layer = cell)");
-	_free_layers.reserve(size_t(_layers));
-	for (int layer = _layers - 1; layer >= 0; --layer) {
-		_free_layers.push_back(layer);
-	}
+	return true;
 }
 
 void Terrain3DCellStore::clear() {
@@ -186,6 +196,7 @@ bool Terrain3DCellStore::publish_cell(const Vector2i &p_cell, uint32_t p_signatu
 		}
 		uploads[channel] = chain;
 	}
+	if (!_ensure_arrays()) { return false; }
 	const auto existing = _cells.find(cell_key(p_cell));
 	int layer = existing != _cells.end() ? existing->second.layer : _acquire_layer(p_cell, r_evicted);
 	if (layer < 0) {
@@ -257,7 +268,8 @@ Dictionary Terrain3DCellStore::get_stats() const {
 	stats["free_layers"] = int64_t(_free_layers.size());
 	stats["published_cells"] = int64_t(_published_cells);
 	stats["evicted_cells"] = int64_t(_evicted_cells);
-	stats["bytes"] = int64_t(chain_bytes(_resolution, _level_count)) * 3 * _layers;
+	stats["allocated"] = _channel_rd[0].is_valid();
+	stats["bytes"] = _channel_rd[0].is_valid() ? int64_t(chain_bytes(_resolution, _level_count)) * 3 * _layers : 0;
 	return stats;
 }
 

@@ -289,7 +289,7 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 		warn_once("Hardware RTGI unavailable (%s); the planned MagicGI fallback retains diffuse lighting." % reason)
 		return
 	var diffuse_availability := get_indirect_gi_availability()
-	if not bool(diffuse_availability.get("available", false)):
+	if not bool(diffuse_availability.get("available", false)) and str(diffuse_availability.get("reason", "")) != "scene_snapshot_pending":
 		warn_once("RTGI diffuse temporarily unavailable (%s); the planned MagicGI fallback retains diffuse lighting." % str(diffuse_availability.get("reason", "indirect_gi_provider_unavailable")))
 	var options := get_resolved_parameters(ctx)
 	var diffuse_amount := float(options.get("strength", 0.0))
@@ -399,6 +399,10 @@ func _execute_frame(ctx: FRPPassContext) -> void:
 			"unsupported_reasons": snapshot.get("unsupported_reasons", []),
 		}
 	if not bool(snapshot.get("valid", false)):
+		if bool(snapshot.get("pending", false)):
+			invalidate(target)
+			_set_diffuse_attempt_failure("scene_snapshot_pending")
+			return
 		var reasons: Array = snapshot.get("unsupported_reasons", [])
 		if not reasons.is_empty():
 			warn_once("Unsupported scene geometry/material: " + str(reasons[0]) + "; native lighting remains active.")

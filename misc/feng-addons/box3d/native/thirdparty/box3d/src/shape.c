@@ -1221,6 +1221,28 @@ float b3Shape_GetDensity( b3ShapeId shapeId )
 	return shape->density;
 }
 
+// feng-box3d: material edits must not reuse pre-edit contact coefficients (#209).
+// Invalidate once at the setter instead of remapping materials on every substep.
+static void b3InvalidateShapeMaterial( b3World* world, b3Shape* shape )
+{
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	int key = body->headContactKey;
+	while ( key != B3_NULL_INDEX )
+	{
+		b3Contact* contact = b3Array_Get( world->contacts, key >> 1 );
+		int edge = key & 1;
+		key = contact->edges[edge].nextKey;
+		if ( contact->shapeIdA != shape->id && contact->shapeIdB != shape->id )
+		{
+			continue;
+		}
+		contact->flags &= ~b3_relativeTransformValid;
+		b3Body* other = b3Array_Get( world->bodies, contact->edges[edge ^ 1].bodyId );
+		b3WakeBody( world, other );
+	}
+	b3WakeBody( world, body );
+}
+
 void b3Shape_SetFriction( b3ShapeId shapeId, float friction )
 {
 	B3_ASSERT( b3IsValidFloat( friction ) && friction >= 0.0f );
@@ -1229,6 +1251,7 @@ void b3Shape_SetFriction( b3ShapeId shapeId, float friction )
 	b3Shape* shape = b3GetShape( world, shapeId );
 	B3_ASSERT( shape->type != b3_compoundShape );
 	b3GetShapeMaterials( shape )[0].friction = friction;
+	b3InvalidateShapeMaterial( world, shape );
 }
 
 float b3Shape_GetFriction( b3ShapeId shapeId )
@@ -1246,6 +1269,7 @@ void b3Shape_SetRestitution( b3ShapeId shapeId, float restitution )
 	b3Shape* shape = b3GetShape( world, shapeId );
 	B3_ASSERT( shape->type != b3_compoundShape );
 	b3GetShapeMaterials( shape )[0].restitution = restitution;
+	b3InvalidateShapeMaterial( world, shape );
 }
 
 float b3Shape_GetRestitution( b3ShapeId shapeId )
@@ -1267,6 +1291,7 @@ void b3Shape_SetSurfaceMaterial( b3ShapeId shapeId, b3SurfaceMaterial surfaceMat
 	b3Shape* shape = b3GetShape( world, shapeId );
 	B3_ASSERT( shape->type != b3_compoundShape );
 	b3GetShapeMaterials( shape )[0] = surfaceMaterial;
+	b3InvalidateShapeMaterial( world, shape );
 }
 
 b3SurfaceMaterial b3Shape_GetSurfaceMaterial( b3ShapeId shapeId )
@@ -1298,6 +1323,7 @@ void b3Shape_SetMeshMaterial( b3ShapeId shapeId, b3SurfaceMaterial surfaceMateri
 
 	B3_REC( world, ShapeSetMeshMaterial, shapeId, surfaceMaterial, index );
 	b3GetShapeMaterials( shape )[index] = surfaceMaterial;
+	b3InvalidateShapeMaterial( world, shape );
 }
 
 b3SurfaceMaterial b3Shape_GetMeshSurfaceMaterial( b3ShapeId shapeId, int index )

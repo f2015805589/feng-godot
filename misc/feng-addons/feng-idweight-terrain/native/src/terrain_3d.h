@@ -91,6 +91,14 @@ private:
 	// SVT in one struct, so the node's own fields stay readable. See
 	// terrain_3d_vt_state.h for the field groups.
 	Terrain3DVTState _vt;
+	Ref<Resource> _vt_neural_data;
+	String _vt_neural_shader_code;
+	uint64_t _vt_neural_bound_baker = 0;
+	uint64_t _vt_neural_signature_revision = UINT64_MAX;
+	uint32_t _vt_neural_signature_materials = 0;
+	String _vt_neural_signature;
+	void _sync_vt_neural_data();
+	void _vt_neural_data_changed();
 
 	bool _ensure_vt_capacity(int p_required);
 	void _process_async_svt_pages();
@@ -878,6 +886,11 @@ public:
 	// sampling support; see get_vt_settings() for what was applied and why a request was
 	// refused.
 	void set_surface_vt_compression(const int p_compression);
+	void set_vt_neural_data(const Ref<Resource> &p_data);
+	Ref<Resource> get_vt_neural_data() const { return _vt_neural_data; }
+	String get_vt_neural_shader_code() const { return _vt_neural_shader_code; }
+	String get_vt_neural_signature();
+	Array export_vt_neural_pages(int p_limit = 4096);
 	int get_surface_vt_compression() const;
 	void set_surface_svt_compression(const int p_compression);
 	int get_surface_svt_compression() const;
@@ -1092,6 +1105,7 @@ public:
 	Vector3 get_intersection(const Vector3 &p_src_pos, const Vector3 &p_direction, const bool p_gpu_mode = false);
 	Dictionary get_raycast_result(const Vector3 &p_src_pos, const Vector3 &p_direction, const uint32_t p_col_mask = 0xFFFFFFFF, const bool p_exclude_self = false) const;
 	Ref<Mesh> bake_mesh(const int p_lod, const Terrain3DData::HeightFilter p_filter = Terrain3DData::HEIGHT_FILTER_NEAREST) const;
+	Dictionary capture_rtgi_geometry() const;
 	PackedVector3Array generate_nav_mesh_source_geometry(const AABB &p_global_aabb, const bool p_require_nav = true) const;
 
 	// Warnings

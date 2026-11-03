@@ -107,6 +107,15 @@ static void b3IntegrateVelocitiesTask( b3SolverBlock block, b3StepContext* conte
 		// I * (w2 - w1) + h * cross(w2, I * w2) = 0
 		// This is all done in local coordinates where the Jacobian is easier to compute.
 		// This improves the simulation of long skinny bodies.
+		// For I = k * identity, cross(w, I*w) is identically zero. Keep w in
+		// world space instead of solving a zero correction and rotating it twice.
+		// Use exact tensor comparisons: nearly isotropic or compound bodies must
+		// retain the full solver. A zero angular velocity also has zero correction.
+		b3Matrix3 invI = sim->invInertiaLocal;
+		bool isotropic = invI.cx.x == invI.cy.y && invI.cy.y == invI.cz.z &&
+			invI.cx.y == 0.0f && invI.cx.z == 0.0f && invI.cy.x == 0.0f &&
+			invI.cy.z == 0.0f && invI.cz.x == 0.0f && invI.cz.y == 0.0f;
+		if ( !isotropic && ( w.x != 0.0f || w.y != 0.0f || w.z != 0.0f ) )
 		{
 			// Get current rotation.
 			b3Quat q0 = sim->transform.q;

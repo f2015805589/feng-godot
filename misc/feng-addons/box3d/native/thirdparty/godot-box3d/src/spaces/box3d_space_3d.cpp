@@ -1,4 +1,5 @@
 #include "box3d_space_3d.hpp"
+#include "../objects/box3d_soft_body_3d.hpp"
 
 #include "../misc/box3d_globals.hpp"
 #include "../misc/type_conversions.hpp"
@@ -10,6 +11,9 @@
 #include "box3d_physics_direct_space_state_3d.hpp"
 
 #include <box3d/box3d.h>
+#include <godot_cpp/variant/builtin_vararg_methods.hpp>
+
+#include <utility>
 
 namespace {
 constexpr int SUB_STEP_COUNT = 4;
@@ -26,6 +30,7 @@ Box3DSpace3D::Box3DSpace3D() {
 }
 
 Box3DSpace3D::~Box3DSpace3D() {
+	while (!soft_bodies.is_empty()) (*soft_bodies.begin())->set_space(nullptr);
 	if (direct_state != nullptr) {
 		memdelete(direct_state);
 		direct_state = nullptr;
@@ -74,6 +79,36 @@ void Box3DSpace3D::set_default_area(Box3DAreaImpl3D* p_area) {
 	default_area = p_area;
 }
 
+void Box3DSpace3D::register_body(Box3DBodyImpl3D* p_body) {
+	bodies.insert(p_body);
+	update_body_subscriptions(p_body);
+}
+
+void Box3DSpace3D::unregister_body(Box3DBodyImpl3D* p_body) {
+	bodies.erase(p_body);
+	query_bodies.erase(p_body);
+	sync_bodies.erase(p_body);
+	contact_bodies.erase(p_body);
+}
+
+void Box3DSpace3D::update_body_subscriptions(Box3DBodyImpl3D* p_body) {
+	if (p_body->get_state_sync_callback().is_valid()) {
+		sync_bodies.insert(p_body);
+	} else {
+		sync_bodies.erase(p_body);
+	}
+	if (p_body->get_state_sync_callback().is_valid() || p_body->get_force_integration_callback().is_valid()) {
+		query_bodies.insert(p_body);
+	} else {
+		query_bodies.erase(p_body);
+	}
+	if (p_body->get_max_contacts_reported() > 0) {
+		contact_bodies.insert(p_body);
+	} else {
+		contact_bodies.erase(p_body);
+	}
+}
+
 void Box3DSpace3D::step(float p_step) {
 	last_step = p_step;
 
@@ -89,17 +124,14 @@ void Box3DSpace3D::step(float p_step) {
 
 	b3World_Step(world_id, p_step, SUB_STEP_COUNT);
 
+	Box3DSoftBody3D::step_all(soft_bodies, p_step);
 	_pull_body_events();
 	_pull_sensor_events();
 
 	// Manifold pointers are only valid until the next step, so cache contacts now.
-	for (Box3DBodyImpl3D* body : bodies) {
+	for (Box3DBodyImpl3D* body : contact_bodies) {
 		body->refresh_contacts();
 	}
-
-	// Drained only so Box3D's per-step event bookkeeping stays consistent; joint events are unused.
-	b3World_GetContactEvents(world_id);
-	b3World_GetJointEvents(world_id);
 }
 
 // Godot walks areas highest priority first, so a REPLACE there wins; ties stay stable.
@@ -229,25 +261,30 @@ Box3DSpace3D::AreaOverrides Box3DSpace3D::compute_area_overrides(Box3DBodyImpl3D
 }
 
 void Box3DSpace3D::_apply_area_overrides() {
+	const bool default_only = areas.is_empty();
+	const float linear = default_area ? float(default_area->get_linear_damp()) : 0;
+	const float angular = default_area ? float(default_area->get_angular_damp()) : 0;
 	for (Box3DBodyImpl3D* body : bodies) {
-		if (!body->has_body_id() || body->is_omitting_force_integration()) {
+		if (!body->has_body_id() || body->is_omitting_force_integration() ||
+				(body->get_mode() != PhysicsServer3D::BODY_MODE_RIGID && body->get_mode() != PhysicsServer3D::BODY_MODE_RIGID_LINEAR)) {
+			continue;
+		}
+		if (default_only) {
+			body->apply_default_environment(linear, angular);
 			continue;
 		}
 
 		const AreaOverrides overrides = compute_area_overrides(body);
 
-		b3Body_SetLinearDamping(body->get_body_id(), (float)overrides.linear_damp);
-		b3Body_SetAngularDamping(body->get_body_id(), (float)overrides.angular_damp);
+		const float world_scale = overrides.replaces_world_gravity ? 0.0f : (float)body->get_gravity_scale();
+		body->apply_environment((float)overrides.linear_damp, (float)overrides.angular_damp, world_scale);
 
 		if (!overrides.affects_gravity) {
-			b3Body_SetGravityScale(body->get_body_id(), (float)body->get_gravity_scale());
 			continue;
 		}
 
 		// Box3D has no per-body gravity vector, so contribute the area gravity as an
 		// equivalent velocity delta. A force would divide by mass and damp differently.
-		const float world_scale = overrides.replaces_world_gravity ? 0.0f : (float)body->get_gravity_scale();
-		b3Body_SetGravityScale(body->get_body_id(), world_scale);
 		const Vector3 delta = overrides.gravity * body->get_gravity_scale() * last_step;
 		const b3Vec3 velocity = b3Body_GetLinearVelocity(body->get_body_id());
 		b3Body_SetLinearVelocity(body->get_body_id(), b3Add(velocity, godot_to_b3(delta)));
@@ -255,6 +292,11 @@ void Box3DSpace3D::_apply_area_overrides() {
 }
 
 void Box3DSpace3D::_pull_body_events() {
+	// Native move events are only needed to notify scene objects of their final
+	// sleep transition. RID-only simulations have no subscribers to notify.
+	if (sync_bodies.is_empty()) {
+		return;
+	}
 	// event.userData is set to the raw C++ object pointer at body creation time (see
 	// Box3DBodyImpl3D::_create_body_id / Box3DAreaImpl3D::_create_body_id), but both
 	// regular bodies AND area-backing kinematic bodies generate move events (areas move
@@ -337,15 +379,19 @@ void Box3DSpace3D::_queue_area_event(
 // Mirrors GodotBody3D::call_queries: force integration then state sync, back to back, so a
 // node that applies forces from its state-sync callback has them picked up by the next step.
 void Box3DSpace3D::_call_body_queries() {
-	LocalVector<RID> body_rids;
-	body_rids.reserve(bodies.size());
-	for (Box3DBodyImpl3D* body : bodies) {
-		body_rids.push_back(body->get_rid());
+	query_body_rids.clear();
+	for (Box3DBodyImpl3D* body : query_bodies) {
+		// Sleeping bodies without pending notifications do not need a callback
+		// snapshot. Keep force-integration callbacks, including custom integrators.
+		if (body->get_force_integration_callback().is_valid() ||
+				(body->get_state_sync_callback().is_valid() && (!body->is_sleeping() || body->needs_state_sync()))) {
+			query_body_rids.push_back(body->get_rid());
+		}
 	}
 
 	// Callbacks may detach or free bodies, so re-resolve each RID instead of holding a
 	// pointer across the call.
-	for (const RID& body_rid : body_rids) {
+	for (const RID& body_rid : query_body_rids) {
 		Box3DBodyImpl3D* body = Box3DPhysicsServer3D::get_singleton()->get_body(body_rid);
 		if (body == nullptr || body->get_space() != this) {
 			continue;
@@ -354,16 +400,11 @@ void Box3DSpace3D::_call_body_queries() {
 		const Callable integration_callback = body->get_force_integration_callback();
 		if (integration_callback.is_valid()) {
 			const Variant userdata = body->get_force_integration_userdata();
-			Array arguments;
 			if (userdata.get_type() == Variant::NIL) {
-				arguments.resize(1);
-				arguments[0] = body->get_direct_state_or_null();
+				integration_callback.call(body->get_direct_state_or_null());
 			} else {
-				arguments.resize(2);
-				arguments[0] = body->get_direct_state_or_null();
-				arguments[1] = userdata;
+				integration_callback.call(body->get_direct_state_or_null(), userdata);
 			}
-			integration_callback.callv(arguments);
 		}
 
 		body = Box3DPhysicsServer3D::get_singleton()->get_body(body_rid);
@@ -376,13 +417,12 @@ void Box3DSpace3D::_call_body_queries() {
 			continue;
 		}
 		const Callable sync_callback = body->get_state_sync_callback();
-		if (sync_callback.is_valid()) {
-			Array arguments;
-			arguments.resize(1);
-			arguments[0] = body->get_direct_state_or_null();
-			sync_callback.callv(arguments);
-		}
+		// Clear before calling: the callback may delete this body or schedule a
+		// fresh notification. Never dereference the body after invoking user code.
 		body->set_needs_state_sync(false);
+		if (sync_callback.is_valid()) {
+			sync_callback.call(body->get_direct_state_or_null());
+		}
 	}
 }
 
@@ -391,17 +431,13 @@ void Box3DSpace3D::flush_queries() {
 
 	_call_body_queries();
 
-	for (const PendingAreaEvent& event : pending_area_events) {
-		Array arguments;
-		arguments.resize(5);
-		arguments[0] = event.status;
-		arguments[1] = event.other_rid;
-		arguments[2] = event.other_instance_id;
-		arguments[3] = 0;
-		arguments[4] = 0;
-		event.callback.callv(arguments);
+	// Callbacks can mutate the world. Keep the batch stable and retain both
+	// buffers' capacity; any newly queued events belong to the next flush.
+	std::swap(dispatch_area_events, pending_area_events);
+	for (const PendingAreaEvent& event : dispatch_area_events) {
+		event.callback.call(event.status, event.other_rid, event.other_instance_id, 0, 0);
 	}
-	pending_area_events.clear();
+	dispatch_area_events.clear();
 
 	flushing_queries = false;
 }

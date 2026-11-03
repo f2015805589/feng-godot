@@ -17,16 +17,18 @@ links project addons directly to `misc/feng-addons/` when opening a project.
 Restart the editor after rebuilding a loaded DLL. The `native/.gdignore` file excludes
 compiler sources from project resource scanning.
 
-### Active Windows debug library
+The extension descriptor uses the standard debug/release library names above.
+BC7 source-array encoding includes the repository's `thirdparty/cvtt` implementation
+in the addon, so it does not require the engine's optional cvtt encoder module.
+Its MIT notice is retained at `../CVTT_LICENSE.txt`.
 
-The terrain project currently routes `windows.debug.x86_64` through
-`bin/libfeng-idweight-terrain.windows.debug.x86_64.gl-normal-fix.dll`. SCons still
-builds the standard `bin/libfeng-idweight-terrain.windows.debug.x86_64.dll` name.
-After editors using the active DLL have exited, copy the fresh build to the active
-filename; if the standard DLL is still locked, build in an independent staging copy
-and copy that output instead. Once the old standard DLL is released, it can be
-replaced with the rebuilt library and the `.gdextension` debug x64 mapping restored
-to the standard filename.
+The optional `vt_neural_data` resource provides encoded evaluated pages for the
+near/far `NTC (baked pages)` setting. Its implementation is supplied by `feng-ntc`:
+either decode missing pages into the ordinary hardware cache, or keep compressed
+features resident with an independently bounded decoded working set. The latter
+injects the addon's portable sampler into the terrain material for cold misses.
+No NTC SDK dependency is added to Terrain3D. See
+[`feng-ntc`](../../feng-ntc/README.md) for baking, platform and memory boundaries.
 
 Validate R16 rendering and editor integration before release using the relevant
 checks in [`tests/README.md`](tests/README.md).

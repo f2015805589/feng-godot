@@ -80,7 +80,7 @@ void Terrain3DSurfaceBaker::set_tier_compression(const int p_tier, const int p_m
 		_resolve_tier_normal_compression(tier);
 	}
 	LOG(INFO, "Surface page compression requested for ", tier == TIER_SVT ? "SVT" : "AVT", ": ",
-			page_codec(_tiers[tier].requested).name,
+			_tiers[tier].requested == SURFACE_PAGE_NTC ? "NTC" : page_codec(_tiers[tier].requested).name,
 			"; effective: ", page_codec(_tiers[tier].effective.load()).name,
 			_tiers[tier].reason.is_empty() ? String() : String(" (") + _tiers[tier].reason + ")");
 	if (_configured) {
@@ -132,10 +132,16 @@ void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
 	tier.format = RenderingDevice::DATA_FORMAT_MAX;
 	tier.format_srgb = RenderingDevice::DATA_FORMAT_MAX;
 	tier.reason = String();
-	if (tier.requested == 0) {
+	if (_neural_direct_tier(p_tier)) { return; }
+	// Neural payload storage and decoded hardware-cache storage are independent.
+	// No BC resource is exported. On a BC-capable GPU the existing page encoder
+	// compresses a decoded cache miss once; unsupported devices retain RGBA16F.
+	const int cache_mode = tier.requested == SURFACE_PAGE_NTC ?
+			(_neural_cache_mode < 0 ? int(SURFACE_PAGE_BC7) : _neural_cache_mode) : tier.requested;
+	if (cache_mode == 0) {
 		return;
 	}
-	const AtlasCodec &codec = page_codec(tier.requested);
+	const AtlasCodec &codec = page_codec(cache_mode);
 	if (codec.channels != Image::USED_CHANNELS_RGBA) {
 		tier.reason = String(codec.name) +
 				" keeps no alpha channel, and the material pages store height, roughness and the validity bit in alpha";
@@ -173,7 +179,7 @@ void Terrain3DSurfaceBaker::_resolve_tier_compression(const int p_tier) {
 		tier.reason = String(codec.name) + " cannot be sampled and updated on this rendering device";
 		return;
 	}
-	tier.effective = tier.requested;
+	tier.effective = cache_mode;
 	tier.format = format;
 	tier.format_srgb = format_srgb;
 	LOG(DEBUG, "Surface page compression for ", tier_name, " resolved to ", codec.name);
@@ -188,7 +194,7 @@ void Terrain3DSurfaceBaker::_resolve_tier_normal_compression(const int p_tier) {
 	int mode = tier.normal_requested;
 	if (mode == SURFACE_NORMAL_AUTO) {
 		// The public tier setting selects the same block format for every page channel.
-		mode = normal_mode_for_page_codec(tier.requested);
+		mode = normal_mode_for_page_codec(tier.requested == SURFACE_PAGE_NTC ? tier.effective.load() : tier.requested);
 	}
 	if (mode == SURFACE_NORMAL_UNCOMPRESSED) {
 		return;
@@ -226,9 +232,20 @@ Dictionary Terrain3DSurfaceBaker::get_tier_compression_info(const int p_tier) co
 	info["applied"] = state.applied.load();
 	info["name"] = String(page_codec(available).name);
 	String reason = state.reason;
-	if (reason.is_empty() && available == 0 && state.requested != 0) {
+	if (reason.is_empty() && available == 0 && state.requested != 0 && state.requested != SURFACE_PAGE_NTC) {
 		reason = String(page_codec(state.requested).name) +
 				String(" was resolved for this device, but the compressed page arrays could not be created");
+	}
+	if (state.requested == SURFACE_PAGE_NTC) {
+		info["name"] = "NTC";
+		info["decoded_cache"] = _neural_direct ? String("Compressed GPU + bounded page cache") : (state.applied.load() == 0 ? String("RGBA16F") : String(page_codec(state.applied.load()).name));
+		info["neural_catalog_pages"] = _neural_entries.size();
+		info["neural_source_available"] = _neural_decoder.is_valid();
+		info["neural_decodes"] = int64_t(_neural_decodes);
+		info["neural_gpu_bytes"] = int64_t(_neural_gpu_bytes);
+		if (_neural_decoder.is_null()) {
+			reason += " Bake VT pages with Feng NTC; missing or stale pages use the live producer";
+		}
 	}
 	info["reason"] = reason;
 	info["rd_format"] = int(state.format.load());
@@ -345,7 +362,9 @@ bool Terrain3DSurfaceBaker::_any_tier_uses_sampled(const bool p_applied) const {
 // state, not from `applied`: the arrays are allocated before a bundle becomes the current one,
 // and the answer has to be the same for the arrays and for the code that indexes them.
 bool Terrain3DSurfaceBaker::_staging_is_scratch() const {
+	if (_all_neural_direct()) { return true; }
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
+		if (_neural_direct_tier(tier)) { continue; }
 		if (_tier_channel_mask(tier, false) != 0x7u) {
 			return false;
 		}
@@ -379,6 +398,11 @@ int64_t Terrain3DSurfaceBaker::_encode_page_bytes() const {
 // count everything else is; a caller that never sets a peak leaves the byte ceiling in charge and
 // the allocation is exactly what it always was.
 int Terrain3DSurfaceBaker::_encode_ring_depth_ceiling() const {
+	if (_staging_is_scratch() && FengRDGpuCopy::available(_rd)) {
+		// Stores finish in this recording; the frame dispatcher flushes a batch
+		// before reusing its staging layers. No readback-latency reservation.
+		return ENCODE_PAGES_MIN;
+	}
 	const int64_t page_bytes = _encode_page_bytes();
 	const int64_t affordable = page_bytes > 0 ? ENCODE_RING_BUDGET_BYTES / page_bytes
 											  : int64_t(ENCODE_PAGES_MAX);
@@ -412,6 +436,11 @@ void Terrain3DSurfaceBaker::_refresh_encode_ring_capacity() {
 // Bytes the independently compressed arrays of one tier cost in the current bundle's slot count.
 int64_t Terrain3DSurfaceBaker::_tier_sampled_bytes(const int p_tier) const {
 	const int tier = CLAMP(p_tier, 0, TIER_COUNT - 1);
+	if (tier > 0 && _resources.sampled[tier].albedo_rd == _resources.sampled[0].albedo_rd &&
+			_resources.sampled[tier].normal_rd == _resources.sampled[0].normal_rd &&
+			_resources.sampled[tier].params_rd == _resources.sampled[0].params_rd) {
+		return 0; // Shared slots are counted once, under AVT.
+	}
 	const int64_t blocks = (int64_t(_stored_size) + 3) / 4;
 	int64_t total = 0;
 	for (int channel = 0; channel < ENCODE_CHANNELS; ++channel) {

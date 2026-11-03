@@ -21,6 +21,7 @@
 #include "logger.h"
 #include "terrain_3d.h"
 #include "terrain_3d_util.h"
+#include "terrain_3d_texture_encoder.h"
 
 #include <godot_cpp/classes/hashing_context.hpp>
 
@@ -63,6 +64,11 @@ static_assert(sizeof(ARRAY_CODECS) / sizeof(ArrayCodec) == Terrain3DAssets::ARRA
 // private, so availability is probed by compressing a tiny image once per
 // update instead of discovering the failure layer by layer.
 bool encoder_available(const ArrayCodec &p_codec) {
+	// BC7 is supplied by this extension even when the engine's optional cvtt
+	// module was omitted. Do not call the null engine encoder just to probe it.
+	if (p_codec.mode == Image::COMPRESS_BPTC && !p_codec.hdr) {
+		return true;
+	}
 	Ref<Image> probe = Image::create_empty(4, 4, false, p_codec.hdr ? Image::FORMAT_RGBAF : Image::FORMAT_RGBA8);
 	return probe.is_valid() && probe->compress_from_channels(p_codec.mode, p_codec.channels, p_codec.block) == OK;
 }
@@ -169,7 +175,13 @@ void Terrain3DAssets::_update_texture_files() {
 			if (effective_compression != ARRAY_UNCOMPRESSED) {
 				// Explicit channels keep every array layer in the same format even
 				// when one source happens to have opaque alpha or fewer used channels.
-				if (image->compress_from_channels(codec.mode, codec.channels, codec.block) != OK || !image->is_compressed()) {
+				if (effective_compression == ARRAY_BC7) {
+					image = terrain_encode_bc7(image, p_normal);
+				} else if (image->compress_from_channels(codec.mode, codec.channels, codec.block) != OK) {
+					LOG(ERROR, "Encoder unavailable for ", codec.name, "; retaining previous arrays.");
+					return false;
+				}
+				if (image.is_null() || !image->is_compressed()) {
 					LOG(ERROR, "Encoder unavailable for ", codec.name, "; retaining previous arrays.");
 					return false;
 				}

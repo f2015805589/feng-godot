@@ -360,6 +360,10 @@ struct material {
 	float total_weight;
 };
 
+bool surface_neural_source_fallback() { return false; }
+bool surface_neural_tier(int tier) { return false; }
+bool surface_neural_material_slot(int slot, vec2 offset, int page_size, int border, vec2 dx, vec2 dy, out material mat, out vec3 normal) { return false; }
+
 varying vec3 v_vertex;
 varying float v_vertex_xz_dist;
 varying vec3 v_camera_pos;
@@ -580,6 +584,9 @@ bool surface_decode_page(vec4 albedo, vec4 normal_rough, vec4 params,
 bool surface_material_slot(int slot, vec2 offset, int page_size, int border,
 		out material r_mat, out vec3 r_normal) {
 	if (slot < 0 || slot == 65535 || slot == 65534) { return false; }
+	if (surface_neural_tier(0)) {
+		return surface_neural_material_slot(slot, offset, page_size, border, vec2(0.0), vec2(0.0), r_mat, r_normal);
+	}
 	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
 	vec4 params = textureLod(_surface_material_params, coord, 0.0);
 	vec4 albedo = textureLod(_surface_material_albedo, coord, 0.0);
@@ -597,6 +604,9 @@ bool avt_material_slot(int slot, vec2 offset, float texel_world, vec2 world_dx, 
 	// plan names whose page has no content yet. It is not a slot - the pool is capped at 2047 - so
 	// it must never be sampled, and rejecting it here keeps the fallback loop honest too.
 	if (slot < 0 || slot == 65535 || slot == 65534) { return false; }
+	if (surface_neural_tier(0)) {
+		return surface_neural_material_slot(slot, offset, _surface_vt_page_size, _surface_vt_page_border, world_dx / (texel_world * float(_surface_vt_page_size + 2 * _surface_vt_page_border)), world_dy / (texel_world * float(_surface_vt_page_size + 2 * _surface_vt_page_border)), r_mat, r_normal);
+	}
 	float stored = float(_surface_vt_page_size + 2 * _surface_vt_page_border);
 	vec3 coord = vec3((offset * float(_surface_vt_page_size) + float(_surface_vt_page_border)) / stored, float(slot));
 	vec2 dx = world_dx / (texel_world * stored);
@@ -631,6 +641,9 @@ float avt_pixel_footprint(vec2 dx, vec2 dy) {
 bool surface_svt_material_slot(int slot, vec2 offset, int page_size, int border,
 		out material r_mat, out vec3 r_normal) {
 	if (slot < 0 || slot == 65535) { return false; }
+	if (surface_neural_tier(1)) {
+		return surface_neural_material_slot(slot, offset, page_size, border, vec2(0.0), vec2(0.0), r_mat, r_normal);
+	}
 	vec3 coord = vec3((offset * float(page_size) + float(border)) / float(page_size + border * 2), float(slot));
 	vec4 params = textureLod(_surface_svt_material_params, coord, 0.0);
 	vec4 albedo = textureLod(_surface_svt_material_albedo, coord, 0.0);
@@ -2372,7 +2385,7 @@ void fragment() {
 	bool page_band = true;
 	bool material_cached = surface_material_sample(v_vertex.xz, mat, blendedNormalWS, page_share, page_band);
 	if (!material_cached) { page_share = 0.0; }
-	bool material_missing = _surface_material_required && !material_cached && page_band;
+	bool material_missing = _surface_material_required && !material_cached && page_band && !surface_neural_source_fallback();
 	if (material_missing) {
 		// VT mode is strict: missing/pending material pages are visible diagnostics,
 		// never silently replaced by the original terrain evaluator.

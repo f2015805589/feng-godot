@@ -15,6 +15,8 @@ if env["platform"] == "linux":
     env["ARCOM"] = "${TEMPFILE('$ARCOM_ORIG', '$ARCOMSTR')}"
 env = env.Clone()
 env.Append(CPPPATH=[str(native / "src"), str(bindings / "gdextension")])
+env.Append(CPPPATH=config.get("include_paths", []))
+env.Append(CPPDEFINES=config.get("defines", []))
 env.Append(LIBS=config.get("libraries", {}).get(env["platform"], []))
 if config.get("exceptions", False):
     # Only worker extensions need stack unwinding; leave godot-cpp unchanged.
@@ -22,6 +24,10 @@ if config.get("exceptions", False):
         CXXFLAGS=["/EHsc" if env["platform"] == "windows" and not env.get("use_mingw", False) else "-fexceptions"]
     )
 sources = Glob(str(native / "src/*.cpp"))
+for extra in config.get("extra_sources", []):
+    # Keep third-party objects in this addon and separate build variants.
+    object_name = f"{Path(extra).stem}.{env['platform']}.{env['target']}.{env['arch']}"
+    sources.append(env.SharedObject(str(native / ".build" / (object_name + env["SHOBJSUFFIX"])), str(extra)))
 if config.get("docs", False) and env["target"] in ("editor", "template_debug"):
     sources.append(
         env.GodotCPPDocData(

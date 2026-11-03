@@ -1,0 +1,5 @@
+.sdk/
+native/.build/
+tests/.work/
+bin/
+*.log

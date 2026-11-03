@@ -1,4 +1,5 @@
 #include "box3d_physics_server_3d.hpp"
+#include "../objects/box3d_soft_body_3d.hpp"
 
 #include "../joints/box3d_hinge_joint_impl_3d.hpp"
 #include "../joints/box3d_joint_impl_3d.hpp"
@@ -23,6 +24,7 @@
 #include "../spaces/box3d_space_3d.hpp"
 
 #include <box3d/box3d.h>
+#include <algorithm>
 #include <godot_cpp/classes/engine.hpp>
 
 Box3DPhysicsServer3D* Box3DPhysicsServer3D::singleton = nullptr;
@@ -285,7 +287,6 @@ void Box3DPhysicsServer3D::_area_add_shape(const RID& p_area, const RID& p_shape
 	ERR_FAIL_NULL(area);
 	Box3DShapeImpl3D* shape = shape_owner.get_or_null(p_shape);
 	ERR_FAIL_NULL(shape);
-	shape->add_owner(area);
 	area->add_shape(shape, p_transform, p_disabled);
 }
 
@@ -294,7 +295,6 @@ void Box3DPhysicsServer3D::_area_set_shape(const RID& p_area, int32_t p_shape_id
 	ERR_FAIL_NULL(area);
 	Box3DShapeImpl3D* shape = shape_owner.get_or_null(p_shape);
 	ERR_FAIL_NULL(shape);
-	shape->add_owner(area);
 	area->set_shape(p_shape_idx, shape);
 }
 
@@ -470,7 +470,6 @@ void Box3DPhysicsServer3D::_body_add_shape(const RID& p_body, const RID& p_shape
 	ERR_FAIL_NULL(body);
 	Box3DShapeImpl3D* shape = shape_owner.get_or_null(p_shape);
 	ERR_FAIL_NULL(shape);
-	shape->add_owner(body);
 	body->add_shape(shape, p_transform, p_disabled);
 }
 
@@ -479,7 +478,6 @@ void Box3DPhysicsServer3D::_body_set_shape(const RID& p_body, int32_t p_shape_id
 	ERR_FAIL_NULL(body);
 	Box3DShapeImpl3D* shape = shape_owner.get_or_null(p_shape);
 	ERR_FAIL_NULL(shape);
-	shape->add_owner(body);
 	body->set_shape(p_shape_idx, shape);
 }
 
@@ -527,6 +525,7 @@ void Box3DPhysicsServer3D::_body_clear_shapes(const RID& p_body) {
 }
 
 void Box3DPhysicsServer3D::_body_attach_object_instance_id(const RID& p_body, uint64_t p_id) {
+	if (auto *soft = soft_body_owner.get_or_null(p_body)) { soft->instance_id = p_id; return; }
 	if (!p_body.is_valid() && Engine::get_singleton()->is_editor_hint()) {
 		return;
 	}
@@ -536,6 +535,7 @@ void Box3DPhysicsServer3D::_body_attach_object_instance_id(const RID& p_body, ui
 }
 
 uint64_t Box3DPhysicsServer3D::_body_get_object_instance_id(const RID& p_body) const {
+	if (auto *soft = soft_body_owner.get_or_null(p_body)) { return soft->instance_id; }
 	Box3DBodyImpl3D* body = body_owner.get_or_null(p_body);
 	ERR_FAIL_NULL_V(body, 0);
 	return body->get_instance_id();
@@ -1181,138 +1181,288 @@ bool Box3DPhysicsServer3D::_joint_is_disabled_collisions_between_bodies(const RI
 	return joint->is_collision_disabled();
 }
 
-// --- Soft bodies (non-goal) ---
+// --- Soft bodies: mesh XPBD and Box3D rigid collisions ---
+
+void Box3DPhysicsServer3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("soft_body_configure", "body", "options"), &Box3DPhysicsServer3D::soft_body_configure);
+	ClassDB::bind_method(D_METHOD("soft_body_get_statistics", "body"), &Box3DPhysicsServer3D::soft_body_get_statistics);
+	ClassDB::bind_method(D_METHOD("soft_body_cut", "body", "from", "to", "radius"), &Box3DPhysicsServer3D::soft_body_cut);
+}
+Dictionary Box3DPhysicsServer3D::soft_body_configure(const RID &rid, const Dictionary &options) {
+	auto *body=soft_body_owner.get_or_null(rid);
+	ERR_FAIL_NULL_V(body, Dictionary());
+	return body->configure(options);
+}
+Dictionary Box3DPhysicsServer3D::soft_body_get_statistics(const RID &rid) const {
+	auto *body=soft_body_owner.get_or_null(rid);
+	ERR_FAIL_NULL_V(body, Dictionary());
+	return body->statistics();
+}
+int Box3DPhysicsServer3D::soft_body_cut(const RID &rid,const Vector3 &from,const Vector3 &to,float radius) {
+	auto *body=soft_body_owner.get_or_null(rid);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->cut(from,to,radius);
+}
 
 RID Box3DPhysicsServer3D::_soft_body_create() {
-	if (Engine::get_singleton()->is_editor_hint()) {
-		return RID();
-	}
-	ERR_FAIL_V_MSG(RID(), "Box3D: SoftBody3D is not supported in this version of the Box3D extension.");
+	auto *body = memnew(Box3DSoftBody3D);
+	body->rid = soft_body_owner.make_rid(body);
+	return body->rid;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_shrinking_factor(const RID& p_body, float p_shrinking_factor) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->shrinking = std::clamp(p_shrinking_factor, -1.0f, 0.99f);
+	body->wake_up();
 }
 
 float Box3DPhysicsServer3D::_soft_body_get_shrinking_factor(const RID& p_body) const {
-	return 0.0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->shrinking;
 }
 
 void Box3DPhysicsServer3D::_soft_body_update_rendering_server(const RID& p_body, PhysicsServer3DRenderingServerHandler* p_rendering_server_handler) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->update_rendering(p_rendering_server_handler);
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_space(const RID& p_body, const RID& p_space) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	Box3DSpace3D *space = space_owner.get_or_null(p_space);
+	ERR_FAIL_COND(p_space.is_valid() && !space);
+	body->set_space(space);
 }
 
 RID Box3DPhysicsServer3D::_soft_body_get_space(const RID& p_body) const {
-	return RID();
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, RID());
+	return body->space ? body->space->get_rid() : RID();
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_ray_pickable(const RID& p_body, bool p_enable) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->ray_pickable = p_enable;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_collision_layer(const RID& p_body, uint32_t p_layer) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->layer = p_layer;
+	body->wake_up();
 }
 
 uint32_t Box3DPhysicsServer3D::_soft_body_get_collision_layer(const RID& p_body) const {
-	return 0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->layer;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_collision_mask(const RID& p_body, uint32_t p_mask) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->mask = p_mask;
+	body->wake_up();
 }
 
 uint32_t Box3DPhysicsServer3D::_soft_body_get_collision_mask(const RID& p_body) const {
-	return 0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->mask;
 }
 
 void Box3DPhysicsServer3D::_soft_body_add_collision_exception(const RID& p_body, const RID& p_excepted_body) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->exceptions.insert(p_excepted_body);
+	body->wake_up();
 }
 
 void Box3DPhysicsServer3D::_soft_body_remove_collision_exception(const RID& p_body, const RID& p_excepted_body) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->exceptions.erase(p_excepted_body);
+	body->wake_up();
 }
 
 TypedArray<RID> Box3DPhysicsServer3D::_soft_body_get_collision_exceptions(const RID& p_body) const {
-	return TypedArray<RID>();
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, TypedArray<RID>());
+	TypedArray<RID> result; for (RID rid : body->exceptions) result.push_back(rid); return result;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_state(const RID& p_body, PhysicsServer3D::BodyState p_state, const Variant& p_variant) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->set_state(p_state, p_variant);
 }
 
 Variant Box3DPhysicsServer3D::_soft_body_get_state(const RID& p_body, PhysicsServer3D::BodyState p_state) const {
-	return Variant();
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, Variant());
+	return body->get_state(p_state);
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_transform(const RID& p_body, const Transform3D& p_transform) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->set_transform(p_transform);
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_simulation_precision(const RID& p_body, int32_t p_simulation_precision) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->precision = std::clamp(p_simulation_precision, 1, 100);
+	body->wake_up();
 }
 
 int32_t Box3DPhysicsServer3D::_soft_body_get_simulation_precision(const RID& p_body) const {
-	return 0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->precision;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_total_mass(const RID& p_body, float p_total_mass) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->mass = std::max(p_total_mass, 0.001f);
+	body->wake_up();
 }
 
 float Box3DPhysicsServer3D::_soft_body_get_total_mass(const RID& p_body) const {
-	return 0.0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->mass;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_linear_stiffness(const RID& p_body, float p_stiffness) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->stiffness = std::clamp(p_stiffness, 0.0f, 1.0f);
+	body->wake_up();
 }
 
 float Box3DPhysicsServer3D::_soft_body_get_linear_stiffness(const RID& p_body) const {
-	return 0.0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->stiffness;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_pressure_coefficient(const RID& p_body, float p_pressure_coefficient) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->pressure = std::max(p_pressure_coefficient, 0.0f);
+	body->wake_up();
 }
 
 float Box3DPhysicsServer3D::_soft_body_get_pressure_coefficient(const RID& p_body) const {
-	return 0.0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->pressure;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_damping_coefficient(const RID& p_body, float p_damping_coefficient) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->damping = std::max(p_damping_coefficient, 0.0f);
+	body->wake_up();
 }
 
 float Box3DPhysicsServer3D::_soft_body_get_damping_coefficient(const RID& p_body) const {
-	return 0.0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->damping;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_drag_coefficient(const RID& p_body, float p_drag_coefficient) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->drag = std::max(p_drag_coefficient, 0.0f);
+	body->wake_up();
 }
 
 float Box3DPhysicsServer3D::_soft_body_get_drag_coefficient(const RID& p_body) const {
-	return 0.0;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+	return body->drag;
 }
 
 void Box3DPhysicsServer3D::_soft_body_set_mesh(const RID& p_body, const RID& p_mesh) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->set_mesh(p_mesh);
 }
 
 AABB Box3DPhysicsServer3D::_soft_body_get_bounds(const RID& p_body) const {
-	return AABB();
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, AABB());
+	return body->bounds;
 }
 
 void Box3DPhysicsServer3D::_soft_body_move_point(const RID& p_body, int32_t p_point_index, const Vector3& p_global_position) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->move(p_point_index, p_global_position);
 }
 
 Vector3 Box3DPhysicsServer3D::_soft_body_get_point_global_position(const RID& p_body, int32_t p_point_index) const {
-	return Vector3();
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, Vector3());
+	return body->point(p_point_index);
 }
 
 void Box3DPhysicsServer3D::_soft_body_remove_all_pinned_points(const RID& p_body) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->pins.clear(); for (auto &particle : body->particles) particle.pinned = false;
 }
 
 void Box3DPhysicsServer3D::_soft_body_pin_point(const RID& p_body, int32_t p_point_index, bool p_pin) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->pin(p_point_index, p_pin);
 }
 
 bool Box3DPhysicsServer3D::_soft_body_is_point_pinned(const RID& p_body, int32_t p_point_index) const {
-	return false;
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL_V(body, false);
+	return body->pins.has(p_point_index);
+}
+
+void Box3DPhysicsServer3D::_soft_body_apply_point_impulse(const RID& p_body, int32_t p_point_index, const Vector3& p_impulse) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->apply_point_impulse(p_point_index, p_impulse);
+}
+
+void Box3DPhysicsServer3D::_soft_body_apply_point_force(const RID& p_body, int32_t p_point_index, const Vector3& p_force) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->apply_point_force(p_point_index, p_force);
+}
+
+void Box3DPhysicsServer3D::_soft_body_apply_central_impulse(const RID& p_body, const Vector3& p_impulse) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->apply_central_impulse(p_impulse);
+}
+
+void Box3DPhysicsServer3D::_soft_body_apply_central_force(const RID& p_body, const Vector3& p_force) {
+	auto *body = soft_body_owner.get_or_null(p_body);
+	ERR_FAIL_NULL(body);
+	body->apply_central_force(p_force);
 }
 
 // --- Lifecycle ---
 
 void Box3DPhysicsServer3D::_free_rid(const RID& p_rid) {
+	if (auto *soft = soft_body_owner.get_or_null(p_rid)) {
+		memdelete(soft); soft_body_owner.free(p_rid); return;
+	}
 	// Joints and shapes free before bodies/areas that reference them; bodies/areas free
 	// before shapes they hold (mirrors JoltPhysicsServer3DExtension::_free_rid's ordering).
 	if (joint_owner.owns(p_rid)) {
@@ -1345,6 +1495,13 @@ void Box3DPhysicsServer3D::_free_rid(const RID& p_rid) {
 	}
 
 	if (Box3DShapeImpl3D* shape = shape_owner.get_or_null(p_rid)) {
+		// Godot's contract detaches a freed shape from every body/area first.
+		// In particular Terrain3D frees heightmaps until its body's shape count
+		// reaches zero. Leaving dangling attachments makes that loop never end.
+		while (!shape->get_owners().is_empty()) {
+			Box3DShapedObjectImpl3D* owner = *shape->get_owners().begin();
+			owner->remove_shape(shape);
+		}
 		memdelete(shape);
 		shape_owner.free(p_rid);
 		return;

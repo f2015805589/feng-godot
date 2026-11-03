@@ -118,6 +118,7 @@ void Terrain3D::_set_resource_signals(bool p_connected) {
 }
 
 void Terrain3D::_invalidate_render_geometry() {
+	_vt_neural_signature_revision = UINT64_MAX;
 	_vt.vt_source_snapshot.reset();
 	_vt.avt_refinement.reset();
 	invalidate_avt_plan_key(_vt.avt_plan.key);

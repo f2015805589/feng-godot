@@ -43,7 +43,7 @@ void Terrain3DSurfaceBaker::_collect_bundle_rids(const ResourceBundle &p_resourc
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		for (const RID &wrapper : { p_resources.sampled[tier].albedo_rs,
 					 p_resources.sampled[tier].normal_rs, p_resources.sampled[tier].params_rs }) {
-			if (wrapper.is_valid()) {
+			if (wrapper.is_valid() && !r_rs_rids.has(wrapper)) {
 				r_rs_rids.push_back(wrapper);
 			}
 		}
@@ -84,7 +84,7 @@ void Terrain3DSurfaceBaker::_collect_bundle_rids(const ResourceBundle &p_resourc
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
 		for (const RID &rid : { p_resources.sampled[tier].albedo_rd, p_resources.sampled[tier].normal_rd,
 					 p_resources.sampled[tier].params_rd }) {
-			if (rid.is_valid()) {
+			if (rid.is_valid() && !r_rd_rids.has(rid)) {
 				r_rd_rids.push_back(rid);
 			}
 		}
@@ -139,6 +139,19 @@ Terrain3DSurfaceBaker::~Terrain3DSurfaceBaker() {
 }
 
 void Terrain3DSurfaceBaker::clear() {
+	Array decoders;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		decoders = _retired_neural_decoders;
+		_retired_neural_decoders = Array();
+		if (_neural_decoder.is_valid()) { decoders.push_back(_neural_decoder); }
+		_neural_decoder.unref();
+		_neural_entries.clear();
+	}
+	RenderingServer *neural_server = RenderingServer::get_singleton();
+	if (neural_server && !neural_server->is_on_render_thread()) {
+		neural_server->call_on_render_thread(callable_mp_static(&Terrain3DSurfaceBaker::_dispose_neural_decoders).bind(decoders));
+	} else { _dispose_neural_decoders(decoders); }
 	std::vector<ResourceBundle> doomed;
 	RenderingDevice *resource_rd = nullptr;
 	// Before the lock and before `_rd` is dropped: the ring's descriptor set is a device object like
@@ -341,6 +354,8 @@ bool Terrain3DSurfaceBaker::_create_bake_core_resources(ResourceBundle &r_next,
 // never reaches this function, which is what keeps its allocation to the core above.
 bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const int p_stored_size,
 		const int p_page_count) {
+	const bool direct_only = _all_neural_direct();
+	const int storage_size = direct_only ? 1 : p_stored_size;
 	// Compressed copies are channel independent. A raw channel keeps sampling its canonical
 	// staging array, while the block encoder fills only the targets its mask names.
 	for (int tier = 0; tier < TIER_COUNT; ++tier) {
@@ -358,6 +373,18 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 		const int params_codec = params_codec_for_channels(diffuse_mode, normal_mode);
 		const RenderingDevice::DataFormat params_format = ATLAS_CODECS[params_codec].rd_format;
 		_tiers[tier].params_format = want_params ? params_format : RenderingDevice::DATA_FORMAT_MAX;
+		// AVT and SVT already own disjoint slots in one pool. Identical storage
+		// formats can share arrays without a second copy of every unused slot.
+		if (tier > 0 && diffuse_mode == _tiers[0].applied.load() &&
+				normal_mode == _tiers[0].normal_applied.load() &&
+				want_params == _tiers[0].params_encoded.load() &&
+				params_format == _tiers[0].params_format.load()) {
+			set = r_next.sampled[0];
+			_tiers[tier].applied.store(diffuse_mode);
+			_tiers[tier].normal_applied.store(normal_mode);
+			_tiers[tier].params_encoded.store(want_params);
+			continue;
+		}
 		if (!want_albedo && !want_normal) {
 			continue;
 		}
@@ -414,6 +441,8 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 	// failed to build its arrays above keeps `applied` at 0 and samples staging by slot, which
 	// is why the count is decided here and not from the request.
 	//
+	// With direct GPU stores, batches reuse a small scratch ring in the same
+	// command stream. Readback-based devices retain the full latency allowance.
 	// The ring's *admitted* depth is derived from the page budget so that the budget, not the
 	// ring, decides the page rate; the ring's *allocation* is the whole ceiling, because the
 	// staging layers and the encoder's output buffer are fixed here and
@@ -424,7 +453,8 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 	// 16-page budget. The ceiling is already bounded by bytes and by half the slot count, so the
 	// headroom costs what the larger budget would have cost anyway.
 	_encode_ring_allocated.store(_encode_ring_depth_ceiling());
-	_staging_layers = _staging_is_scratch() ? _encode_ring_allocated.load() : p_page_count;
+	// RS layered textures require at least two layers, even for these 1x1 dummies.
+	_staging_layers = direct_only ? 2 : (_staging_is_scratch() ? _encode_ring_allocated.load() : p_page_count);
 	_refresh_encode_ring_capacity();
 	const uint64_t sampled_usage = RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT |
 			RenderingDevice::TEXTURE_USAGE_CAN_UPDATE_BIT;
@@ -438,9 +468,9 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 			_rd->texture_is_format_supported_for_usage(RenderingDevice::DATA_FORMAT_R16_UNORM, source_storage_usage) &&
 			_rd->texture_is_format_supported_for_usage(RenderingDevice::DATA_FORMAT_R32_SFLOAT, source_storage_usage);
 	const uint64_t source_usage = source_storage_supported ? source_storage_usage : sampled_usage;
-	r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
+	r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, storage_size,
 			_staging_layers, source_usage);
-	r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
+	r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, storage_size,
 			_staging_layers, source_usage);
 	// A format query is necessary but some devices can still reject an array allocation with
 	// storage usage. Retain the established sampled/updateable arrays in that case.
@@ -455,20 +485,20 @@ bool Terrain3DSurfaceBaker::_create_page_resources(ResourceBundle &r_next, const
 			r_next.source_height_rd = RID();
 		}
 		source_upload_storage_available = false;
-		r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, p_stored_size,
+		r_next.source_id_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16_UNORM, storage_size,
 				_staging_layers, sampled_usage);
-		r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, p_stored_size,
+		r_next.source_height_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R32_SFLOAT, storage_size,
 				_staging_layers, sampled_usage);
 	}
-	if (source_upload_storage_available && r_next.source_id_rd.is_valid() && r_next.source_height_rd.is_valid()) {
+	if (!direct_only && source_upload_storage_available && r_next.source_id_rd.is_valid() && r_next.source_height_rd.is_valid()) {
 		_compile_source_upload_pipeline(r_next, p_stored_size, p_page_count);
 	}
 	r_next.output_albedo_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
-			p_stored_size, _staging_layers, output_usage);
+			storage_size, _staging_layers, output_usage);
 	r_next.output_normal_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
-			p_stored_size, _staging_layers, output_usage);
+			storage_size, _staging_layers, output_usage);
 	r_next.output_params_rd = _create_texture(_rd, RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT,
-			p_stored_size, _staging_layers, output_usage);
+			storage_size, _staging_layers, output_usage);
 	if (!r_next.source_id_rd.is_valid() || !r_next.source_height_rd.is_valid() ||
 			!r_next.output_albedo_rd.is_valid() || !r_next.output_normal_rd.is_valid() ||
 			!r_next.output_params_rd.is_valid()) {

@@ -111,6 +111,8 @@ inline constexpr int PAGE_CODEC_ATLAS[SURFACE_PAGE_COUNT] = {
 	0, // SURFACE_PAGE_UNCOMPRESSED - samples the staging arrays, no codec involved.
 	1, // SURFACE_PAGE_BC7 - 16 bytes per 4x4 block, the higher quality of the two.
 	3, // SURFACE_PAGE_BC3 - 16 bytes per 4x4 block, the same storage size as BC7.
+	3, // Legacy ARRAY_BC3 value.
+	0, // NTC is decoded by an optional addon into the canonical page cache.
 };
 static_assert(PAGE_CODEC_ATLAS[SURFACE_PAGE_UNCOMPRESSED] < ATLAS_CODEC_COUNT &&
 				PAGE_CODEC_ATLAS[SURFACE_PAGE_BC7] < ATLAS_CODEC_COUNT &&

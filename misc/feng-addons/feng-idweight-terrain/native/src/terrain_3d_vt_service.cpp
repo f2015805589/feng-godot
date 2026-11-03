@@ -187,6 +187,9 @@ void Terrain3D::set_vt_motion_lead_ms(real_t p_lead) {
 // both views, release every resident page and grow the pool back to a capacity it had
 // already published, which is why a storage decision must not go through it.
 void Terrain3D::_apply_vt_tier_compression(const int p_tier, const int p_mode) {
+	if (!_vt_neural_shader_code.is_empty() && _material.is_valid()) {
+		_material->update(Terrain3DMaterial::FULL_REBUILD);
+	}
 	if (_vt.vt_baker.is_valid()) {
 		baker(_vt.vt_baker)->set_tier_compression(p_tier, p_mode);
 		// The rebuilt arrays start blank, so the pages produced in the previous format have
@@ -217,6 +220,8 @@ void Terrain3D::_apply_vt_tier_compression(const int p_tier, const int p_mode) {
 //     EAC and ASTC have no shader encoder.
 static int page_codec_from_request(const int p_requested) {
 	switch (p_requested) {
+		case SURFACE_PAGE_NTC:
+			return SURFACE_PAGE_NTC;
 		case SURFACE_PAGE_BC7:
 			return SURFACE_PAGE_BC7;
 		case SURFACE_PAGE_BC3:
@@ -549,6 +554,11 @@ void Terrain3D::_update_vt_service() {
 	Terrain3DSurfaceBaker *producer = baker(_vt.vt_baker);
 	if (!producer) {
 		return;
+	}
+	_sync_vt_neural_data();
+	if (get_camera() && get_camera()->get_viewport()) {
+		producer->set_neural_view(get_camera()->get_camera_projection() * Projection(get_camera()->get_camera_transform().affine_inverse()),
+				get_camera()->get_viewport()->get_visible_rect().size, get_avt_anisotropy(get_camera()));
 	}
 	if (!_vt.vt_callback_registered && RS->has_method("virtual_texture_set_update_callback")) {
 		RS->call("virtual_texture_set_update_callback", int64_t(get_instance_id()),

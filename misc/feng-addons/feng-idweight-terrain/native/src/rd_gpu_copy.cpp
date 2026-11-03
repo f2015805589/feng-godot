@@ -42,6 +42,11 @@ void resolve(RenderingDevice *p_device) {
 } // namespace
 
 bool FengRDGpuCopy::available(RenderingDevice *p_device) {
+	// Statistics can ask before the producer has acquired the main RD. A null
+	// probe must not permanently disable the GPU-copy path for this process.
+	if (p_device == nullptr) {
+		return false;
+	}
 	if (!g_resolved) {
 		resolve(p_device);
 	}

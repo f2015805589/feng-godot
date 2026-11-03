@@ -119,6 +119,17 @@ func snapshot(target: RID, targets: Array[RID]) -> Dictionary:
 			continue
 		if not node.is_visible_in_tree():
 			continue
+		if bool(node.get_meta("_frp_exclude_from_rtgi", false)):
+			continue
+		if node.is_class("Terrain3D"):
+			var terrain_row := _capture_terrain(node, active_surface_keys)
+			if terrain_row.has("unsupported_reason"):
+				unsupported.append(str(terrain_row.unsupported_reason))
+			else:
+				tracking_changed = bool(terrain_row.get("tracking_changed", false)) or tracking_changed
+				terrain_row.erase("tracking_changed")
+				instances.append(terrain_row)
+			continue
 		if not node is MeshInstance3D:
 			unsupported.append("unsupported_visible_geometry:%s" % node.get_class())
 			continue
@@ -265,8 +276,46 @@ func snapshot(target: RID, targets: Array[RID]) -> Dictionary:
 		"render_target": target,
 		"instances": instances,
 		"unsupported_reasons": unsupported,
-		"capability": "dynamic_array_primitive_opaque_meshes_v2",
+		"reason": "; ".join(unsupported) if not unsupported.is_empty() else ("" if not instances.is_empty() else "no_visible_geometry"),
+		"capability": "dynamic_meshes_and_heightfield_terrain_v3",
 	}
+
+func _capture_terrain(node: Node3D, active_keys: Dictionary) -> Dictionary:
+	if not node.has_method("capture_rtgi_geometry"):
+		return {"unsupported_reason": "terrain_rtgi_requires_updated_extension"}
+	var id := node.get_instance_id()
+	var key: Array = [node.get("data"), node.get("assets"), node.call("get_vt_neural_signature"), node.get("vertex_spacing")]
+	var changed: bool = _instance_keys.get(id, []) != key
+	if changed or not _mesh_payloads.has(id):
+		_instance_keys[id] = key
+		_mesh_payloads[id] = node.call("capture_rtgi_geometry")
+		_revision += 1
+		_topology_revision += 1
+		_material_revision += 1
+	var payload: Dictionary = _mesh_payloads[id]
+	if payload.has("unsupported_reason"):
+		return payload
+	# Terrain's stored grid is world aligned; the node deliberately ignores
+	# arbitrary Node3D transforms, just like its raster and collision meshes.
+	var rows: Array[Dictionary] = []
+	for i in payload.surfaces.size():
+		var surface: Dictionary = payload.surfaces[i]
+		var material: Dictionary = payload.materials[i]
+		var slot_key := "terrain:%d:%d" % [id, i]
+		var signature: Array = [id, i, surface.source_geometry_signature]
+		var slot := _acquire_surface_slot(slot_key, signature, int(material.material_signature))
+		if slot < 0:
+			return {"unsupported_reason": "surface_tracking_slot_limit_exceeded"}
+		active_keys[slot_key] = true
+		var tracking := _surface_tracking_row(Transform3D.IDENTITY, _surface_slot_records[slot], false)
+		_surface_slot_records[slot] = tracking
+		rows.append({"surface_index": i, "slot": slot, "generation": int(tracking.identity[0]),
+			"geometry_revision": int(tracking.identity[1]), "motion_revision": 0,
+			"deforming": false, "nee_unsampled": false, "material_signature": int(material.material_signature),
+			"deformation_revision": 0, "deformation": {"supported": true, "deforming": false}})
+	return {"instance_id": id, "mesh_id": id, "transform": Transform3D.IDENTITY,
+		"mesh": payload, "layers": int(node.get("render_layers")), "cast_shadow": true,
+		"surface_rows": rows, "deformation_revision": 0, "tracking_changed": changed}
 
 func _on_node_added(node: Node) -> void:
 	if node is Node3D:

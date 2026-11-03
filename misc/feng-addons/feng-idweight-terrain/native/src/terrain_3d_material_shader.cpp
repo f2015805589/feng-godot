@@ -22,6 +22,7 @@
 #include "logger.h"
 #include "terrain_3d_clipmap_common.h"
 #include "terrain_3d_material.h"
+#include "terrain_3d_surface_baker.h"
 
 ///////////////////////////
 // Private Functions
@@ -230,6 +231,16 @@ String Terrain3DMaterial::_generate_shader_code() const {
 		excludes.push_back("OUTPUT_AMBIENT_OCCLUSION");
 	}
 	String shader = _apply_inserts(_shader_code["main"], excludes);
+	const String neural = _terrain->get_vt_neural_shader_code();
+	if (!neural.is_empty()) {
+		const bool near_neural = _terrain->get_surface_vt_compression() == SURFACE_PAGE_NTC;
+		const bool far_neural = _terrain->get_surface_svt_compression() == SURFACE_PAGE_NTC;
+		// Storage is a shader variant, not a per-pixel branch. This also preserves
+		// mixed NTC/BC tiers without keeping both paths live in the same shader.
+		const String route = String("bool surface_neural_tier(int tier) { return ") +
+				(near_neural ? (far_neural ? "true" : "tier == 0") : (far_neural ? "tier == 1" : "false")) + "; }\n";
+		shader = shader.replace("bool surface_neural_source_fallback() { return false; }\nbool surface_neural_tier(int tier) { return false; }\nbool surface_neural_material_slot(int slot, vec2 offset, int page_size, int border, vec2 dx, vec2 dy, out material mat, out vec3 normal) { return false; }", route + neural);
+	}
 	return shader;
 }
 

@@ -2,6 +2,7 @@
 
 #include "../misc/type_conversions.hpp"
 #include "box3d_physics_direct_body_state_3d.hpp"
+#include "../spaces/box3d_space_3d.hpp"
 
 #include <box3d/box3d.h>
 
@@ -36,6 +37,7 @@ b3BodyType to_box3d_body_type(PhysicsServer3D::BodyMode p_mode) {
 } // namespace
 
 b3BodyId Box3DBodyImpl3D::_create_body_id(b3WorldId p_world_id) {
+	environment_valid = false;
 	b3BodyDef def = b3DefaultBodyDef();
 	const b3Transform t = godot_to_b3_transform(get_transform());
 	def.type = to_box3d_body_type(mode);
@@ -65,6 +67,7 @@ b3BodyId Box3DBodyImpl3D::_create_body_id(b3WorldId p_world_id) {
 }
 
 void Box3DBodyImpl3D::set_mode(BodyMode p_mode) {
+	environment_valid = false;
 	if (mode == p_mode) {
 		return;
 	}
@@ -79,6 +82,35 @@ void Box3DBodyImpl3D::set_mode(BodyMode p_mode) {
 void Box3DBodyImpl3D::set_mass(real_t p_mass) {
 	mass = p_mass;
 	_refresh_mass_data();
+}
+
+void Box3DBodyImpl3D::set_friction(real_t p_friction) {
+	if (friction == p_friction) {
+		return;
+	}
+	friction = p_friction;
+	_refresh_shape_material();
+}
+
+void Box3DBodyImpl3D::set_bounce(real_t p_bounce) {
+	if (bounce == p_bounce) {
+		return;
+	}
+	bounce = p_bounce;
+	_refresh_shape_material();
+}
+
+void Box3DBodyImpl3D::_refresh_shape_material() {
+	for (int i = 0; i < get_shape_count(); ++i) {
+		if (!has_shape_id(i)) {
+			continue;
+		}
+		const b3ShapeId id = get_shape_id(i);
+		auto material = b3Shape_GetSurfaceMaterial(id);
+		material.friction = _get_shape_friction();
+		material.restitution = _get_shape_restitution();
+		b3Shape_SetSurfaceMaterial(id, material);
+	}
 }
 
 Vector3 Box3DBodyImpl3D::get_inertia() const {
@@ -146,6 +178,7 @@ void Box3DBodyImpl3D::_refresh_mass_data() {
 }
 
 void Box3DBodyImpl3D::set_linear_damping(real_t p_damping) {
+	environment_valid = false;
 	linear_damping = p_damping;
 	if (has_body_id()) {
 		b3Body_SetLinearDamping(body_id, omit_force_integration ? 0.0f : (float)p_damping);
@@ -153,6 +186,7 @@ void Box3DBodyImpl3D::set_linear_damping(real_t p_damping) {
 }
 
 void Box3DBodyImpl3D::set_angular_damping(real_t p_damping) {
+	environment_valid = false;
 	angular_damping = p_damping;
 	if (has_body_id()) {
 		b3Body_SetAngularDamping(body_id, omit_force_integration ? 0.0f : (float)p_damping);
@@ -160,6 +194,7 @@ void Box3DBodyImpl3D::set_angular_damping(real_t p_damping) {
 }
 
 void Box3DBodyImpl3D::set_gravity_scale(real_t p_scale) {
+	environment_valid = false;
 	gravity_scale = p_scale;
 	if (has_body_id()) {
 		b3Body_SetGravityScale(body_id, omit_force_integration ? 0.0f : (float)p_scale);
@@ -175,6 +210,7 @@ void Box3DBodyImpl3D::set_omit_force_integration(bool p_enabled) {
 }
 
 void Box3DBodyImpl3D::_sync_force_integration_settings() {
+	environment_valid = false;
 	if (!has_body_id()) {
 		return;
 	}
@@ -375,6 +411,23 @@ void Box3DBodyImpl3D::set_constant_torque(const Vector3& p_torque) {
 	constant_torque = p_torque;
 }
 
+void Box3DBodyImpl3D::set_state_sync_callback(const Callable& p_callable) {
+	state_sync_callback = p_callable;
+	if (space != nullptr) space->update_body_subscriptions(this);
+}
+
+void Box3DBodyImpl3D::set_force_integration_callback(const Callable& p_callable, const Variant& p_userdata) {
+	force_integration_callback = p_callable;
+	force_integration_userdata = p_userdata;
+	if (space != nullptr) space->update_body_subscriptions(this);
+}
+
+void Box3DBodyImpl3D::set_max_contacts_reported(int32_t p_count) {
+	max_contacts_reported = MAX(p_count, 0);
+	if (max_contacts_reported == 0) contacts.clear();
+	if (space != nullptr) space->update_body_subscriptions(this);
+}
+
 void Box3DBodyImpl3D::refresh_contacts() {
 	contacts.clear();
 	// Godot has no separate contact-monitor enable call; max_contacts_reported is the signal.
@@ -465,4 +518,24 @@ void Box3DBodyImpl3D::pre_step() {
 	}
 	applied_force = Vector3();
 	applied_torque = Vector3();
+}
+
+void Box3DBodyImpl3D::apply_environment(float linear, float angular, float gravity) {
+	default_environment = false;
+	if (!environment_valid || environment_linear != linear) b3Body_SetLinearDamping(body_id,linear);
+	if (!environment_valid || environment_angular != angular) b3Body_SetAngularDamping(body_id,angular);
+	if (!environment_valid || environment_gravity != gravity) b3Body_SetGravityScale(body_id,gravity);
+	environment_linear=linear; environment_angular=angular; environment_gravity=gravity;
+	environment_valid=true;
+}
+
+void Box3DBodyImpl3D::apply_default_environment(float linear, float angular) {
+	if (environment_valid && default_environment && default_linear == linear && default_angular == angular) {
+		return;
+	}
+	apply_environment(float(linear_damping) + (linear_damp_mode == PhysicsServer3D::BODY_DAMP_MODE_REPLACE ? 0 : linear),
+			float(angular_damping) + (angular_damp_mode == PhysicsServer3D::BODY_DAMP_MODE_REPLACE ? 0 : angular), float(gravity_scale));
+	default_environment = true;
+	default_linear = linear;
+	default_angular = angular;
 }

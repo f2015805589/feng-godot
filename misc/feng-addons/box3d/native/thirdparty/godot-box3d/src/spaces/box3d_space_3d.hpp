@@ -12,6 +12,7 @@
 
 using namespace godot;
 
+class Box3DSoftBody3D;
 class Box3DAreaImpl3D;
 class Box3DBodyImpl3D;
 class Box3DPhysicsDirectSpaceState3D;
@@ -21,7 +22,8 @@ class Box3DShapedObjectImpl3D;
 // transient (Box3D documents them as becoming invalid once bodies/shapes are destroyed),
 // and _step()/_flush_queries() are separate engine-driven calls, so every event is
 // converted into a queued descriptor immediately after b3World_Step returns rather than
-// held onto across the _step/_flush_queries boundary (see step()).
+// held onto across the _step/_flush_queries boundary (see step()). Unused native
+// contact/joint event arrays are not read; Godot contact reports use manifolds.
 class Box3DSpace3D {
 public:
 	explicit Box3DSpace3D();
@@ -52,16 +54,20 @@ public:
 
 	bool is_flushing_queries() const { return flushing_queries; }
 
-	void register_body(Box3DBodyImpl3D* p_body) { bodies.insert(p_body); }
+	void register_soft_body(Box3DSoftBody3D *p_body) { soft_bodies.insert(p_body); }
+	const HashSet<Box3DSoftBody3D *> &get_soft_bodies() const { return soft_bodies; }
+	void unregister_soft_body(Box3DSoftBody3D *p_body) { soft_bodies.erase(p_body); }
+	void register_body(Box3DBodyImpl3D* p_body);
 
-	void unregister_body(Box3DBodyImpl3D* p_body) { bodies.erase(p_body); }
+	void unregister_body(Box3DBodyImpl3D* p_body);
+	void update_body_subscriptions(Box3DBodyImpl3D* p_body);
 
 	void register_area(Box3DAreaImpl3D* p_area) { areas.insert(p_area); }
 
 	void unregister_area(Box3DAreaImpl3D* p_area) { areas.erase(p_area); }
 
 	// Applies area gravity/damp overrides + constant-force accumulators, steps the world,
-	// then immediately drains every Box3D event array into the pending queues below.
+	// then copies the subscribed body/sensor events into the pending queues below.
 	void step(float p_step);
 
 	// Drains the pending queues, invoking every queued callable directly (this call *is*
@@ -129,10 +135,16 @@ private:
 	Box3DAreaImpl3D* default_area = nullptr;
 
 	HashSet<Box3DBodyImpl3D*> bodies;
+	HashSet<Box3DBodyImpl3D*> query_bodies;
+	HashSet<Box3DBodyImpl3D*> sync_bodies;
+	HashSet<Box3DBodyImpl3D*> contact_bodies;
+	HashSet<Box3DSoftBody3D*> soft_bodies;
 	HashSet<Box3DAreaImpl3D*> areas;
 
 	HashMap<SensorPairKey, SensorPair, SensorPairKey> sensor_pairs;
 	LocalVector<PendingAreaEvent> pending_area_events;
+	LocalVector<PendingAreaEvent> dispatch_area_events;
+	LocalVector<RID> query_body_rids;
 
 	float last_step = 0.0f;
 	bool active = false;

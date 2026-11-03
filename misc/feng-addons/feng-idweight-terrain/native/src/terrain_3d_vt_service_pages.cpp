@@ -494,6 +494,13 @@ void Terrain3D::_queue_vt_material_page(int p_slot, const Ref<Image> &p_payload,
 	// fixes, so they are published apart. See `_avt_finish_produce()`.
 	const uint64_t record_done = Time::get_singleton()->get_ticks_usec();
 	_vt.avt_cost.queue_record_sum_ms += double(record_done - queue_started) / 1000.0;
+	if ((p_svt ? get_surface_svt_compression() : get_surface_vt_compression()) == SURFACE_PAGE_NTC &&
+			_vt_neural_data.is_valid() && producer->queue_neural_page(p_slot, p_rect,
+					p_svt ? Terrain3DSurfaceBaker::TIER_SVT : Terrain3DSurfaceBaker::TIER_AVT, get_vt_neural_signature())) {
+		record.state = Terrain3DVTState::PageRecord::PENDING_BAKE;
+		_vt.svt_pending_pages.erase(p_slot);
+		return;
+	}
 	if (p_svt) {
 		// The far field has three sources, in this order of preference:
 		//   1. a resident baked cell (this store) - a GPU copy, no CPU work and no file;

@@ -1,0 +1,11 @@
+[configuration]
+entry_symbol = "feng_ntc_library_init"
+compatibility_minimum = "4.5"
+reloadable = false
+
+[libraries]
+windows.debug.x86_64 = "res://addons/feng-ntc/bin/feng_ntc.dll"
+windows.release.x86_64 = "res://addons/feng-ntc/bin/feng_ntc.dll"
+
+[dependencies]
+windows.x86_64 = { "res://addons/feng-ntc/bin/ntc.dll": "" }

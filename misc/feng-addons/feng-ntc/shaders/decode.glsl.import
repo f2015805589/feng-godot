@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bfdsllcd2dr61"
+path="res://.godot/imported/decode.glsl-56327fb1d4bcf5a890b5163bdb649076.res"
+
+[deps]
+
+source_file="res://addons/feng-ntc/shaders/decode.glsl"
+dest_files=["res://.godot/imported/decode.glsl-56327fb1d4bcf5a890b5163bdb649076.res"]
+
+[params]
+

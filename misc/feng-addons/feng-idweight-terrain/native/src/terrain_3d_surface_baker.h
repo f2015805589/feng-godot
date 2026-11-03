@@ -52,6 +52,8 @@ enum SurfacePageCompression {
 	SURFACE_PAGE_UNCOMPRESSED = 0,
 	SURFACE_PAGE_BC7,
 	SURFACE_PAGE_BC3,
+	// Value 3 was serialized as ARRAY_BC3 by older scenes.
+	SURFACE_PAGE_NTC = 4,
 	SURFACE_PAGE_COUNT,
 };
 VARIANT_ENUM_CAST(SurfacePageCompression);
@@ -109,11 +111,14 @@ private:
 		PENDING_INVALIDATE = 1,
 		PENDING_CACHED = 2,
 		PENDING_CELL = 3,
+		PENDING_NEURAL = 4,
 	};
 
 	struct PendingJob {
 		int slot = -1;
 		Array cells;
+		Dictionary neural_page;
+		Ref<godot::RefCounted> neural_decoder;
 		PendingKind kind = PENDING_INVALIDATE;
 		// Which tier's storage the page is produced into. The pool is shared, so a slot can
 		// change tier when it is freed and handed to the other view; the tier travels with
@@ -201,6 +206,27 @@ private:
 		RID sampler_linear;
 	};
 
+	// Opaque addon decoder: called only on the render thread, never during sampling.
+	Ref<godot::RefCounted> _neural_decoder;
+	Array _retired_neural_decoders;
+	Dictionary _neural_entries;
+	Dictionary _neural_failed_entries;
+	String _neural_source_signature;
+	int _neural_page_budget = 1;
+	int _neural_cache_mode = -1;
+	bool _neural_direct = false;
+	bool _neural_direct_tier(int p_tier) const { return _neural_direct && _tiers[p_tier].requested == SURFACE_PAGE_NTC; }
+	bool _all_neural_direct() const { return _neural_direct_tier(0) && _neural_direct_tier(1); }
+	uint64_t _neural_decodes = 0;
+	uint64_t _neural_gpu_bytes = 0;
+	Dictionary _neural_runtime_stats;
+	Projection _neural_view;
+	Vector2 _neural_view_size;
+	float _neural_anisotropy = 1.f;
+	bool _neural_view_dirty = false;
+	uint64_t _neural_misses = 0;
+	static void _dispose_neural_decoders(const Array &p_decoders);
+	bool _decode_neural_page(const PendingJob &p_job);
 	mutable std::mutex _mutex;
 	int _page_size = 0;
 	int _border = 0;
@@ -781,6 +807,10 @@ public:
 	// never rewritten. A codec that costs an encode per production is therefore worth its
 	// cost for one tier and not necessarily for the other.
 	void set_tier_compression(int p_tier, int p_mode);
+	void set_neural_codec(const Dictionary &p_snapshot);
+	void set_neural_view(const Projection &p_view, const Vector2 &p_size, float p_anisotropy);
+	bool queue_neural_page(int p_slot, const Rect2 &p_rect, int p_tier, const String &p_source_signature);
+	static String neural_page_key(const Rect2 &p_rect, int p_size, int p_border, int p_tier);
 	void set_tier_normal_compression(int p_tier, int p_mode);
 	Dictionary get_tier_compression_info(int p_tier) const;
 	void request_capacity(int p_count);

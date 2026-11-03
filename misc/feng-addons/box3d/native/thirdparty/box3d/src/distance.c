@@ -1079,6 +1079,13 @@ b3CastOutput b3ShapeCast( const b3ShapeCastPairInput* input )
 				{
 					// Initial overlap
 					output.hit = true;
+					// The slop region can still have a valid separating axis.
+					// Preserve it so callers can distinguish departure from entry;
+					// leave deep/degenerate overlaps without an invented normal.
+					if ( distanceOutput.distance > 0.0f )
+					{
+						output.normal = distanceOutput.normal;
+					}
 
 					// Compute a common point
 					b3Vec3 c1 = b3MulAdd( distanceOutput.pointA, input->proxyA.radius, distanceOutput.normal );

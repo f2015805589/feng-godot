@@ -1,2 +1,10 @@
 #!/usr/bin/env python
-SConscript("../../native_extension.py", exports={"config": {"docs": True}})
+from pathlib import Path
+
+cvtt = Path(Dir("#").abspath).parents[3] / "thirdparty/cvtt"
+SConscript("../../native_extension.py", exports={"config": {
+    "docs": True,
+    "include_paths": [str(cvtt)],
+    "defines": ["CVTT_SINGLE_FILE"],
+    "extra_sources": [str(cvtt / "ConvectionKernels_SingleFile.cpp")],
+}})

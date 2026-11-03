@@ -8,6 +8,8 @@
     "ProjectSettings",
     "OS",
     "Engine",
+    "RenderingServer",
+    "Mesh",
     "PhysicsServer3DExtensionMotionCollision",
     "PhysicsServer3DExtensionMotionResult",
     "PhysicsServer3DExtensionRayResult",

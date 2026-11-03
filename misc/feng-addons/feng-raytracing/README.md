@@ -24,7 +24,11 @@ The native indirect-specular attachment is captured after DFG and energy compens
 
 ArrayMesh and PrimitiveMesh triangle surfaces support rigid transforms, skeletal skinning, blend shapes, per-instance material overrides, opaque BaseMaterial3D albedo colors and UV1 textures, metallic, roughness, specular, emission, a selected directional sun and FengSkyLight radiance. Texture arrays retain source resolution and sampling wrap/filter, with at most eight groups, 32 layers per group and 128 MiB of albedo data. Diffuse hit lighting uses Lambert scattering and samples texture mip zero. Reflection hits use the supported material's direct/emissive lighting plus one evaluated FengSkyLight environment term; the tracer does not recursively trace secondary reflections.
 
-Terrain3D/GridMap, custom shader materials, transparent materials, material overlays and advanced material layers are unsupported. Their presence in the visible world causes an explicit warning and retains native indirect lighting; unsupported geometry is not silently removed from the acceleration structure. Local omni/spot/area light nodes are not evaluated by this pass; opaque emissive mesh surfaces are sampled as area emitters. WorldEnvironment ambient and sky reflection remain isolated from the FengSkyLight indirect inputs.
+Feng Terrain3D is supported through `capture_rtgi_geometry()`: loaded regions supply full-resolution height geometry, holes, normals, transforms, and a diffuse albedo atlas to the RT acceleration structure. Immutable region snapshots are reused until terrain/material data changes. The editor's private mouse-picking quad is excluded. Startup waits silently for the first snapshot; actual unsupported content still reports an explicit warning and retains native indirect lighting.
+
+Terrain secondary-hit materials use a filtered, two-layer ID-weight diffuse approximation; detailed normal maps, triplanar projection and advanced procedural material blends are not reproduced. Primary camera surfaces continue using the normal terrain shader. Full-resolution capture has a startup and memory cost: the current 16-region test captured in about 3 seconds with 128.5 MiB of packed vertex data, excluding indices, acceleration structures and material atlases. This is not an RT terrain streaming/LOD solution.
+
+GridMap, custom shader materials, transparent materials, material overlays and advanced material layers are unsupported. Unsupported geometry is not silently removed from the acceleration structure. Local omni/spot/area light nodes are not evaluated by this pass; opaque emissive mesh surfaces are sampled as area emitters. WorldEnvironment ambient and sky reflection remain isolated from the FengSkyLight indirect inputs.
 
 The validator enforces native pass ordering. Custom Height Fog must be placed after RTGI manually because it has no native pass ID.
 
@@ -43,6 +47,7 @@ Run the scripts in `tests` from an isolated project with the FRP, ray-tracing, M
 - `test_rt_gi_denoise.gd` and `test_rt_gi_reflection_denoise.gd`: noise convergence, material boundaries, camera motion, disocclusion, exposure and mirror preservation.
 - `test_rt_gi_scene.gd`: complete FRP on/off rendering and viewport timing in a small synthetic scene.
 - `test_rt_gi_primitive_capture_cpu.gd`: headless geometry contract checks for primitive meshes, indexed skin/blend-shape inputs, dirty geometry and unsupported surfaces.
+- `test_rt_gi_terrain.gd`: actual `PROJECT/test场景` terrain capture, unchanged-revision caching, GPU BLAS/TLAS construction and trace/resolve/composite dispatch verification (requires its D3D12 FRP project).
 
 Timings are fixture measurements, not a production benchmark.
 

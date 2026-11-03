@@ -16,9 +16,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--godot", type=Path, default=ROOT / "bin/godot.windows.editor.x86_64.exe")
     parser.add_argument("--test", action="append", help="Run selected test stems only")
+    parser.add_argument("--library", type=Path, help="Alternate Box3D build for regression comparisons")
     args = parser.parse_args()
     suffix = ".dll" if os.name == "nt" else ".so"
-    library = ADDON / "bin" / ("box3d" + suffix)
+    library = args.library or ADDON / "bin" / ("box3d" + suffix)
     if not library.is_file():
         parser.error("Build the Box3D native extension first")
     work_root = ADDON / "tests/.work"
@@ -28,6 +29,8 @@ def main():
     (target / "bin").mkdir(parents=True)
     shutil.copy2(library, target / "bin" / library.name)
     shutil.copy2(ADDON / "box3d.gdextension", target)
+    shutil.copy2(ADDON / "soft_body_3d.gd", target)
+    shutil.copytree(ADDON / "examples", target / "examples")
     (project / ".godot").mkdir()
     (project / ".godot/extension_list.cfg").write_text("res://addons/box3d/box3d.gdextension\n", encoding="utf-8")
     (project / "project.godot").write_text('''config_version=5
@@ -61,7 +64,7 @@ renderer/rendering_method="gl_compatibility"
             passed = run.returncode == 0 and "RESULT: PASS" in output and not any(
                 marker in output for marker in ("ERROR:", "RESULT: FAIL", "not have been freed", "leaked at exit"))
         except subprocess.TimeoutExpired as error:
-            output = "TIMEOUT\n" + str(error)
+            output = "TIMEOUT\n" + str(error) + "\n" + ((error.stdout or b"") + (error.stderr or b"")).decode("utf-8", errors="replace")
             passed = False
         (project / (script.stem + ".log")).write_text(output, encoding="utf-8")
         results.append({"test": script.stem, "passed": passed})

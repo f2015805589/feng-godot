@@ -4,6 +4,7 @@
 #include "objects/box3d_physics_direct_body_state_3d.hpp"
 #include "servers/box3d_physics_server_3d.hpp"
 #include "spaces/box3d_physics_direct_space_state_3d.hpp"
+#include "physics_stress_batch.h"
 
 #include <godot_cpp/classes/physics_server3d_manager.hpp>
 #include <godot_cpp/core/class_db.hpp>
@@ -21,6 +22,9 @@ Box3DPhysicsServer3D* _create_box3d_physics_server() {
 } // namespace
 
 void initialize_box3d_module(ModuleInitializationLevel p_level) {
+	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
+		GDREGISTER_CLASS(FengPhysicsStressBatch);
+	}
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
 		box3d_initialize();
 

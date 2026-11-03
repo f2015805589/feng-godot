@@ -57,6 +57,8 @@ public:
 	void set_shape_disabled(int32_t p_index, bool p_disabled);
 
 	void set_space(Box3DSpace3D* p_space) override;
+	void set_collision_layer(uint32_t p_layer) override;
+	void set_collision_mask(uint32_t p_mask) override;
 
 	// Rebuilds every live b3ShapeId for the current body (used after (re)attaching to a
 	// space, and after body type transitions that need shapes recreated).
@@ -87,6 +89,9 @@ protected:
 	b3BodyId body_id = b3_nullBodyId;
 
 private:
+	void _refresh_collision_filter();
+	bool _uses_shape(const Box3DShapeImpl3D* p_shape) const;
+
 	void _create_shape_instance(Box3DShapeInstance3D& p_instance);
 
 	void _destroy_shape_instance(Box3DShapeInstance3D& p_instance);

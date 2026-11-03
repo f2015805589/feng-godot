@@ -11,8 +11,8 @@
 
 #include <stdio.h>
 
-// This guards against excessive memory usage and complex collision
-#define B3_MAX_MESH_CONTACT_TRIANGLES 256
+// Stack fast path; dense mesh contacts grow into the worker's reusable arena.
+#define B3_STACK_MESH_CONTACT_TRIANGLES 256
 #define B3_MAX_POINTS_PER_TRIANGLE 32
 
 #if B3_ENABLE_VALIDATION
@@ -41,13 +41,12 @@ static bool b3CollectTriangleIndicesCallback( b3Vec3 a, b3Vec3 b, b3Vec3 c, int 
 {
 	B3_UNUSED( a, b, c );
 	b3TriangleQueryContext* triangleContext = (b3TriangleQueryContext*)context;
-	if ( triangleContext->count == triangleContext->capacity )
+	if ( triangleContext->count < triangleContext->capacity )
 	{
-		return false;
+		triangleContext->indices[triangleContext->count] = triangleIndex;
 	}
-	triangleContext->indices[triangleContext->count] = triangleIndex;
 	triangleContext->count += 1;
-	return triangleContext->count < triangleContext->capacity;
+	return true;
 }
 
 static int b3QueryMeshTriangles( int* indices, int capacity, const b3Mesh* mesh, b3AABB bounds )
@@ -74,7 +73,7 @@ static int b3QueryHeightFieldTriangles( int* indices, int capacity, const b3Heig
 	return context.count;
 }
 
-static void b3RefreshCache( b3Contact* contact, const b3Shape* shapeA, b3WorldTransform xfA, const b3AABB* bounds )
+static void b3RefreshCache( b3Contact* contact, const b3Shape* shapeA, b3WorldTransform xfA, const b3AABB* bounds, b3Arena arena )
 {
 	B3_ASSERT( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape );
 
@@ -102,9 +101,10 @@ static void b3RefreshCache( b3Contact* contact, const b3Shape* shapeA, b3WorldTr
 	meshContact->queryBounds.upperBound = b3Add( bounds->upperBound, extension );
 
 	// Query triangles
-	int triangleCapacity = B3_MAX_MESH_CONTACT_TRIANGLES;
+	int triangleCapacity = B3_STACK_MESH_CONTACT_TRIANGLES;
 
-	int triangleIndices[B3_MAX_MESH_CONTACT_TRIANGLES];
+	int stackIndices[B3_STACK_MESH_CONTACT_TRIANGLES];
+	int* triangleIndices = stackIndices;
 
 	// Bounds are in world space. Convert to the local mesh frame. The broadphase bounds are float,
 	// so the demoted mesh transform is the matching float world frame (exact in float mode).
@@ -121,21 +121,30 @@ static void b3RefreshCache( b3Contact* contact, const b3Shape* shapeA, b3WorldTr
 		triangleCount = b3QueryHeightFieldTriangles( triangleIndices, triangleCapacity, shapeA->heightField, localBounds );
 	}
 
-	if ( triangleCount == triangleCapacity )
+	if ( triangleCount > triangleCapacity )
 	{
-		static bool s_once = false;
-		if ( s_once == false )
+		// #184: truncation can drop the very triangle that stopped a CCD sweep.
+		// The first traversal counts all candidates; the second fills an exact buffer.
+		triangleCapacity = triangleCount;
+		triangleIndices = b3Bump( &arena, triangleCapacity * sizeof( int ) );
+		if ( shapeA->type == b3_meshShape )
 		{
-			b3Log( "WARNING: complex mesh detected, triangle buffer capacity of %d reached", triangleCapacity );
-			s_once = true;
+			triangleCount = b3QueryMeshTriangles( triangleIndices, triangleCapacity, &shapeA->mesh, localBounds );
 		}
+		else
+		{
+			triangleCount = b3QueryHeightFieldTriangles( triangleIndices, triangleCapacity, shapeA->heightField, localBounds );
+		}
+		B3_ASSERT( triangleCount <= triangleCapacity );
 	}
 
 	// Triangle indices must be sorted to match caches.
 	B3_VALIDATE( b3IsSorted( triangleIndices, triangleCount ) );
 
 	// Create new contact cache and match with old one
-	b3ContactCache contactCache[B3_MAX_MESH_CONTACT_TRIANGLES];
+	b3ContactCache stackCache[B3_STACK_MESH_CONTACT_TRIANGLES];
+	b3ContactCache* contactCache = triangleCount <= B3_STACK_MESH_CONTACT_TRIANGLES ? stackCache :
+		b3Bump( &arena, triangleCount * sizeof( b3ContactCache ) );
 
 	int index2 = 0;
 	for ( int index1 = 0; index1 < triangleCount; ++index1 )
@@ -532,7 +541,7 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 
 	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
 
-	b3RefreshCache( contact, shapeA, xfA, &shapeB->aabb );
+	b3RefreshCache( contact, shapeA, xfA, &shapeB->aabb, arena );
 
 	// Collide with triangles and build manifolds
 	b3MeshContact* meshContact = &contact->meshContact;

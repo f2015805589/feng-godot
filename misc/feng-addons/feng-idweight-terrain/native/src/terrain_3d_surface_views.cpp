@@ -286,6 +286,7 @@ void Terrain3D::set_surface_array_enabled(const bool p_enabled) {
 // carry it. Without this, an array-free configuration would keep rendering the material
 // the page was produced with until the LRU happened to evict it.
 void Terrain3D::invalidate_surface_pages(const Vector2i &p_region_loc, bool p_force) {
+	_vt_neural_signature_revision = UINT64_MAX;
 	if (!p_force && is_vt_editor_preview_active()) {
 		_vt.vt_editor_dirty_regions[p_region_loc] = true;
 		_vt.bake.dirty_regions[p_region_loc] = true;

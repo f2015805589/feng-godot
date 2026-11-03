@@ -409,8 +409,8 @@ bool GDExtensionManager::ensure_extensions_loaded(const HashSet<String> &p_exten
 			}
 		}
 	} else {
-		if (loaded_extensions.size() || FileAccess::exists(extension_list_config_file)) {
-			// Extensions were removed.
+		if (FileAccess::exists(extension_list_config_file)) {
+			// Manually loaded editor extensions may have no persisted discovery list.
 			Ref<DirAccess> da = DirAccess::create(DirAccess::ACCESS_RESOURCES);
 			if (da.is_null()) {
 				ERR_PRINT(vformat("Could not remove GDExtension list '%s': could not create resource directory access. The stale list may be read again on the next editor launch.", extension_list_config_global_path));
