@@ -258,7 +258,8 @@ func test_bounds_and_manual_api() -> void:
 
 func test_directory_switch_keeps_working() -> void:
 	# Terrain3D::set_data_directory recreates Terrain3DData; the streamer must
-	# re-resolve it instead of dereferencing a freed pointer.
+	# re-resolve it instead of dereferencing a freed pointer, and must drop the
+	# old dataset's streamed ownership, missing-file cache and last center.
 	var original := terrain.data_directory
 	terrain.data_directory = ""
 	require(terrain.data.get_region_count() == 0, "clearing the directory should drop the data")
@@ -267,10 +268,14 @@ func test_directory_switch_keeps_working() -> void:
 	require(terrain.data_directory == original, "directory should be restored")
 	require(terrain.data.get_region_count() == 25, "restoring the directory should load all 25 regions")
 	require(streamer.get_directory() == original, "streamer should follow the terrain directory")
+	require(streamer.get_streamed_count() == 0, "data replacement should drop the old streamed set")
+	require(streamer.get_missing_count() == 0, "data replacement should drop the old missing cache")
+	require(streamer.get_stats().last_center == Vector2i(2147483647, 2147483647), "data replacement should reset the last center")
 
-	streamer.clear_tracking()
-	require(streamer.get_streamed_count() == 0, "clear_tracking should empty the streamed set")
-	require(streamer.get_stats().last_center == Vector2i(2147483647, 2147483647), "cleared center uses the documented sentinel")
+	# A stale streamed location would make this update unload a region the new
+	# data loaded itself, so the update must be a no-op and all 25 must survive.
+	require(not streamer.update(center_of(Vector2i(10, 10))), "stale tracking must not drive an unload")
+	require(terrain.data.get_region_count() == 25, "the replacement data's regions must stay resident")
 	require(streamer.load_region(Vector2i(1, 1)) == Terrain3DStreamer.LOAD_OK, "load after a data rebuild")
 	require(streamer.get_streamed_count() == 1, "the reloaded region should be tracked")
 	require(streamer.unload_region(Vector2i(1, 1)), "unload after a data rebuild")

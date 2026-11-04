@@ -461,8 +461,8 @@ func _upload_prepare_parameters(state: Dictionary, frame: Dictionary,
 		full_size: Vector2i, max_distance: float) -> bool:
 	var half_size: Vector2i = state.get("size", Vector2i.ZERO)
 	var bytes := PackedByteArray()
-	_append_projection(bytes, frame.get("inverse_projection", Projection.IDENTITY))
-	_append_transform(bytes, frame.get("camera_transform", Transform3D.IDENTITY))
+	bytes.append_array(U.projection_bytes(frame.get("inverse_projection", Projection.IDENTITY)))
+	bytes.append_array(U.transform_bytes(frame.get("camera_transform", Transform3D.IDENTITY)))
 	bytes.append_array(PackedFloat32Array([full_size.x, full_size.y,
 		half_size.x, half_size.y, float(frame.get("near_plane_m", 0.1)),
 		float(frame.get("far_plane_m", max_distance)), max_distance, 0.0]).to_byte_array())
@@ -476,10 +476,10 @@ func _upload_compose_parameters(state: Dictionary, frame: Dictionary,
 		snapshot: Dictionary, full_size: Vector2i, strength: float,
 		replacement_enabled: bool, frame_token: int) -> bool:
 	var bytes := PackedByteArray()
-	_append_projection(bytes, frame.get("inverse_projection", Projection.IDENTITY))
-	_append_transform(bytes, frame.get("camera_transform", Transform3D.IDENTITY))
+	bytes.append_array(U.projection_bytes(frame.get("inverse_projection", Projection.IDENTITY)))
+	bytes.append_array(U.transform_bytes(frame.get("camera_transform", Transform3D.IDENTITY)))
 	var owner_transform: Transform3D = snapshot.get("owner_transform", Transform3D.IDENTITY)
-	_append_transform(bytes, owner_transform.affine_inverse())
+	bytes.append_array(U.transform_bytes(owner_transform.affine_inverse()))
 	var owner_size: Vector3 = snapshot.get("owner_size", Vector3.ZERO)
 	var settings_value: Variant = snapshot.get("surfel_settings", {})
 	var settings: Dictionary = settings_value if settings_value is Dictionary else {}
@@ -713,19 +713,6 @@ func _texture_format(size: Vector2i, format: int) -> RDTextureFormat:
 			| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT \
 			| RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT
 	return desc
-
-
-func _append_projection(bytes: PackedByteArray, projection: Projection) -> void:
-	for column in 4:
-		var axis: Vector4 = projection[column]
-		bytes.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]).to_byte_array())
-
-
-func _append_transform(bytes: PackedByteArray, transform: Transform3D) -> void:
-	for axis in [transform.basis.x, transform.basis.y, transform.basis.z]:
-		bytes.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]).to_byte_array())
-	bytes.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y,
-		transform.origin.z, 1.0]).to_byte_array())
 
 
 func _finite_range(value: Variant, fallback: float, minimum: float, maximum: float) -> float:

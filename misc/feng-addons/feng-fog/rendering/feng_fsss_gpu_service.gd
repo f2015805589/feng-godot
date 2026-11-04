@@ -204,10 +204,10 @@ static func mip_count_for_size(size: Vector2i) -> int:
 func _pack_frame(frame: Dictionary, previous_exposure: float,
 		history_valid: bool, source_mode: int) -> PackedFloat32Array:
 	var values := PackedFloat32Array()
-	_append_projection(values, frame.inverse_projection)
-	_append_transform(values, frame.camera_transform)
-	_append_projection(values, frame.previous_projection)
-	_append_transform(values, frame.previous_camera_transform.affine_inverse())
+	RDUniforms.append_projection(values, frame.inverse_projection)
+	RDUniforms.append_transform(values, frame.camera_transform)
+	RDUniforms.append_projection(values, frame.previous_projection)
+	RDUniforms.append_transform(values, frame.previous_camera_transform.affine_inverse())
 	values.append_array(PackedFloat32Array([
 		_domain_scale(frame), _positive(previous_exposure, 1.0),
 		0.9, 1.0 if history_valid else 0.0,
@@ -634,18 +634,6 @@ func _update_ubo_bytes(rid: RID, values: PackedFloat32Array, expected_bytes: int
 
 func _valid_texture(rd: RenderingDevice, rid: RID) -> bool:
 	return rid.is_valid() and rd.texture_is_valid(rid)
-
-
-func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
-	for column in 4:
-		var axis: Vector4 = projection[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
-
-
-func _append_transform(values: PackedFloat32Array, transform: Transform3D) -> void:
-	for axis in [transform.basis.x, transform.basis.y, transform.basis.z]:
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
-	values.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y, transform.origin.z, 1.0]))
 
 
 func _eye_offsets(frames: Array[Dictionary]) -> Array:

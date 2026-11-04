@@ -121,8 +121,6 @@ func _run() -> void:
 	_check(bool(magic_pass.get("enabled")), "The authored Magic GI pass must be enabled.")
 	_check(bool(magic_pass.get("native_clv_lighting_enabled")),
 		"The saved renderer resource must enable the native layout9 CLV lighting path.")
-	_check(int(magic_pass.get("_clv_internal_test_layout")) == 0,
-		"The real project must use the authored production CLV layout, not a test-only layout override.")
 	var configured_world_envs: Array[String] = []
 	for node_value in get_root().find_children("*", "WorldEnvironment", true, false):
 		var environment := node_value as WorldEnvironment

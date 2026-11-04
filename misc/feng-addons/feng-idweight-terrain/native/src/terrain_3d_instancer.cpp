@@ -52,12 +52,7 @@ void Terrain3DInstancer::_process_updates() {
 	// Both sentinels mean "everything", and they differ in what happens to what is already built:
 	// `(V2I_MAX, -2)` destroys first, `(V2I_MAX, -1)` refreshes in place. The second is what
 	// `update_mmis()` with no arguments queues, and `initialize()` is one of its callers - so it is the
-	// pair that materialises instances after a scene loads.
-	//
-	// This arm and the guard in the loop below were removed once as "unreachable, since `update_mmis()`
-	// writes `(V2I_MAX, -2)`" - which is true only of a rebuild. With them gone the pair fell through to
-	// the per-region expansion, where V2I_MAX is not a region: the refresh built nothing and every mesh
-	// id logged "Errant null region found at: (2147483647, 2147483647)".
+	// pair that materialises instances after a scene loads. Both arms are live paths.
 	bool update_all = _queued_updates.find({ V2I_MAX, -2 }) != _queued_updates.end();
 	if (update_all) {
 		destroy();

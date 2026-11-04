@@ -218,8 +218,8 @@ func _pack_frame(frame: Dictionary, fog_parameters: PackedFloat32Array, view: in
 	if fog_parameters.size() != 28:
 		return PackedFloat32Array()
 	var values := PackedFloat32Array()
-	_append_projection(values, frame.inverse_projection)
-	_append_transform(values, frame.camera_transform)
+	RDUniforms.append_projection(values, frame.inverse_projection)
+	RDUniforms.append_transform(values, frame.camera_transform)
 	values.append_array(PackedFloat32Array([
 		frame.camera_transform.origin.x, frame.camera_transform.origin.y,
 		frame.camera_transform.origin.z, 1.0,
@@ -230,19 +230,6 @@ func _pack_frame(frame: Dictionary, fog_parameters: PackedFloat32Array, view: in
 	values.append_array(fog_parameters.slice(4, 28))
 	values.append_array(PackedFloat32Array([float(view), 1.0 if cloud_valid else 0.0, 0.0, 0.0]))
 	return values
-
-
-func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
-	for column in 4:
-		var axis: Vector4 = projection[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
-
-
-func _append_transform(values: PackedFloat32Array, transform: Transform3D) -> void:
-	for axis in [transform.basis.x, transform.basis.y, transform.basis.z]:
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
-	values.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y,
-			transform.origin.z, 1.0]))
 
 
 func _update_ubo(rid: RID, values: PackedFloat32Array, rd: RenderingDevice) -> bool:

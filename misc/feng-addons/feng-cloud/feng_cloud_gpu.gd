@@ -1292,9 +1292,9 @@ func _make_frame_packet(ctx: FRPPassContext, snapshot: Dictionary, scene_data: R
 	if camera_projection.is_orthogonal(): flags |= 8
 	if not capture and ctx.supports_cloud_holdout(): flags |= 16
 	var floats := PackedFloat32Array()
-	_append_projection(floats, view_projection.inverse())
-	_append_projection(floats, previous_projection)
-	_append_projection(floats, Projection(base_camera.affine_inverse()))
+	RDUniforms.append_projection(floats, view_projection.inverse())
+	RDUniforms.append_projection(floats, previous_projection)
+	RDUniforms.append_projection(floats, Projection(base_camera.affine_inverse()))
 	_append4(floats, camera.origin.x, camera.origin.y, camera.origin.z, 1.0)
 	_append4(floats, previous_camera.origin.x, previous_camera.origin.y, previous_camera.origin.z, 1.0)
 	_append4(floats, full_size.x, full_size.y, 1.0 / maxf(float(full_size.x), 1.0), 1.0 / maxf(float(full_size.y), 1.0))
@@ -1447,12 +1447,12 @@ func _make_projection_parameters(snapshot: Dictionary, lighting: PackedFloat32Ar
 	var ao_near := ao_anchor - Vector3.DOWN * ((layer_top_km + ao_snap_km) * 1000.0)
 	var ao_far_depth_km := 2.0 * (layer_top_km + ao_snap_km)
 	var ao_projection_pair := _make_direction_projection(ao_near, Vector3.DOWN, ao_extent_km * 1000.0, ao_far_depth_km * 1000.0)
-	_append_projection(output, world_to_shadow[0])
-	_append_projection(output, world_to_shadow[1])
-	_append_projection(output, shadow_to_world[0])
-	_append_projection(output, shadow_to_world[1])
-	_append_projection(output, ao_projection_pair[0])
-	_append_projection(output, ao_projection_pair[1])
+	RDUniforms.append_projection(output, world_to_shadow[0])
+	RDUniforms.append_projection(output, world_to_shadow[1])
+	RDUniforms.append_projection(output, shadow_to_world[0])
+	RDUniforms.append_projection(output, shadow_to_world[1])
+	RDUniforms.append_projection(output, ao_projection_pair[0])
+	RDUniforms.append_projection(output, ao_projection_pair[1])
 	_append4(output, far_depths[0], far_depths[1], resolutions[0], resolutions[1])
 	_append4(output, strengths[0], strengths[1], strengths[2], strengths[3])
 	_append4(output, surface_atmosphere[0], surface_atmosphere[1], surface_atmosphere[2], surface_atmosphere[3])
@@ -1786,12 +1786,6 @@ func _vector3_from_packet(values: PackedFloat32Array, offset: int, fallback: Vec
 
 func _finite(value: float, fallback: float) -> float:
 	return value if is_finite(value) else fallback
-
-
-func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
-	for column in 4:
-		var axis: Vector4 = projection[column]
-		_append4(values, axis.x, axis.y, axis.z, axis.w)
 
 
 func _append4(values: PackedFloat32Array, x: float, y: float, z: float, w: float) -> void:

@@ -1186,9 +1186,9 @@ func _pack_frame(frame: Dictionary, size: Vector2i, max_distance: float,
 		rays_per_surfel: int, update_cursor: int, frame_token: int,
 		sky_array: bool, raygen_mode: int = 0) -> PackedByteArray:
 	var bytes := PackedByteArray()
-	_append_projection(bytes, frame.get("inverse_projection", Projection.IDENTITY))
+	bytes.append_array(U.projection_bytes(frame.get("inverse_projection", Projection.IDENTITY)))
 	var camera: Transform3D = frame.get("camera_transform", Transform3D.IDENTITY)
-	_append_transform(bytes, Transform3D(camera.basis.orthonormalized(), camera.origin))
+	bytes.append_array(U.transform_bytes(Transform3D(camera.basis.orthonormalized(), camera.origin)))
 	bytes.append_array(PackedFloat32Array([size.x, size.y,
 		_finite_range(frame.get("pre_exposure", 1.0), 1.0, 1e-6, 1e6),
 		_finite_range(frame.get("scene_normalization", 1.0), 1.0, 1e-6, 1e6),
@@ -1218,8 +1218,8 @@ func _pack_config(owner: Transform3D, owner_size: Vector3, radius: float,
 		guide_cosine_floor: float, seed_cursor: int, tile_count: int,
 		surface_count: int) -> PackedByteArray:
 	var bytes := PackedByteArray()
-	_append_transform(bytes, owner.affine_inverse())
-	_append_transform(bytes, owner)
+	bytes.append_array(U.transform_bytes(owner.affine_inverse()))
+	bytes.append_array(U.transform_bytes(owner))
 	bytes.append_array(PackedFloat32Array([owner_size.x, owner_size.y, owner_size.z, radius]).to_byte_array())
 	bytes.append_array(PackedInt32Array([capacity, hash_capacity - 1, updates, frame_token]).to_byte_array())
 	bytes.append_array(light_counts.to_byte_array())
@@ -1230,18 +1230,6 @@ func _pack_config(owner: Transform3D, owner_size: Vector3, radius: float,
 		_finite_range(guide_cosine_floor, 0.5, 0.25, 1.0),
 		0.75, 0.5]).to_byte_array())
 	return bytes
-
-func _append_projection(bytes: PackedByteArray, projection: Projection) -> void:
-	var values := PackedFloat32Array()
-	for column in 4:
-		var axis: Vector4 = projection[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
-	bytes.append_array(values.to_byte_array())
-
-func _append_transform(bytes: PackedByteArray, transform: Transform3D) -> void:
-	for axis in [transform.basis.x, transform.basis.y, transform.basis.z]:
-		bytes.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]).to_byte_array())
-	bytes.append_array(PackedFloat32Array([transform.origin.x, transform.origin.y, transform.origin.z, 1.0]).to_byte_array())
 
 func _ensure_white_ao(state: Dictionary) -> RID:
 	var texture: RID = state.get("white_ao", RID())

@@ -321,8 +321,8 @@ static func pack_ray_frame_uniform(p_frame_inputs: Dictionary, p_grid: Vector3i,
 	var eye_offset: Vector3 = p_frame_inputs.get("eye_offset", Vector3.ZERO)
 	var internal_size: Vector2i = p_frame_inputs.get("internal_size", Vector2i.ZERO)
 	var values := PackedFloat32Array()
-	_append_projection(values, projection)
-	_append_transform(values, camera)
+	RDUniforms.append_projection(values, projection)
+	RDUniforms.append_transform(values, camera)
 	values.append_array(PackedFloat32Array([eye_offset.x, eye_offset.y, eye_offset.z, 0.0]))
 	values.append_array(PackedFloat32Array([camera.origin.x, camera.origin.y, camera.origin.z,
 			1.0 if frame_projection.is_orthogonal() else 0.0]))
@@ -361,8 +361,8 @@ static func pack_depth_parameters_uniform(p_frame_inputs: Dictionary,
 	if not projection is Projection or not inverse_projection is Projection:
 		return PackedByteArray()
 	var values := PackedFloat32Array()
-	_append_projection(values, projection)
-	_append_projection(values, inverse_projection)
+	RDUniforms.append_projection(values, projection)
+	RDUniforms.append_projection(values, inverse_projection)
 	values.append_array(PackedFloat32Array([
 			1.0 if p_available else 0.0,
 			0.5, # UE GridCenterOffsetFromDepthBuffer.
@@ -621,20 +621,6 @@ static func validate_light_slots(p_slots: PackedInt32Array, p_counts: Vector4i) 
 			return {"valid": false, "reason": "Duplicate light slots would duplicate a shadow batch."}
 		unique_slots[key] = true
 	return {"valid": true, "slot_count": int(p_slots.size() / 2)}
-
-
-static func _append_projection(p_values: PackedFloat32Array, p_projection: Projection) -> void:
-	for column in 4:
-		var axis: Vector4 = p_projection[column]
-		p_values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
-
-
-static func _append_transform(p_values: PackedFloat32Array, p_transform: Transform3D) -> void:
-	for axis in [p_transform.basis.x, p_transform.basis.y, p_transform.basis.z]:
-		p_values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
-	p_values.append_array(PackedFloat32Array([
-		p_transform.origin.x, p_transform.origin.y, p_transform.origin.z, 1.0,
-	]))
 
 
 func _validate_request(p_rd: RenderingDevice, p_frame: Dictionary,

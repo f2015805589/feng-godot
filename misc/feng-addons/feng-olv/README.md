@@ -6,7 +6,7 @@ OLV 是 MagicGI 的离线标签子组件，每个 MagicGI Volume 只使用一个
 
 启用 **Feng Magic GI** 插件即可。选中 `MagicGIVolume`，点击 **打开 OLV 子节点**；没有则创建，已有则选中，重复点击不会添加新节点。OLV 直接使用父节点的 Probe 和范围，无需另选源 Volume。白光盒子项目已经放置了 `MagicGIVolume/OLV`。
 
-OLV 不再单独注册一个插件，也不再提供旧的 `FMagicGIOlvRegion` 校正节点。单点／批量校正都在同一个 OLV 子节点中完成。误复制的第二个 OLV 会显示重复警告，并拒绝编辑或发布父 Volume 的标签；保留已有数据，删除多余节点即可。
+单点／批量校正都在同一个 OLV 子节点中完成。误复制的第二个 OLV 会显示重复警告，并拒绝编辑或发布父 Volume 的标签；保留已有数据，删除多余节点即可。
 
 - **启用 OLV 防漏光**：立即开关标签过滤，保留数据，不重烘焙 GI。
 - **导入已有 OLV**：将旧 GI 缓存的有效标签复制到独立资源，不启动模型。
@@ -40,7 +40,7 @@ python tools/train.py --evaluate-test --bundle model --out F:/godot/feng-godot/T
 python tools/train.py --evaluate-benchmark --bundle model --out F:/godot/feng-godot/Temp/olv-benchmark
 ```
 
-在本目录执行。输出目录必须是新目录。训练从随机权重开始，复用生产的 Transformer 架构和输入变换；只用训练集拟合归一化，以开发集选模，测试／Benchmark 从不参与训练。导出的新模型放在输出目录的 `model/`，不会自动覆盖生产。该入口已去除历轮数据生成和实验分支；它不是历史训练过程的逐字节重放。
+在本目录执行。输出目录必须是新目录。训练从随机权重开始，复用生产的 Transformer 架构和输入变换；只用训练集拟合归一化，以开发集选模，测试／Benchmark 从不参与训练。导出的新模型放在输出目录的 `model/`，不会自动覆盖生产。该入口不是历史训练过程的逐字节重放。
 
 ## 功能回归
 

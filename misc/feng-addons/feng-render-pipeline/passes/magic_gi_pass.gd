@@ -13,9 +13,6 @@ const PreinterpolatedVolumeCache = preload("magic_gi_preinterpolated_volume_cach
 const PagedPreparedVolumeCache = preload("magic_gi_paged_prepared_volume_cache.gd")
 const CLVEditorSnapshot = preload("magic_gi_clv_editor_snapshot.gd")
 const ClipmapCache = preload("magic_gi_clv_cache.gd")
-const MagicDawnBlockChartCache = preload("magic_gi_block_chart_cache.gd")
-const ProbeBlockFieldCache = preload("magic_gi_probe_block_field_cache.gd")
-const MagicDawnBakedSHCache = preload("magic_gi_baked_sh_clv_cache.gd")
 const PageStream = preload("magic_gi_page_stream.gd")
 const PageResidency = preload("magic_gi_page_residency.gd")
 const PageUpload = preload("magic_gi_page_upload.gd")
@@ -40,7 +37,6 @@ const MAGIC_GI_DYNAMIC_SCREEN_DIAGNOSTIC_COUNTER_NAMES := [
 	"tile_count", "coherent_tiles", "edge_tiles", "valid_receivers",
 	"invalid_receivers", "sample_calls", "sample_misses"]
 const MAGIC_GI_APPLY_SHADER: RDShaderFile = preload("../library/magic-gi/magic_gi_apply.glsl")
-const MAGIC_GI_APPLY_MAGICDAWN_SHADER: RDShaderFile = preload("../library/magic-gi/magic_gi_apply_magicdawn.glsl")
 const MAGIC_GI_CLV_DEBUG_SHADER: RDShaderFile = preload("../library/magic-gi/magic_gi_clv_debug.glsl")
 const MAGIC_GI_CLV_SCREEN_RESOLVE_SHADER: RDShaderFile = preload("../library/magic-gi/magic_gi_clv_screen_resolve.glsl")
 const MAGIC_GI_CLV_SCREEN_PARTIAL_SHADER: RDShaderFile = preload("../library/magic-gi/magic_gi_clv_screen_partial.glsl")
@@ -108,9 +104,6 @@ const PROBE_CLUSTER_BINDING := 24
 const CLV_STATS_BINDING := 27
 const CLV_STATS_WORDS := 140
 const CLV_STATS_BYTES := CLV_STATS_WORDS * 4
-const MAGICDAWN_STATS_WORDS := 8
-const MAGICDAWN_STATS_BYTES := MAGICDAWN_STATS_WORDS * 4
-const MAGICDAWN_NATIVE_LAYOUT_VERSION := 17
 const MAGICDAWN_BAKED_SH_REVISION := 2
 const MAGICDAWN_NATIVE_OWNER_PARAMETER_BYTES := 96
 const CLV_APPROX_DIAG_LEVEL_REASONS := [
@@ -147,16 +140,7 @@ const PROBE_CLUSTER_CPU_CACHE_LIMIT := 32
 const PROBE_CLUSTER_CPU_CACHE_BYTES := 16 * 1024 * 1024
 const CLV_CACHE_BACKEND_LEGACY := 0
 const CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART := 1
-const CLV_INTERNAL_LAYOUT_AUTHORED := 0
-const CLV_INTERNAL_LAYOUT13_TEST := 13
-const CLV_INTERNAL_LAYOUT14_V0_TEST := 14
-const CLV_MAGICDAWN_BAKED_SH_LAYOUT_VERSION := 17
-const CLV_MAGICDAWN_BAKED_SH_TEXTURE_COUNT := 7
 const CLV_LEGACY_LAYOUT_VERSION := 9
-const CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION := 9
-const CLV_BLOCK_CHART_LAYOUT_VERSION := 13
-const CLV_BLOCK_CHART_COLUMN_COUNT := 72
-const CLV_INTERNAL_LAYOUT14_B_APPLY_SHADER_PATH := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply_b14.glsl"
 
 enum CLVDebugView { OFF, CASCADE_LEVELS, CACHE_VALIDITY, CELLS, RECONSTRUCTED_LIGHTING, REJECTION_REASONS, OLV_DOMAINS }
 
@@ -217,8 +201,8 @@ var _relight_shader := RID()
 var _relight_pipeline := RID()
 var _magicdawn_clv_debug_shader := RID()
 var _magicdawn_clv_debug_pipeline := RID()
-var _magicdawn_clv_debug_nearest_sampler := RID()
-var _magicdawn_clv_debug_linear_sampler := RID()
+var _nearest_sampler := RID()
+var _linear_sampler := RID()
 var _magicdawn_screen_resolve_shader := RID()
 var _magicdawn_screen_resolve_pipeline := RID()
 var _magicdawn_screen_partial_shader := RID()
@@ -226,14 +210,10 @@ var _magicdawn_screen_partial_pipeline := RID()
 var _magicdawn_screen_classify_shader_resource: RDShaderFile
 var _magicdawn_screen_classify_shader := RID()
 var _magicdawn_screen_classify_pipeline := RID()
-var _magicdawn_screen_resolve_nearest_sampler := RID()
-var _magicdawn_screen_resolve_linear_sampler := RID()
 var _magicdawn_screen_resolve_diagnostics_buffer := RID()
 var _dynamic_volume_screen_resolve_shader := RID()
 var _dynamic_volume_screen_resolve_pipeline := RID()
 var _dynamic_volume_screen_resolve_shader_resource: RDShaderFile
-var _dynamic_volume_screen_nearest_sampler := RID()
-var _dynamic_volume_screen_linear_sampler := RID()
 var _dynamic_volume_screen_diagnostics_buffer := RID()
 var _dynamic_volume_screen_frame_ubo := RID()
 var _dynamic_volume_screen_frame_bytes := PackedByteArray()
@@ -255,33 +235,12 @@ var _magicdawn_screen_diagnostic_result: Dictionary = {"status": "not_requested"
 var _magicdawn_screen_resolve_dispatch_serial := 0
 var _magicdawn_screen_resolve_status := "idle"
 var _magicdawn_clv_debug_status := "not_requested"
-var _magicdawn_active_readback_armed := false
-var _magicdawn_active_readback_context: Dictionary = {}
-var _magicdawn_active_readback_token := 0
-var _magicdawn_active_readback_result: Dictionary = {}
-var _magicdawn_active_readback_queue_state: Dictionary = {}
 var _frame_magicdawn_clv_renderer_active := false
 var _clipmaps: Dictionary = {}
 var _frame_clipmap: RefCounted
 var _last_clv_cache_backend := CLV_CACHE_BACKEND_LEGACY
-## RAM-only experiment selector. This is intentionally not exported or stored in
-## scene resources; 14 is a falsification prototype, never an authored backend.
-var _clv_internal_test_layout := CLV_INTERNAL_LAYOUT_AUTHORED
-var _layout14_b_internal_test_enabled := false
-var _layout14_b_apply_shader_resource: RDShaderFile
-var _layout14_b_saved_shader_file: RDShaderFile
-var _layout14_b_frame_active := false
-var _layout14_b_frame_moments := RID()
-var _layout14_b_frame_sampler := RID()
-var _layout14_b_frame_tags := RID()
-var _layout14_b_error := "disabled"
-var _layout14_b_apply_runtime_rejected := false
 var _clv_fallback: Dictionary = {}
 @export var native_clv_lighting_enabled := true
-## Native deferred consumer for the persisted layout-17 total-SH clipmap. When
-## unavailable or not confirmed consumed, the standalone MagicDawn apply remains
-## the correctness fallback and can be used for A/B comparison.
-@export var native_baked_sh_lighting_enabled := true
 ## Experimental deferred general-CLV path. It requires fast exact CLV, one view,
 ## single-sample G-buffer resources and a ready source-only queue consumer.
 @export var native_deferred_general_queue_enabled := false
@@ -355,15 +314,7 @@ var _last_prt_two_stage_stage_values := PackedInt32Array([MAGIC_GI_PRT_STAGE_LEG
 var _last_prt_three_stage_active := false
 var _last_prt_three_stage_stage_values := PackedInt32Array([MAGIC_GI_PRT_STAGE_LEGACY])
 var _native_prepared_views: Dictionary = {}
-var _native_baked_sh_prepared_views: Dictionary = {}
-var _native_baked_sh_attempted_views: Dictionary = {}
-var _native_baked_sh_publications: Dictionary = {}
-var _native_baked_sh_publication_counter: int = 0
-var _frame_native_baked_sh_consumed := false
-var _frame_native_baked_sh_publication: Dictionary = {}
-var _native_baked_sh_state: Dictionary = {"enabled": false, "active": false,
-	"consumed": false, "frame": -1, "publication_token": 0,
-	"status": "not_started", "fallback_reason": "not_started"}
+var _magicdawn_publication_counter: int = 0
 var _frame_native_clv_fallback_only := false
 var _frame_native_clv_status_known := false
 var _frame_native_general_queue_active := false
@@ -376,11 +327,9 @@ var _native_general_queue_state: Dictionary = {
 	"queue_capacity_pixels": 0, "consumer": "source_only_exact_gather",
 }
 var _last_native_clv_lighting_active := false
-var _last_native_clv_lighting_qa_mode := -1
 var _last_native_screen_cache_lighting_active := false
 var _last_native_screen_cache_lighting_frame := -1
 var _last_native_screen_cache_frame_token := -1
-var _last_native_clv_owner_control_w := -1.0
 var _last_native_clv_owner_parameters_rid := RID()
 var _last_prt_shader_full_features := true
 var _prt_hdr_readback_mutex := Mutex.new()
@@ -421,12 +370,6 @@ var _dynamic_volume_source_instance_id := 0
 var _dynamic_volume_publication_token := 0
 var _dynamic_volume_runtime_state: Dictionary = {"status": "idle"}
 var _dynamic_volume_debug: RefCounted
-## Hidden RAM-only baked-SH QA selector. Modes 0..2 preserve their prior
-## sampling behavior; mode 3 tests valid-weight normalization at the mode-0 point.
-var _magicdawn_receiver_qa_mode := 0
-## Hidden runner-only field codec selector: 0 prefers scaled R16F, 16 requires
-## trying R16F, and 32 uses the unscaled R32F reference path.
-var _magicdawn_field_format_override := 0
 
 var _bake_resources: Dictionary = {}
 var _cache_clock := 0
@@ -457,7 +400,6 @@ var _prt_guide_shader := RID()
 var _prt_guide_pipeline := RID()
 var _prt_resolve_shader := RID()
 var _prt_resolve_pipeline := RID()
-var _prt_linear_sampler := RID()
 var _prt_raw_views: Dictionary = {}
 var _prt_profile_resource_log_count := 0
 var _prt_raw_debug_output := false
@@ -477,20 +419,10 @@ var _clv_stats_buffer_bytes := 0
 var _clv_stats_capture_armed := false
 var _clv_stats_capture_active := false
 var _clv_stats_capture_frame := -1
-var _magicdawn_stats_buffer := RID()
-var _magicdawn_stats_capture_armed := false
-var _magicdawn_stats_capture_active := false
-var _magicdawn_stats_capture_frame := -1
-var _magicdawn_stats_last_values := PackedInt32Array()
-var _magicdawn_frame_active := false
 var _magicdawn_clv_prt_frame := false
 var _magicdawn_clv_prt_prepared := false
 var _magicdawn_dynamic_output_cleared := false
-var _magicdawn_unready_bake_warning_keys: Dictionary = {}
-var _magicdawn_shader_saved: RDShaderFile
-var _magicdawn_keywords_saved: Dictionary = {}
 var _magicdawn_runtime_state: Dictionary = {}
-var _magicdawn_debug_sidecar_forced := false
 var _last_frame_ubo_bytes := PackedByteArray()
 var _last_page_params_bytes := PackedByteArray()
 var _clv_fallback_mode := -1
@@ -545,504 +477,15 @@ var _rtgi_runtime_script_checked := false
 func get_indirect_gi_kind() -> StringName:
 	return IndirectGISelection.KIND_MAGIC
 
-func set_internal_clv_test_layout(layout_version: int) -> bool:
-	if layout_version not in [CLV_INTERNAL_LAYOUT_AUTHORED,
-			CLV_INTERNAL_LAYOUT13_TEST, CLV_INTERNAL_LAYOUT14_V0_TEST]:
-		return false
-	if layout_version != CLV_INTERNAL_LAYOUT14_V0_TEST \
-			and _layout14_b_internal_test_enabled:
-		set_internal_layout14_b_test_enabled(false)
-	_clv_internal_test_layout = layout_version
-	return true
-
-## Runner-only receiver sampling control. Mode 4 preserves the active owner and
-## its sky-replacement branch while bypassing receiver sampling for a paired
-## zero-contribution cost baseline. Mode 5 colors native sampler hits magenta
-## and misses cyan to validate the renderer route. Mode 6 forces only dynamic
-## volume moment visibility to one; mode 7 also bypasses only the receiver-side
-## gate, mode 8 preserves the original hard gate with moments visible, and mode
-## 9 bypasses only sidedness while retaining the real moment visibility.
-## None are exported.
-func set_magicdawn_receiver_qa_mode_for_runner(mode: int) -> bool:
-	if mode < 0 or mode > 9:
-		return false
-	_magicdawn_receiver_qa_mode = mode
-	return true
-
-## RAM-only GPU A/B selector. It is deliberately not an exported resource field.
-func set_magicdawn_field_format_for_runner(format_tag: int) -> bool:
-	if format_tag != 0 and format_tag != 16 and format_tag != 32:
-		return false
-	_magicdawn_field_format_override = format_tag
-	return true
-
-## Arms one explicit readback from the exact active layout-9 cache.
-## This is a diagnostic-only operation; normal rendering never reads the cache back.
-func request_magicdawn_active_cache_readback_for_runner() -> bool:
-	_magicdawn_active_readback_armed = true
-	_magicdawn_active_readback_context.clear()
-	_magicdawn_active_readback_result.clear()
-	_magicdawn_active_readback_queue_state.clear()
-	return true
-
-## Queues asynchronous reads after a completed frame. Never call synchronous RD readback
-## from the render callback: on D3D12 it can invalidate the active command list.
-func read_magicdawn_active_cache_readback_for_runner() -> Dictionary:
-	if not _magicdawn_active_readback_armed:
-		return {"started": false, "error": "readback_not_armed"}
-	if _magicdawn_active_readback_context.is_empty():
-		return {"started": false, "error": "active_cache_not_captured"}
-	var context := _magicdawn_active_readback_context
-	var prepared_value: Variant = context.get("prepared")
-	var cache_value: Variant = context.get("cache")
-	if not prepared_value is Dictionary or not cache_value is RefCounted:
-		return {"started": false, "error": "active_cache_context_invalid"}
-	var prepared: Dictionary = prepared_value
-	var cache: RefCounted = cache_value
-	# Freeze this frame's prepared/cache lease before scheduling async copies. Later
-	# render callbacks must not replace the context while its readbacks are pending.
-	_magicdawn_active_readback_armed = false
-	var rd := RenderingServer.get_rendering_device()
-	if rd == null:
-		return {"started": false, "error": "rendering_device_unavailable"}
-	var resolution := int(cache.get("resolution"))
-	if resolution not in [16, 24]:
-		return {"started": false, "error": "active_cache_resolution_unsupported"}
-	var cache_key := str(prepared.get("cache_key", ""))
-	var bake: Dictionary = _bake_resources.get(cache_key, {})
-	var directional_value: Variant = bake.get("directional")
-	var bindings: Dictionary = {}
-	if directional_value is RefCounted and directional_value.has_method("get_clv_transfer_bindings"):
-		var bindings_value: Variant = directional_value.call("get_clv_transfer_bindings")
-		if bindings_value is Dictionary:
-			bindings = bindings_value
-	context["input_bindings"] = bindings
-	context["snapshot_lighting"] = _frame_snapshot.get("lighting", PackedFloat32Array()).duplicate()
-	context["snapshot_sky"] = _frame_snapshot.get("sky_lighting", PackedFloat32Array()).duplicate()
-	_magicdawn_active_readback_token += 1
-	var token := _magicdawn_active_readback_token
-	context["token"] = token
-	context["readbacks"] = {}
-	context["errors"] = {}
-	context["pending"] = 0
-	context["queued"] = 0
-	context["request_frame"] = Engine.get_frames_drawn()
-	var probes := int(bindings.get("probes", 0))
-	var emitters := int(bindings.get("emitters", 0))
-	var requests: Array[Dictionary] = [
-		{"key": "params", "kind": "buffer", "rid": cache.get("parameters"), "size": 80},
-		{"key": "ubo", "kind": "buffer", "rid": _ubo, "size": UBO_SIZE},
-		{"key": "input_transfer", "kind": "buffer", "rid": bindings.get("transfer", RID()),
-			"size": mini(probes * 243 * 4, 4096)},
-		{"key": "input_sky", "kind": "buffer", "rid": bindings.get("sky", RID()),
-			"size": mini(probes * 81 * 4, 4096)},
-		{"key": "input_emission", "kind": "buffer", "rid": bindings.get("emission", RID()),
-			"size": mini(probes * emitters * 54 * 4, 4096)},
-		{"key": "input_sources", "kind": "buffer", "rid": bindings.get("sources", RID()),
-			"size": mini(emitters * 6 * 4, 4096)}]
-	for request in requests:
-		var key := str(request.get("key", ""))
-		var rid_value: Variant = request.get("rid", RID())
-		if not rid_value is RID or not rid_value.is_valid():
-			context["errors"][key] = "invalid_rid"
-			continue
-		var callback := Callable(self, "_magicdawn_active_cache_readback_callback").bind(token, key)
-		var error := ERR_INVALID_PARAMETER
-		if str(request.get("kind", "")) == "texture":
-			error = rd.texture_get_data_async(rid_value, 0, callback)
-		else:
-			var request_size := int(request.get("size", 0))
-			if request_size > 0:
-				error = rd.buffer_get_data_async(rid_value, callback, 0, request_size)
-		if error == OK:
-			context["pending"] = int(context["pending"]) + 1
-			context["queued"] = int(context["queued"]) + 1
-		else:
-			context["errors"][key] = error
-	# Include a small, one-shot snapshot of representative receivers from the exact
-	# prepared cache. The cache owns its diagnostic buffers/pipeline, and this context
-	# keeps that cache lease alive until its asynchronous callback completes.
-	var summary_error := ERR_UNAVAILABLE
-	if cache.has_method("debug_summary_request"):
-		var receivers: Array[Dictionary] = [
-			{"name": "sphere_front", "world": Vector3(0.68, 0.68, 1.23), "normal": Vector3.BACK},
-			{"name": "sphere_left", "world": Vector3(0.0, 0.68, 0.55), "normal": Vector3.LEFT},
-			{"name": "sphere_bottom_contact", "world": Vector3(0.68, 0.0, 0.55), "normal": Vector3.DOWN},
-			{"name": "back_wall_floor_corner", "world": Vector3(0.0, 0.02, -2.39), "normal": Vector3.BACK}]
-		var summary_context := {"view": int(context.get("view", -1)),
-			"frame": int(prepared.get("frame", -1)), "cache_key": cache_key,
-			"request_frame": int(context.get("request_frame", -1)),
-			"debug_view": int(clv_debug_view)}
-		var summary_callback := Callable(self, "_magicdawn_active_cache_debug_summary_callback")
-		summary_error = int(cache.call("debug_summary_request", rd, receivers,
-			summary_callback, token, summary_context))
-		if summary_error == OK:
-			context["debug_summary_cache_lease"] = cache
-			context["pending"] = int(context["pending"]) + 1
-			context["queued"] = int(context["queued"]) + 1
-		else:
-			context["errors"]["debug_summary"] = {"code": summary_error,
-				"state": cache.call("get_debug_summary_state") \
-					if cache.has_method("get_debug_summary_state") else {}}
-	else:
-		context["errors"]["debug_summary"] = "active_cache_debug_summary_api_unavailable"
-	if int(context["pending"]) == 0:
-		_magicdawn_active_readback_context.clear()
-		return {"started": false, "error": "no_readbacks_queued", "request_errors": context["errors"]}
-	var status := {"started": true, "queued": int(context["queued"]),
-		"request_frame": int(context["request_frame"]), "token": token,
-		"debug_summary_error": summary_error, "request_errors": context["errors"]}
-	_magicdawn_runtime_state["active_cache_readback_queue"] = status
-	_magicdawn_active_readback_queue_state = status.duplicate(true)
-	print("[CLV_ACTIVE_READBACK_QUEUED] " + JSON.stringify(status))
-	return status
-
-func _magicdawn_active_cache_readback_callback(data: PackedByteArray, token: int, key: String) -> void:
-	# RenderingDevice owns/reuses its callback buffer. Copy before deferring to the main thread.
-	call_deferred("_magicdawn_finish_active_cache_readback", data.duplicate(), token, key)
-
-func _magicdawn_active_cache_debug_summary_callback(data: PackedByteArray,
-		token: int, metadata: Dictionary) -> void:
-	if token != _magicdawn_active_readback_token \
-			or int(_magicdawn_active_readback_context.get("token", -1)) != token:
-		return
-	_magicdawn_active_readback_context["debug_summary_metadata"] = metadata.duplicate(true)
-	# The cache already marshals this callback to the main thread. Reuse the same
-	# request counter/finalizer so the active cache lease survives all readbacks.
-	call_deferred("_magicdawn_finish_active_cache_readback", data.duplicate(),
-		token, "debug_summary")
-
-func _magicdawn_finish_active_cache_readback(data: PackedByteArray, token: int, key: String) -> void:
-	if token != _magicdawn_active_readback_token \
-			or int(_magicdawn_active_readback_context.get("token", -1)) != token:
-		return
-	var readbacks: Dictionary = _magicdawn_active_readback_context.get("readbacks", {})
-	readbacks[key] = data
-	_magicdawn_active_readback_context["readbacks"] = readbacks
-	_magicdawn_active_readback_context["pending"] = maxi(0,
-		int(_magicdawn_active_readback_context.get("pending", 0)) - 1)
-	if int(_magicdawn_active_readback_context["pending"]) > 0:
-		return
-	var context := _magicdawn_active_readback_context
-	var result := _magicdawn_read_active_clv_cache(context, readbacks)
-	var summary_bytes: PackedByteArray = readbacks.get("debug_summary", PackedByteArray())
-	if not summary_bytes.is_empty():
-		result["representative_cache"] = _magicdawn_summarize_debug_summary(
-			summary_bytes, context.get("debug_summary_metadata", {}))
-	else:
-		result["representative_cache"] = {"valid": false,
-			"error": context.get("errors", {}).get("debug_summary", "debug_summary_callback_missing")}
-	_magicdawn_runtime_state["active_cache_readback"] = result
-	_magicdawn_active_readback_result = result.duplicate(true)
-	_magicdawn_active_readback_queue_state = {
-		"started": true, "completed": true, "queued": int(context.get("queued", 0)),
-		"request_frame": int(context.get("request_frame", -1)),
-		"callback_frame": int(context.get("callback_frame", -1)),
-		"completion_frame": Engine.get_frames_drawn(),
-		"token": token, "request_errors": context.get("errors", {}).duplicate(true)}
-	print("[CLV_ACTIVE_READBACK] " + JSON.stringify(result))
-	_magicdawn_active_readback_context.clear()
-	_magicdawn_active_readback_armed = false
-
-
-func _magicdawn_summarize_debug_summary(bytes: PackedByteArray,
-		metadata_value: Variant) -> Dictionary:
-	if not metadata_value is Dictionary:
-		return {"valid": false, "error": "debug_summary_metadata_invalid"}
-	var metadata: Dictionary = metadata_value
-	var record_words := int(metadata.get("record_words", 0))
-	var record_count := int(metadata.get("record_count", 0))
-	var sample_count := int(metadata.get("sample_count", 0))
-	var level_count := int(metadata.get("levels", 0))
-	var corners_per_level := int(metadata.get("corners_per_level", 0))
-	var expected_bytes := record_count * record_words * 4
-	if int(metadata.get("snapshot_format_version", -1)) != 1 \
-			or int(metadata.get("cache_layout_version", -1)) != 9 \
-			or record_words != 194 or sample_count <= 0 or level_count != 3 \
-			or corners_per_level != 8 \
-			or record_count != sample_count * level_count * corners_per_level \
-			or bytes.size() != expected_bytes:
-		return {"valid": false, "error": "debug_summary_shape_or_version_mismatch",
-			"actual_bytes": bytes.size(), "expected_bytes": expected_bytes,
-			"metadata": metadata}
-	var receivers_value: Variant = metadata.get("receivers", [])
-	if not receivers_value is Array or receivers_value.size() != sample_count:
-		return {"valid": false, "error": "debug_summary_receiver_metadata_mismatch"}
-	var receiver_summaries: Array[Dictionary] = []
-	for sample_index in sample_count:
-		var receiver_value: Variant = receivers_value[sample_index]
-		var receiver: Dictionary = receiver_value if receiver_value is Dictionary else {}
-		var level_summaries: Array[Dictionary] = []
-		for level in level_count:
-			var counts := {"window": 0, "tag_match": 0, "axis_supported": 0,
-				"stencil_count_valid": 0, "transfer_marker": 0, "neighbor_ready": 0,
-				"relit_rgb_nonzero_corners": 0, "secondary_alpha_positive": 0,
-				"primary_alpha_positive": 0}
-			var corner_summaries: Array[Dictionary] = []
-			for corner in corners_per_level:
-				var record_index := sample_index * level_count * corners_per_level \
-						+ level * corners_per_level + corner
-				var word := record_index * record_words
-				var flags := int(bytes.decode_u32((word + 4) * 4))
-				var logical := Vector3i(bytes.decode_s32((word + 9) * 4),
-					bytes.decode_s32((word + 10) * 4), bytes.decode_s32((word + 11) * 4))
-				var tag := Vector4i(bytes.decode_s32((word + 13) * 4),
-					bytes.decode_s32((word + 14) * 4), bytes.decode_s32((word + 15) * 4),
-					bytes.decode_s32((word + 16) * 4))
-				var support := int(bytes.decode_u32((word + 17) * 4))
-				var stencil_count := int(bytes.decode_u32((word + 18) * 4))
-				var stencil_marker := int(bytes.decode_u32((word + 19) * 4))
-				var stencil_candidates := bytes.decode_float((word + 20) * 4)
-				var stencil_visible := bytes.decode_float((word + 21) * 4)
-				var transport_stats := _magicdawn_summary_read_vec4f(bytes, (word + 22) * 4)
-				var sky_stats := _magicdawn_summary_read_vec4f(bytes, (word + 26) * 4)
-				var emission_stats := _magicdawn_summary_read_vec4f(bytes, (word + 30) * 4)
-				var relit_nonzero_rgb := 0
-				var relit_max_abs_rgb := 0.0
-				for coefficient in 18:
-					var sh := _magicdawn_summary_read_vec4f(bytes, (word + 46 + coefficient * 4) * 4)
-					for channel in 3:
-						var absolute := absf(sh[channel])
-						if absolute > 1e-20:
-							relit_nonzero_rgb += 1
-						relit_max_abs_rgb = maxf(relit_max_abs_rgb, absolute)
-				var secondary := _magicdawn_summary_read_vec4f(bytes, (word + 118) * 4)
-				var primary := _magicdawn_summary_read_vec4f(bytes, (word + 122) * 4)
-				var metadata_vec := _magicdawn_summary_read_vec4f(bytes, (word + 126) * 4)
-				var anchor := _magicdawn_summary_read_vec4f(bytes, (word + 130) * 4)
-				var approx_geometry := _magicdawn_summary_read_vec4f(bytes, (word + 134) * 4)
-				var plane_moments := _magicdawn_summary_read_vec4f(bytes, (word + 138) * 4)
-				var fraction := _magicdawn_summary_read_vec4f(bytes, (word + 142) * 4)
-				var first_blocker := "none"
-				if (flags & 2) == 0:
-					first_blocker = "window"
-				elif (flags & 4) == 0:
-					first_blocker = "tag_epoch"
-				elif (flags & 8) == 0:
-					first_blocker = "axis_support"
-				elif (flags & 16) == 0:
-					first_blocker = "stencil_count"
-				elif (flags & 32) == 0:
-					first_blocker = "transfer_marker"
-				elif (flags & 64) == 0:
-					first_blocker = "neighbor_tags"
-				else:
-					first_blocker = "candidate"
-				if (flags & 2) != 0:
-					counts["window"] = int(counts["window"]) + 1
-				if (flags & 4) != 0:
-					counts["tag_match"] = int(counts["tag_match"]) + 1
-				if (flags & 8) != 0:
-					counts["axis_supported"] = int(counts["axis_supported"]) + 1
-				if (flags & 16) != 0:
-					counts["stencil_count_valid"] = int(counts["stencil_count_valid"]) + 1
-				if (flags & 32) != 0:
-					counts["transfer_marker"] = int(counts["transfer_marker"]) + 1
-				if (flags & 64) != 0:
-					counts["neighbor_ready"] = int(counts["neighbor_ready"]) + 1
-				if relit_nonzero_rgb > 0:
-					counts["relit_rgb_nonzero_corners"] = int(counts["relit_rgb_nonzero_corners"]) + 1
-				if secondary.w > 0.0:
-					counts["secondary_alpha_positive"] = int(counts["secondary_alpha_positive"]) + 1
-				if primary.w > 0.0:
-					counts["primary_alpha_positive"] = int(counts["primary_alpha_positive"]) + 1
-				var stencils: Array[Dictionary] = []
-				for stencil_index in mini(stencil_count, 4):
-					var stencil_word := word + 146 + stencil_index * 3
-					stencils.append({"probe": int(bytes.decode_u32(stencil_word * 4)),
-						"secondary_weight": bytes.decode_float((stencil_word + 1) * 4),
-						"sky_weight": bytes.decode_float((stencil_word + 2) * 4)})
-				corner_summaries.append({"corner": corner, "flags": flags,
-					"valid": (flags & 1) != 0, "window": (flags & 2) != 0,
-					"tag_match": (flags & 4) != 0, "axis_supported": (flags & 8) != 0,
-					"stencil_count_valid": (flags & 16) != 0,
-					"transfer_marker": (flags & 32) != 0,
-					"neighbor_ready": (flags & 64) != 0,
-					"first_blocker": first_blocker, "logical": logical, "tag": tag,
-					"support": support, "stencil_count": stencil_count,
-					"stencil_marker": stencil_marker,
-					"stencil_candidates": stencil_candidates,
-					"stencil_visible": stencil_visible,
-					"transport_stats_nonzero_max_sum_nonfinite": transport_stats,
-					"sky_stats_nonzero_max_sum_nonfinite": sky_stats,
-					"emission_stats_nonzero_max_sum_nonfinite": emission_stats,
-					"relit_rgb_nonzero": relit_nonzero_rgb,
-					"relit_rgb_max_abs": relit_max_abs_rgb,
-					"diffuse_secondary": secondary, "diffuse_primary": primary,
-					"metadata": metadata_vec, "anchor": anchor,
-					"approx_geometry": approx_geometry,
-					"plane_moments": plane_moments, "fraction": fraction,
-					"stencils_first4": stencils})
-			level_summaries.append({"level": level, "counts": counts,
-				"corners": corner_summaries})
-		receiver_summaries.append({"name": str(receiver.get("name", "receiver_%d" % sample_index)),
-			"world": receiver.get("world", Vector3.ZERO),
-			"normal": receiver.get("normal", Vector3.UP), "levels": level_summaries})
-	return {"valid": true, "snapshot_format_version": 1, "cache_layout_version": 9,
-		"record_words": record_words, "record_count": record_count,
-		"bytes": bytes.size(), "resolution": metadata.get("resolution", -1),
-		"spacing": metadata.get("spacing", -1.0),
-		"geometry_epoch": metadata.get("geometry_epoch", -1),
-		"emitter_count": metadata.get("emitter_count", -1),
-		"relight_serial": metadata.get("relight_serial", -1),
-		"relight_lighting_revision": metadata.get("relight_lighting_revision", -1),
-		"origins": metadata.get("origins", []), "context": metadata.get("context", {}),
-		"receivers": receiver_summaries}
-
-func _magicdawn_summary_read_vec4f(bytes: PackedByteArray, offset: int) -> Vector4:
-	if offset < 0 or offset + 16 > bytes.size():
-		return Vector4.ZERO
-	return Vector4(bytes.decode_float(offset), bytes.decode_float(offset + 4),
-		bytes.decode_float(offset + 8), bytes.decode_float(offset + 12))
-
-func set_internal_layout14_b_test_enabled(enabled: bool) -> bool:
-	if enabled and _clv_internal_test_layout != CLV_INTERNAL_LAYOUT14_V0_TEST:
-		return false
-	if enabled and _effective_clv_resolution() != 16:
-		return false
-	if enabled and (prt_apply_scale != 1 or prt_compact_miss_queue_enabled \
-			or prt_two_stage_source_fallback_enabled \
-			or prt_three_stage_source_fallback_enabled):
-		return false
-	if enabled:
-		_layout14_b_apply_runtime_rejected = false
-		if _layout14_b_saved_shader_file == null:
-			if not shader_file is RDShaderFile:
-				_layout14_b_error = "normal_apply_shader_unavailable"
-				return false
-			_layout14_b_saved_shader_file = shader_file as RDShaderFile
-		_layout14_b_internal_test_enabled = true
-		_layout14_b_error = "not_initialized"
-		_ensure_layout14_b_apply_shader_resource()
-	else:
-		_layout14_b_internal_test_enabled = false
-		_layout14_b_frame_active = false
-		_layout14_b_frame_moments = RID()
-		_layout14_b_frame_sampler = RID()
-		_layout14_b_frame_tags = RID()
-		_layout14_b_error = "disabled"
-		if _layout14_b_saved_shader_file != null:
-			shader_file = _layout14_b_saved_shader_file
-	for entry_value in _clipmaps.values():
-		if not entry_value is Dictionary:
-			continue
-		var cache: RefCounted = entry_value.get("cache")
-		if cache != null and cache.has_method("set_internal_b_test_enabled"):
-			cache.call("set_internal_b_test_enabled", _layout14_b_cache_requested())
-	return true
-
-
-func get_internal_layout14_b_test_state() -> Dictionary:
-	return {"requested": _layout14_b_internal_test_enabled,
-		"frame_active": _layout14_b_frame_active,
-		"apply_shader_loaded": _layout14_b_apply_shader_resource != null,
-		"error": _layout14_b_error,
-		"sidecar_bytes": ProbeBlockFieldCache.estimate_node_visibility_gpu_bytes(
-				_effective_clv_resolution()) if _layout14_b_cache_requested() else 0}
-
-
-func _layout14_b_cache_requested() -> bool:
-	return _layout14_b_internal_test_enabled \
-			and _ensure_layout14_b_apply_shader_resource()
-
-
-func _ensure_layout14_b_apply_shader_resource() -> bool:
-	if _layout14_b_apply_runtime_rejected:
-		return false
-	if _layout14_b_apply_shader_resource == null:
-		var shader_value: Resource = ResourceLoader.load(
-				CLV_INTERNAL_LAYOUT14_B_APPLY_SHADER_PATH)
-		if shader_value is RDShaderFile:
-			_layout14_b_apply_shader_resource = shader_value as RDShaderFile
-	if _layout14_b_apply_shader_resource == null:
-		_layout14_b_error = "apply_shader_unavailable"
-		return false
-	var spirv: RDShaderSPIRV = _layout14_b_apply_shader_resource.get_spirv()
-	if spirv == null or _layout14_b_apply_shader_resource.base_error != "" \
-			or spirv.bytecode_compute.is_empty() or spirv.compile_error_compute != "":
-		_layout14_b_error = "apply_shader_compile_error"
-		return false
-	return true
-
-
-func _layout14_b_raw_source_ready(directional: RefCounted) -> bool:
-	if directional == null or not directional.has_method("raw_sidecar_matches"):
-		return false
-	var raw_rid_value: Variant = directional.get("raw_lighting")
-	if not raw_rid_value is RID:
-		return false
-	var raw_rid: RID = raw_rid_value
-	var probe_count := int(directional.get("probes"))
-	var expected_bytes := maxi(4, probe_count * 18 * 16)
-	return raw_rid.is_valid() and probe_count > 0 \
-			and int(directional.get("raw_lighting_bytes")) == expected_bytes \
-			and bool(directional.call("raw_sidecar_matches", _frame_snapshot))
-
-func _set_layout14_b_frame_active(active: bool, state: Dictionary = {}) -> void:
-	_layout14_b_frame_active = active
-	_layout14_b_frame_moments = RID()
-	_layout14_b_frame_sampler = RID()
-	_layout14_b_frame_tags = RID()
-	if active:
-		_layout14_b_frame_moments = state.get("moments", RID())
-		_layout14_b_frame_sampler = state.get("sampler", RID())
-		_layout14_b_frame_tags = state.get("tags", RID())
-		shader_file = _layout14_b_apply_shader_resource
-	else:
-		if _layout14_b_saved_shader_file != null:
-			shader_file = _layout14_b_saved_shader_file
-
 func _clv_cache_backend(snapshot: Dictionary) -> int:
-	if _clv_internal_test_layout == CLV_INTERNAL_LAYOUT13_TEST \
-			or _clv_internal_test_layout == CLV_INTERNAL_LAYOUT14_V0_TEST:
-		return CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART
 	return int(snapshot.get("clv_cache_backend", CLV_CACHE_BACKEND_LEGACY))
 
-func _clv_layout_version_for_backend(backend: int) -> int:
-	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT14_V0_TEST:
-		return CLV_INTERNAL_LAYOUT14_V0_TEST
-	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED:
-		return CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION
-	return CLV_BLOCK_CHART_LAYOUT_VERSION \
-			if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART else CLV_LEGACY_LAYOUT_VERSION
-
-func _clv_texture_columns_for_backend(backend: int) -> int:
-	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT14_V0_TEST:
-		return ProbeBlockFieldCache.FIELD_COLUMN_COUNT
-	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED:
-		return ClipmapCache.CLV_TEXTURE_COLUMNS
-	return CLV_BLOCK_CHART_COLUMN_COUNT \
-			if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART else ClipmapCache.CLV_TEXTURE_COLUMNS
-
 func _clv_gpu_bytes_for_backend(backend: int, requested_resolution: int,
-		requested_format_tag := -1, boundary_record_count := 0,
 		dynamic_emitter_count := 0) -> int:
 	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
-		if _clv_internal_test_layout == CLV_INTERNAL_LAYOUT14_V0_TEST:
-			var bytes := ProbeBlockFieldCache.estimate_field_gpu_bytes(requested_resolution)
-			if _layout14_b_cache_requested():
-				bytes += ProbeBlockFieldCache.estimate_node_visibility_gpu_bytes(requested_resolution)
-			return bytes
-		if _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED:
-			return ClipmapCache.estimate_gpu_bytes(requested_resolution, true,
-				maxi(dynamic_emitter_count, 0))
-		return MagicDawnBlockChartCache.estimate_block_gpu_bytes(requested_resolution)
+		return ClipmapCache.estimate_gpu_bytes(requested_resolution, true,
+			maxi(dynamic_emitter_count, 0))
 	return ClipmapCache.estimate_gpu_bytes(requested_resolution)
-
-func _new_clv_cache(backend: int):
-	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
-		if _clv_internal_test_layout == CLV_INTERNAL_LAYOUT14_V0_TEST:
-			var cache := ProbeBlockFieldCache.new()
-			cache.set_internal_b_test_enabled(_layout14_b_cache_requested())
-			return cache
-		if _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED:
-			return ClipmapCache.new()
-		return MagicDawnBlockChartCache.new()
-	return ClipmapCache.new()
 
 func get_last_prt_compact_queue_metadata() -> Dictionary:
 	var metadata := _prt_compact_queue_metadata.duplicate(true)
@@ -1056,7 +499,6 @@ func get_native_clv_lighting_state() -> Dictionary:
 	var last_frame := _last_native_clv_lighting_frame
 	var frame_age := query_frame - last_frame if last_frame >= 0 else -1
 	var frame_is_current := last_frame >= 0 and frame_age == 0
-	var execution_qa_mode := _last_native_clv_lighting_qa_mode if frame_is_current else -1
 	var status := "not_rendered"
 	if last_frame >= 0:
 		if frame_is_current:
@@ -1069,20 +511,10 @@ func get_native_clv_lighting_state() -> Dictionary:
 		"query_frame": query_frame,
 		"frame_age": frame_age,
 		"frame_is_current": frame_is_current,
-		"receiver_sample_qa_mode": execution_qa_mode,
-		"owner_control_w_from_published_buffer": _last_native_clv_owner_control_w \
-				if frame_is_current else -1.0,
 		"owner_parameters_rid_id": _last_native_clv_owner_parameters_rid.get_id() \
 				if frame_is_current and _last_native_clv_owner_parameters_rid.is_valid() else 0,
 		"owner_control_source": "same_owner_rid_published_to_clv_binding_58" \
 				if frame_is_current and _last_native_clv_owner_parameters_rid.is_valid() else "unavailable",
-		"consumer_sample_bypassed": frame_is_current and execution_qa_mode == 4,
-		"consumer_sample_status": "matched_sky_zero_sample_baseline" \
-				if frame_is_current and execution_qa_mode == 4 \
-				else ("native_sample_hit_magenta_miss_cyan" \
-				if frame_is_current and execution_qa_mode == 5 \
-				else ("native_clv_sampling" if frame_is_current \
-				and execution_qa_mode == 0 else "unverified")),
 		"status": status,
 		"approximate_clv_volume_enabled": approximate_clv_volume_enabled,
 		"approximate_clv_ready_bit_enabled": approximate_clv_ready_bit_enabled,
@@ -1100,8 +532,8 @@ func get_native_clv_lighting_state() -> Dictionary:
 		"native_general_queue": native_queue_state,
 		"specialization_values": shader_keywords.duplicate(),
 		"clv_cache_backend": _last_clv_cache_backend,
-		"clv_layout_version": _clv_layout_version_for_backend(_last_clv_cache_backend),
-		"clv_texture_columns": _clv_texture_columns_for_backend(_last_clv_cache_backend),
+		"clv_layout_version": CLV_LEGACY_LAYOUT_VERSION,
+		"clv_texture_columns": ClipmapCache.CLV_TEXTURE_COLUMNS,
 		"magicdawn": get_magicdawn_runtime_state(),
 		"prepare_rejection": _last_native_prepare_rejection,
 		"prepare_frame": _last_native_prepare_frame,
@@ -1112,8 +544,6 @@ func get_native_clv_lighting_state() -> Dictionary:
 		"last_frame_scene_exposure_normalization": _last_frame_scene_exposure_normalization,
 		"last_exposure_frame": _last_exposure_frame}
 
-func get_native_baked_sh_lighting_state() -> Dictionary:
-	return _native_baked_sh_state.duplicate(true)
 
 
 func _native_general_source_queue_pipeline_metadata() -> Dictionary:
@@ -1596,11 +1026,6 @@ func get_prt_clv_runtime_state() -> Dictionary:
 		var tags_rid: RID = cache.get("tags")
 		var support_rid: RID = cache.get("support")
 		var cache_backend := int(entry.get("cache_backend", CLV_CACHE_BACKEND_LEGACY))
-		var layout14_state: Dictionary = {}
-		if cache.has_method("get_layout14_runtime_state"):
-			var layout14_value: Variant = cache.call("get_layout14_runtime_state")
-			if layout14_value is Dictionary:
-				layout14_state = layout14_value
 		var layout_state: Dictionary = {}
 		if cache.has_method("get_layout16_runtime_state"):
 			var layout_value: Variant = cache.call("get_layout16_runtime_state")
@@ -1636,14 +1061,12 @@ func get_prt_clv_runtime_state() -> Dictionary:
 			"geometry_epoch": int(cache.get("_geometry_epoch")),
 			"content_revision": int(cache.get("_content_revision")),
 			"cache_backend": cache_backend,
-			"layout_version": _clv_layout_version_for_backend(cache_backend),
-			"texture_columns": _clv_texture_columns_for_backend(cache_backend),
+			"layout_version": CLV_LEGACY_LAYOUT_VERSION,
+			"texture_columns": ClipmapCache.CLV_TEXTURE_COLUMNS,
 			"texture_valid": texture_rid.is_valid(),
 			"tags_valid": tags_rid.is_valid(),
 			"support_valid": support_rid.is_valid(),
-			"layout14_runtime_state": layout14_state,
 			"layout16_runtime_state": layout_state,
-			"layout17_runtime_state": layout_state,
 			"field_format_tag": int(entry.get("field_format_tag", 0)),
 			"field_codec": entry.get("field_codec", Vector4.ZERO),
 			"field_codec_fallback_reason": str(entry.get("field_codec_fallback_reason", "")),
@@ -1660,8 +1083,8 @@ func get_prt_clv_runtime_state() -> Dictionary:
 		raw_sidecar_allocated_total += int(raw_state.get("allocated_bytes", 0))
 	return {"cache_count": caches.size(), "requested_resolution": prt_clv_resolution,
 		"selected_backend": _last_clv_cache_backend,
-		"layout_version": _clv_layout_version_for_backend(_last_clv_cache_backend),
-		"texture_columns": _clv_texture_columns_for_backend(_last_clv_cache_backend),
+		"layout_version": CLV_LEGACY_LAYOUT_VERSION,
+		"texture_columns": ClipmapCache.CLV_TEXTURE_COLUMNS,
 		"raw_sidecar_resources": raw_sidecars_by_bake.values(),
 		"raw_sidecar_estimated_bytes": raw_sidecar_estimated_total,
 		"raw_sidecar_allocated_bytes": raw_sidecar_allocated_total,
@@ -1671,8 +1094,6 @@ func get_prt_clv_runtime_state() -> Dictionary:
 ## FP32 storage buffer used by the CLV producer; it does not read or synchronize it.
 func get_magicdawn_baked_source_state(cache_key := "") -> Dictionary:
 	var selected_key := cache_key
-	if selected_key.is_empty():
-		selected_key = str(_native_baked_sh_state.get("cache_key", ""))
 	if selected_key.is_empty():
 		selected_key = str(_magicdawn_runtime_state.get("cache_key", ""))
 	if selected_key.is_empty() and _bake_resources.size() == 1:
@@ -1807,8 +1228,8 @@ func read_prt_clv_cell_readback(receivers: Array[Dictionary]) -> Dictionary:
 			var in_query_window := relative.x >= 0 and relative.y >= 0 and relative.z >= 0 \
 					and relative.x < resolution - 1 and relative.y < resolution - 1 \
 					and relative.z < resolution - 1
-			var physical := Vector3i(_clv_posmod(base.x, resolution),
-				_clv_posmod(base.y, resolution), _clv_posmod(base.z, resolution))
+			var physical := Vector3i(posmod(base.x, resolution),
+				posmod(base.y, resolution), posmod(base.z, resolution))
 			var seam := physical.x == resolution - 1 or physical.y == resolution - 1 \
 				or physical.z == resolution - 1
 			var slot := Vector3i(physical.x, physical.y, physical.z + level * resolution)
@@ -1817,8 +1238,8 @@ func read_prt_clv_cell_readback(receivers: Array[Dictionary]) -> Dictionary:
 			var corners: Array[Dictionary] = []
 			for corner in 8:
 				var logical := base + Vector3i(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1)
-				var corner_physical := Vector3i(_clv_posmod(logical.x, resolution),
-					_clv_posmod(logical.y, resolution), _clv_posmod(logical.z, resolution))
+				var corner_physical := Vector3i(posmod(logical.x, resolution),
+					posmod(logical.y, resolution), posmod(logical.z, resolution))
 				var corner_slot := Vector3i(corner_physical.x, corner_physical.y,
 					corner_physical.z + level * resolution)
 				var tag := _clv_read_vec4i(tag_bytes, resolution, resolution, corner_slot)
@@ -1908,9 +1329,6 @@ func _clv_dominant_axis(normal: Vector3) -> int:
 		return 1
 	return 2
 
-func _clv_posmod(value: int, modulus: int) -> int:
-	return ((value % modulus) + modulus) % modulus
-
 func _clv_xyz(value: Vector4) -> Vector3:
 	return Vector3(value.x, value.y, value.z)
 
@@ -1933,8 +1351,6 @@ func _clv_read_vec4f(bytes: PackedByteArray, width: int, height: int,
 func _frp_execute(ctx: FRPPassContext) -> void:
 	var cpu_start_usec := Time.get_ticks_usec()
 	_last_prt_pass_cpu_usec = 0
-	_frame_native_baked_sh_consumed = false
-	_frame_native_baked_sh_publication.clear()
 	_frame_prt_scale = 1
 	_frame_native_clv_fallback_only = false
 	_frame_native_clv_status_known = false
@@ -1945,7 +1361,6 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_frame_native_general_queue_view_count = 0
 	_last_native_clv_lighting_active = false
 	_last_native_clv_lighting_frame = Engine.get_frames_drawn()
-	_last_native_clv_lighting_qa_mode = -1
 	_last_native_screen_cache_lighting_active = false
 	_last_native_screen_cache_lighting_frame = Engine.get_frames_drawn()
 	_last_native_screen_cache_frame_token = -1
@@ -1972,11 +1387,6 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 		_release_surfel_nrd_if_active()
 		_clear_magic_gi_output(ctx)
 		_native_prepared_views.clear()
-		_native_baked_sh_prepared_views.clear()
-		_native_baked_sh_attempted_views.clear()
-		_native_baked_sh_publications.clear()
-		if ctx.has_method("clear_magic_gi_baked_sh_inputs"):
-			ctx.call("clear_magic_gi_baked_sh_inputs")
 		_capture_gpu_timestamp(rd, "End")
 		_last_prt_pass_cpu_usec = Time.get_ticks_usec() - cpu_start_usec
 		return
@@ -2003,43 +1413,38 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	# variant. Only that renderer decision can authorize the compute pass to skip
 	# certified pixels; a locally prepared cache alone is not proof that deferred
 	# lighting consumed the borrowed CLV RIDs.
-	_frame_native_clv_status_known = ctx != null \
-		and ctx.has_method("is_magic_gi_clv_lighting_active")
+	_frame_native_clv_status_known = ctx != null
 	_frame_native_clv_fallback_only = _frame_native_clv_status_known \
-		and bool(ctx.call("is_magic_gi_clv_lighting_active"))
+		and bool(ctx.is_magic_gi_clv_lighting_active())
 	_frame_native_general_queue_active = ctx != null \
-			and ctx.has_method("is_magic_gi_general_queue_active") \
-			and bool(ctx.call("is_magic_gi_general_queue_active"))
-	if ctx != null and ctx.has_method("get_magic_gi_general_queue_runtime_msaa"):
-		_frame_native_general_queue_msaa = int(ctx.call("get_magic_gi_general_queue_runtime_msaa"))
-	if ctx != null and ctx.has_method("get_magic_gi_general_queue_runtime_view_count"):
-		_frame_native_general_queue_view_count = int(ctx.call("get_magic_gi_general_queue_runtime_view_count"))
+			and bool(ctx.is_magic_gi_general_queue_active())
+	if ctx != null:
+		_frame_native_general_queue_msaa = int(ctx.get_magic_gi_general_queue_runtime_msaa())
+	if ctx != null:
+		_frame_native_general_queue_view_count = int(ctx.get_magic_gi_general_queue_runtime_view_count())
 	_native_general_queue_state["active"] = _frame_native_general_queue_active
 	_native_general_queue_state["runtime_msaa"] = _frame_native_general_queue_msaa
 	_native_general_queue_state["runtime_view_count"] = _frame_native_general_queue_view_count
 	_native_general_queue_state["frame"] = Engine.get_frames_drawn()
 	super._frp_execute(ctx)
-	if ctx != null and ctx.has_method("is_magic_gi_clv_lighting_active"):
-		_last_native_clv_lighting_active = bool(ctx.call("is_magic_gi_clv_lighting_active"))
+	if ctx != null:
+		_last_native_clv_lighting_active = bool(ctx.is_magic_gi_clv_lighting_active())
 	_last_native_clv_lighting_frame = Engine.get_frames_drawn()
-	_last_native_screen_cache_frame_token = int(ctx.call("get_frame_token")) \
-			if ctx != null and ctx.has_method("get_frame_token") else -1
+	_last_native_screen_cache_frame_token = int(ctx.get_frame_token()) \
+			if ctx != null else -1
 	var screen_cache_input_current: bool = ctx != null \
-			and ctx.has_method("has_magic_gi_screen_cache_input") \
-			and bool(ctx.call("has_magic_gi_screen_cache_input", 0)) \
+			and bool(ctx.has_magic_gi_screen_cache_input(0)) \
 			and _last_native_screen_cache_frame_token >= 0 \
 			and int(_magicdawn_runtime_state.get("screen_cache_frame_token", -1)) \
 			== _last_native_screen_cache_frame_token \
 			and int(_magicdawn_runtime_state.get("screen_cache_dispatch_token", 0)) > 0
 	_last_native_screen_cache_lighting_active = screen_cache_input_current \
-			and ctx.has_method("is_magic_gi_screen_cache_lighting_active") \
-			and bool(ctx.call("is_magic_gi_screen_cache_lighting_active"))
+			and bool(ctx.is_magic_gi_screen_cache_lighting_active())
 	_last_native_screen_cache_lighting_frame = Engine.get_frames_drawn()
 	_magicdawn_runtime_state["screen_cache_renderer_active"] = \
 			_last_native_screen_cache_lighting_active
 	_magicdawn_runtime_state["screen_cache_renderer_active_raw"] = ctx != null \
-			and ctx.has_method("is_magic_gi_screen_cache_lighting_active") \
-			and bool(ctx.call("is_magic_gi_screen_cache_lighting_active"))
+			and bool(ctx.is_magic_gi_screen_cache_lighting_active())
 	_magicdawn_runtime_state["screen_cache_renderer_frame"] = \
 			_last_native_screen_cache_lighting_frame
 	_magicdawn_runtime_state["screen_cache_renderer_frame_token"] = \
@@ -2051,16 +1456,12 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 		_magicdawn_runtime_state["renderer_path_active"] = true
 		_magicdawn_runtime_state["status"] = \
 				"native_layout9_screen_cache_renderer_path_active"
-	_last_native_clv_owner_control_w = -1.0
 	_last_native_clv_owner_parameters_rid = RID()
 	for prepared_value in _native_prepared_views.values():
-		if prepared_value is Dictionary and prepared_value.has("owner_control_w") \
+		if prepared_value is Dictionary \
 				and prepared_value.get("owner_parameters_rid", RID()) is RID:
-			_last_native_clv_owner_control_w = float(prepared_value.get("owner_control_w", -1.0))
 			_last_native_clv_owner_parameters_rid = prepared_value.get("owner_parameters_rid", RID())
 			break
-	_last_native_clv_lighting_qa_mode = int(round(_last_native_clv_owner_control_w)) \
-			if is_finite(_last_native_clv_owner_control_w) and _last_native_clv_owner_control_w >= 0.0 else -1
 	_capture_gpu_timestamp(rd, "End")
 	_pre_exposure = 1.0
 	_scene_exposure_normalization = 1.0
@@ -2073,12 +1474,6 @@ func _frp_execute(ctx: FRPPassContext) -> void:
 	_surfel_replacement_requested = false
 	_frame_prt_scale = 1
 	_frame_native_clv_fallback_only = false
-	_frame_native_baked_sh_consumed = false
-	_frame_native_baked_sh_publication.clear()
-	_native_prepared_views.clear()
-	_native_baked_sh_prepared_views.clear()
-	_native_baked_sh_attempted_views.clear()
-	_native_baked_sh_publications.clear()
 	_last_prt_pass_cpu_usec = Time.get_ticks_usec() - cpu_start_usec
 
 func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> void:
@@ -2089,33 +1484,26 @@ func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> vo
 	if _dynamic_volume_publication_token > 0:
 		var expected_token := _dynamic_volume_publication_token
 		var expected_frame_token := int(_dynamic_volume_runtime_state.get("frame_token", -1))
-		var current_frame_token := int(ctx.call("get_frame_token")) \
-				if ctx != null and ctx.has_method("get_frame_token") else -1
+		var current_frame_token := int(ctx.get_frame_token()) if ctx != null else -1
 		var lease_current := current_frame_token == expected_frame_token \
-				and ctx != null and ctx.has_method("has_magic_gi_dynamic_volume_input") \
-				and bool(ctx.call("has_magic_gi_dynamic_volume_input", 0))
+				and ctx != null \
+				and bool(ctx.has_magic_gi_dynamic_volume_input(0))
 		var olv_input_present := ctx != null \
-				and ctx.has_method("has_magic_gi_dynamic_volume_olv_input") \
-				and bool(ctx.call("has_magic_gi_dynamic_volume_olv_input", 0))
-		var consumed_token := int(ctx.call("get_magic_gi_dynamic_volume_consumed_token")) \
-				if ctx != null and ctx.has_method("get_magic_gi_dynamic_volume_consumed_token") else 0
+				and bool(ctx.has_magic_gi_dynamic_volume_olv_input(0))
+		var consumed_token := int(ctx.get_magic_gi_dynamic_volume_consumed_token()) if ctx != null else 0
 		var direct_volume_consumed := lease_current and consumed_token == expected_token \
-				and ctx.has_method("is_magic_gi_dynamic_volume_lighting_active") \
-				and bool(ctx.call("is_magic_gi_dynamic_volume_lighting_active"))
+				and bool(ctx.is_magic_gi_dynamic_volume_lighting_active())
 		var olv_lighting_active := lease_current and consumed_token == expected_token \
 				and olv_input_present \
-				and ctx.has_method("is_magic_gi_dynamic_volume_olv_lighting_active") \
-				and bool(ctx.call("is_magic_gi_dynamic_volume_olv_lighting_active"))
+				and bool(ctx.is_magic_gi_dynamic_volume_olv_lighting_active())
 		var screen_state: Dictionary = _dynamic_volume_screen_runtime_state
 		var screen_lease_current: bool = lease_current \
 				and current_frame_token == int(screen_state.get("frame_token", -1)) \
 				and int(screen_state.get("source_publication_token", 0)) == expected_token \
 				and int(screen_state.get("dispatch_token", 0)) > 0 \
-				and ctx.has_method("has_magic_gi_dynamic_screen_cache_input") \
-				and bool(ctx.call("has_magic_gi_dynamic_screen_cache_input", 0))
+				and bool(ctx.has_magic_gi_dynamic_screen_cache_input(0))
 		var screen_active_raw := ctx != null \
-				and ctx.has_method("is_magic_gi_dynamic_screen_cache_lighting_active") \
-				and bool(ctx.call("is_magic_gi_dynamic_screen_cache_lighting_active"))
+				and bool(ctx.is_magic_gi_dynamic_screen_cache_lighting_active())
 		var screen_cache_consumed := screen_lease_current and screen_active_raw
 		var renderer_consumed := direct_volume_consumed or screen_cache_consumed
 		_dynamic_volume_runtime_state["renderer_active"] = renderer_consumed
@@ -2174,16 +1562,12 @@ func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> vo
 		return
 	if _magicdawn_clv_prt_frame:
 		var renderer_clv_active := ctx != null \
-				and ctx.has_method("is_magic_gi_clv_lighting_active") \
-				and bool(ctx.call("is_magic_gi_clv_lighting_active"))
+				and bool(ctx.is_magic_gi_clv_lighting_active())
 		var renderer_screen_cache_active := ctx != null \
-				and ctx.has_method("is_magic_gi_screen_cache_lighting_active") \
-				and bool(ctx.call("is_magic_gi_screen_cache_lighting_active"))
-		var screen_cache_token := int(ctx.call("get_frame_token")) \
-				if ctx != null and ctx.has_method("get_frame_token") else -1
+				and bool(ctx.is_magic_gi_screen_cache_lighting_active())
+		var screen_cache_token := int(ctx.get_frame_token()) if ctx != null else -1
 		var screen_cache_lease_current: bool = ctx != null \
-				and ctx.has_method("has_magic_gi_screen_cache_input") \
-				and bool(ctx.call("has_magic_gi_screen_cache_input", 0)) \
+				and bool(ctx.has_magic_gi_screen_cache_input(0)) \
 				and screen_cache_token >= 0 \
 				and screen_cache_token == int(_magicdawn_runtime_state.get(
 						"screen_cache_frame_token", -1)) \
@@ -2219,9 +1603,8 @@ func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> vo
 		else:
 			# Keep the screen lease intact when the renderer selected the screen-cache
 			# specialization; clearing CLV inputs also clears the screen-cache lease.
-			if not screen_cache_lease_current and ctx != null \
-					and ctx.has_method("clear_magic_gi_clv_inputs"):
-				ctx.call("clear_magic_gi_clv_inputs")
+			if not screen_cache_lease_current and ctx != null:
+				ctx.clear_magic_gi_clv_inputs()
 			_magicdawn_runtime_state["status"] = "native_layout9_clv_not_consumed_fail_closed"
 			_magicdawn_runtime_state["renderer_path_active"] = false
 			_magicdawn_runtime_state["native_clv_lighting_active"] = renderer_clv_active
@@ -2241,34 +1624,7 @@ func _frp_execute_with_snapshot(ctx: FRPPassContext, snapshot: Dictionary) -> vo
 		_magicdawn_clv_prt_prepared = false
 		_frame_magicdawn_clv_renderer_active = false
 		return
-	_frame_native_baked_sh_publication = _confirmed_magicdawn_native_publication(
-			ctx, snapshot)
-	_frame_native_baked_sh_consumed = not _frame_native_baked_sh_publication.is_empty()
-	if _frame_native_baked_sh_consumed:
-		_native_baked_sh_state = _frame_native_baked_sh_publication.duplicate(true)
-		_native_baked_sh_state["active"] = true
-		_native_baked_sh_state["consumed"] = true
-		if not str(_native_baked_sh_state.get("status", "")).begins_with("native_consumed"):
-			_native_baked_sh_state["status"] = "native_consumed"
-		_native_baked_sh_state["fallback_reason"] = ""
-	else:
-		var prepare_fallback_reason := str(_native_baked_sh_state.get(
-				"fallback_reason", ""))
-		var prepare_fallback_is_specific := not prepare_fallback_reason.is_empty() \
-				and prepare_fallback_reason != "preflight_pending" \
-				and prepare_fallback_reason != "native_consumption_not_confirmed"
-		_native_baked_sh_state["active"] = false
-		_native_baked_sh_state["consumed"] = false
-		_native_baked_sh_state["frame"] = Engine.get_frames_drawn()
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		if not prepare_fallback_is_specific:
-			_native_baked_sh_state["fallback_reason"] = "native_layout17_not_confirmed_consumed"
 	super._frp_execute_with_snapshot(ctx, snapshot)
-	_frame_native_baked_sh_consumed = false
-	_frame_native_baked_sh_publication.clear()
-	_native_baked_sh_prepared_views.clear()
-	_native_baked_sh_attempted_views.clear()
-	_native_baked_sh_publications.clear()
 	_frame_input_bindings.clear()
 	_frame_view_matrices.clear()
 
@@ -2298,16 +1654,6 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 	_magicdawn_clv_prt_frame = false
 	_magicdawn_clv_prt_prepared = false
 	_native_prepared_views.clear()
-	_native_baked_sh_prepared_views.clear()
-	_native_baked_sh_attempted_views.clear()
-	_native_baked_sh_publications.clear()
-	_frame_native_baked_sh_consumed = false
-	_frame_native_baked_sh_publication.clear()
-	_native_baked_sh_state = {"enabled": native_baked_sh_lighting_enabled,
-		"active": false, "consumed": false, "frame": Engine.get_frames_drawn(),
-		"publication_token": 0, "status": "preflight_pending",
-		"fallback_reason": "preflight_pending"}
-	_magicdawn_debug_sidecar_forced = false
 	_dynamic_volume_publication_token = 0
 	_dynamic_volume_runtime_state = {"status": "idle", "active": false,
 		"frame": Engine.get_frames_drawn(), "publication_token": 0}
@@ -2323,22 +1669,14 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 		if _native_prepare_diagnostics_enabled:
 			_last_native_prepare_rejection = "missing_context"
 		return
-	if ctx.has_method("clear_magic_gi_baked_sh_inputs"):
-		ctx.call("clear_magic_gi_baked_sh_inputs")
-	if ctx.has_method("clear_magic_gi_dynamic_volume_inputs"):
-		ctx.call("clear_magic_gi_dynamic_volume_inputs")
-	var general_queue_bridge_reason := _native_general_queue_bridge_reason(ctx)
+	ctx.clear_magic_gi_dynamic_volume_inputs()
 	if not IndirectGISelection.is_owner(ctx, String(get_parameter_key()),
 			IndirectGISelection.KIND_MAGIC, true):
 		if _native_prepare_diagnostics_enabled:
 			_last_native_prepare_rejection = "not_indirect_gi_owner"
 		return
-	if general_queue_bridge_reason.is_empty():
-		ctx.call("clear_magic_gi_general_queue_inputs")
-	elif native_deferred_general_queue_enabled:
-		_native_general_queue_state["fallback_reason"] = general_queue_bridge_reason
-	if ctx.has_method("set_magic_gi_profile_enabled"):
-		ctx.set_magic_gi_profile_enabled(gpu_timestamp_profiling_enabled)
+	ctx.clear_magic_gi_general_queue_inputs()
+	ctx.set_magic_gi_profile_enabled(gpu_timestamp_profiling_enabled)
 	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
 	var snapshot := _snapshot_for_target(buffers)
 	if bool(snapshot.get("surfel", false)):
@@ -2401,15 +1739,11 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 	if dynamic_clv_snapshot:
 		_magicdawn_clv_prt_frame = true
 		_magicdawn_clv_prt_prepared = false
-		_native_baked_sh_state = {"enabled": false, "active": false,
-			"consumed": false, "frame": Engine.get_frames_drawn(),
-			"status": "not_used_dynamic_clv_layout9",
-			"fallback_reason": "backend_1_uses_live_transfer_matrix"}
 		_magicdawn_runtime_state = {
 			"backend": CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART,
 			"prt_model": "CLV_BLOCK_RELIGHT",
 			"sh_basis": "real_orthonormal_degree2_coefficients9",
-			"layout_version": CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION,
+			"layout_version": CLV_LEGACY_LAYOUT_VERSION,
 			"status": "native_clv_prepare_started",
 			"pixel_csr_fallback": false,
 			"replacement_enabled": replacement_requested,
@@ -2439,13 +1773,12 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 			_magicdawn_runtime_state["status"] = "native_clv_prepared_waiting_for_renderer"
 			_magicdawn_runtime_state["native_inputs_published"] = true
 			_magicdawn_runtime_state["screen_cache_status"] = "waiting_for_gbuffer"
-			if buffers.get_view_count() == 1 and ctx.has_method("enqueue_after_operation") \
-					and ctx.has_method("get_frame_token"):
-				var renderer_frame_token := int(ctx.call("get_frame_token"))
+			if buffers.get_view_count() == 1:
+				var renderer_frame_token := int(ctx.get_frame_token())
 				var prepared_key := _native_view_key(buffers, 0)
 				var callback := Callable(self, "_render_magicdawn_screen_cache_after_gbuffer") \
 						.bind(buffers, prepared_key, renderer_frame_token)
-				var queued := bool(ctx.call("enqueue_after_operation", NativeSpec.PASS_GBUFFER,
+				var queued := bool(ctx.enqueue_after_operation(NativeSpec.PASS_GBUFFER,
 						callback))
 				_magicdawn_runtime_state["screen_cache_status"] = "gbuffer_callback_queued" \
 						if queued else "gbuffer_operation_not_scheduled"
@@ -2458,25 +1791,6 @@ func _frp_prepare(ctx: FRPPassContext) -> void:
 			if not _magicdawn_runtime_state.has("fallback_reason"):
 				_magicdawn_runtime_state["fallback_reason"] = "clipmap_or_native_binding_unavailable"
 			ctx.clear_magic_gi_clv_inputs()
-		return
-	if _is_magicdawn_authored_snapshot(snapshot):
-		if not native_baked_sh_lighting_enabled:
-			_native_baked_sh_state["status"] = "standalone_a_b_selected"
-			_native_baked_sh_state["fallback_reason"] = "native_baked_sh_disabled"
-			return
-		if bool(snapshot.get("streamed", false)):
-			_native_baked_sh_state["status"] = "streamed_not_supported"
-			_native_baked_sh_state["fallback_reason"] = "streamed_combined_field_not_ready"
-			return
-		if _magicdawn_debug_sidecar_requested(buffers):
-			_magicdawn_debug_sidecar_forced = true
-			_native_baked_sh_state["status"] = "debug_sidecar_forced_standalone"
-			_native_baked_sh_state["fallback_reason"] = "debug_buffers_magic_gi_selected"
-			return
-		var prepare_cpu_start_usec := Time.get_ticks_usec()
-		_prepare_native_magicdawn_baked_sh(ctx, buffers, snapshot, resolved,
-				replacement_requested)
-		_last_native_prepare_cpu_usec = Time.get_ticks_usec() - prepare_cpu_start_usec
 		return
 	if native_clv_lighting_enabled and _can_prepare_native_prt(ctx, buffers, snapshot):
 		var prepare_cpu_start_usec := Time.get_ticks_usec()
@@ -2657,13 +1971,12 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 	_dynamic_volume_screen_runtime_state = {"status": "prepare_started",
 		"frame": Engine.get_frames_drawn(), "active": false,
 		"frame_token": -1, "dispatch_token": 0}
-	if ctx != null and ctx.has_method("clear_magic_gi_dynamic_screen_cache_inputs"):
-		ctx.call("clear_magic_gi_dynamic_screen_cache_inputs")
+	if ctx != null:
+		ctx.clear_magic_gi_dynamic_screen_cache_inputs()
 	_dynamic_volume_runtime_state = {"status": "prepare_started",
 		"frame": Engine.get_frames_drawn(), "active": false,
 		"publication_token": 0, "fallback_reason": "prepare_started"}
-	if ctx == null or buffers == null or not ctx.has_method("set_magic_gi_dynamic_volume_input") \
-			or not ctx.has_method("get_frame_token"):
+	if ctx == null or buffers == null:
 		_dynamic_volume_runtime_state["status"] = "bridge_unavailable"
 		_dynamic_volume_runtime_state["fallback_reason"] = "missing_context_or_dynamic_volume_api"
 		return
@@ -2673,15 +1986,11 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		_dynamic_volume_runtime_state["fallback_reason"] = "view_count:%d" % view_count
 		return
 	var paged := snapshot.get("prepared_source_header") is Resource
-	if paged and (not ctx.has_method("get_magic_gi_paged_prepared_abi_version") \
-			or int(ctx.call("get_magic_gi_paged_prepared_abi_version")) != 2 \
-			or not ctx.has_method("get_magic_gi_paged_prepared_layout_version") \
-			or int(ctx.call("get_magic_gi_paged_prepared_layout_version")) != 7 \
-			or not ctx.has_method("get_magic_gi_paged_prepared_parameters_size") \
-			or int(ctx.call("get_magic_gi_paged_prepared_parameters_size")) != 208 \
-			or not ctx.has_method("get_magic_gi_paged_prepared_max_lods") \
-			or int(ctx.call("get_magic_gi_paged_prepared_max_lods")) < 10):
-		ctx.call("clear_magic_gi_dynamic_volume_inputs")
+	if paged and (int(ctx.get_magic_gi_paged_prepared_abi_version()) != 2 \
+			or int(ctx.get_magic_gi_paged_prepared_layout_version()) != 7 \
+			or int(ctx.get_magic_gi_paged_prepared_parameters_size()) != 208 \
+			or int(ctx.get_magic_gi_paged_prepared_max_lods()) < 10):
+		ctx.clear_magic_gi_dynamic_volume_inputs()
 		_dynamic_volume_runtime_state["status"] = "paged_prepared_bridge_incompatible"
 		_dynamic_volume_runtime_state["fallback_reason"] = "engine_requires_paged_clv_sh2_abi_2"
 		return
@@ -2746,11 +2055,9 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 			olv_binding = {}
 	var selected_prepared_resolution := _effective_prepared_clv_resolution()
 	if use_prepared and not paged \
-			and (not ctx.has_method("get_magic_gi_prepared_sh2_layout_version") \
-				or int(ctx.call("get_magic_gi_prepared_sh2_layout_version")) != 8 \
-				or not ctx.has_method("get_magic_gi_prepared_sh2_parameters_size") \
-				or int(ctx.call("get_magic_gi_prepared_sh2_parameters_size")) != 96):
-		ctx.call("clear_magic_gi_dynamic_volume_inputs")
+			and (int(ctx.get_magic_gi_prepared_sh2_layout_version()) != 8 \
+				or int(ctx.get_magic_gi_prepared_sh2_parameters_size()) != 96):
+		ctx.clear_magic_gi_dynamic_volume_inputs()
 		_dynamic_volume_runtime_state["status"] = "whole_volume_prepared_bridge_incompatible"
 		_dynamic_volume_runtime_state["fallback_reason"] = "engine_requires_whole_volume_clv_sh2_layout_8_abi_1"
 		return
@@ -2844,7 +2151,7 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 			and owner_transform is Transform3D and owner_size is Vector3)
 		owner_ubos.append(_magicdawn_native_owner_ubos[view])
 	var token := _next_magicdawn_publication_token()
-	var frame_token := int(ctx.call("get_frame_token"))
+	var frame_token := int(ctx.get_frame_token())
 	var bridge_layout_version := int(cache.get_runtime_state().get("layout_version",
 			DynamicVolumeCache.LAYOUT_VERSION))
 	if owner_ok and frame_token > 0:
@@ -2859,25 +2166,24 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		# remains explicit in the cache UBO and its operator-schema metadata.
 		bridge_layout_version = cache_layout_version
 		if bool(cache_runtime_state.get("paged_prepared_transfer", false)):
-			bridge_layout_version = int(ctx.call("get_magic_gi_paged_prepared_layout_version"))
+			bridge_layout_version = int(ctx.get_magic_gi_paged_prepared_layout_version())
 		elif bool(cache_runtime_state.get("preinterpolated_transfer", false)):
-			bridge_layout_version = int(ctx.call("get_magic_gi_prepared_sh2_layout_version"))
+			bridge_layout_version = int(ctx.get_magic_gi_prepared_sh2_layout_version())
 		for view in view_count:
-			ctx.call("set_magic_gi_dynamic_volume_input", view, fields,
+			ctx.set_magic_gi_dynamic_volume_input(view, fields,
 					cache.parameters, owner_ubos[view], cache.dimensions,
 					moments, relocation, validity_buffer, cache.origin_world,
 					cache.spacing_m, cache.response_resolution,
 					bridge_layout_version, token, frame_token)
-			owner_ok = owner_ok and bool(ctx.call("has_magic_gi_dynamic_volume_input", view))
+			owner_ok = owner_ok and bool(ctx.has_magic_gi_dynamic_volume_input(view))
 		if owner_ok and not olv_binding.is_empty() and cache.has_method("has_olv_binding") \
 				and bool(cache.call("has_olv_binding")):
 			var olv_resources: Dictionary = cache.call("get_olv_binding")
-			if ctx.has_method("set_magic_gi_dynamic_volume_olv_input"):
-				ctx.call("set_magic_gi_dynamic_volume_olv_input", 0,
+			ctx.set_magic_gi_dynamic_volume_olv_input(0,
 					olv_resources.label_atlas, olv_resources.label_parameters)
-				owner_ok = bool(ctx.call("has_magic_gi_dynamic_volume_olv_input", 0))
+			owner_ok = bool(ctx.has_magic_gi_dynamic_volume_olv_input(0))
 		if not owner_ok:
-			ctx.call("clear_magic_gi_dynamic_volume_inputs")
+			ctx.clear_magic_gi_dynamic_volume_inputs()
 			_dynamic_volume_runtime_state["status"] = "volume_lease_rejected"
 			_dynamic_volume_runtime_state["fallback_reason"] = "context_rejected_current_volume_lease"
 	if owner_ok and frame_token > 0:
@@ -2908,8 +2214,6 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 			"olv_prepared_check_cache_hits": int(prepared_check_stats.get("cache_hits", 0)),
 			"source_validated": validated, "source_instance_id": source.get_instance_id(),
 			"source_signature": source_signature, "active": false,
-			"owner_control_w_published": float(_magicdawn_receiver_qa_mode),
-			"receiver_sample_qa_mode_published": _magicdawn_receiver_qa_mode,
 			"owner_parameters_rid_id": owner_ubos[0].get_id() if not owner_ubos.is_empty() \
 					and owner_ubos[0].is_valid() else 0,
 			"replacement_requested": replacement_requested,
@@ -2926,7 +2230,7 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 			"active": false, "half_size": Vector2i.ZERO}
 		if is_prepared_sh2:
 			_dynamic_volume_screen_runtime_state["status"] = "native_preinterpolated_clv"
-		elif view_count == 1 and ctx.has_method("enqueue_after_operation"):
+		elif view_count == 1:
 			var frame_ubo_bytes := _build_dynamic_volume_screen_frame_bytes(scene_data,
 					buffers.get_internal_size())
 			if frame_ubo_bytes.size() == MAGIC_GI_DYNAMIC_SCREEN_FRAME_UBO_BYTES:
@@ -2936,7 +2240,7 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 					int(_dynamic_volume_screen_runtime_state["cache_revision"]),
 					int(_dynamic_volume_screen_runtime_state["dispatch_token"]),
 					frame_ubo_bytes)
-				var queued := bool(ctx.call("enqueue_after_operation",
+				var queued := bool(ctx.enqueue_after_operation(
 						NativeSpec.PASS_GBUFFER, callback))
 				_dynamic_volume_screen_runtime_state["status"] = \
 						"gbuffer_callback_queued" if queued else "gbuffer_operation_not_scheduled"
@@ -2980,6 +2284,34 @@ func _build_dynamic_volume_screen_frame_bytes(scene_data: RenderSceneData,
 			return PackedByteArray()
 	return values.to_byte_array()
 
+func _ensure_shared_samplers(rd: RenderingDevice) -> bool:
+	if rd == null:
+		return false
+	var changed := false
+	if not _nearest_sampler.is_valid():
+		var nearest_state := RDSamplerState.new()
+		nearest_state.mag_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+		nearest_state.min_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+		nearest_state.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+		nearest_state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		nearest_state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		nearest_state.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		_nearest_sampler = rd.sampler_create(nearest_state)
+		changed = true
+	if not _linear_sampler.is_valid():
+		var linear_state := RDSamplerState.new()
+		linear_state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+		linear_state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+		linear_state.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+		linear_state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		linear_state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		linear_state.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		_linear_sampler = rd.sampler_create(linear_state)
+		changed = true
+	if changed:
+		_sync_owned_rid_snapshot()
+	return _nearest_sampler.is_valid() and _linear_sampler.is_valid()
+
 func _ensure_dynamic_volume_screen_resolve_resources(rd: RenderingDevice) -> bool:
 	if rd == null:
 		_dynamic_volume_screen_runtime_state["status"] = "rendering_device_unavailable"
@@ -3009,29 +2341,8 @@ func _ensure_dynamic_volume_screen_resolve_resources(rd: RenderingDevice) -> boo
 		if not _dynamic_volume_screen_resolve_pipeline.is_valid():
 			_dynamic_volume_screen_runtime_state["status"] = "screen_pipeline_create_failed"
 			return false
-	if not _dynamic_volume_screen_nearest_sampler.is_valid():
-		var nearest_state := RDSamplerState.new()
-		nearest_state.mag_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		nearest_state.min_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		nearest_state.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		nearest_state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		nearest_state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		nearest_state.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		_dynamic_volume_screen_nearest_sampler = rd.sampler_create(nearest_state)
-	if not _dynamic_volume_screen_nearest_sampler.is_valid():
-		_dynamic_volume_screen_runtime_state["status"] = "screen_nearest_sampler_create_failed"
-		return false
-	if not _dynamic_volume_screen_linear_sampler.is_valid():
-		var linear_state := RDSamplerState.new()
-		linear_state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-		linear_state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-		linear_state.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		linear_state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		linear_state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		linear_state.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		_dynamic_volume_screen_linear_sampler = rd.sampler_create(linear_state)
-	if not _dynamic_volume_screen_linear_sampler.is_valid():
-		_dynamic_volume_screen_runtime_state["status"] = "screen_linear_sampler_create_failed"
+	if not _ensure_shared_samplers(rd):
+		_dynamic_volume_screen_runtime_state["status"] = "screen_sampler_create_failed"
 		return false
 	if not _dynamic_volume_screen_diagnostics_buffer.is_valid():
 		var diagnostic_zero := PackedByteArray()
@@ -3175,11 +2486,9 @@ func _render_dynamic_volume_screen_cache_after_gbuffer(ctx: FRPPassContext,
 	if ctx == null or buffers == null:
 		_dynamic_volume_screen_runtime_state["status"] = "invalid_callback_context"
 		return
-	ctx.call("clear_magic_gi_dynamic_screen_cache_inputs")
-	if buffers.get_view_count() != 1 or not ctx.has_method("get_frame_token") \
-			or int(ctx.call("get_frame_token")) != frame_token \
-			or not ctx.has_method("has_magic_gi_dynamic_volume_input") \
-			or not bool(ctx.call("has_magic_gi_dynamic_volume_input", 0)) \
+	ctx.clear_magic_gi_dynamic_screen_cache_inputs()
+	if buffers.get_view_count() != 1 or int(ctx.get_frame_token()) != frame_token \
+			or not bool(ctx.has_magic_gi_dynamic_volume_input(0)) \
 			or source_publication_token <= 0 or cache == null \
 			or cache != _dynamic_volume_cache:
 		_dynamic_volume_screen_runtime_state["status"] = "source_or_frame_lease_mismatch"
@@ -3242,13 +2551,13 @@ func _render_dynamic_volume_screen_cache_after_gbuffer(ctx: FRPPassContext,
 		_dynamic_volume_screen_runtime_state["status"] = "screen_response_field_unavailable"
 		return
 	var set0 := UniformSetCacheRD.get_cache(_dynamic_volume_screen_resolve_shader, 0, [
-		U.sampled(0, _dynamic_volume_screen_nearest_sampler, depth),
-		U.sampled(1, _dynamic_volume_screen_nearest_sampler, normal),
+		U.sampled(0, _nearest_sampler, depth),
+		U.sampled(1, _nearest_sampler, normal),
 		U.image(2, half_incident), U.image(3, half_guide), U.image(4, edge_incident),
 		U.uniform_buffer(5, _dynamic_volume_screen_frame_ubo),
 		U.storage_buffer(6, _dynamic_volume_screen_diagnostics_buffer)])
 	var set1 := UniformSetCacheRD.get_cache(_dynamic_volume_screen_resolve_shader, 1, [
-		_magicdawn_sampler_uniform(62, _dynamic_volume_screen_linear_sampler),
+		_magicdawn_sampler_uniform(62, _linear_sampler),
 		_magicdawn_texture_uniform(69, field_textures[0]),
 		U.uniform_buffer(76, cache.parameters), U.uniform_buffer(77, owner_parameters),
 		_magicdawn_texture_uniform(87, cache.get_moments_texture()),
@@ -3302,11 +2611,11 @@ func _render_dynamic_volume_screen_cache_after_gbuffer(ctx: FRPPassContext,
 		_dynamic_volume_screen_diagnostic_result = {"status": "pending_readback",
 			"frame_token": frame_token, "cache_revision": cache_revision,
 			"dispatch_serial": _dynamic_volume_screen_dispatch_serial}
-	ctx.call("set_magic_gi_dynamic_screen_cache_input", 0, half_incident, half_guide,
+	ctx.set_magic_gi_dynamic_screen_cache_input(0, half_incident, half_guide,
 			edge_incident, source_publication_token, cache_revision,
 			_dynamic_volume_screen_dispatch_serial, frame_token)
-	if not bool(ctx.call("has_magic_gi_dynamic_screen_cache_input", 0)):
-		ctx.call("clear_magic_gi_dynamic_screen_cache_inputs")
+	if not bool(ctx.has_magic_gi_dynamic_screen_cache_input(0)):
+		ctx.clear_magic_gi_dynamic_screen_cache_inputs()
 		_dynamic_volume_screen_runtime_state["status"] = "screen_publication_rejected"
 		return
 	_dynamic_volume_screen_runtime_state = {
@@ -3351,19 +2660,10 @@ func _can_prepare_native_prt(ctx: FRPPassContext, buffers: RenderSceneBuffersRD,
 			and not magicdawn_dynamic_prt:
 		_set_native_prepare_rejection("block_chart_requires_compute_consumer")
 		return false
-	if not ctx.has_method("set_magic_gi_clv_input"):
-		_set_native_prepare_rejection("missing_native_bridge")
-		return false
 	# Older canonical executables may expose the bridge name while still consuming
 	# the pre-ABI9 CLV columns. Never let such a consumer steal this frame from the
-	# compute implementation. A missing getter means the bridge is unversioned.
-	if not ctx.has_method("get_magic_gi_clv_layout_version"):
-		_set_native_prepare_rejection("missing_native_clv_layout_version")
-		return false
-	if not ctx.has_method("supports_magic_gi_clv_resolution"):
-		_set_native_prepare_rejection("missing_native_clv_resolution_guard")
-		return false
-	var native_clv_layout_version := int(ctx.call("get_magic_gi_clv_layout_version"))
+	# compute implementation.
+	var native_clv_layout_version := int(ctx.get_magic_gi_clv_layout_version())
 	if native_clv_layout_version != CLV_LEGACY_LAYOUT_VERSION:
 		_set_native_prepare_rejection("native_clv_layout_mismatch:%d" % native_clv_layout_version)
 		return false
@@ -3371,7 +2671,7 @@ func _can_prepare_native_prt(ctx: FRPPassContext, buffers: RenderSceneBuffersRD,
 			and prt_clv_resolution != ClipmapCache.EXPANDED_RESOLUTION:
 		_set_native_prepare_rejection("unsupported_clv_resolution:%d" % prt_clv_resolution)
 		return false
-	if not bool(ctx.call("supports_magic_gi_clv_resolution", _effective_clv_resolution())):
+	if not bool(ctx.supports_magic_gi_clv_resolution(_effective_clv_resolution())):
 		_set_native_prepare_rejection("native_clv_resolution_unsupported:%d" % _effective_clv_resolution())
 		return false
 	if bool(snapshot.get("surfel", false)):
@@ -3492,15 +2792,13 @@ func _prepare_native_prt_clv(ctx: FRPPassContext, buffers: RenderSceneBuffersRD,
 		var key := _native_view_key(buffers, view)
 		_native_prepared_views[key] = {
 			"frame": Engine.get_frames_drawn(),
-			"renderer_frame_token": int(ctx.call("get_frame_token")) \
-					if ctx.has_method("get_frame_token") else -1,
+			"renderer_frame_token": int(ctx.get_frame_token()),
 			"cache_key": str(snapshot.get("cache_key", "")),
 			"version": int(snapshot.get("version", -1)),
 			"lighting_revision": int(_magicdawn_runtime_state.get("completed_lighting_revision", -1)),
 			"screen_cache_revision": screen_cache_revision,
 			"screen_cache_dispatch_token": screen_cache_dispatch_token,
 			"owner_parameters_rid": owner_parameters,
-			"owner_control_w": float(_magicdawn_receiver_qa_mode) if magicdawn_dynamic_clv else 0.0,
 			"clipmap": clipmap,
 		}
 	if not published:
@@ -3587,29 +2885,8 @@ func _ensure_magicdawn_screen_resolve_resources(rd: RenderingDevice) -> bool:
 		if not _magicdawn_screen_partial_pipeline.is_valid():
 			_magicdawn_screen_resolve_status = "partial_pipeline_create_failed"
 			return false
-	if not _magicdawn_screen_resolve_nearest_sampler.is_valid():
-		var sampler := RDSamplerState.new()
-		sampler.mag_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		sampler.min_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		sampler.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		sampler.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		sampler.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		sampler.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		_magicdawn_screen_resolve_nearest_sampler = rd.sampler_create(sampler)
-	if not _magicdawn_screen_resolve_nearest_sampler.is_valid():
+	if not _ensure_shared_samplers(rd):
 		_magicdawn_screen_resolve_status = "sampler_create_failed"
-		return false
-	if not _magicdawn_screen_resolve_linear_sampler.is_valid():
-		var linear := RDSamplerState.new()
-		linear.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-		linear.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-		linear.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		linear.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		linear.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		linear.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		_magicdawn_screen_resolve_linear_sampler = rd.sampler_create(linear)
-	if not _magicdawn_screen_resolve_linear_sampler.is_valid():
-		_magicdawn_screen_resolve_status = "linear_sampler_create_failed"
 		return false
 	if not _magicdawn_screen_resolve_diagnostics_buffer.is_valid():
 		var zero_diagnostics := PackedByteArray()
@@ -3705,11 +2982,10 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 	if ctx == null or buffers == null or buffers.get_view_count() != 1:
 		_magicdawn_screen_resolve_status = "invalid_callback_context"
 		if ctx != null:
-			ctx.call("clear_magic_gi_screen_cache_inputs")
+			ctx.clear_magic_gi_screen_cache_inputs()
 		return
-	ctx.call("clear_magic_gi_screen_cache_inputs")
-	if not ctx.has_magic_gi_clv_input(0) or not ctx.has_method("get_frame_token") \
-			or int(ctx.call("get_frame_token")) != frame_token:
+	ctx.clear_magic_gi_screen_cache_inputs()
+	if not ctx.has_magic_gi_clv_input(0) or int(ctx.get_frame_token()) != frame_token:
 		_magicdawn_screen_resolve_status = "clv_or_frame_lease_mismatch"
 		return
 	var prepared_value: Variant = _native_prepared_views.get(prepared_key, {})
@@ -3776,7 +3052,7 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 	if full_size.x <= 0 or full_size.y <= 0 or half_size.x <= 0 or half_size.y <= 0 \
 			or not _ensure_magicdawn_screen_resolve_resources(rd):
 		_magicdawn_screen_resolve_status = "empty_size_or_pipeline_unavailable"
-		ctx.call("clear_magic_gi_screen_cache_inputs")
+		ctx.clear_magic_gi_screen_cache_inputs()
 		return
 	var owner_parameters: RID = prepared.get("owner_parameters_rid", RID())
 	if not owner_parameters.is_valid() or not _ubo.is_valid() \
@@ -3784,8 +3060,8 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 		_magicdawn_screen_resolve_status = "frame_parameters_unavailable"
 		return
 	var classify_set0 := UniformSetCacheRD.get_cache(_magicdawn_screen_classify_shader, 0, [
-		U.sampled(0, _magicdawn_screen_resolve_nearest_sampler, depth),
-		U.sampled(1, _magicdawn_screen_resolve_nearest_sampler, normal),
+		U.sampled(0, _nearest_sampler, depth),
+		U.sampled(1, _nearest_sampler, normal),
 		U.image(2, half_incident), U.image(3, half_guide), U.image(4, edge_incident),
 		U.uniform_buffer(5, _ubo),
 		U.storage_buffer(6, _magicdawn_screen_resolve_diagnostics_buffer)])
@@ -3793,8 +3069,8 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 		U.uniform_buffer(58, owner_parameters),
 		U.uniform_buffer(60, _native_gi_parameters_ubo)])
 	var fast_set0 := UniformSetCacheRD.get_cache(_magicdawn_screen_resolve_shader, 0, [
-		U.sampled(0, _magicdawn_screen_resolve_nearest_sampler, depth),
-		U.sampled(1, _magicdawn_screen_resolve_nearest_sampler, normal),
+		U.sampled(0, _nearest_sampler, depth),
+		U.sampled(1, _nearest_sampler, normal),
 		U.image(2, half_incident), U.image(3, half_guide), U.image(4, edge_incident),
 		U.uniform_buffer(5, _ubo),
 		U.storage_buffer(6, _magicdawn_screen_resolve_diagnostics_buffer)])
@@ -3805,11 +3081,11 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 		U.uniform_buffer(53, cache.parameters),
 		U.uniform_buffer(58, owner_parameters),
 		U.uniform_buffer(60, _native_gi_parameters_ubo),
-		_magicdawn_sampler_uniform(61, _magicdawn_screen_resolve_nearest_sampler),
-		_magicdawn_sampler_uniform(62, _magicdawn_screen_resolve_linear_sampler)])
+		_magicdawn_sampler_uniform(61, _nearest_sampler),
+		_magicdawn_sampler_uniform(62, _linear_sampler)])
 	var partial_set0 := UniformSetCacheRD.get_cache(_magicdawn_screen_partial_shader, 0, [
-		U.sampled(0, _magicdawn_screen_resolve_nearest_sampler, depth),
-		U.sampled(1, _magicdawn_screen_resolve_nearest_sampler, normal),
+		U.sampled(0, _nearest_sampler, depth),
+		U.sampled(1, _nearest_sampler, normal),
 		U.image(2, half_incident), U.image(3, half_guide), U.image(4, edge_incident),
 		U.uniform_buffer(5, _ubo),
 		U.storage_buffer(6, _magicdawn_screen_resolve_diagnostics_buffer)])
@@ -3820,8 +3096,8 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 		U.uniform_buffer(53, cache.parameters),
 		U.uniform_buffer(58, owner_parameters),
 		U.uniform_buffer(60, _native_gi_parameters_ubo),
-		_magicdawn_sampler_uniform(61, _magicdawn_screen_resolve_nearest_sampler),
-		_magicdawn_sampler_uniform(62, _magicdawn_screen_resolve_linear_sampler),
+		_magicdawn_sampler_uniform(61, _nearest_sampler),
+		_magicdawn_sampler_uniform(62, _linear_sampler),
 		U.storage_buffer(63, visibility_nodes),
 		U.storage_buffer(64, visibility_triangles)])
 	if not classify_set0.is_valid() or not classify_set1.is_valid() \
@@ -3994,11 +3270,11 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 				"error": readback_error, "frame_token": frame_token,
 				"cache_revision": expected_revision}
 	var dispatch_token := expected_dispatch
-	ctx.call("set_magic_gi_screen_cache_input", 0, half_incident, half_guide,
+	ctx.set_magic_gi_screen_cache_input(0, half_incident, half_guide,
 			edge_incident, cache.texture, expected_revision, dispatch_token, frame_token)
 	if not ctx.has_magic_gi_screen_cache_input(0):
 		_magicdawn_screen_resolve_status = "publication_rejected_by_context_lease"
-		ctx.call("clear_magic_gi_screen_cache_inputs")
+		ctx.clear_magic_gi_screen_cache_inputs()
 		return
 	_magicdawn_screen_resolve_status = "classify_fast_and_partial_five_stage_dispatched_and_published"
 	_magicdawn_runtime_state["screen_cache_status"] = _magicdawn_screen_resolve_status
@@ -4010,15 +3286,9 @@ func _render_magicdawn_screen_cache_after_gbuffer(ctx: FRPPassContext,
 	_magicdawn_runtime_state["screen_cache_tile_size"] = 8
 	_magicdawn_runtime_state["screen_cache_edge_fallback"] = "coarse 8x8 tile, grouped 2x2, then full-pixel discontinuity"
 
-func _is_magicdawn_authored_snapshot(snapshot: Dictionary) -> bool:
-	return _clv_cache_backend(snapshot) == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED \
-			and _clv_layout_version_for_backend(CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART) \
-			== MAGICDAWN_NATIVE_LAYOUT_VERSION
 
 func _is_magicdawn_dynamic_clv_snapshot(snapshot: Dictionary) -> bool:
-	return _clv_cache_backend(snapshot) == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED
+	return _clv_cache_backend(snapshot) == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART
 
 func _magicdawn_debug_sidecar_requested(buffers: RenderSceneBuffersRD) -> bool:
 	if buffers == null:
@@ -4026,43 +3296,15 @@ func _magicdawn_debug_sidecar_requested(buffers: RenderSceneBuffersRD) -> bool:
 	var target := buffers.get_render_target()
 	return target.is_valid() and MagicGIDebugRequest.is_requested(int(target.get_id()))
 
-func _magicdawn_native_bridge_reason(ctx: FRPPassContext) -> String:
-	if ctx == null:
-		return "missing_context"
-	for method_name in ["set_magic_gi_baked_sh_input",
-			"has_magic_gi_baked_sh_input", "clear_magic_gi_baked_sh_inputs",
-			"get_magic_gi_baked_sh_layout_version",
-			"get_magic_gi_baked_sh_consumed_token"]:
-		if not ctx.has_method(method_name):
-			return "missing_native_layout17_api:%s" % method_name
-	var layout_version := int(ctx.call("get_magic_gi_baked_sh_layout_version"))
-	if layout_version != MAGICDAWN_NATIVE_LAYOUT_VERSION:
-		return "native_baked_sh_layout_mismatch:%d" % layout_version
-	return ""
-
-static func _magicdawn_layout16_codec_valid(codec_value: Variant,
-		format_tag: int) -> bool:
-	if not codec_value is Vector4:
-		return false
-	var codec: Vector4 = codec_value
-	if format_tag == 16:
-		return is_finite(codec.x) and codec.x > 0.0 \
-				and is_finite(codec.y) and codec.y > 0.0 \
-				and is_finite(codec.x * codec.y) \
-				and absf(codec.x * codec.y - 1.0) <= 2e-6 \
-				and codec.z == 16.0 and codec.w == 1.0
-	if format_tag == 32:
-		return codec == MagicDawnBakedSHCache.DEFAULT_CODEC_R32
-	return false
 
 func _next_magicdawn_publication_token() -> int:
-	if _native_baked_sh_publication_counter >= 9223372036854775806:
-		_native_baked_sh_publication_counter = 1
+	if _magicdawn_publication_counter >= 9223372036854775806:
+		_magicdawn_publication_counter = 1
 	else:
-		_native_baked_sh_publication_counter += 1
-	if _native_baked_sh_publication_counter == 0:
-		_native_baked_sh_publication_counter = 1
-	return _native_baked_sh_publication_counter
+		_magicdawn_publication_counter += 1
+	if _magicdawn_publication_counter == 0:
+		_magicdawn_publication_counter = 1
+	return _magicdawn_publication_counter
 
 func _ensure_magicdawn_native_owner_buffers(rd: RenderingDevice) -> bool:
 	var changed := false
@@ -4094,14 +3336,14 @@ func _write_magicdawn_native_owner_parameters(rd: RenderingDevice, view: int,
 	var normalization := scene_normalization if is_finite(scene_normalization) \
 			and scene_normalization > 0.0 else 1.0
 	var values := PackedFloat32Array()
-	_append_matrix4(values, owner_transform.affine_inverse())
+	_append_transform(values, owner_transform.affine_inverse())
 	values.append_array(PackedFloat32Array([owner_size.x, owner_size.y,
 		owner_size.z, 1.0]))
 	values.append_array(PackedFloat32Array([
 		maxf(float(snapshot.get("strength", 1.0)) * pass_strength, 0.0),
 		1.0 if replacement_requested else 0.0,
 		normalization,
-		float(_magicdawn_receiver_qa_mode)]))
+		0.0]))
 	var bytes := values.to_byte_array()
 	if bytes.size() != MAGICDAWN_NATIVE_OWNER_PARAMETER_BYTES:
 		return false
@@ -4112,337 +3354,6 @@ func _write_magicdawn_native_owner_parameters(rd: RenderingDevice, view: int,
 	_magicdawn_native_owner_bytes[view] = bytes
 	return true
 
-func _prepare_native_magicdawn_baked_sh(ctx: FRPPassContext,
-		buffers: RenderSceneBuffersRD, snapshot: Dictionary,
-		resolved_parameters: Variant, replacement_requested: bool) -> void:
-	var bridge_reason := _magicdawn_native_bridge_reason(ctx)
-	if not bridge_reason.is_empty():
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = bridge_reason
-		return
-	if buffers == null:
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "missing_render_buffers"
-		return
-	if not replacement_requested or not _replacement_request_prepared:
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "sky_replacement_not_requested"
-		return
-	if bool(snapshot.get("surfel", false)) or bool(snapshot.get("streamed", false)) \
-			or not bool(snapshot.get("use_clv", true)):
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "unsupported_scene_mode"
-		return
-	if buffers.get_view_count() < 1 or buffers.get_view_count() > 2:
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "unsupported_view_count:%d" % buffers.get_view_count()
-		return
-	if prt_apply_scale != 1 or clv_debug_view != CLVDebugView.OFF \
-			or _clv_stats_capture_armed or int(prt_surface_exact_debug_mode) != 0:
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "unsupported_apply_configuration"
-		return
-	var data: Variant = snapshot.get("data")
-	if not is_instance_valid(data) or not data.has_method("has_baked_indirect_sh") \
-			or not bool(data.call("has_baked_indirect_sh")):
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "revision2_baked_sh_unavailable"
-		return
-	var baked_revision := int(data.get("baked_indirect_sh_revision"))
-	if baked_revision != MAGICDAWN_BAKED_SH_REVISION:
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "baked_sh_revision_mismatch:%d" % baked_revision
-		return
-	var render_data := ctx.get_render_data()
-	var scene_data := render_data.get_render_scene_data() if render_data != null else null
-	var rd := RenderingServer.get_rendering_device()
-	if scene_data == null or rd == null:
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "missing_scene_or_rendering_device"
-		return
-	if not _ensure_magicdawn_native_owner_buffers(rd):
-		_native_baked_sh_state["status"] = "standalone_fallback"
-		_native_baked_sh_state["fallback_reason"] = "owner_parameter_buffer_creation_failed"
-		return
-
-	var previous_snapshot := _frame_snapshot
-	var previous_scene_data := _frame_scene_data
-	var previous_parameters := _frame_parameters
-	var previous_replacement := _frame_replacement_enabled
-	var previous_pre_exposure := _pre_exposure
-	var previous_scene_exposure := _scene_exposure_normalization
-	var previous_frame_clipmap := _frame_clipmap
-	var previous_magicdawn_active := _magicdawn_frame_active
-	var previous_prt_scale := _frame_prt_scale
-	_frame_snapshot = snapshot
-	_frame_scene_data = scene_data
-	_frame_parameters = resolved_parameters
-	_frame_replacement_enabled = replacement_requested
-	_pre_exposure = ctx.get_pre_exposure(0)
-	_scene_exposure_normalization = _get_scene_exposure_normalization(ctx)
-	_frame_prt_scale = 1
-	_frame_clipmap = null
-	_magicdawn_frame_active = false
-	var frame := Engine.get_frames_drawn()
-	var view_count := buffers.get_view_count()
-	var cache_key := str(snapshot.get("cache_key", ""))
-	var bake_version := int(snapshot.get("version", -1))
-	var token := _next_magicdawn_publication_token()
-	var published := not cache_key.is_empty() and bake_version >= 0
-	var failure_reason := ""
-	var failure_details: Dictionary = {}
-	var publication_field_format_tag := -1
-	var publication_codec := Vector4.ZERO
-	_capture_gpu_timestamp(rd, "Native Prepare Begin")
-	for view in view_count:
-		var view_key := _native_view_key(buffers, view)
-		_native_baked_sh_attempted_views[view_key] = {
-			"frame": frame, "cache_key": cache_key, "version": bake_version,
-			"layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"baked_sh_revision": baked_revision, "view": view,
-			"view_count": view_count}
-		if not published:
-			published = false
-			failure_reason = "invalid_publication_key"
-			break
-		if not _prepare_prt_clv_view(buffers, view, rd):
-			published = false
-			failure_reason = "layout17_cache_prepare_failed"
-			failure_details = _magicdawn_runtime_state.duplicate(true)
-			break
-		var clipmap: RefCounted = _frame_clipmap
-		if clipmap == null or not clipmap.has_method("get_field_textures") \
-				or not clipmap.has_method("get_layout16_runtime_state"):
-			published = false
-			failure_reason = "layout17_cache_api_unavailable"
-			break
-		var fields_value: Variant = clipmap.call("get_field_textures")
-		var fields: Array[RID] = []
-		if fields_value is Array:
-			for field_value in fields_value:
-				if field_value is RID:
-					fields.append(field_value)
-		var fields_valid := true
-		for field in fields:
-			fields_valid = fields_valid and field.is_valid()
-		if fields.size() != CLV_MAGICDAWN_BAKED_SH_TEXTURE_COUNT \
-				or not fields_valid \
-				or not clipmap.parameters.is_valid():
-			published = false
-			failure_reason = "layout17_field_or_parameter_rid_invalid"
-			break
-		var cache_report_value: Variant = clipmap.call("get_layout16_runtime_state")
-		if not cache_report_value is Dictionary:
-			published = false
-			failure_reason = "layout17_cache_state_unavailable"
-			break
-		var cache_report: Dictionary = cache_report_value
-		if int(cache_report.get("layout_version", -1)) != MAGICDAWN_NATIVE_LAYOUT_VERSION \
-				or not bool(cache_report.get("texture_count_valid", false)) \
-				or not bool(cache_report.get("texture_rids_valid", false)) \
-				or int(cache_report.get("field_texture_count", -1)) != CLV_MAGICDAWN_BAKED_SH_TEXTURE_COUNT \
-				or int(cache_report.get("clipmap_parameter_bytes", -1)) != 96 \
-				or int(cache_report.get("geometry_epoch", -1)) < 0:
-			published = false
-			failure_reason = "layout17_cache_state_invalid"
-			break
-		var codec_value: Variant = cache_report.get("codec", Vector4.ZERO)
-		var field_format_tag := int(cache_report.get("format_tag", -1))
-		if not _magicdawn_layout16_codec_valid(codec_value, field_format_tag):
-			published = false
-			failure_reason = "layout17_codec_or_format_invalid"
-			break
-		var field_codec: Vector4 = codec_value
-		publication_field_format_tag = field_format_tag
-		publication_codec = field_codec
-		var prepared_state := {
-			"frame": frame, "buffer_instance_id": buffers.get_instance_id(),
-			"view": view, "view_count": view_count,
-			"cache_key": cache_key, "version": bake_version,
-			"data_instance_id": data.get_instance_id(),
-			"baked_sh_revision": baked_revision,
-			"layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"field_format_tag": field_format_tag, "codec": field_codec,
-			"geometry_epoch": int(cache_report.get("geometry_epoch", -1)),
-			"content_revision": int(cache_report.get("content_revision", -1)),
-			"clipmap": clipmap, "fields": fields,
-			"parameters": clipmap.parameters,
-			"cache_report": cache_report.duplicate(true), "prepared": true}
-		_native_baked_sh_prepared_views[view_key] = prepared_state
-		if not _write_magicdawn_native_owner_parameters(rd, view, snapshot,
-				replacement_requested, _scene_exposure_normalization):
-			published = false
-			failure_reason = "layout17_owner_parameter_upload_failed"
-			break
-		ctx.call("set_magic_gi_baked_sh_input", view, fields,
-				clipmap.parameters, _magicdawn_native_owner_ubos[view], field_codec, token)
-		if not bool(ctx.call("has_magic_gi_baked_sh_input", view)):
-			published = false
-			failure_reason = "layout17_context_rejected_view"
-			break
-	if published:
-		var publication := {"enabled": true, "active": false, "consumed": false,
-			"frame": frame, "view_count": view_count, "publication_token": token,
-			"cache_key": cache_key, "bake_version": bake_version,
-			"baked_sh_revision": baked_revision,
-			"layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"field_format_tag": publication_field_format_tag,
-			"codec": publication_codec,
-			"status": "published_waiting_for_native_draw",
-			"fallback_reason": "native_consumption_not_confirmed",
-			"strength": maxf(float(snapshot.get("strength", 1.0)) \
-					* (float(resolved_parameters.x) if resolved_parameters is Vector4 \
-						else float(parameters.x)), 0.0),
-			"scene_exposure_normalization": _scene_exposure_normalization,
-			"pre_exposure_applied_by": "FRP deferred-lighting tail exactly once",
-			"replacement_enabled": replacement_requested,
-			"sky_ownership_bridge_active": replacement_requested,
-			"receiver_sample_qa_mode": _magicdawn_receiver_qa_mode,
-			"sky_attachment_requested_for_standalone_fallback": _replacement_request_prepared}
-		_native_baked_sh_publications[token] = publication
-		_native_baked_sh_state = publication.duplicate(true)
-	else:
-		if failure_reason.is_empty():
-			failure_reason = "invalid_publication_key"
-		ctx.call("clear_magic_gi_baked_sh_inputs")
-		_native_baked_sh_state = {"enabled": true, "active": false,
-			"consumed": false, "frame": frame, "publication_token": token,
-			"cache_key": cache_key, "bake_version": bake_version,
-			"baked_sh_revision": baked_revision,
-			"layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "standalone_fallback", "fallback_reason": failure_reason,
-			"prepared_view_count": _native_baked_sh_prepared_views.size(),
-			"failure_details": failure_details}
-	_capture_gpu_timestamp(rd, "Native Prepare End")
-	_frame_clipmap = previous_frame_clipmap
-	_magicdawn_frame_active = previous_magicdawn_active
-	_frame_prt_scale = previous_prt_scale
-	_frame_snapshot = previous_snapshot
-	_frame_scene_data = previous_scene_data
-	_frame_parameters = previous_parameters
-	_frame_replacement_enabled = previous_replacement
-	_pre_exposure = previous_pre_exposure
-	_scene_exposure_normalization = previous_scene_exposure
-	_frame_view_matrices.clear()
-	_frame_input_bindings.clear()
-
-func _magicdawn_native_prepared_state(buffers: RenderSceneBuffersRD, view: int,
-		snapshot: Dictionary) -> Dictionary:
-	if buffers == null or view < 0 or view >= buffers.get_view_count():
-		return {}
-	var view_key := _native_view_key(buffers, view)
-	var state: Dictionary = _native_baked_sh_prepared_views.get(view_key, {})
-	var data: Variant = snapshot.get("data")
-	if state.is_empty() or not bool(state.get("prepared", false)) \
-			or int(state.get("frame", -1)) != Engine.get_frames_drawn() \
-			or int(state.get("buffer_instance_id", -1)) != buffers.get_instance_id() \
-			or int(state.get("view", -1)) != view \
-			or int(state.get("view_count", -1)) != buffers.get_view_count() \
-			or str(state.get("cache_key", "")) != str(snapshot.get("cache_key", "")) \
-			or int(state.get("version", -1)) != int(snapshot.get("version", -1)) \
-			or not is_instance_valid(data) \
-			or int(state.get("data_instance_id", -1)) != data.get_instance_id() \
-			or int(state.get("baked_sh_revision", -1)) != MAGICDAWN_BAKED_SH_REVISION \
-			or int(data.get("baked_indirect_sh_revision")) != MAGICDAWN_BAKED_SH_REVISION \
-			or int(state.get("layout_version", -1)) != MAGICDAWN_NATIVE_LAYOUT_VERSION:
-		return {}
-	var clipmap: RefCounted = state.get("clipmap")
-	if clipmap == null or not clipmap.parameters.is_valid() \
-			or not clipmap.has_method("get_field_textures") \
-			or not clipmap.has_method("get_layout16_runtime_state"):
-		return {}
-	var clip_key := "%d:%d:%d:%s" % [buffers.get_instance_id(), view,
-			MAGICDAWN_NATIVE_LAYOUT_VERSION, str(snapshot.get("cache_key", ""))]
-	if not _clipmaps.has(clip_key) or _clipmaps[clip_key].get("cache") != clipmap:
-		return {}
-	var report_value: Variant = clipmap.call("get_layout16_runtime_state")
-	if not report_value is Dictionary:
-		return {}
-	var report: Dictionary = report_value
-	if int(report.get("layout_version", -1)) != MAGICDAWN_NATIVE_LAYOUT_VERSION \
-			or int(report.get("geometry_epoch", -2)) != int(state.get("geometry_epoch", -1)) \
-			or int(report.get("content_revision", -2)) != int(state.get("content_revision", -1)) \
-			or int(report.get("clipmap_parameter_bytes", -1)) != 96 \
-			or int(report.get("format_tag", -1)) != int(state.get("field_format_tag", -2)) \
-			or report.get("codec", Vector4.ZERO) != state.get("codec", Vector4.ONE) \
-			or not _magicdawn_layout16_codec_valid(report.get("codec", Vector4.ZERO),
-					int(report.get("format_tag", -1))):
-		return {}
-	var fields_value: Variant = clipmap.call("get_field_textures")
-	if not fields_value is Array or fields_value.size() != CLV_MAGICDAWN_BAKED_SH_TEXTURE_COUNT:
-		return {}
-	var expected_fields: Array = state.get("fields", [])
-	if expected_fields.size() != fields_value.size():
-		return {}
-	for index in fields_value.size():
-		var field: RID = fields_value[index]
-		if field != expected_fields[index] or not field.is_valid():
-			return {}
-	return state
-
-func _magicdawn_native_prepare_attempted_this_frame(buffers: RenderSceneBuffersRD,
-		view: int) -> bool:
-	if buffers == null:
-		return false
-	var state: Dictionary = _native_baked_sh_attempted_views.get(
-			_native_view_key(buffers, view), {})
-	return not state.is_empty() and int(state.get("frame", -1)) == Engine.get_frames_drawn()
-
-func _confirmed_magicdawn_native_publication(ctx: FRPPassContext,
-		snapshot: Dictionary) -> Dictionary:
-	if not native_baked_sh_lighting_enabled or ctx == null \
-			or not ctx.has_method("get_magic_gi_baked_sh_consumed_token"):
-		return {}
-	var buffers := ctx.get_render_scene_buffers() as RenderSceneBuffersRD
-	if buffers == null:
-		return {}
-	var token := int(ctx.call("get_magic_gi_baked_sh_consumed_token"))
-	if token <= 0 or not _native_baked_sh_publications.has(token):
-		return {}
-	var publication: Dictionary = _native_baked_sh_publications[token].duplicate(true)
-	# A matching consumed token is emitted only after the renderer submitted its
-	# native lighting draw with every current view input. Once that happened, late
-	# snapshot changes must never cause standalone Apply to add the same GI twice.
-	# Keep the consumed publication for this frame and report any drift for refresh
-	# on the next prepare instead of rejecting the token.
-	var resolved_value: Variant = get_resolved_parameters(ctx).get("parameters", parameters)
-	var current_pass_strength := float(resolved_value.x) if resolved_value is Vector4 \
-			else float(parameters.x)
-	var current_strength := maxf(float(snapshot.get("strength", 1.0)) \
-			* current_pass_strength, 0.0)
-	var current_normalization := _get_scene_exposure_normalization(ctx)
-	if int(publication.get("frame", -1)) != Engine.get_frames_drawn() \
-			or int(publication.get("view_count", -1)) != buffers.get_view_count() \
-			or int(publication.get("baked_sh_revision", -1)) != MAGICDAWN_BAKED_SH_REVISION \
-			or int(publication.get("layout_version", -1)) != MAGICDAWN_NATIVE_LAYOUT_VERSION:
-		return {}
-	var tuple_matches := str(publication.get("cache_key", "")) \
-			== str(snapshot.get("cache_key", "")) \
-			and int(publication.get("bake_version", -1)) == int(snapshot.get("version", -1)) \
-			and is_equal_approx(float(publication.get("strength", -1.0)), current_strength) \
-			and is_equal_approx(float(publication.get("scene_exposure_normalization", -1.0)), current_normalization) \
-			and _replacement_requested(snapshot, current_pass_strength) \
-			and _is_magicdawn_authored_snapshot(snapshot)
-	var cache_lease_matches := true
-	for view in buffers.get_view_count():
-		if not ctx.has_method("has_magic_gi_baked_sh_input") \
-				or not bool(ctx.call("has_magic_gi_baked_sh_input", view)) \
-				or _magicdawn_native_prepared_state(buffers, view, snapshot).is_empty():
-			cache_lease_matches = false
-			break
-	publication["publication_token"] = token
-	publication["confirmed_consumed_token"] = token
-	publication["published_tuple_matches_current"] = tuple_matches
-	publication["prepared_cache_lease_matches"] = cache_lease_matches
-	publication["status"] = "native_consumed" if tuple_matches and cache_lease_matches \
-			else "native_consumed_frozen_payload"
-	publication["deferred_refresh_reason"] = "" if tuple_matches and cache_lease_matches \
-			else ("snapshot_changed_after_native_draw" if not tuple_matches \
-				else "cache_lease_changed_after_native_draw")
-	publication["active"] = true
-	publication["consumed"] = true
-	publication["fallback_reason"] = ""
-	return publication
 
 func _native_view_key(buffers: RenderSceneBuffersRD, view: int) -> String:
 	return "%d:%d" % [buffers.get_instance_id(), view]
@@ -4475,33 +3386,12 @@ func _native_general_queue_eligibility_reason(buffers: RenderSceneBuffersRD,
 			return "unsupported_sampler_specialization_%d" % constant_id
 	return ""
 
-func _native_general_queue_bridge_reason(ctx: FRPPassContext) -> String:
-	if ctx == null:
-		return "missing_context"
-	var required_methods := PackedStringArray([
-		"set_magic_gi_general_queue_input",
-		"clear_magic_gi_general_queue_inputs",
-		"has_magic_gi_general_queue_input",
-		"set_magic_gi_general_queue_active",
-		"is_magic_gi_general_queue_active",
-		"get_magic_gi_general_queue_runtime_msaa",
-		"get_magic_gi_general_queue_runtime_view_count",
-	])
-	for method_name in required_methods:
-		if not ctx.has_method(method_name):
-			return "missing_queue_bridge:" + method_name
-	return ""
-
 func _prepare_native_deferred_general_queue(ctx: FRPPassContext,
 		buffers: RenderSceneBuffersRD, rd: RenderingDevice, snapshot: Dictionary) -> bool:
 	var size := buffers.get_internal_size() if buffers != null else Vector2i.ZERO
 	var reason := _native_general_queue_eligibility_reason(buffers, snapshot)
 	if not reason.is_empty():
 		_native_general_queue_state["fallback_reason"] = reason
-		return false
-	var bridge_reason := _native_general_queue_bridge_reason(ctx)
-	if not bridge_reason.is_empty():
-		_native_general_queue_state["fallback_reason"] = bridge_reason
 		return false
 	if rd == null or size.x <= 0 or size.y <= 0:
 		_native_general_queue_state["fallback_reason"] = "invalid_rendering_device_or_size"
@@ -4595,7 +3485,7 @@ func _prepare_native_deferred_general_queue(ctx: FRPPassContext,
 		return false
 	# The renderer inserts an ordering boundary before its next eligible lighting draw;
 	# descriptor-resource hazards order these clears before fragment writes.
-	ctx.call("set_magic_gi_general_queue_input", 0,
+	ctx.set_magic_gi_general_queue_input(0,
 			cached["geometry"], cached["visibility_moments"],
 			cached["visibility_nodes"], cached["visibility_triangles"],
 			directional.lighting, _prt_compact_queue_buffer,
@@ -4665,7 +3555,7 @@ func _write_native_gi_parameters(rd: RenderingDevice, snapshot: Dictionary) -> b
 	if not world_to_grid is Transform3D or not dimensions is Vector3i:
 		return false
 	var values := PackedFloat32Array()
-	_append_matrix4(values, world_to_grid)
+	_append_transform(values, world_to_grid)
 	values.append_array(PackedFloat32Array([float(dimensions.x), float(dimensions.y),
 		float(dimensions.z), float(cached.get("probe_count", 0))]))
 	values.append_array(PackedFloat32Array([float(snapshot.get("strength", 1.0)),
@@ -4692,7 +3582,7 @@ func _write_native_owner_parameters(rd: RenderingDevice, view: int,
 		return false
 	var pass_strength := float(_frame_parameters.x) if _frame_parameters is Vector4 else float(parameters.x)
 	var values := PackedFloat32Array()
-	_append_matrix4(values, owner_transform.affine_inverse())
+	_append_transform(values, owner_transform.affine_inverse())
 	values.append_array(PackedFloat32Array([owner_size.x, owner_size.y, owner_size.z, 1.0]))
 	values.append_array(PackedFloat32Array([
 		maxf(float(snapshot.get("strength", 1.0)) * pass_strength, 0.0),
@@ -4767,10 +3657,6 @@ func _warn_missing_replacement_bridge() -> void:
 func _parameter_bytes(scale_sign := 1.0) -> PackedByteArray:
 	var value: Vector4 = _frame_parameters if _frame_parameters is Vector4 else parameters
 	var pre_exposure := _pre_exposure * _scene_exposure_normalization
-	if _magicdawn_frame_active:
-		return PackedFloat32Array([value.x, pre_exposure,
-				float(_magicdawn_receiver_qa_mode),
-				201.0 if _magicdawn_stats_capture_active else 0.0]).to_byte_array()
 	if _frame_native_clv_fallback_only and _frame_prt_scale == 1:
 		scale_sign = -absf(scale_sign)
 	var debug_view := 100.0 if _prt_raw_debug_output else float(clv_debug_view)
@@ -5548,26 +4434,7 @@ func _ensure_magicdawn_clv_debug_resources(rd: RenderingDevice) -> bool:
 		if not _magicdawn_clv_debug_pipeline.is_valid():
 			_magicdawn_clv_debug_status = "pipeline_create_failed"
 			return false
-	if not _magicdawn_clv_debug_nearest_sampler.is_valid():
-		var nearest := RDSamplerState.new()
-		nearest.mag_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		nearest.min_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		nearest.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		nearest.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		nearest.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		nearest.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		_magicdawn_clv_debug_nearest_sampler = rd.sampler_create(nearest)
-	if not _magicdawn_clv_debug_linear_sampler.is_valid():
-		var linear := RDSamplerState.new()
-		linear.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-		linear.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-		linear.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-		linear.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		linear.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		linear.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-		_magicdawn_clv_debug_linear_sampler = rd.sampler_create(linear)
-	if not _magicdawn_clv_debug_nearest_sampler.is_valid() \
-			or not _magicdawn_clv_debug_linear_sampler.is_valid():
+	if not _ensure_shared_samplers(rd):
 		_magicdawn_clv_debug_status = "sampler_create_failed"
 		return false
 	_sync_owned_rid_snapshot()
@@ -5662,12 +4529,12 @@ func _render_magicdawn_dynamic_clv_debug(buffers: RenderSceneBuffersRD,
 		_magicdawn_runtime_state["clv_debug_view_status"] = _magicdawn_clv_debug_status
 		return
 	var set0 := UniformSetCacheRD.get_cache(_magicdawn_clv_debug_shader, 0, [
-		U.sampled(1, _magicdawn_clv_debug_nearest_sampler, depth),
-		U.sampled(2, _magicdawn_clv_debug_nearest_sampler, normal),
-		U.sampled(3, _magicdawn_clv_debug_nearest_sampler, albedo),
-		U.sampled(4, _magicdawn_clv_debug_nearest_sampler, orm),
+		U.sampled(1, _nearest_sampler, depth),
+		U.sampled(2, _nearest_sampler, normal),
+		U.sampled(3, _nearest_sampler, albedo),
+		U.sampled(4, _nearest_sampler, orm),
 		U.image(5, output), U.uniform_buffer(9, _ubo),
-		U.sampled(16, _magicdawn_clv_debug_linear_sampler, diffuse_ao)])
+		U.sampled(16, _linear_sampler, diffuse_ao)])
 	var set1 := UniformSetCacheRD.get_cache(_magicdawn_clv_debug_shader, 1, [
 		_magicdawn_texture_uniform(50, cache.texture),
 		_magicdawn_texture_uniform(51, cache.tags),
@@ -5675,8 +4542,8 @@ func _render_magicdawn_dynamic_clv_debug(buffers: RenderSceneBuffersRD,
 		U.uniform_buffer(53, cache.parameters),
 		U.uniform_buffer(58, owner_parameters),
 		U.uniform_buffer(60, _native_gi_parameters_ubo),
-		_magicdawn_sampler_uniform(61, _magicdawn_clv_debug_nearest_sampler),
-		_magicdawn_sampler_uniform(62, _magicdawn_clv_debug_linear_sampler)])
+		_magicdawn_sampler_uniform(61, _nearest_sampler),
+		_magicdawn_sampler_uniform(62, _linear_sampler)])
 	if not set0.is_valid() or not set1.is_valid():
 		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
 		_magicdawn_clv_debug_status = "uniform_set_create_failed"
@@ -5688,14 +4555,6 @@ func _render_magicdawn_dynamic_clv_debug(buffers: RenderSceneBuffersRD,
 		_magicdawn_clv_debug_status = "empty_render_size"
 		_magicdawn_runtime_state["clv_debug_view_status"] = _magicdawn_clv_debug_status
 		return
-	if _magicdawn_active_readback_armed \
-			and clv_debug_view in [CLVDebugView.RECONSTRUCTED_LIGHTING,
-				CLVDebugView.REJECTION_REASONS]:
-		# Keep this exact view/cache alive until the runner queues async readback after
-		# frame_post_draw. Synchronous RD readback from this callback is unsafe on D3D12.
-		_magicdawn_active_readback_context = {
-			"prepared": prepared, "cache": cache, "view": view,
-			"callback_frame": Engine.get_frames_drawn()}
 	var push := PackedByteArray()
 	push.append_array(PackedInt32Array([size.x, size.y, clv_debug_view]).to_byte_array())
 	push.append_array(PackedFloat32Array([maxf(_pre_exposure, 0.0)]).to_byte_array())
@@ -5745,253 +4604,6 @@ func _render_preinterpolated_clv_debug(buffers: RenderSceneBuffersRD,
 	_magicdawn_runtime_state["clv_debug_mirror_frame"] = Engine.get_frames_drawn()
 	_sync_owned_rid_snapshot()
 
-func _magicdawn_read_active_clv_cache(context: Dictionary,
-		readbacks: Dictionary) -> Dictionary:
-	var prepared: Dictionary = context.get("prepared", {})
-	var cache: RefCounted = context.get("cache")
-	var view := int(context.get("view", -1))
-	var result := {"valid": false, "view": view,
-		"frame": int(prepared.get("frame", -1)),
-		"cache_key": str(prepared.get("cache_key", "")),
-		"callback_frame": int(context.get("callback_frame", -1)),
-		"request_frame": int(context.get("request_frame", -1)),
-		"request_errors": context.get("errors", {}),
-		"timing_note": "One-shot asynchronous diagnostic only; excluded from normal rendering and performance samples."}
-	if cache == null:
-		result["error"] = "active_cache_unavailable"
-		return result
-	var resolution := int(cache.get("resolution"))
-	if resolution not in [16, 24]:
-		result["error"] = "active_cache_resolution_unsupported"
-		return result
-	var cache_state: Dictionary = cache.get_runtime_state() \
-			if cache.has_method("get_runtime_state") else {}
-	var params_bytes: PackedByteArray = readbacks.get("params", PackedByteArray())
-	var parameters := {"valid": params_bytes.size() == 80,
-		"spacing_m": -1.0, "approximate_enabled": -1.0,
-		"exact_corner_visibility_enabled": -1.0, "approximate_ready_bit_enabled": -1.0,
-		"resolution": -1, "levels": -1, "epoch": -1, "layout": -1}
-	if params_bytes.size() == 80:
-		parameters["spacing_m"] = params_bytes.decode_float(48)
-		parameters["approximate_enabled"] = params_bytes.decode_float(52)
-		parameters["exact_corner_visibility_enabled"] = params_bytes.decode_float(56)
-		parameters["approximate_ready_bit_enabled"] = params_bytes.decode_float(60)
-		parameters["resolution"] = params_bytes.decode_s32(64)
-		parameters["levels"] = params_bytes.decode_s32(68)
-		parameters["epoch"] = params_bytes.decode_s32(72)
-		parameters["layout"] = params_bytes.decode_s32(76)
-	result["cache_state"] = cache_state
-	result["parameters"] = parameters
-
-	var ubo_bytes: PackedByteArray = readbacks.get("ubo", PackedByteArray())
-	var lighting_value: Variant = context.get("snapshot_lighting", PackedFloat32Array())
-	var sky_value: Variant = context.get("snapshot_sky", PackedFloat32Array())
-	var lighting := PackedFloat32Array()
-	var sky := PackedFloat32Array()
-	if lighting_value is PackedFloat32Array:
-		lighting = lighting_value
-	if sky_value is PackedFloat32Array:
-		sky = sky_value
-	result["live_sh"] = {
-		"ubo_bytes": ubo_bytes.size(),
-		"snapshot_lighting": _magicdawn_readback_packed_metrics(lighting),
-		"ubo_lighting": _magicdawn_readback_float_metrics(ubo_bytes, 224, 27),
-		"lighting_max_abs_delta": _magicdawn_readback_max_delta(ubo_bytes, 224, lighting),
-		"snapshot_sky": _magicdawn_readback_packed_metrics(sky),
-		"ubo_sky": _magicdawn_readback_float_metrics(ubo_bytes, 336, 27),
-		"sky_max_abs_delta": _magicdawn_readback_max_delta(ubo_bytes, 336, sky)}
-
-	var bake: Dictionary = _bake_resources.get(str(prepared.get("cache_key", "")), {})
-	var directional_value: Variant = bake.get("directional")
-	var input_bindings: Dictionary = context.get("input_bindings", {})
-	if directional_value is RefCounted and directional_value.has_method("get_clv_transfer_bindings"):
-		var bindings_value: Variant = directional_value.call("get_clv_transfer_bindings")
-		if bindings_value is Dictionary:
-			input_bindings = bindings_value
-	var probes := int(input_bindings.get("probes", 0))
-	var emitters := int(input_bindings.get("emitters", 0))
-	result["transfer_inputs"] = {
-		"lighting_revision": int(input_bindings.get("lighting_revision", -1)),
-		"sources_ready": bool(input_bindings.get("sources_ready", false)),
-		"probes": probes, "emitters": emitters,
-		"transfer": _magicdawn_readback_buffer_metrics(readbacks.get("input_transfer", PackedByteArray()),
-			mini(probes * 243 * 4, 4096)),
-		"sky": _magicdawn_readback_buffer_metrics(readbacks.get("input_sky", PackedByteArray()),
-			mini(probes * 81 * 4, 4096)),
-		"emission": _magicdawn_readback_buffer_metrics(readbacks.get("input_emission", PackedByteArray()),
-			mini(probes * emitters * 54 * 4, 4096)),
-		"sources": _magicdawn_readback_buffer_metrics(readbacks.get("input_sources", PackedByteArray()),
-			mini(emitters * 6 * 4, 4096))}
-	result["readback_sizes"] = {"params": [params_bytes.size(), 80],
-		"ubo": [ubo_bytes.size(), UBO_SIZE],
-		"input_transfer": [readbacks.get("input_transfer", PackedByteArray()).size(),
-			mini(probes * 243 * 4, 4096)],
-		"input_sky": [readbacks.get("input_sky", PackedByteArray()).size(),
-			mini(probes * 81 * 4, 4096)]}
-	result["next_layer"] = "aggregate_transfer_matrix_and_relit_layout9_texture_not_read_in_small_buffer_tier"
-	result["valid"] = params_bytes.size() == 80 and ubo_bytes.size() == UBO_SIZE
-	return result
-
-func _magicdawn_readback_float_metrics(bytes: PackedByteArray, offset: int,
-		count: int) -> Dictionary:
-	if offset < 0 or count < 0 or offset + count * 4 > bytes.size():
-		return {"valid": false, "float_count": count}
-	var nonzero := 0
-	var nonfinite := 0
-	var maximum := 0.0
-	var sum_abs := 0.0
-	for index in count:
-		var value := bytes.decode_float(offset + index * 4)
-		if not is_finite(value):
-			nonfinite += 1
-			continue
-		var absolute := absf(value)
-		if absolute > 1e-20:
-			nonzero += 1
-		maximum = maxf(maximum, absolute)
-		sum_abs += absolute
-	return {"valid": true, "float_count": count, "nonzero": nonzero,
-		"nonfinite": nonfinite, "max_abs": maximum, "sum_abs": sum_abs}
-
-func _magicdawn_readback_packed_metrics(values: PackedFloat32Array) -> Dictionary:
-	var nonzero := 0
-	var nonfinite := 0
-	var maximum := 0.0
-	var sum_abs := 0.0
-	for value in values:
-		if not is_finite(value):
-			nonfinite += 1
-			continue
-		var absolute := absf(value)
-		if absolute > 1e-20:
-			nonzero += 1
-		maximum = maxf(maximum, absolute)
-		sum_abs += absolute
-	return {"count": values.size(), "nonzero": nonzero,
-		"nonfinite": nonfinite, "max_abs": maximum, "sum_abs": sum_abs}
-
-func _magicdawn_readback_max_delta(bytes: PackedByteArray, offset: int,
-		values: PackedFloat32Array) -> float:
-	if values.size() != 27 or bytes.size() < offset + 27 * 4:
-		return INF
-	var maximum := 0.0
-	for index in 27:
-		maximum = maxf(maximum, absf(bytes.decode_float(offset + index * 4) - values[index]))
-	return maximum
-
-func _magicdawn_readback_buffer_metrics(bytes: PackedByteArray, byte_count: int) -> Dictionary:
-	var request_size := mini(byte_count, 4096)
-	return {"valid": request_size > 0 and bytes.size() == request_size, "bytes": bytes.size(),
-		"summary": _magicdawn_readback_float_metrics(bytes, 0, bytes.size() / 4)}
-
-func _magicdawn_readback_transfer_face(bytes: PackedByteArray, width: int,
-		resolution: int, slot: Vector3i, axis: int, emitters: int) -> Dictionary:
-	var level := floori(float(slot.z) / float(resolution))
-	var local_z := slot.z % resolution
-	var texture_z := (level * 3 + axis) * resolution + local_z
-	var summary := {"directional": {"nonzero": 0, "max_abs": 0.0, "sum_abs": 0.0},
-		"sky": {"nonzero": 0, "max_abs": 0.0, "sum_abs": 0.0},
-		"emission": {"nonzero": 0, "max_abs": 0.0, "sum_abs": 0.0}}
-	for scalar_index in 324 + maxi(0, emitters) * 54:
-		var column := scalar_index >> 2
-		var component := scalar_index & 3
-		var x := column * resolution + slot.x
-		var offset := ((texture_z * resolution + slot.y) * width + x) * 16 + component * 4
-		if offset < 0 or offset + 4 > bytes.size():
-			continue
-		var value := bytes.decode_float(offset)
-		if not is_finite(value):
-			continue
-		var category := "directional" if scalar_index < 243 else \
-				("sky" if scalar_index < 324 else "emission")
-		var stats: Dictionary = summary[category]
-		var absolute := absf(value)
-		if absolute > 1e-20:
-			stats["nonzero"] = int(stats["nonzero"]) + 1
-		stats["max_abs"] = maxf(float(stats["max_abs"]), absolute)
-		stats["sum_abs"] = float(stats["sum_abs"]) + absolute
-	return summary
-
-func _magicdawn_readback_relight_face(bytes: PackedByteArray, width: int,
-		resolution: int, slot: Vector3i, axis: int) -> Dictionary:
-	var coefficients := {"nonzero_rgb": 0, "max_abs_rgb": 0.0, "sum_abs_rgb": 0.0}
-	for column in 18:
-		var value := _magicdawn_readback_vec4f(bytes, width, resolution, slot, axis * 24 + column)
-		for component in 3:
-			var absolute := absf(value[component])
-			if absolute > 1e-20:
-				coefficients["nonzero_rgb"] = int(coefficients["nonzero_rgb"]) + 1
-			coefficients["max_abs_rgb"] = maxf(float(coefficients["max_abs_rgb"]), absolute)
-			coefficients["sum_abs_rgb"] = float(coefficients["sum_abs_rgb"]) + absolute
-	var metadata := _magicdawn_readback_vec4f(bytes, width, resolution, slot, axis * 24 + 18)
-	var anchor := _magicdawn_readback_vec4f(bytes, width, resolution, slot, axis * 24 + 19)
-	var secondary := _magicdawn_readback_vec4f(bytes, width, resolution, slot, axis * 24 + 20)
-	var primary := _magicdawn_readback_vec4f(bytes, width, resolution, slot, axis * 24 + 21)
-	return {"coefficient_rgb": coefficients, "metadata": metadata, "anchor": anchor,
-		"secondary_rgb": Vector3(secondary.x, secondary.y, secondary.z),
-		"secondary_alpha": secondary.w,
-		"primary_rgb": Vector3(primary.x, primary.y, primary.z), "primary_alpha": primary.w}
-
-func _magicdawn_readback_vec4f(bytes: PackedByteArray, width: int,
-		resolution: int, slot: Vector3i, column: int) -> Vector4:
-	var x := slot.x + column * resolution
-	var offset := ((slot.z * resolution + slot.y) * width + x) * 16
-	if offset < 0 or offset + 16 > bytes.size():
-		return Vector4.ZERO
-	return Vector4(bytes.decode_float(offset), bytes.decode_float(offset + 4),
-		bytes.decode_float(offset + 8), bytes.decode_float(offset + 12))
-
-func _magicdawn_readback_receiver(cache_bytes: PackedByteArray, tag_bytes: PackedByteArray,
-		support_bytes: PackedByteArray, stencil_bytes: PackedByteArray,
-		texture_width: int, resolution: int, spacing: float, geometry_epoch: int,
-		origins: Array, receiver: Dictionary) -> Dictionary:
-	var world: Vector3 = receiver.get("world", Vector3.ZERO)
-	var normal: Vector3 = receiver.get("normal", Vector3.UP)
-	var axis := _clv_dominant_axis(normal)
-	var levels: Array[Dictionary] = []
-	for level in 3:
-		if level >= origins.size() or spacing <= 0.0:
-			continue
-		var step := spacing * float(1 << level)
-		var position := (world + normal * step * 0.75) / step - Vector3.ONE * 0.5
-		var base := Vector3i(floori(position.x), floori(position.y), floori(position.z))
-		var origin: Vector3i = origins[level]
-		var relative := base - origin
-		var corners: Array[Dictionary] = []
-		for corner in 8:
-			var logical := base + Vector3i(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1)
-			var physical := Vector3i(_clv_posmod(logical.x, resolution),
-				_clv_posmod(logical.y, resolution), _clv_posmod(logical.z, resolution))
-			var slot := Vector3i(physical.x, physical.y, physical.z + level * resolution)
-			var tag := _clv_read_vec4i(tag_bytes, resolution, resolution, slot)
-			var support := _clv_read_u32(support_bytes, resolution, resolution, slot)
-			var face_index := ((slot.z * resolution + slot.y) * resolution + slot.x) * 3 + axis
-			var stencil_word := face_index * 52
-			var marker := stencil_word * 4 + 8 <= stencil_bytes.size() \
-					and (int(stencil_bytes.decode_u32((stencil_word + 1) * 4)) & 0x80000000) != 0
-			var stencil_count := int(stencil_bytes.decode_u32(stencil_word * 4)) \
-				if stencil_word * 4 + 4 <= stencil_bytes.size() else -1
-			corners.append({"corner": corner, "logical": logical, "slot": slot,
-				"tag": tag, "tag_epoch_match": tag.w == geometry_epoch,
-				"support": support, "axis_support": (support & (1 << axis)) != 0,
-				"transfer_valid": marker, "stencil_count": stencil_count,
-				"metadata": _magicdawn_readback_vec4f(cache_bytes, texture_width,
-					resolution, slot, axis * 24 + 18),
-				"anchor": _magicdawn_readback_vec4f(cache_bytes, texture_width,
-					resolution, slot, axis * 24 + 19),
-				"secondary": _magicdawn_readback_vec4f(cache_bytes, texture_width,
-					resolution, slot, axis * 24 + 20),
-				"primary": _magicdawn_readback_vec4f(cache_bytes, texture_width,
-					resolution, slot, axis * 24 + 21)})
-		levels.append({"level": level, "step_m": step, "origin": origin,
-			"query_position": position, "query_fraction": position - position.floor(),
-			"logical_base": base, "relative_base": relative,
-			"inside_window": relative.x >= 0 and relative.y >= 0 and relative.z >= 0 \
-					and relative.x < resolution - 1 and relative.y < resolution - 1 \
-					and relative.z < resolution - 1, "axis": axis, "corners": corners})
-	return {"name": str(receiver.get("name", "receiver")), "world": world,
-		"normal": normal, "axis": axis, "levels": levels}
-
 func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> void:
 	_last_prt_two_stage_active = false
 	_last_prt_two_stage_stage_values = PackedInt32Array([MAGIC_GI_PRT_STAGE_LEGACY])
@@ -6025,8 +4637,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		_warn_missing_replacement_bridge()
 	if bool(_frame_snapshot.get("streamed", false)):
 		_release_prt_raw_view(buffers, view, rd)
-		if _clv_cache_backend(_frame_snapshot) == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-				and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED:
+		if _clv_cache_backend(_frame_snapshot) == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
 			# Layout 16 needs one persistent field spanning all resident pages. Until
 			# the streamed producer can publish that combined field, fail closed and
 			# leave native lighting untouched instead of entering the legacy CSR path.
@@ -6034,7 +4645,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 			var streamed_output: RID = inputs[5].get_texture(buffers, view)
 			if streamed_output.is_valid():
 				rd.texture_clear(streamed_output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
+			_magicdawn_runtime_state = {"backend": 1, "layout_version": CLV_LEGACY_LAYOUT_VERSION,
 				"status": "streamed_combined_field_not_ready", "pixel_csr_fallback": false,
 				"replacement_enabled": false}
 			return
@@ -6050,38 +4661,6 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		_complete_prt_scene_hdr_readback_error("PRT output is unavailable in the requested scene HDR frame")
 		return
 	var cache_key := str(_frame_snapshot.get("cache_key", ""))
-	var magicdawn_prepared_state := _magicdawn_native_prepared_state(
-			buffers, view, _frame_snapshot)
-	if _frame_native_baked_sh_consumed:
-		if magicdawn_prepared_state.is_empty():
-			# The renderer reported a consumed publication, but the matching cache
-			# lease no longer validates. Never add a second contribution or re-update
-			# a cache that was already prepared earlier in this frame.
-			rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-			_magicdawn_frame_active = false
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "native_consumed_cache_lease_mismatch",
-				"pixel_csr_fallback": false, "native_consumed": true,
-				"standalone_apply_dispatched": false,
-				"replacement_enabled": true, "sky_ownership_bridge_active": true}
-			_complete_prt_scene_hdr_readback_error(
-					"Native baked-SH draw consumed a publication whose cache lease no longer matches")
-			return
-		_frame_replacement_enabled = true
-		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-		_magicdawn_frame_active = false
-		_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "native_consumed_standalone_apply_skipped",
-			"pixel_csr_fallback": false, "native_consumed": true,
-			"standalone_apply_dispatched": false,
-			"replacement_enabled": true, "sky_ownership_bridge_active": true,
-			"publication_token": int(_frame_native_baked_sh_publication.get(
-					"publication_token", 0)),
-			"baked_indirect_sh_revision": MAGICDAWN_BAKED_SH_REVISION,
-			"scene_exposure_normalization": _scene_exposure_normalization,
-			"pre_exposure_applied_by": "FRP deferred-lighting tail exactly once"}
-		_service_prt_scene_hdr_readback(buffers, view, rd)
-		return
 	var exact_debug_mode := int(prt_surface_exact_debug_mode)
 	var exact_debug_active := _frame_prt_scale == 1 \
 			and ((exact_debug_mode >= 100 and exact_debug_mode <= 105) \
@@ -6094,25 +4673,6 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 		prt_surface_exact_debug_point_buffer = _exact_point_debug_buffer
 	var native_state := _native_prepared_state(buffers, view, cache_key)
 	var prepared_clipmap: RefCounted = native_state.get("clipmap") if not native_state.is_empty() else null
-	if not magicdawn_prepared_state.is_empty():
-		prepared_clipmap = magicdawn_prepared_state.get("clipmap")
-	elif _magicdawn_native_prepare_attempted_this_frame(buffers, view):
-		# Native preflight already attempted this view and failed or its frame/bake
-		# tuple changed. Repeating update() here could double the producer budget.
-		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
-		_magicdawn_frame_active = false
-		_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "prepared_cache_mismatch_fail_closed",
-			"pixel_csr_fallback": false, "native_consumed": false,
-			"standalone_apply_dispatched": false,
-			"fallback_reason": "frame_view_bake_layout_or_revision_changed",
-			"native_prepare_fallback_reason": str(
-					_native_baked_sh_state.get("fallback_reason", "")),
-			"native_prepare_failure_details": _native_baked_sh_state.get(
-					"failure_details", {})}
-		_complete_prt_scene_hdr_readback_error(
-				"Prepared layout-17 cache lease changed; skipped repeat update and pixel fallback")
-		return
 	if not _prepare_prt_clv_view(buffers, view, rd, prepared_clipmap):
 		_frame_replacement_enabled = false
 		rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
@@ -6121,10 +4681,7 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	var shader_before := _shader
 	var compute_before := _compute_pipeline
 	var sampler_before := _sampler
-	var shader_file_before := shader_file
 	var raster_count_before := _raster_pipelines.size()
-	var magicdawn_active := _magicdawn_frame_active
-	var keywords_before: Dictionary = shader_keywords.duplicate(true) if magicdawn_active else {}
 	var force_full_features := _frame_prt_scale != 1
 	force_full_features = force_full_features or clv_debug_view != CLVDebugView.OFF
 	force_full_features = force_full_features or _prt_raw_debug_output
@@ -6133,25 +4690,10 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	force_full_features = force_full_features or exact_clv_corner_visibility_enabled
 	force_full_features = force_full_features or prt_surface_exact_debug_mode != 0
 	var full_shader_features := not prt_fast_shader_variant_enabled or force_full_features
-	if magicdawn_active:
-		shader_file = MAGIC_GI_APPLY_MAGICDAWN_SHADER
-		# The dedicated layout-17 shader declares no specialization constants. Do
-		# not inherit the old shader's IDs, B14 keywords, or staged source variants.
-		shader_keywords.clear()
-		_keyword_signature = ""
-	else:
-		set_shader_keyword(MAGIC_GI_FULL_FEATURES_SPEC_ID, full_shader_features)
-		_last_prt_shader_full_features = full_shader_features
+	set_shader_keyword(MAGIC_GI_FULL_FEATURES_SPEC_ID, full_shader_features)
+	_last_prt_shader_full_features = full_shader_features
 	_clv_stats_capture_active = _clv_stats_capture_armed
 	_clv_stats_capture_armed = false
-	_magicdawn_stats_capture_active = magicdawn_active and _magicdawn_stats_capture_armed
-	if magicdawn_active:
-		_magicdawn_stats_capture_armed = false
-		_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "shader_or_dispatch_not_started", "pixel_csr_fallback": false,
-			"includes_primary_sky": true, "includes_direct_directional_light": false,
-			"replacement_enabled": _frame_replacement_enabled,
-			"stats_capture_frame": _magicdawn_stats_capture_frame}
 	_capture_gpu_timestamp(rd, "Apply Begin")
 	super._render(buffers, view, rd)
 	_capture_gpu_timestamp(rd, "Apply End")
@@ -6160,16 +4702,11 @@ func _render(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevice) -> v
 	_service_prt_linear_output_readback(output, view, rd)
 	_service_prt_scene_hdr_readback(buffers, view, rd)
 	_clv_stats_capture_active = false
-	_magicdawn_stats_capture_active = false
 	if exact_debug_active:
 		prt_surface_exact_debug_last_mode = exact_debug_mode
 		prt_surface_exact_debug_frame += 1
 		prt_surface_exact_debug_capture_frame = Engine.get_process_frames()
 	_frame_clipmap = null
-	if magicdawn_active:
-		shader_file = shader_file_before
-		shader_keywords = keywords_before
-		_keyword_signature = ""
 	if shader_before != _shader or compute_before != _compute_pipeline \
 			or sampler_before != _sampler or raster_count_before != _raster_pipelines.size():
 		_sync_owned_rid_snapshot()
@@ -6179,292 +4716,78 @@ func _prepare_prt_clv_view(buffers: RenderSceneBuffersRD, view: int,
 	if _is_magicdawn_dynamic_clv_snapshot(_frame_snapshot):
 		return _prepare_magicdawn_dynamic_clv_view(buffers, view, rd)
 	_frame_clipmap = null
-	_magicdawn_frame_active = false
-	if _layout14_b_internal_test_enabled:
-		_set_layout14_b_frame_active(false)
-	else:
-		_layout14_b_frame_active = false
-		_layout14_b_frame_moments = RID()
-		_layout14_b_frame_sampler = RID()
-		_layout14_b_frame_tags = RID()
-		if _layout14_b_saved_shader_file != null \
-				and shader_file == _layout14_b_apply_shader_resource:
-			shader_file = _layout14_b_saved_shader_file
 	var clv_backend := _clv_cache_backend(_frame_snapshot)
 	if _last_clv_cache_backend != clv_backend:
 		_last_clv_cache_backend = clv_backend
 		if Engine.is_editor_hint():
 			notify_property_list_changed()
-	var requested_layout := _clv_layout_version_for_backend(clv_backend)
-	var magicdawn_baked_path := requested_layout == CLV_MAGICDAWN_BAKED_SH_LAYOUT_VERSION \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED
-	if magicdawn_baked_path:
-		_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "layout17_prepare_started", "pixel_csr_fallback": false,
-			"replacement_enabled": false}
-	if magicdawn_baked_path and (not bool(_frame_snapshot.get("use_clv", true)) \
-			or _frame_prt_scale != 1):
-		_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "unsupported_apply_configuration", "pixel_csr_fallback": false,
-			"replacement_enabled": false}
-		return false
-	if magicdawn_baked_path and clv_debug_view != CLVDebugView.OFF:
-		# The baked-SH shader has no CLV diagnostic visualization. Keep the normal
-		# contribution live; Debug Buffers → Magic GI reads this standalone output.
-		_magicdawn_runtime_state["clv_debug_view_status"] = "unsupported_ignored_gi_remains_active"
 	if not _ensure_sampler(rd):
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "sampler_setup_failed", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
 		return false
 	if not _ensure_page_param_buffers(rd):
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "page_parameter_buffer_setup_failed", "pixel_csr_fallback": false,
-				"page_params_valid": _page_params_ubo.is_valid(),
-				"pending_page_params_valid": _pending_page_params_ubo.is_valid(),
-				"replacement_enabled": false}
 		return false
 	if not _write_page_params(rd, AABB(), Rect2i(Vector2i.ZERO, buffers.get_internal_size()),
 			_frame_snapshot, false):
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "page_parameter_upload_failed", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
 		return false
 	var cache_key := str(_frame_snapshot.get("cache_key", ""))
 	var data: Variant = _frame_snapshot.get("data")
 	var version := int(_frame_snapshot.get("version", -1))
 	if _frame_scene_data == null:
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "missing_scene_data", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
 		return false
 	if cache_key.is_empty():
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "missing_bake_cache_key", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
 		return false
 	if not is_instance_valid(data):
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "missing_bake_data", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
-		return false
-	# Layout-16 segment visibility requires a persisted, validated v6 BVH.
-	# Older moment previews intentionally synthesize empty traversal buffers and
-	# must never enter the baked-SH producer, whose empty-tree result is clear.
-	if magicdawn_baked_path and int(data.get("format_version")) != 6:
-		_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "current_visibility_bvh_required", "pixel_csr_fallback": false,
-			"data_format_version": int(data.get("format_version")),
-			"required_data_format_version": 6, "replacement_enabled": false}
 		return false
 	if not _ensure_bake_resources(cache_key, data, version, rd):
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "bake_resource_prepare_failed", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
 		return false
 	var cached: Dictionary = _bake_resources[cache_key]
-	# This O(1) cache bit proves the uploaded BVH came through Data's full v6
-	# validator. It also rejects a stale/legacy cache reused by the baked backend.
-	if magicdawn_baked_path and not bool(cached.get("exact_visibility", false)):
-		_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-			"status": "validated_visibility_bvh_upload_missing", "pixel_csr_fallback": false,
-			"exact_visibility": false, "replacement_enabled": false}
-		return false
-	var clv_layout_version := _clv_layout_version_for_backend(clv_backend)
-	if magicdawn_baked_path:
-		if not data.has_method("has_baked_indirect_sh") \
-				or not bool(data.call("has_baked_indirect_sh")):
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "revision2_baked_sh_unavailable", "pixel_csr_fallback": false,
-				"baked_sh_revision": int(data.get("baked_indirect_sh_revision")),
-				"replacement_enabled": false}
-			_report_baked_sh_unready_once(data,
-				"MagicDawn baked SH backend needs a verified revision-2 total-SH Bake; run Bake before using backend 1.")
-			return false
-		var baked_directional: RefCounted = cached.get("directional")
-		var baked_field_value: Variant = null
-		if baked_directional != null:
-			baked_field_value = baked_directional.get("baked_indirect_lighting")
-		if not baked_field_value is RID:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "baked_source_buffer_missing", "pixel_csr_fallback": false,
-				"baked_sh_revision": int(data.get("baked_indirect_sh_revision")),
-				"replacement_enabled": false}
-			_report("MagicDawn baked SH producer has no uploaded revision-2 probe field.")
-			return false
-		var baked_field: RID = baked_field_value
-		if not baked_field.is_valid():
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "baked_source_buffer_invalid", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
-			return false
-	if not magicdawn_baked_path \
-			and not _update_emission_texture(cache_key, _frame_snapshot, data, rd):
+	var clv_layout_version := CLV_LEGACY_LAYOUT_VERSION
+	if not _update_emission_texture(cache_key, _frame_snapshot, data, rd):
 		return false
 	var selected_resolution := _effective_clv_resolution(clv_backend)
-	var codec_info: Dictionary = {}
-	var requested_format_tag := 32
-	var requested_codec := MagicDawnBakedSHCache.DEFAULT_CODEC_R32
-	if magicdawn_baked_path:
-		var codec_info_value: Variant = cached.get("magicdawn_baked_sh_codec", {})
-		if not codec_info_value is Dictionary:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "baked_sh_codec_unavailable", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
-			return false
-		codec_info = codec_info_value
-		var codec_value: Variant = codec_info.get("codec", Vector4.ZERO)
-		if not bool(codec_info.get("valid", false)) or not codec_value is Vector4:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "baked_sh_codec_invalid", "pixel_csr_fallback": false,
-				"codec_error": str(codec_info.get("error", "missing_codec")),
-				"replacement_enabled": false}
-			return false
-		requested_codec = codec_value
-		requested_format_tag = int(codec_info.get("format_tag", 32))
-		if _magicdawn_field_format_override == 32:
-			requested_format_tag = 32
-			requested_codec = MagicDawnBakedSHCache.DEFAULT_CODEC_R32
-		elif requested_format_tag != 16:
-			requested_format_tag = 32
-			requested_codec = MagicDawnBakedSHCache.DEFAULT_CODEC_R32
-	var boundary_tensor_payload: Dictionary = {"valid": false}
-	var boundary_record_count := 0
-	if magicdawn_baked_path \
-			and clv_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and clv_layout_version == CLV_MAGICDAWN_BAKED_SH_LAYOUT_VERSION \
-			and data.has_method("get_baked_boundary_tensor_records_for_runtime"):
-		var boundary_payload_value: Variant = data.call(
-				"get_baked_boundary_tensor_records_for_runtime")
-		if boundary_payload_value is Dictionary:
-			boundary_tensor_payload = boundary_payload_value
-			if bool(boundary_tensor_payload.get("valid", false)):
-				var boundary_keys_value: Variant = boundary_tensor_payload.get("keys", null)
-				if boundary_keys_value is PackedInt32Array \
-						and boundary_keys_value.size() % 4 == 0:
-					boundary_record_count = boundary_keys_value.size() / 4
-	var clv_gpu_bytes := _clv_gpu_bytes_for_backend(clv_backend,
-			selected_resolution, requested_format_tag, boundary_record_count)
-	# Compute fallback reconstructs its own view ray for each view; native deferred
-	# lighting receives a separate bake-only UBO so a multiview draw shares no camera matrix.
+	var clv_gpu_bytes := _clv_gpu_bytes_for_backend(clv_backend, selected_resolution)
 	if not _update_frame_ubo(_frame_snapshot, _frame_scene_data, view, rd):
-		if magicdawn_baked_path:
-			_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-				"status": "frame_ubo_update_failed", "pixel_csr_fallback": false,
-				"replacement_enabled": false}
 		return false
-	if clv_layout_version == CLV_INTERNAL_LAYOUT14_V0_TEST \
-			and int(cached.get("probe_count", 0)) <= 0:
-		# There is no directional payload to turn into the optional V0 field.
-		# Leave the clipmap null so the ordinary PRT pass uses its source path;
-		# in particular, do not allocate or bind a zero-probe raw sidecar.
-		_frame_clipmap = null
-		_cache_clock += 1
-		cached["last_used"] = _cache_clock
-		_bake_resources[cache_key] = cached
-		return true
 	if prepared_clipmap != null:
 		_frame_clipmap = prepared_clipmap
-		_magicdawn_frame_active = magicdawn_baked_path
 	else:
-		if not magicdawn_baked_path:
-			_capture_gpu_timestamp(rd, "Relight Begin")
-			if not _update_probe_lighting(cache_key, _frame_snapshot, rd):
-				return false
-			_capture_gpu_timestamp(rd, "Relight End")
+		_capture_gpu_timestamp(rd, "Relight Begin")
+		if not _update_probe_lighting(cache_key, _frame_snapshot, rd):
+			return false
+		_capture_gpu_timestamp(rd, "Relight End")
 		var directional: RefCounted = cached.get("directional")
 		_capture_gpu_timestamp(rd, "CLV Begin")
 		if directional != null and bool(_frame_snapshot.get("use_clv", true)):
 			var clip_key := "%d:%d:%d:%s" % [buffers.get_instance_id(), view,
-				MAGICDAWN_NATIVE_LAYOUT_VERSION, cache_key]
+				clv_layout_version, cache_key]
 			if _clipmaps.has(clip_key):
 				var old_entry: Dictionary = _clipmaps[clip_key]
-				if not _clipmap_layout_is_current(old_entry, clv_backend,
-						_magicdawn_field_format_override if magicdawn_baked_path else -1):
+				if not _clipmap_layout_is_current(old_entry, clv_backend, -1):
 					var old_cache: RefCounted = old_entry.get("cache")
 					if old_cache != null:
 						_free_rids(rd, old_cache.owned_rids())
 					_clipmaps.erase(clip_key)
 					_sync_owned_rid_snapshot()
 			if not _clipmaps.has(clip_key):
-				var clipmap = _new_clv_cache(clv_backend)
-				var create_succeeded := false
-				if magicdawn_baked_path:
-					create_succeeded = bool(clipmap.call("create", rd,
-							selected_resolution, false, 0, requested_format_tag, requested_codec,
-							boundary_record_count))
-				else:
-					create_succeeded = clipmap.create(rd, selected_resolution)
-				if not create_succeeded:
-					var cache_create_state: Dictionary = {}
-					if clipmap.has_method("get_layout16_runtime_state"):
-						var cache_create_state_value: Variant = \
-								clipmap.call("get_layout16_runtime_state")
-						if cache_create_state_value is Dictionary:
-							cache_create_state = cache_create_state_value
-					var cache_create_error := str(cache_create_state.get("last_error",
-							clipmap.get("_last_error")))
+				var clipmap = ClipmapCache.new()
+				if not clipmap.create(rd, selected_resolution):
 					_free_rids(rd, clipmap.owned_rids())
-					# A missing block-chart cache is an ordinary CLV miss: keep the PRT
-					# pass alive and let the shared tail evaluate its source gather.
 					if clv_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
 						_capture_gpu_timestamp(rd, "CLV End")
-						if magicdawn_baked_path:
-							_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-								"status": "clipmap_create_failed", "pixel_csr_fallback": false,
-								"replacement_enabled": false,
-								"resolution": selected_resolution,
-								"requested_format_tag": requested_format_tag,
-								"requested_codec": requested_codec,
-								"cache_error": cache_create_error,
-								"cache_state": cache_create_state}
-							return false
 						return true
 					return false
-				var actual_gpu_bytes := clv_gpu_bytes
-				var field_cache_state: Dictionary = {}
-				if magicdawn_baked_path:
-					var field_cache_state_value: Variant = clipmap.call("get_layout16_runtime_state")
-					if not field_cache_state_value is Dictionary:
-						_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-							"status": "layout17_cache_state_unavailable",
-							"pixel_csr_fallback": false, "replacement_enabled": false}
-						_free_rids(rd, clipmap.owned_rids())
-						return false
-					field_cache_state = field_cache_state_value
-					actual_gpu_bytes = int(field_cache_state.get("field_gpu_bytes_estimate", 0))
-					if actual_gpu_bytes <= 0:
-						_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-							"status": "layout17_cache_memory_estimate_invalid",
-							"pixel_csr_fallback": false, "replacement_enabled": false,
-							"cache_state": field_cache_state.duplicate(true)}
-						_free_rids(rd, clipmap.owned_rids())
-						return false
 				_clipmaps[clip_key] = {"cache": clipmap, "owner": weakref(buffers),
 					"last_used": _cache_clock, "bake": cache_key,
 					"layout_version": clv_layout_version, "cache_backend": clv_backend,
 					"requested_resolution": selected_resolution,
 					"resolution": int(clipmap.get("resolution")),
-					"gpu_bytes": actual_gpu_bytes,
-				"field_format_tag": int(field_cache_state.get("format_tag", 0)),
-					"field_codec": field_cache_state.get("codec", Vector4.ZERO),
-				"boundary_tensor_record_count": int(field_cache_state.get(
-						"boundary_tensor_record_count", 0)),
-				"boundary_tensor_buffer_generation": int(field_cache_state.get(
-						"boundary_tensor_buffer_generation", 0)),
-					"field_codec_fallback_reason": str(codec_info.get("fallback_reason", "")) \
-							if magicdawn_baked_path else "",
-					"field_format_fallback_reason": str(
-							field_cache_state.get("format_fallback_reason", "")),
-					"field_format_override": _magicdawn_field_format_override \
-							if magicdawn_baked_path else -1}
+					"gpu_bytes": clv_gpu_bytes,
+					"field_format_tag": 0,
+					"field_codec": Vector4.ZERO,
+					"boundary_tensor_record_count": 0,
+					"boundary_tensor_buffer_generation": 0,
+					"field_codec_fallback_reason": "",
+					"field_format_fallback_reason": "",
+					"field_format_override": -1}
 				_sync_owned_rid_snapshot()
 			var entry: Dictionary = _clipmaps[clip_key]
 			entry.last_used = _cache_clock
@@ -6474,186 +4797,37 @@ func _prepare_prt_clv_view(buffers: RenderSceneBuffersRD, view: int,
 			var focus := ClipmapCache.focus_for_bounds(
 					camera_world_position, source_bounds, spacing,
 					int(entry.cache.get("resolution")))
-			var baked_focus := focus
-			var baked_focus_domain := AABB()
-			var baked_focus_report: Dictionary = {}
-			if magicdawn_baked_path:
-				baked_focus_domain = _magicdawn_world_focus_domain(source_bounds, _frame_snapshot)
-				if not _valid_clv_focus_bounds(baked_focus_domain):
-					_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-						"status": "invalid_world_space_focus_domain", "pixel_csr_fallback": false,
-						"replacement_enabled": false,
-						"source_bounds_world": [source_bounds.position.x, source_bounds.position.y,
-							source_bounds.position.z, source_bounds.size.x, source_bounds.size.y,
-							source_bounds.size.z],
-						"owner_transform": _frame_snapshot.get("owner_transform"),
-						"owner_size": _frame_snapshot.get("owner_size"),
-						"focus_domain_valid": false}
-					return false
-				baked_focus_report = MagicDawnBakedSHCache.focus_for_baked_domain(
-						camera_world_position, baked_focus_domain, spacing,
-						int(entry.cache.get("resolution")))
-				if not bool(baked_focus_report.get("valid", false)):
-					_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-						"status": "invalid_world_space_focus_domain", "pixel_csr_fallback": false,
-						"replacement_enabled": false,
-						"focus_report": baked_focus_report}
-					return false
-				var baked_focus_value: Variant = baked_focus_report.get("focus_world")
-				if not baked_focus_value is Vector3:
-					_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-						"status": "invalid_world_space_focus_domain", "pixel_csr_fallback": false,
-						"replacement_enabled": false,
-						"focus_report": baked_focus_report}
-					return false
-				baked_focus = baked_focus_value
 			var clv_bake := cached
-			var clv_bake_is_copy := false
 			var clv_cluster_buffer := _cluster_binding_for_cache(cached, rd)
 			if not clv_cluster_buffer.is_valid():
 				if clv_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
 					_capture_gpu_timestamp(rd, "CLV End")
-					if magicdawn_baked_path:
-						_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-								"status": "probe_cluster_unavailable", "pixel_csr_fallback": false,
-								"replacement_enabled": false}
-						return false
 					return true
 				return false
 			if clv_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
-				# Layout 12 builds chart domains from the exact packed CPU bake snapshot.
-				# The GPU RIDs remain the normal production bindings; these arrays are
-				# consumed only by the bounded CPU geometry index builder.
 				clv_bake = cached.duplicate(false)
-				clv_bake_is_copy = true
 				clv_bake["probe_clusters"] = clv_cluster_buffer
-				clv_bake["cpu_visibility_nodes"] = data.visibility_nodes
-				clv_bake["cpu_visibility_triangles"] = data.visibility_triangles
-				clv_bake["cpu_geometry_key"] = "%s:%d:%d" % [cache_key,
-					int(cached.get("data_id", -1)), version]
 			elif clv_cluster_buffer != cached.get("probe_clusters", RID()):
 				clv_bake = cached.duplicate(false)
-				clv_bake_is_copy = true
 				clv_bake["probe_clusters"] = clv_cluster_buffer
-			if magicdawn_baked_path \
-					and clv_layout_version == CLV_MAGICDAWN_BAKED_SH_LAYOUT_VERSION:
-				if not clv_bake_is_copy:
-					clv_bake = cached.duplicate(false)
-					clv_bake_is_copy = true
-				clv_bake["boundary_tensor_records_payload"] = boundary_tensor_payload
 			var geometry_epoch := _nonstream_clv_geometry_epoch(
 					_frame_snapshot, cache_key, int(cached.get("data_id", -1)), version)
-			var content_revision := 1 if magicdawn_baked_path else \
-					_nonstream_clv_content_revision(_frame_snapshot, cached, int(directional.epoch))
-			var layout14_b_requested_for_frame := clv_layout_version == CLV_INTERNAL_LAYOUT14_V0_TEST \
-				and _layout14_b_internal_test_enabled
-			var layout14_b_raw_ready := false
-			if layout14_b_requested_for_frame:
-				layout14_b_raw_ready = _layout14_b_raw_source_ready(directional)
-				if not layout14_b_raw_ready:
-					# A stale raw sidecar must not spend work building a field the B root cannot use.
-					_frame_clipmap = null
-					_set_layout14_b_frame_active(false)
-					_layout14_b_error = "raw_directional_sidecar_unavailable_or_stale"
-					_capture_gpu_timestamp(rd, "CLV End")
-					_prune_clipmaps(rd)
-					_cache_clock += 1
-					cached["last_used"] = _cache_clock
-					_bake_resources[cache_key] = cached
-					return true
-			var cache_update_succeeded := false
-			var boundary_buffer_generation_before := int(
-					entry.get("boundary_tensor_buffer_generation", 0))
-			if clv_layout_version == CLV_INTERNAL_LAYOUT14_V0_TEST:
-				if entry.cache.has_method("set_internal_b_test_enabled"):
-					entry.cache.call("set_internal_b_test_enabled",
-							_layout14_b_cache_requested())
-				cache_update_succeeded = entry.cache.update(rd, focus, spacing,
-					geometry_epoch, content_revision, clv_bake, directional, _ubo, _sampler,
-					int(_frame_snapshot.get("clv_cells_per_frame", 256)),
-					approximate_clv_volume_enabled,
-					exact_clv_corner_visibility_enabled,
-					approximate_clv_ready_bit_enabled, false, camera_world_position)
-			elif magicdawn_baked_path:
-				cache_update_succeeded = entry.cache.update(rd, baked_focus,
-					spacing, geometry_epoch, content_revision, clv_bake, directional,
-					_ubo, _sampler,
-					int(_frame_snapshot.get("clv_cells_per_frame", 256)),
-					false, false, false, false, camera_world_position,
-					baked_focus_domain, baked_focus_report)
-			else:
-				cache_update_succeeded = entry.cache.update(rd, focus, spacing,
+			var content_revision := _nonstream_clv_content_revision(
+					_frame_snapshot, cached, int(directional.epoch))
+			var cache_update_succeeded: bool = entry.cache.update(rd, focus, spacing,
 					geometry_epoch, content_revision, clv_bake, directional, _ubo, _sampler,
 					int(_frame_snapshot.get("clv_cells_per_frame", 256)),
 					approximate_clv_volume_enabled,
 					exact_clv_corner_visibility_enabled,
 					approximate_clv_ready_bit_enabled)
-			var updated_gpu_bytes := int(entry.get("gpu_bytes", clv_gpu_bytes))
-			if magicdawn_baked_path \
-					and clv_layout_version == CLV_MAGICDAWN_BAKED_SH_LAYOUT_VERSION:
-				var updated_state_value: Variant = entry.cache.call("get_layout16_runtime_state")
-				if not updated_state_value is Dictionary:
-					_sync_owned_rid_snapshot()
-					_magicdawn_runtime_state = {"backend": 1,
-						"layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-						"status": "layout17_cache_state_unavailable_after_update",
-						"pixel_csr_fallback": false, "replacement_enabled": false}
-					return false
-				var updated_state: Dictionary = updated_state_value
-				updated_gpu_bytes = int(updated_state.get("field_gpu_bytes_estimate", 0))
-				if updated_gpu_bytes <= 0:
-					_magicdawn_runtime_state = {"backend": 1,
-						"layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-						"status": "layout17_cache_memory_estimate_invalid_after_update",
-						"pixel_csr_fallback": false, "replacement_enabled": false}
-					return false
-				entry["boundary_tensor_buffer_generation"] = int(
-						updated_state.get("boundary_tensor_buffer_generation", 0))
-				entry["boundary_tensor_record_count"] = int(
-						updated_state.get("boundary_tensor_record_count", 0))
-				if int(entry.get("boundary_tensor_buffer_generation", 0)) \
-						!= boundary_buffer_generation_before:
-					_clipmaps[clip_key] = entry
-					_sync_owned_rid_snapshot()
-			entry["gpu_bytes"] = updated_gpu_bytes
+			entry["gpu_bytes"] = int(entry.get("gpu_bytes", clv_gpu_bytes))
 			_clipmaps[clip_key] = entry
 			if not cache_update_succeeded:
-				# Never sample an older block-chart entry after a failed producer update.
-				# A null cache binds the zero-tag fallback and forces the PRT source path.
 				if clv_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
 					_capture_gpu_timestamp(rd, "CLV End")
-					if magicdawn_baked_path:
-						_magicdawn_runtime_state = {"backend": 1, "layout_version": MAGICDAWN_NATIVE_LAYOUT_VERSION,
-								"status": "producer_update_failed", "pixel_csr_fallback": false,
-								"replacement_enabled": false,
-							"cache_error": str(entry.cache.get("_last_error")),
-							"cache_state": entry.cache.call("get_layout16_runtime_state") \
-								if entry.cache.has_method("get_layout16_runtime_state") else {}}
-						return false
 					return true
 				return false
 			_frame_clipmap = entry.cache
-			_magicdawn_frame_active = magicdawn_baked_path
-			if clv_layout_version == CLV_INTERNAL_LAYOUT14_V0_TEST \
-					and _layout14_b_internal_test_enabled:
-				_sync_owned_rid_snapshot()
-				var b_state_value: Variant = entry.cache.call("get_node_visibility_bindings", rd) \
-						if entry.cache.has_method("get_node_visibility_bindings") else {}
-				var b_state: Dictionary = b_state_value if b_state_value is Dictionary else {}
-				var raw_source_ready := layout14_b_raw_ready
-				if bool(b_state.get("valid", false)) \
-						and _ensure_layout14_b_apply_shader_resource() and raw_source_ready:
-					_set_layout14_b_frame_active(true, b_state)
-					_layout14_b_error = ""
-				else:
-					_frame_clipmap = null
-					_set_layout14_b_frame_active(false)
-					if not bool(b_state.get("valid", false)):
-						_layout14_b_error = str(b_state.get("error", "sidecar_unavailable"))
-					elif not raw_source_ready:
-						_layout14_b_error = "raw_directional_sidecar_unavailable_or_stale"
-			else:
-				_set_layout14_b_frame_active(false)
 		_capture_gpu_timestamp(rd, "CLV End")
 		_prune_clipmaps(rd)
 	_cache_clock += 1
@@ -6664,7 +4838,6 @@ func _prepare_prt_clv_view(buffers: RenderSceneBuffersRD, view: int,
 func _prepare_magicdawn_dynamic_clv_view(buffers: RenderSceneBuffersRD,
 		view: int, rd: RenderingDevice) -> bool:
 	_frame_clipmap = null
-	_magicdawn_frame_active = false
 	var failure := func(status: String, reason: String, details: Dictionary = {}) -> bool:
 		_magicdawn_runtime_state["status"] = status
 		_magicdawn_runtime_state["fallback_reason"] = reason
@@ -6735,13 +4908,13 @@ func _prepare_magicdawn_dynamic_clv_view(buffers: RenderSceneBuffersRD,
 			"requested_resolution": prt_clv_resolution,
 			"selected_resolution": selected_resolution})
 	var gpu_bytes := _clv_gpu_bytes_for_backend(CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART,
-			selected_resolution, -1, 0, emitter_count)
+			selected_resolution, emitter_count)
 	if gpu_bytes <= 0:
 		return failure.call("dynamic_clv_memory_estimate_invalid_fail_closed",
 			"dynamic_clv_memory_estimate_invalid", {"resolution": selected_resolution,
 			"emitter_count": emitter_count})
 	var clip_key := "%d:%d:%d:%s" % [buffers.get_instance_id(), view,
-			CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION, cache_key]
+			CLV_LEGACY_LAYOUT_VERSION, cache_key]
 	if _clipmaps.has(clip_key):
 		var previous_entry: Dictionary = _clipmaps[clip_key]
 		if not _clipmap_layout_is_current(previous_entry,
@@ -6778,7 +4951,7 @@ func _prepare_magicdawn_dynamic_clv_view(buffers: RenderSceneBuffersRD,
 		_clipmaps[clip_key] = {"cache": new_cache, "owner": weakref(buffers),
 			"last_used": _cache_clock, "bake": cache_key,
 			"view": view,
-			"layout_version": CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION,
+			"layout_version": CLV_LEGACY_LAYOUT_VERSION,
 			"cache_backend": CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART,
 			"requested_resolution": selected_resolution,
 			"resolution": int(new_cache.get("resolution")),
@@ -6849,7 +5022,7 @@ func _prepare_magicdawn_dynamic_clv_view(buffers: RenderSceneBuffersRD,
 	_magicdawn_runtime_state.merge({
 		"status": "resident_clv_relit",
 		"cache_key": cache_key,
-		"layout_version": CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION,
+		"layout_version": CLV_LEGACY_LAYOUT_VERSION,
 		"resolution": int(clipmap.get("resolution")),
 		"spacing_m": spacing,
 		"source_probe_count": int(direct_inputs.get("probes", 0)),
@@ -6881,15 +5054,6 @@ func _magicdawn_transfer_bindings_valid(bindings: Dictionary) -> bool:
 			return false
 	return bool(bindings.get("sources_ready", false))
 
-func _report_baked_sh_unready_once(data: Resource, reason: String) -> void:
-	var resource_id := data.get_instance_id() if is_instance_valid(data) else 0
-	var bake_version := int(data.get("bake_version")) if is_instance_valid(data) else -1
-	var revision := int(data.get("baked_indirect_sh_revision")) if is_instance_valid(data) else -1
-	var key := "%d:%d:%d:%s" % [resource_id, bake_version, revision, reason]
-	if _magicdawn_unready_bake_warning_keys.has(key):
-		return
-	_magicdawn_unready_bake_warning_keys[key] = true
-	_report(reason)
 
 func _ensure_page_param_buffers(rd: RenderingDevice) -> bool:
 	if not _page_params_ubo.is_valid():
@@ -6903,11 +5067,6 @@ func _ensure_page_param_buffers(rd: RenderingDevice) -> bool:
 		_pending_page_params_ubo = rd.uniform_buffer_create(PENDING_PARAMS_SIZE, zero)
 	return _page_params_ubo.is_valid() and _pending_page_params_ubo.is_valid()
 
-func _append_matrix4(values: PackedFloat32Array, transform: Transform3D) -> void:
-	for axis in [transform.basis.x, transform.basis.y, transform.basis.z, transform.origin]:
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
-	values[values.size() - 1] = 1.0
-
 func _write_page_params(rd: RenderingDevice, core: AABB, rect: Rect2i,
 		snapshot: Dictionary, enabled: bool) -> bool:
 	var owner_transform: Variant = snapshot.get("owner_transform", Transform3D.IDENTITY)
@@ -6920,9 +5079,7 @@ func _write_page_params(rd: RenderingDevice, core: AABB, rect: Rect2i,
 	bytes.append_array(PackedFloat32Array([core_max.x, core_max.y, core_max.z, 0.0]).to_byte_array())
 	bytes.append_array(PackedInt32Array([rect.position.x, rect.position.y, rect.size.x, rect.size.y]).to_byte_array())
 	var inverse: Transform3D = owner_transform.affine_inverse() if has_owner else Transform3D.IDENTITY
-	var matrix := PackedFloat32Array()
-	_append_matrix4(matrix, inverse)
-	bytes.append_array(matrix.to_byte_array())
+	bytes.append_array(U.transform_bytes(inverse))
 	bytes.append_array(PackedFloat32Array([owner_size.x if has_owner else 0.0,
 		owner_size.y if has_owner else 0.0, owner_size.z if has_owner else 0.0, 1.0 if has_owner else 0.0]).to_byte_array())
 	if bytes.size() != PAGE_PARAMS_SIZE:
@@ -6946,20 +5103,14 @@ func _write_pending_page_params(rd: RenderingDevice, core: AABB, rect: Rect2i,
 	var has_owner: bool = owner_transform is Transform3D and owner_size is Vector3 \
 			and owner_size.x > 0.0 and owner_size.y > 0.0 and owner_size.z > 0.0
 	var bytes := PackedByteArray()
-	var projection_values := PackedFloat32Array()
-	_append_projection(projection_values, inverse_projection)
-	bytes.append_array(projection_values.to_byte_array())
-	var camera_values := PackedFloat32Array()
-	_append_transform(camera_values, Transform3D(camera.basis.orthonormalized(), camera.origin))
-	bytes.append_array(camera_values.to_byte_array())
+	bytes.append_array(U.projection_bytes(inverse_projection))
+	bytes.append_array(U.transform_bytes(Transform3D(camera.basis.orthonormalized(), camera.origin)))
 	bytes.append_array(PackedFloat32Array([core.position.x, core.position.y, core.position.z, 1.0 if enabled else 0.0]).to_byte_array())
 	var core_max := core.position + core.size
 	bytes.append_array(PackedFloat32Array([core_max.x, core_max.y, core_max.z, ownership]).to_byte_array())
 	bytes.append_array(PackedInt32Array([rect.position.x, rect.position.y, rect.size.x, rect.size.y]).to_byte_array())
 	var inverse_owner: Transform3D = owner_transform.affine_inverse() if has_owner else Transform3D.IDENTITY
-	var owner_values := PackedFloat32Array()
-	_append_matrix4(owner_values, inverse_owner)
-	bytes.append_array(owner_values.to_byte_array())
+	bytes.append_array(U.transform_bytes(inverse_owner))
 	bytes.append_array(PackedFloat32Array([owner_size.x if has_owner else 0.0,
 		owner_size.y if has_owner else 0.0, owner_size.z if has_owner else 0.0, 1.0 if has_owner else 0.0]).to_byte_array())
 	return bytes.size() == PENDING_PARAMS_SIZE \
@@ -6968,9 +5119,7 @@ func _write_pending_page_params(rd: RenderingDevice, core: AABB, rect: Rect2i,
 var _active_render_view := 0
 
 func _ensure_shader(rd: RenderingDevice) -> bool:
-	if shader_file == MAGIC_GI_APPLY_SHADER \
-			or (_layout14_b_apply_shader_resource != null \
-				and shader_file == _layout14_b_apply_shader_resource):
+	if shader_file == MAGIC_GI_APPLY_SHADER:
 		# Make all current defaults explicit once. Legacy leaves all stage flags false.
 		var spec_defaults := {0: true, 1: false, 2: false, 3: false,
 				4: false, 6: false, 7: false}
@@ -6995,16 +5144,6 @@ func _ensure_shader(rd: RenderingDevice) -> bool:
 	var shader_ready := super._ensure_shader(rd)
 	if shader_ready:
 		return true
-	if shader_file == _layout14_b_apply_shader_resource \
-			and _layout14_b_frame_active:
-		# A valid SPIR-V blob does not guarantee that this device can create its
-		# shader or pipeline. Fail closed to the ordinary source gather instead of
-		# returning from the pass with no GI output.
-		_layout14_b_apply_runtime_rejected = true
-		_layout14_b_error = "apply_pipeline_creation_failed_source_fallback"
-		_set_layout14_b_frame_active(false)
-		_frame_clipmap = null
-		return super._ensure_shader(rd)
 	return false
 
 func _clear_prt_stage_pipeline_cache(rd: RenderingDevice) -> void:
@@ -7797,8 +5936,7 @@ func _render_prt_compact_miss_queue(buffers: RenderSceneBuffersRD, view: int,
 	return true
 
 func _make_uniform_set(uniforms: Array[RDUniform]) -> RID:
-	var source_pending_required := _shader_resource == MAGIC_GI_APPLY_SHADER \
-			or (_layout14_b_frame_active and shader_file == _layout14_b_apply_shader_resource)
+	var source_pending_required := _shader_resource == MAGIC_GI_APPLY_SHADER
 	if not source_pending_required:
 		return super._make_uniform_set(uniforms)
 	var rd := RenderingServer.get_rendering_device()
@@ -7894,9 +6032,6 @@ func _render_compute(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDevi
 		_magicdawn_runtime_state["status"] = "native_layout9_requires_frp_fail_closed"
 		_magicdawn_runtime_state["fallback_reason"] = "native_frp_clv_consumer_unavailable"
 		_magicdawn_runtime_state["pixel_csr_fallback"] = false
-		return
-	if _magicdawn_frame_active:
-		_render_magicdawn_compute(buffers, view, rd)
 		return
 	_prt_compact_dispatch_frame = _last_native_clv_lighting_frame
 	if _frame_native_general_queue_active:
@@ -8078,7 +6213,7 @@ func _render_prt_scaled(buffers: RenderSceneBuffersRD, view: int,
 	var use_fast_resolve := prt_resolve_fast_path and _frame_prt_scale > 1
 	if not output.is_valid() or full_size.x <= 0 or full_size.y <= 0 \
 			or not _ensure_prt_resolve_pipeline(rd) or not _ensure_sampler(rd) \
-			or not _ensure_prt_linear_sampler(rd) \
+			or not _ensure_shared_samplers(rd) \
 			or (use_fast_resolve and not _ensure_prt_guide_pipeline(rd)):
 		if output.is_valid():
 			rd.texture_clear(output, Color(0, 0, 0, 0), 0, 1, 0, 1)
@@ -8193,12 +6328,12 @@ func _dispatch_prt_resolve(buffers: RenderSceneBuffersRD, view: int,
 		U.sampled(6, _sampler, diffuse_ao), U.image(7, color),
 		U.image(8, output), U.uniform_buffer(9, _ubo)]
 	if not guide.is_valid() or not certificate.is_valid() \
-			or not _prt_linear_sampler.is_valid():
+			or not _linear_sampler.is_valid():
 		_report("PRT resolve requires valid guide, certificate, and linear sampler resources.")
 		return false
 	uniforms.append(U.sampled(10, _sampler, guide))
 	uniforms.append(U.sampled(11, _sampler, certificate))
-	uniforms.append(U.sampled(12, _prt_linear_sampler, raw))
+	uniforms.append(U.sampled(12, _linear_sampler, raw))
 	var uniform_set := UniformSetCacheRD.get_cache(_prt_resolve_shader, 0, uniforms)
 	if not uniform_set.is_valid():
 		_report("Magic GI PRT resolve uniform set is invalid.")
@@ -8325,18 +6460,6 @@ func _ensure_prt_guide_textures(buffers: RenderSceneBuffersRD, view: int,
 	_sync_owned_rid_snapshot()
 	return {"guide": guide, "certificate": certificate}
 
-func _ensure_prt_linear_sampler(rd: RenderingDevice) -> bool:
-	if _prt_linear_sampler.is_valid():
-		return true
-	var state := RDSamplerState.new()
-	state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-	state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
-	state.mip_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
-	state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-	state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-	state.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
-	_prt_linear_sampler = rd.sampler_create(state)
-	return _prt_linear_sampler.is_valid()
 
 func _ensure_prt_guide_pipeline(rd: RenderingDevice) -> bool:
 	if _prt_guide_shader.is_valid() and _prt_guide_pipeline.is_valid():
@@ -8898,7 +7021,7 @@ func _nonstream_clv_geometry_epoch(snapshot: Dictionary, cache_key: String,
 	return _nonzero_clv_epoch(hash([int(snapshot.get("world_id", -1)),
 		int(snapshot.get("volume_id", -1)), cache_key, data_id, version,
 		float(snapshot.get("clv_cell_size", 0.5)),
-		_clv_layout_version_for_backend(_clv_cache_backend(snapshot))]))
+		CLV_LEGACY_LAYOUT_VERSION]))
 
 
 func _nonstream_clv_content_revision(snapshot: Dictionary, cached: Dictionary,
@@ -9217,12 +7340,11 @@ func _clipmap_layout_is_current(entry: Dictionary, backend := -1,
 		requested_format_override := -1, expected_dynamic_emitters := -1) -> bool:
 	if backend < 0:
 		backend = int(entry.get("cache_backend", CLV_CACHE_BACKEND_LEGACY))
-	if int(entry.get("layout_version", -1)) != _clv_layout_version_for_backend(backend) \
+	if int(entry.get("layout_version", -1)) != CLV_LEGACY_LAYOUT_VERSION \
 			or int(entry.get("cache_backend", CLV_CACHE_BACKEND_LEGACY)) != backend \
 			or int(entry.get("resolution", -1)) != _effective_clv_resolution(backend):
 		return false
-	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED:
+	if backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
 		var dynamic_cache: RefCounted = entry.get("cache")
 		if not bool(entry.get("dynamic_transfer", false)) \
 				or dynamic_cache == null or not dynamic_cache.has_method("get_runtime_state"):
@@ -9237,7 +7359,7 @@ func _clipmap_layout_is_current(entry: Dictionary, backend := -1,
 		var expected_gpu_bytes := ClipmapCache.estimate_gpu_bytes(
 				_effective_clv_resolution(backend), true, maxi(dynamic_emitters, 0))
 		return int(dynamic_state.get("layout_version", -1)) \
-				== CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION \
+				== CLV_LEGACY_LAYOUT_VERSION \
 			and bool(dynamic_state.get("transfer_matrix_valid", false)) \
 			and int(dynamic_state.get("transfer_matrix_emitters", -1)) == dynamic_emitters \
 			and int(dynamic_state.get("resident_resolution", -1)) \
@@ -9264,8 +7386,7 @@ func _effective_clv_resolution(backend := -1) -> int:
 	if selected_backend < 0:
 		selected_backend = _clv_cache_backend(_frame_snapshot) \
 				if not _frame_snapshot.is_empty() else _last_clv_cache_backend
-	if selected_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
-			and _clv_internal_test_layout == CLV_INTERNAL_LAYOUT_AUTHORED:
+	if selected_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART:
 		if prt_clv_resolution >= 32:
 			return 32
 		if prt_clv_resolution >= 24:
@@ -9281,38 +7402,6 @@ static func _valid_clv_focus_bounds(bounds: AABB) -> bool:
 			and bounds.size.x >= 0.0 and bounds.size.y >= 0.0 and bounds.size.z >= 0.0
 
 
-static func _magicdawn_world_focus_domain(source_bounds: AABB,
-		snapshot: Dictionary) -> AABB:
-	var invalid := AABB(Vector3.ZERO, Vector3.ONE * -1.0)
-	if not _valid_clv_focus_bounds(source_bounds):
-		return invalid
-	var transform_value: Variant = snapshot.get("owner_transform")
-	var size_value: Variant = snapshot.get("owner_size")
-	if not transform_value is Transform3D or not size_value is Vector3:
-		return invalid
-	var owner_transform: Transform3D = transform_value
-	var owner_size: Vector3 = size_value
-	if not owner_transform.origin.is_finite() or not owner_size.is_finite() \
-			or owner_size.x <= 0.0 or owner_size.y <= 0.0 or owner_size.z <= 0.0 \
-			or not owner_transform.basis.x.is_finite() \
-			or not owner_transform.basis.y.is_finite() \
-			or not owner_transform.basis.z.is_finite():
-		return invalid
-	var half_extent := (owner_transform.basis.x.abs() * owner_size.x \
-			+ owner_transform.basis.y.abs() * owner_size.y \
-			+ owner_transform.basis.z.abs() * owner_size.z) * 0.5
-	var owner_lower := owner_transform.origin - half_extent
-	var owner_upper := owner_transform.origin + half_extent
-	var source_upper := source_bounds.position + source_bounds.size
-	var lower := Vector3(maxf(source_bounds.position.x, owner_lower.x),
-		maxf(source_bounds.position.y, owner_lower.y),
-		maxf(source_bounds.position.z, owner_lower.z))
-	var upper := Vector3(minf(source_upper.x, owner_upper.x),
-		minf(source_upper.y, owner_upper.y),
-		minf(source_upper.z, owner_upper.z))
-	if upper.x < lower.x or upper.y < lower.y or upper.z < lower.z:
-		return invalid
-	return AABB(lower, upper - lower)
 
 
 static func _union_clv_source_bounds(source_bounds: Array[AABB]) -> AABB:
@@ -9603,14 +7692,6 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 					or bool(cached.get("probe_neighbor_cell_list_enabled", false)) \
 					or str(cached.get("probe_neighbor_cell_list_reason", "disabled")) != "disabled") \
 				and _baked_indirect_sh_upload_matches(data, cached):
-			if not cached.has("magicdawn_baked_sh_codec") \
-					and data.has_method("has_baked_indirect_sh") \
-					and bool(data.call("has_baked_indirect_sh")):
-				var source_value: Variant = data.get("baked_indirect_sh")
-				if source_value is PackedFloat32Array:
-					cached["magicdawn_baked_sh_codec"] = \
-							MagicDawnBakedSHCache.choose_codec(source_value)
-					_bake_resources[cache_key] = cached
 			return true
 		_release_bake_resources(cache_key, rd)
 	# Data owns validation and all atlas layouts. It validates once, then prepares
@@ -9716,18 +7797,12 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 			RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT)
 	var lighting_rid := rd.storage_buffer_create(probe_count * 32)
 	var source_bounds: AABB = source_bounds_value
-	var baked_sh_codec: Dictionary = {}
 	var baked_sh_revision := int(data.get("baked_indirect_sh_revision"))
 	var baked_sh_source_value: Variant = data.get("baked_indirect_sh")
 	var baked_sh_persisted_scalar_count := 0
 	if baked_sh_source_value is PackedFloat32Array:
 		var baked_sh_source: PackedFloat32Array = baked_sh_source_value
 		baked_sh_persisted_scalar_count = baked_sh_source.size()
-	if data.has_method("has_baked_indirect_sh") \
-			and bool(data.call("has_baked_indirect_sh")):
-		var baked_sh_value: Variant = data.get("baked_indirect_sh")
-		if baked_sh_value is PackedFloat32Array:
-			baked_sh_codec = MagicDawnBakedSHCache.choose_codec(baked_sh_value)
 	var directional: RefCounted
 	if data.get("directional") != null:
 		directional = DirectionalCache.new()
@@ -9790,7 +7865,6 @@ func _ensure_bake_resources(cache_key: String, data: Resource, version: int, rd:
 		"probe_lighting": lighting_rid,
 		"directional": directional,
 		"source_bounds": source_bounds,
-		"magicdawn_baked_sh_codec": baked_sh_codec,
 		"emission_identity": "",
 		"emission_revision": -1,
 		"grid_dims": dims,
@@ -9844,24 +7918,6 @@ func _update_probe_lighting(cache_key: String, snapshot: Dictionary, rd: Renderi
 	var cached: Dictionary = _bake_resources[cache_key]
 	var sources := _probe_lighting_sources(cached, snapshot)
 	if cached.get("lighting_sources", []) == sources:
-		if _clv_internal_test_layout == CLV_INTERNAL_LAYOUT14_V0_TEST:
-			var current_directional: RefCounted = cached.get("directional")
-			if current_directional == null \
-					or not current_directional.has_method("ensure_raw_sidecar") \
-					or not current_directional.has_method("raw_sidecar_matches"):
-				return false
-			if not bool(current_directional.ensure_raw_sidecar(rd)):
-				# Calibrated lighting is already current; keep the ordinary root live.
-				# B activation below separately rejects the missing raw sidecar.
-				return true
-			if not bool(current_directional.raw_sidecar_matches(snapshot)):
-				if bool(current_directional.update(rd, _ubo, snapshot,
-						cached["probe_lighting"], true)):
-					return true
-				# Raw-sidecar refresh failed before dispatch; relight the calibrated buffer
-				# and let the binding gate select the ordinary source path this frame.
-				return bool(current_directional.update(rd, _ubo, snapshot,
-					cached["probe_lighting"], false))
 		return true
 	if not _ensure_sampler(rd):
 		return false
@@ -9892,14 +7948,7 @@ func _update_probe_lighting(cache_key: String, snapshot: Dictionary, rd: Renderi
 	rd.draw_command_end_label()
 	var directional: RefCounted = cached.get("directional")
 	if directional != null:
-		var write_raw_sidecar := _clv_internal_test_layout == CLV_INTERNAL_LAYOUT14_V0_TEST
-		if not bool(directional.update(rd, _ubo, snapshot, cached["probe_lighting"],
-				write_raw_sidecar)):
-			if write_raw_sidecar and bool(directional.update(rd, _ubo, snapshot,
-					cached["probe_lighting"], false)):
-				# Preserve ordinary calibrated output while B's raw sidecar is unavailable.
-				cached["lighting_sources"] = sources.duplicate(true)
-				return true
+		if not bool(directional.update(rd, _ubo, snapshot, cached["probe_lighting"], false)):
 			return false
 	cached["lighting_sources"] = sources.duplicate(true)
 	return true
@@ -10107,8 +8156,6 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	var binding_data := _collect_frame_input_bindings(buffers, view, rd)
 	if _binding_error or _frame_snapshot.is_empty():
 		return binding_data
-	if _magicdawn_frame_active:
-		return _collect_magicdawn_bindings(binding_data, rd)
 	var cache_key := str(_frame_snapshot.get("cache_key", ""))
 	if not _bake_resources.has(cache_key):
 		_binding_error = true
@@ -10154,22 +8201,13 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 		return binding_data
 	var directional: RefCounted = cached.get("directional")
 	if _frame_clipmap == null:
-		var mode_value := _clv_layout_version_for_backend(_last_clv_cache_backend) \
+		var mode_value := CLV_LEGACY_LAYOUT_VERSION \
 				if _last_clv_cache_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
 				else (1 if directional != null else 0)
 		if mode_value != _clv_fallback_mode:
 			var fallback_parameters := PackedByteArray()
-			if mode_value == CLV_BLOCK_CHART_LAYOUT_VERSION \
-					or mode_value == CLV_INTERNAL_LAYOUT14_V0_TEST:
-				for _origin_index in 3:
-					fallback_parameters.append_array(PackedInt32Array([0, 0, 0, 0]).to_byte_array())
-				fallback_parameters.append_array(PackedFloat32Array([
-					maxf(float(_frame_snapshot.get("clv_cell_size", 0.25)), 0.001), 0.0, 0.0, 0.0]).to_byte_array())
-				fallback_parameters.append_array(PackedInt32Array([1, 3, 0,
-					mode_value]).to_byte_array())
-			else:
-				fallback_parameters.resize(80)
-				fallback_parameters.encode_s32(76, mode_value)
+			fallback_parameters.resize(80)
+			fallback_parameters.encode_s32(76, mode_value)
 			if rd.buffer_update(_clv_fallback.parameters, 0, fallback_parameters.size(), fallback_parameters) != OK:
 				_binding_error = true
 				return binding_data
@@ -10181,23 +8219,6 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	uniforms.append(U.uniform_buffer(21, _frame_clipmap.parameters if _frame_clipmap != null else _clv_fallback.parameters))
 	uniforms.append(U.sampled(25, _sampler,
 		_frame_clipmap.support if _frame_clipmap != null else _clv_fallback.support))
-	if _layout14_b_frame_active:
-		if not _layout14_b_frame_moments.is_valid() \
-				or not _layout14_b_frame_sampler.is_valid() \
-				or not _layout14_b_frame_tags.is_valid():
-			_binding_error = true
-			return binding_data
-		uniforms.append(U.sampled(33, _layout14_b_frame_sampler,
-				_layout14_b_frame_moments))
-		uniforms.append(U.storage_buffer(34, _layout14_b_frame_tags))
-		var raw_directional: RefCounted = cached.get("directional")
-		var raw_rid_value: Variant = raw_directional.get("raw_lighting") \
-				if raw_directional != null else null
-		if not raw_rid_value is RID:
-			_binding_error = true
-			return binding_data
-		var raw_rid: RID = raw_rid_value
-		uniforms.append(U.storage_buffer(35, raw_rid))
 	if not _ensure_exact_point_debug_buffer(rd):
 		_binding_error = true
 		return binding_data
@@ -10222,97 +8243,6 @@ func _collect_bindings(buffers: RenderSceneBuffersRD, view: int, rd: RenderingDe
 	_record_probe_cluster_binding(cache_key)
 	return binding_data
 
-func _collect_magicdawn_bindings(binding_data: Dictionary, rd: RenderingDevice) -> Dictionary:
-	if _frame_clipmap == null or not _frame_clipmap.has_method("get_field_textures") \
-			or not _ensure_magicdawn_stats_buffer(rd) or not _ubo.is_valid() \
-			or not _page_params_ubo.is_valid():
-		_binding_error = true
-		return binding_data
-	var fields_value: Variant = _frame_clipmap.call("get_field_textures")
-	if not fields_value is Array or fields_value.size() != CLV_MAGICDAWN_BAKED_SH_TEXTURE_COUNT:
-		_binding_error = true
-		return binding_data
-	var fields: Array = fields_value
-	var field_sampler: RID = _frame_clipmap.get("sampler")
-	var clipmap_parameters: RID = _frame_clipmap.get("parameters")
-	if not field_sampler.is_valid() or not clipmap_parameters.is_valid():
-		_binding_error = true
-		return binding_data
-	var uniforms: Array[RDUniform] = []
-	var found_required := {}
-	var input_uniforms: Array = binding_data.get("uniforms", [])
-	for uniform_value in input_uniforms:
-		if not uniform_value is RDUniform:
-			continue
-		var uniform: RDUniform = uniform_value
-		if uniform.binding in [0, 1, 2, 3, 4, 5, 12, DIFFUSE_AO_BINDING]:
-			uniforms.append(uniform)
-			found_required[uniform.binding] = true
-	for required_binding in [0, 1, 2, 3, 4, 5, 12, DIFFUSE_AO_BINDING]:
-		if not found_required.has(required_binding):
-			_binding_error = true
-			return binding_data
-	uniforms.append(_ubo_uniform(UBO_BINDING))
-	for field_index in CLV_MAGICDAWN_BAKED_SH_TEXTURE_COUNT:
-		var field_value: Variant = fields[field_index]
-		if not field_value is RID:
-			_binding_error = true
-			return binding_data
-		var field_rid: RID = field_value
-		if not field_rid.is_valid():
-			_binding_error = true
-			return binding_data
-		uniforms.append(U.sampled(40 + field_index, field_sampler, field_rid))
-	uniforms.append(U.uniform_buffer(21, clipmap_parameters))
-	uniforms.append(U.uniform_buffer(PAGE_PARAMS_BINDING, _page_params_ubo))
-	uniforms.append(U.storage_buffer(CLV_STATS_BINDING, _magicdawn_stats_buffer))
-	binding_data["uniforms"] = uniforms
-	return binding_data
-
-func _ensure_magicdawn_stats_buffer(rd: RenderingDevice) -> bool:
-	if _magicdawn_stats_buffer.is_valid():
-		return true
-	var zero := PackedByteArray()
-	zero.resize(MAGICDAWN_STATS_BYTES)
-	_magicdawn_stats_buffer = rd.storage_buffer_create(MAGICDAWN_STATS_BYTES, zero)
-	if _magicdawn_stats_buffer.is_valid():
-		_sync_owned_rid_snapshot()
-	return _magicdawn_stats_buffer.is_valid()
-
-func arm_magicdawn_stats_capture() -> bool:
-	if _magicdawn_stats_capture_active or _magicdawn_stats_capture_armed \
-			or clv_debug_view != CLVDebugView.OFF or prt_apply_scale != 1:
-		return false
-	var rd := RenderingServer.get_rendering_device()
-	if rd == null or not _ensure_magicdawn_stats_buffer(rd) \
-			or rd.buffer_clear(_magicdawn_stats_buffer, 0, MAGICDAWN_STATS_BYTES) != OK:
-		return false
-	_magicdawn_stats_capture_armed = true
-	_magicdawn_stats_last_values = PackedInt32Array()
-	return true
-
-func read_magicdawn_stats() -> Dictionary:
-	var rd := RenderingServer.get_rendering_device()
-	if rd == null or not _magicdawn_stats_buffer.is_valid() \
-			or _magicdawn_stats_capture_frame < 0:
-		return {"status": "not_captured", "dispatch_frame": _magicdawn_stats_capture_frame}
-	var bytes := rd.buffer_get_data(_magicdawn_stats_buffer, 0, MAGICDAWN_STATS_BYTES)
-	var counts := bytes.to_int32_array()
-	if counts.size() < MAGICDAWN_STATS_WORDS:
-		return {"status": "readback_failed", "bytes": bytes.size()}
-	_magicdawn_stats_last_values = counts
-	return _magicdawn_stats_snapshot()
-
-func _magicdawn_stats_snapshot() -> Dictionary:
-	if _magicdawn_stats_last_values.size() < MAGICDAWN_STATS_WORDS:
-		return {"status": "not_read_back", "dispatch_frame": _magicdawn_stats_capture_frame}
-	var counts := _magicdawn_stats_last_values
-	return {"status": "read_back", "dispatch_frame": _magicdawn_stats_capture_frame,
-		"dispatched_invocations": counts[0], "depth_material_receivers": counts[1],
-		"valid_world_normal_receivers": counts[2], "positive_coverage_samples": counts[3],
-		"zero_coverage_samples": counts[4], "single_lod_samples": counts[5],
-		"two_lod_transition_samples": counts[6], "outer_fade_samples": counts[7],
-		"counts": counts}
 
 func get_magicdawn_runtime_state() -> Dictionary:
 	var state := _magicdawn_runtime_state.duplicate(true)
@@ -10320,40 +8250,18 @@ func get_magicdawn_runtime_state() -> Dictionary:
 	state["dynamic_volume_screen"] = _dynamic_volume_screen_runtime_state.duplicate(true)
 	state["screen_resolve_diagnostics"] = \
 			_magicdawn_screen_diagnostic_result.duplicate(true)
-	if not _magicdawn_active_readback_queue_state.is_empty():
-		state["active_cache_readback_queue"] = _magicdawn_active_readback_queue_state.duplicate(true)
-	if not _magicdawn_active_readback_result.is_empty():
-		state["active_cache_readback"] = _magicdawn_active_readback_result.duplicate(true)
-	var native_fusion := _native_baked_sh_state.duplicate(true)
-	state["native_fusion"] = native_fusion
-	var native_sky_ownership_active := bool(native_fusion.get("consumed", false)) \
-			and bool(native_fusion.get("replacement_enabled", false))
-	if native_sky_ownership_active:
-		# Report the last publication the renderer actually consumed. The per-frame
-		# scratch replacement flag is cleared after Execute and is not ownership state.
-		state["replacement_enabled"] = true
-		state["sky_ownership_bridge_active"] = true
-	else:
-		state["sky_ownership_bridge_active"] = bool(state.get("replacement_enabled", false))
+	state["sky_ownership_bridge_active"] = bool(state.get("replacement_enabled", false))
 	state["backend"] = _last_clv_cache_backend
-	state["layout_version"] = _clv_layout_version_for_backend(_last_clv_cache_backend)
-	state["screen_shader_resource"] = \
-			"res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply_magicdawn.glsl"
+	state["layout_version"] = CLV_LEGACY_LAYOUT_VERSION
 	state["pixel_csr_fallback"] = false if _last_clv_cache_backend == 1 else null
 	state["includes_primary_sky"] = bool(state.get("includes_primary_sky", false))
 	state["includes_direct_directional_light"] = false
-	state["receiver_sample_qa_mode"] = _magicdawn_receiver_qa_mode
-	state["stats_capture_frame"] = _magicdawn_stats_capture_frame
-	state["stats"] = _magicdawn_stats_snapshot()
 	state["clv_debug_view"] = clv_debug_view
 	state["clv_debug_view_supported"] = true
 	state["clv_debug_view_status"] = _magicdawn_clv_debug_status \
 			if _last_clv_cache_backend == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
 			else "available"
-	state["debug_sidecar_forced_standalone"] = _magicdawn_debug_sidecar_forced
 	state["standalone_apply_dispatched"] = str(state.get("status", "")) == "dispatched"
-	state["native_baked_sh_consumed"] = bool(native_fusion.get("consumed", false))
-	var caches: Array[Dictionary] = []
 	var dynamic_caches: Array[Dictionary] = []
 	var primary_dynamic: Dictionary = {}
 	var primary_dynamic_last_used := -1
@@ -10361,7 +8269,7 @@ func get_magicdawn_runtime_state() -> Dictionary:
 		if not entry_value is Dictionary:
 			continue
 		var entry := entry_value as Dictionary
-		if int(entry.get("layout_version", -1)) == CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION \
+		if int(entry.get("layout_version", -1)) == CLV_LEGACY_LAYOUT_VERSION \
 				and int(entry.get("cache_backend", -1)) == CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART \
 				and bool(entry.get("dynamic_transfer", false)):
 			var dynamic_cache_value: Variant = entry.get("cache")
@@ -10386,12 +8294,6 @@ func get_magicdawn_runtime_state() -> Dictionary:
 						if last_used >= primary_dynamic_last_used:
 							primary_dynamic = dynamic_entry
 							primary_dynamic_last_used = last_used
-		if int(entry.get("layout_version", -1)) != CLV_MAGICDAWN_BAKED_SH_LAYOUT_VERSION:
-			continue
-		var cache: RefCounted = entry.get("cache")
-		if cache != null and cache.has_method("get_layout16_runtime_state"):
-			caches.append(cache.call("get_layout16_runtime_state"))
-	state["field_caches"] = caches
 	state["dynamic_clv_caches"] = dynamic_caches
 	state["dynamic_clv_cache_count"] = dynamic_caches.size()
 	state["prt_model"] = "CLV_BLOCK_RELIGHT" if not primary_dynamic.is_empty() else ""
@@ -10405,7 +8307,7 @@ func get_magicdawn_runtime_state() -> Dictionary:
 		# mirror state here as well so callers do not see the pre-selection default.
 		state["clv_debug_view_status"] = _magicdawn_clv_debug_status
 		state["backend"] = CLV_CACHE_BACKEND_MAGICDAWN_BLOCK_CHART
-		state["layout_version"] = CLV_MAGICDAWN_DYNAMIC_PRT_LAYOUT_VERSION
+		state["layout_version"] = CLV_LEGACY_LAYOUT_VERSION
 		state["view"] = int(primary_dynamic.get("view", -1))
 		state["cache_key"] = str(primary_dynamic.get("cache_key", ""))
 		state["source_probe_count"] = int(primary_dynamic.get("source_probe_count", 0))
@@ -10471,57 +8373,6 @@ func get_magicdawn_runtime_state() -> Dictionary:
 				state[field] = volume_cache_state.get(field)
 	return state
 
-func _render_magicdawn_compute(buffers: RenderSceneBuffersRD, view: int,
-		rd: RenderingDevice) -> void:
-	if workgroup_size.x <= 0 or workgroup_size.y <= 0:
-		_magicdawn_runtime_state["status"] = "invalid_workgroup_size"
-		return
-	var binding_data := _collect_bindings(buffers, view, rd)
-	if _binding_error:
-		_magicdawn_runtime_state["status"] = "apply_binding_failed"
-		return
-	var uniforms: Array[RDUniform] = binding_data.get("uniforms", [])
-	var uniform_set := _make_uniform_set(uniforms)
-	if not uniform_set.is_valid():
-		_magicdawn_runtime_state["status"] = "apply_uniform_set_failed"
-		return
-	var dispatch_size := buffers.get_internal_size()
-	var target := _selected_target(false)
-	if target != &"":
-		if not buffers.has_texture(PIPELINE_SCOPE, target):
-			_magicdawn_runtime_state["status"] = "apply_target_unavailable"
-			return
-		dispatch_size = buffers.get_texture_slice_size(PIPELINE_SCOPE, target, 0)
-	if dispatch_size.x <= 0 or dispatch_size.y <= 0:
-		_magicdawn_runtime_state["status"] = "empty_dispatch"
-		return
-	var list := rd.compute_list_begin()
-	if list < 0:
-		_magicdawn_runtime_state["status"] = "compute_list_begin_failed"
-		return
-	rd.compute_list_bind_compute_pipeline(list, _compute_pipeline)
-	rd.compute_list_bind_uniform_set(list, uniform_set, 0)
-	var push := _parameter_bytes()
-	rd.compute_list_set_push_constant(list, push, push.size())
-	rd.compute_list_dispatch(list,
-		ceili(float(dispatch_size.x) / workgroup_size.x),
-		ceili(float(dispatch_size.y) / workgroup_size.y), 1)
-	rd.compute_list_end()
-	_magicdawn_runtime_state["status"] = "dispatched"
-	_magicdawn_runtime_state["dispatch_frame"] = Engine.get_process_frames()
-	if _magicdawn_stats_capture_active:
-		_magicdawn_stats_capture_frame = Engine.get_process_frames()
-		_magicdawn_runtime_state["stats_capture_frame"] = _magicdawn_stats_capture_frame
-	_magicdawn_runtime_state["dispatch_size"] = [dispatch_size.x, dispatch_size.y]
-	_magicdawn_runtime_state["shader_resource"] = \
-			"res://addons/feng-render-pipeline/library/magic-gi/magic_gi_apply_magicdawn.glsl"
-	_magicdawn_runtime_state["includes_primary_sky"] = true
-	_magicdawn_runtime_state["includes_direct_directional_light"] = false
-	_magicdawn_runtime_state["pixel_csr_fallback"] = false
-	_magicdawn_runtime_state["replacement_enabled"] = _frame_replacement_enabled
-	_magicdawn_runtime_state["baked_indirect_sh_revision"] = 2
-	_magicdawn_runtime_state["source_spacing_m"] = float(_frame_snapshot.get("source_spacing", 0.25))
-	_magicdawn_runtime_state["clv_spacing_m"] = float(_frame_snapshot.get("clv_cell_size", 0.25))
 
 func _ensure_exact_point_debug_buffer(rd: RenderingDevice) -> bool:
 	if _exact_point_debug_buffer.is_valid():
@@ -10967,7 +8818,7 @@ func _current_owned_rids() -> Array[RID]:
 	if _surfel_nrd != null and _surfel_nrd.has_method("get_all_rids"):
 		rids.append_array(_surfel_nrd.call("get_all_rids"))
 	rids.append_array(_raster_pipelines.values())
-	rids.append_array([_compute_pipeline, _shader, _sampler, _ubo])
+	rids.append_array([_compute_pipeline, _shader, _sampler, _ubo, _nearest_sampler, _linear_sampler])
 	rids.append_array(_prt_stage_pipelines.values())
 	rids.append(_prt_source_pending_texture)
 	rids.append(_prt_compact_finalize_uniform_set)
@@ -10976,30 +8827,26 @@ func _current_owned_rids() -> Array[RID]:
 	rids.append_array([_prt_compact_shader, _prt_compact_finalize_shader,
 		_prt_compact_queue_buffer, _prt_compact_queue_control_buffer,
 		_prt_compact_indirect_args_buffer])
-	rids.append_array([_exact_point_debug_buffer, _clv_stats_buffer, _magicdawn_stats_buffer])
+	rids.append_array([_exact_point_debug_buffer, _clv_stats_buffer])
 	rids.append(_probe_neighbor_mask_disabled)
 	rids.append_array(_native_owner_ubos)
 	rids.append_array(_magicdawn_native_owner_ubos)
 	rids.append(_native_gi_parameters_ubo)
 	rids.append_array([_relight_pipeline, _relight_shader])
-	rids.append_array([_magicdawn_clv_debug_pipeline, _magicdawn_clv_debug_shader,
-		_magicdawn_clv_debug_nearest_sampler, _magicdawn_clv_debug_linear_sampler])
+	rids.append_array([_magicdawn_clv_debug_pipeline, _magicdawn_clv_debug_shader])
 	if _dynamic_volume_debug != null:
 		rids.append_array(_dynamic_volume_debug.owned_rids())
 	rids.append_array([_magicdawn_screen_classify_pipeline, _magicdawn_screen_classify_shader])
 	rids.append_array([_magicdawn_screen_resolve_pipeline,
-		_magicdawn_screen_resolve_shader, _magicdawn_screen_resolve_nearest_sampler,
-		_magicdawn_screen_resolve_linear_sampler,
+		_magicdawn_screen_resolve_shader,
 		_magicdawn_screen_resolve_diagnostics_buffer])
 	rids.append_array([_magicdawn_screen_partial_pipeline, _magicdawn_screen_partial_shader])
 	rids.append_array([_dynamic_volume_screen_resolve_pipeline,
-		_dynamic_volume_screen_resolve_shader, _dynamic_volume_screen_nearest_sampler,
-		_dynamic_volume_screen_linear_sampler,
+		_dynamic_volume_screen_resolve_shader,
 		_dynamic_volume_screen_diagnostics_buffer, _dynamic_volume_screen_frame_ubo])
 	rids.append_array([_page_params_ubo, _probe_cluster_fallback, _pending_page_params_ubo,
 		_pending_page_pipeline, _pending_page_shader, _prt_guide_pipeline,
-		_prt_guide_shader, _prt_resolve_pipeline, _prt_resolve_shader,
-		_prt_linear_sampler])
+		_prt_guide_shader, _prt_resolve_pipeline, _prt_resolve_shader])
 	for raw_view: Dictionary in _prt_raw_views.values():
 		for name in ["texture", "guide", "certificate"]:
 			var texture: RID = raw_view.get(name, RID())
@@ -11035,49 +8882,14 @@ func _sync_owned_rid_snapshot() -> void:
 	_replace_owned_rid_snapshot(_current_owned_rids())
 
 func _take_owned_rids() -> Array[RID]:
-	# PREDELETE invalidates this script's live dispatch after the inherited
-	# shader pass transfers its RIDs. Capture the complete owned-only inventory
-	# and clear our fields first; only append the detached snapshot afterwards.
+	# PREDELETE invalidates this script's live dispatch after the inherited shader
+	# pass transfers its RIDs. _current_owned_rids stays a flat body so super.call
+	# can still run it; append only child take_owned_rids differences, then clear.
 	var owned_rids: Array[RID] = super.call("_current_owned_rids")
-	if _dynamic_volume_cache != null and _dynamic_volume_cache.has_method("owned_rids"):
-		owned_rids.append_array(_dynamic_volume_cache.call("owned_rids"))
 	if _surfel_gpu != null and _surfel_gpu.has_method("take_owned_rids"):
 		owned_rids.append_array(_surfel_gpu.call("take_owned_rids"))
 	if _surfel_nrd != null and _surfel_nrd.has_method("take_owned_rids"):
 		owned_rids.append_array(_surfel_nrd.call("take_owned_rids"))
-	owned_rids.append_array([_prt_guide_pipeline, _prt_guide_shader,
-		_prt_resolve_pipeline, _prt_resolve_shader,
-		_prt_linear_sampler])
-	owned_rids.append_array([_exact_point_debug_buffer, _clv_stats_buffer, _magicdawn_stats_buffer])
-	owned_rids.append_array([_magicdawn_clv_debug_pipeline, _magicdawn_clv_debug_shader,
-		_magicdawn_clv_debug_nearest_sampler, _magicdawn_clv_debug_linear_sampler])
-	if _dynamic_volume_debug != null:
-		owned_rids.append_array(_dynamic_volume_debug.owned_rids())
-	owned_rids.append_array([_magicdawn_screen_classify_pipeline, _magicdawn_screen_classify_shader])
-	owned_rids.append_array([_magicdawn_screen_resolve_pipeline,
-		_magicdawn_screen_resolve_shader, _magicdawn_screen_resolve_nearest_sampler,
-		_magicdawn_screen_resolve_linear_sampler,
-		_magicdawn_screen_resolve_diagnostics_buffer])
-	owned_rids.append_array([_magicdawn_screen_partial_pipeline, _magicdawn_screen_partial_shader])
-	owned_rids.append_array([_dynamic_volume_screen_resolve_pipeline,
-		_dynamic_volume_screen_resolve_shader, _dynamic_volume_screen_nearest_sampler,
-		_dynamic_volume_screen_linear_sampler,
-		_dynamic_volume_screen_diagnostics_buffer, _dynamic_volume_screen_frame_ubo])
-	owned_rids.append_array(_magicdawn_native_owner_ubos)
-	owned_rids.append(_probe_neighbor_mask_disabled)
-	owned_rids.append_array(_prt_stage_pipelines.values())
-	owned_rids.append(_prt_source_pending_texture)
-	owned_rids.append(_prt_compact_finalize_uniform_set)
-	owned_rids.append(_prt_compact_finalize_pipeline)
-	owned_rids.append_array(_prt_compact_pipelines.values())
-	owned_rids.append_array([_prt_compact_shader, _prt_compact_finalize_shader,
-		_prt_compact_queue_buffer, _prt_compact_queue_control_buffer,
-		_prt_compact_indirect_args_buffer])
-	for raw_view: Dictionary in _prt_raw_views.values():
-		for name in ["texture", "guide", "certificate"]:
-			var texture: RID = raw_view.get(name, RID())
-			if texture.is_valid():
-				owned_rids.append(texture)
 	_surfel_gpu = null
 	_surfel_nrd = null
 	_dynamic_volume_cache = null
@@ -11098,11 +8910,6 @@ func _take_owned_rids() -> Array[RID]:
 	_clv_fallback_mode = -1
 	_frame_clipmap = null
 	_native_prepared_views.clear()
-	_native_baked_sh_prepared_views.clear()
-	_native_baked_sh_attempted_views.clear()
-	_native_baked_sh_publications.clear()
-	_frame_native_baked_sh_consumed = false
-	_frame_native_baked_sh_publication.clear()
 	_frame_native_clv_fallback_only = false
 	for view in 2:
 		_native_owner_ubos[view] = RID()
@@ -11115,8 +8922,8 @@ func _take_owned_rids() -> Array[RID]:
 	_relight_pipeline = RID()
 	_magicdawn_clv_debug_shader = RID()
 	_magicdawn_clv_debug_pipeline = RID()
-	_magicdawn_clv_debug_nearest_sampler = RID()
-	_magicdawn_clv_debug_linear_sampler = RID()
+	_nearest_sampler = RID()
+	_linear_sampler = RID()
 	_magicdawn_screen_resolve_shader = RID()
 	_magicdawn_screen_resolve_pipeline = RID()
 	_magicdawn_screen_partial_shader = RID()
@@ -11124,13 +8931,9 @@ func _take_owned_rids() -> Array[RID]:
 	_magicdawn_screen_classify_shader = RID()
 	_magicdawn_screen_classify_pipeline = RID()
 	_magicdawn_screen_classify_shader_resource = null
-	_magicdawn_screen_resolve_nearest_sampler = RID()
-	_magicdawn_screen_resolve_linear_sampler = RID()
 	_magicdawn_screen_resolve_diagnostics_buffer = RID()
 	_dynamic_volume_screen_resolve_shader = RID()
 	_dynamic_volume_screen_resolve_pipeline = RID()
-	_dynamic_volume_screen_nearest_sampler = RID()
-	_dynamic_volume_screen_linear_sampler = RID()
 	_dynamic_volume_screen_diagnostics_buffer = RID()
 	_dynamic_volume_screen_frame_ubo = RID()
 	_dynamic_volume_screen_frame_bytes = PackedByteArray()
@@ -11184,17 +8987,11 @@ func _take_owned_rids() -> Array[RID]:
 	_last_prt_three_stage_stage_values = PackedInt32Array([MAGIC_GI_PRT_STAGE_LEGACY])
 	_prt_resolve_shader = RID()
 	_prt_resolve_pipeline = RID()
-	_prt_linear_sampler = RID()
 	_exact_point_debug_buffer = RID()
 	_clv_stats_buffer = RID()
 	_clv_stats_buffer_bytes = 0
 	_clv_stats_capture_armed = false
 	_clv_stats_capture_active = false
-	_magicdawn_stats_buffer = RID()
-	_magicdawn_stats_capture_armed = false
-	_magicdawn_stats_capture_active = false
-	_magicdawn_stats_capture_frame = -1
-	_magicdawn_stats_last_values = PackedInt32Array()
 	_prt_raw_views.clear()
 	_frame_prt_scale = 1
 	_zero_sky_diffuse = RID()
@@ -11209,4 +9006,10 @@ func _take_owned_rids() -> Array[RID]:
 	_probe_cluster_debug_frame = -1
 	var rids := super._take_owned_rids()
 	rids.append_array(owned_rids)
-	return rids
+	var unique: Array[RID] = []
+	var seen: Dictionary = {}
+	for rid in rids:
+		if rid.is_valid() and not seen.has(rid):
+			seen[rid] = true
+			unique.append(rid)
+	return unique

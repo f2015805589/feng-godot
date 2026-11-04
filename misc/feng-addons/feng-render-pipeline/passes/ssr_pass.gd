@@ -444,11 +444,7 @@ func _finite_option(name: String, fallback: float, minimum: float, maximum: floa
 	return clampf(value, minimum, maximum)
 
 func _matrix_bytes(matrix: Projection) -> PackedByteArray:
-	var values := PackedFloat32Array()
-	for column in 4:
-		var axis: Vector4 = matrix[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
-	return values.to_byte_array()
+	return U.projection_bytes(matrix)
 
 func _is_camera_cut(state: Dictionary, transform: Transform3D, projection: Projection,
 		generation: int) -> bool:

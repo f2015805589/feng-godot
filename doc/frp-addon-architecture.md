@@ -150,7 +150,7 @@ Debug Buffers 的输入契约由 buffer 选择决定，因此选择项属于作�
 
 ## 扩展与验证
 
-当前固定 D3D12 运行样本的条件、结果和限制见 [FRP runtime performance (2026-10-10)](frp-performance-20261010.md)。
+固定 D3D12 条件下 2026-10-10 的一次运行样本，其条件、结果与限制见 [FRP runtime performance (2026-10-10)](frp-performance-20261010.md)。
 
 新增效果添加 Pass 脚本、资源及需要的库清单项。字段权限写在 Pass；空间混合写在
 VolumeResolver；编辑器操作写在对应 controller。现有 Core 无法表达底层工作时，

@@ -18,7 +18,7 @@ args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="magic-gi-tests-", dir=ROOT / "bin"))
 addons = project / "addons"
 addons.mkdir()
-selected_addons = ("feng-render-pipeline", "feng-magic-gi", "feng-fog", "feng-sky", "feng-cloud")
+selected_addons = ("feng-render-pipeline", "feng-magic-gi", "feng-fog", "feng-sky", "feng-cloud", "feng-olv")
 for name in selected_addons:
     shutil.copytree(ROOT / "misc/feng-addons" / name, addons / name)
 for addon in (ROOT / "misc/feng-addons").iterdir():

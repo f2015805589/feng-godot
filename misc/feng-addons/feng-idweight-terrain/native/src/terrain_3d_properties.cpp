@@ -47,6 +47,9 @@ void Terrain3D::set_data_directory(String p_dir) {
 		_destroy_collision();
 		_destroy_instancer();
 		memdelete_safely(_data);
+		if (_streamer) {
+			_streamer->clear_tracking();
+		}
 		_initialize();
 	}
 	update_configuration_warnings();

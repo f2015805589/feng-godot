@@ -17,7 +17,7 @@ args = parser.parse_args()
 project = Path(tempfile.mkdtemp(prefix="deferred-tests-", dir=ROOT / "bin"))
 # Exercise the complete stock manifest, including the optional cloud templates.
 # Include the producer types preloaded by the stock pass implementations.
-selected_addons = ("feng-render-pipeline", "feng-fog", "feng-sky", "feng-cloud", "feng-magic-gi")
+selected_addons = ("feng-render-pipeline", "feng-fog", "feng-sky", "feng-cloud", "feng-magic-gi", "feng-olv")
 for name in selected_addons:
     shutil.copytree(ROOT / "misc/feng-addons" / name, project / "addons" / name)
 # The editor auto-links sibling addons. Keep this regression isolated from their

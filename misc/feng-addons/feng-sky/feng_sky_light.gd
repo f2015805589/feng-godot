@@ -656,8 +656,6 @@ func _feng_sky_light_volumetric_metadata() -> Dictionary:
 func _sync_active_source() -> void:
 	if not _provider_active or _output_sky == null:
 		return
-	if not NativeAdapter.supports_external_radiance():
-		return
 	# In manual mode the completed radiance is immutable. Authored changes are
 	# pending until Capture Now/Bake Now explicitly authorizes a replacement.
 	if not _external_radiance_enabled:
@@ -698,8 +696,6 @@ func _sync_active_source() -> void:
 				_record_bake_capture_submission(_effective_capture_position(),
 						cubemap.get_width(), revision_before_cubemap,
 						global_basis.orthonormalized())
-		return
-	if not NativeAdapter.supports_scene_capture():
 		return
 	# A submitted capture owns its Environment snapshot and output Sky until the
 	# renderer publishes a newer complete radiance revision. Requests arriving
@@ -1097,8 +1093,7 @@ func _sync_frp_sources() -> void:
 		if not targets.has(target):
 			NativeAdapter.clear_frp_source(target, get_instance_id())
 			_registered_targets.erase(target)
-	if not _native_radiance_ready or _native_radiance_revision < 0 \
-			or not NativeAdapter.supports_frp_registration():
+	if not _native_radiance_ready or _native_radiance_revision < 0:
 		return
 	var source_revision := _current_source_registration_revision()
 	var signature: Array = [

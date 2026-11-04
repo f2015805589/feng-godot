@@ -190,9 +190,9 @@ func _pack_frame(frame: Dictionary, fog_parameters: PackedFloat32Array,
 		if not projection_axis.is_finite():
 			return PackedFloat32Array()
 	var values := PackedFloat32Array()
-	_append_projection(values, inverse_projection)
+	RDUniforms.append_projection(values, inverse_projection)
 	var view_to_world := Transform3D(camera.basis.orthonormalized(), camera.origin)
-	_append_transform(values, view_to_world)
+	RDUniforms.append_transform(values, view_to_world)
 	var frame_exposure := float(frame.get("pre_exposure", pre_exposure))
 	if not is_finite(frame_exposure) or frame_exposure <= 0.0:
 		return PackedFloat32Array()
@@ -202,20 +202,6 @@ func _pack_frame(frame: Dictionary, fog_parameters: PackedFloat32Array,
 	values.append_array(fog_parameters.slice(4, 28))
 	values.append_array(PackedFloat32Array([maxf(fog_parameters[3], 0.0), 0.0, 0.0, 0.0]))
 	return values
-
-
-func _append_projection(values: PackedFloat32Array, projection: Projection) -> void:
-	for column in 4:
-		var axis: Vector4 = projection[column]
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, axis.w]))
-
-
-func _append_transform(values: PackedFloat32Array, transform: Transform3D) -> void:
-	for axis in [transform.basis.x, transform.basis.y, transform.basis.z]:
-		values.append_array(PackedFloat32Array([axis.x, axis.y, axis.z, 0.0]))
-	values.append_array(PackedFloat32Array([
-		transform.origin.x, transform.origin.y, transform.origin.z, 1.0,
-	]))
 
 
 func _update_ubo(rid: RID, values: PackedFloat32Array, rd: RenderingDevice) -> bool:

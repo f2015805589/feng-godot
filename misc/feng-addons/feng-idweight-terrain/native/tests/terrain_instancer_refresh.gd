@@ -1,13 +1,8 @@
 # Run with a graphical rendering driver; see README.md in this directory.
 #
 # `update_mmis()` with no arguments means "every mesh in every region, without destroying first". It
-# queues the `(V2I_MAX, -1)` sentinel, and `Terrain3DInstancer::initialize()` is its caller, so this is
-# also what materialises instances after a scene loads.
-#
-# A pass of this repository removed the arm that recognises that pair and the guard that skips it in the
-# pair loop, judging both unreachable. They are not: with them gone the pair fell through to the
-# "all mesh ids for this region" expansion, where `V2I_MAX` is not a region - so the refresh built
-# nothing and every mesh id logged `Errant null region found at: (2147483647, 2147483647)`.
+# queues the `(V2I_MAX, -1)` sentinel and `Terrain3DInstancer::initialize()` is one of its callers, so
+# this is the refresh that materialises instances after a scene loads.
 #
 # The observable is the instance count, because it is derived from the resident multimeshes
 # (`_recount_master_lods()`). The fixture edits a region's stored transforms directly, which is the state
