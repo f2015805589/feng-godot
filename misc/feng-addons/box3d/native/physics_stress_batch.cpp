@@ -24,6 +24,7 @@ void FengPhysicsStressBatch::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("inspect"), &FengPhysicsStressBatch::inspect);
 	ClassDB::bind_method(D_METHOD("core_profile"), &FengPhysicsStressBatch::core_profile);
 	ClassDB::bind_method(D_METHOD("initial_buffer"), &FengPhysicsStressBatch::initial_buffer);
+	ClassDB::bind_method(D_METHOD("final_state_buffer"), &FengPhysicsStressBatch::final_state_buffer);
 }
 
 FengPhysicsStressBatch::~FengPhysicsStressBatch() { clear(); }
@@ -143,6 +144,39 @@ PackedFloat32Array FengPhysicsStressBatch::initial_buffer() const {
 		}
 	}
 	return buffer;
+}
+
+PackedFloat32Array FengPhysicsStressBatch::final_state_buffer() const {
+	// Read-only diagnostic layout, matching benchmark rigid_state:
+	// [count, then per body in creation order: transform columns(9), origin(3),
+	//  linear(3), angular(3), sleeping(1=awake/0=sleep)].
+	const int stride = 19;
+	PackedFloat32Array result;
+	result.resize(1 + int(bodies.size()) * stride);
+	float *p = result.ptrw();
+	p[0] = float(bodies.size());
+	auto *server = PhysicsServer3D::get_singleton();
+	int out = 1;
+	for (const RID &body : bodies) {
+		Transform3D xform = server->body_get_state(body, PhysicsServer3D::BODY_STATE_TRANSFORM);
+		Vector3 linear = server->body_get_state(body, PhysicsServer3D::BODY_STATE_LINEAR_VELOCITY);
+		Vector3 angular = server->body_get_state(body, PhysicsServer3D::BODY_STATE_ANGULAR_VELOCITY);
+		bool sleeping = (bool)server->body_get_state(body, PhysicsServer3D::BODY_STATE_SLEEPING);
+		for (int column = 0; column < 3; ++column) {
+			for (int row = 0; row < 3; ++row) p[out++] = xform.basis.rows[row][column];
+		}
+		p[out++] = xform.origin.x;
+		p[out++] = xform.origin.y;
+		p[out++] = xform.origin.z;
+		p[out++] = linear.x;
+		p[out++] = linear.y;
+		p[out++] = linear.z;
+		p[out++] = angular.x;
+		p[out++] = angular.y;
+		p[out++] = angular.z;
+		p[out++] = sleeping ? 0.0f : 1.0f;
+	}
+	return result;
 }
 
 Dictionary FengPhysicsStressBatch::core_profile() const {

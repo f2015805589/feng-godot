@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--godot", type=Path, default=ROOT / "bin/godot.windows.editor.x86_64.exe")
     parser.add_argument("--library", type=Path, default=ADDON / "bin/box3d.dll")
-    parser.add_argument("--case", action="append", choices=["rigid", "soft", "soft_contacts", "soft_stack", "cloth4096", "cloth2048", "soft_balls", "soft_rest", "ragdolls", "ragdolls_rest"])
+    parser.add_argument("--case", action="append", choices=["rigid", "soft", "soft_contacts", "soft_stack", "cloth4096", "cloth2048", "cloth_ground", "cloth_ground_no_balls", "cloth_ground_no_self", "cloth_reimpact", "cloth_reimpact_create", "soft_balls", "soft_rest", "ragdolls", "ragdolls_rest"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--workers", type=int, default=4, choices=range(1, 33))
     args = parser.parse_args()
@@ -27,7 +27,7 @@ def main():
     project = Path(tempfile.mkdtemp(prefix="benchmark-", dir=base))
     target = project / "addons/box3d"
     (target / "bin").mkdir(parents=True)
-    shutil.copy2(args.library, target / "bin" / args.library.name)
+    shutil.copy2(args.library, target / "bin" / "box3d.dll")
     shutil.copy2(ADDON / "box3d.gdextension", target)
     shutil.copy2(ADDON / "tests/physics_benchmark.gd", project)
     (target / "examples").mkdir()

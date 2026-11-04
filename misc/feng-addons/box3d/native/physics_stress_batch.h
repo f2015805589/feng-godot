@@ -37,4 +37,5 @@ public:
 	// Optional diagnostic readback; never used to simulate or synchronize bodies.
 	godot::Dictionary core_profile() const;
 	godot::PackedFloat32Array initial_buffer() const;
+	godot::PackedFloat32Array final_state_buffer() const;
 };

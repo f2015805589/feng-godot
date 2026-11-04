@@ -104,7 +104,11 @@ static void b3IntegrateVelocitiesTask( b3SolverBlock block, b3StepContext* conte
 		w = b3MulAdd( angularVelocityDelta, angularDamping, w );
 
 		// Gyroscopic torque by solving this nonlinear equation using Newton-Raphson.
-		// I * (w2 - w1) + h * cross(w2, I * w2) = 0
+		// Implicit midpoint: I * (w2 - w1) + h * cross(wm, I * wm) = 0, wm = (w1 + w2) / 2.
+		// When converged this scheme is time symmetric and conserves angular momentum and
+		// rotational kinetic energy for torque-free motion. The previous backward Euler
+		// form damped the transverse component by 1 / sqrt(1 + (h * omega)^2) per substep,
+		// which is visible as long-horizon |L| and KE loss for spinning bodies.
 		// This is all done in local coordinates where the Jacobian is easier to compute.
 		// This improves the simulation of long skinny bodies.
 		// For I = k * identity, cross(w, I*w) is identically zero. Keep w in
@@ -138,33 +142,35 @@ static void b3IntegrateVelocitiesTask( b3SolverBlock block, b3StepContext* conte
 
 			for ( int gyroIteration = 0; gyroIteration < B3_GYROSCOPIC_ITERATIONS; ++gyroIteration )
 			{
-				float w1 = omega2.x;
-				float w2 = omega2.y;
-				float w3 = omega2.z;
+				// Midpoint of the step and its angular momentum
+				float w1m = 0.5f * ( omega1.x + omega2.x );
+				float w2m = 0.5f * ( omega1.y + omega2.y );
+				float w3m = 0.5f * ( omega1.z + omega2.z );
 
-				// Iw = I * omega2 (shared between residual and Jacobian)
-				float Iw1 = i00 * w1 + i01 * w2 + i02 * w3;
-				float Iw2 = i01 * w1 + i11 * w2 + i12 * w3;
-				float Iw3 = i02 * w1 + i12 * w2 + i22 * w3;
+				// Iwm = I * wm (shared between residual and Jacobian)
+				float Iw1 = i00 * w1m + i01 * w2m + i02 * w3m;
+				float Iw2 = i01 * w1m + i11 * w2m + i12 * w3m;
+				float Iw3 = i02 * w1m + i12 * w2m + i22 * w3m;
 
-				// Residual: b = I * (omega2 - omega1) + h * cross(omega2, I * omega2)
+				// Residual: b = I * (omega2 - omega1) + h * cross(wm, I * wm)
 				b3Vec3 dw = b3Sub( omega2, omega1 );
 				b3Vec3 b = {
-					i00 * dw.x + i01 * dw.y + i02 * dw.z + h * ( w2 * Iw3 - w3 * Iw2 ),
-					i01 * dw.x + i11 * dw.y + i12 * dw.z + h * ( w3 * Iw1 - w1 * Iw3 ),
-					i02 * dw.x + i12 * dw.y + i22 * dw.z + h * ( w1 * Iw2 - w2 * Iw1 ),
+					i00 * dw.x + i01 * dw.y + i02 * dw.z + h * ( w2m * Iw3 - w3m * Iw2 ),
+					i01 * dw.x + i11 * dw.y + i12 * dw.z + h * ( w3m * Iw1 - w1m * Iw3 ),
+					i02 * dw.x + i12 * dw.y + i22 * dw.z + h * ( w1m * Iw2 - w2m * Iw1 ),
 				};
 
-				// Jacobian J = I + h * (skew(omega2) * I - skew(I * omega2))
+				// Jacobian J = I + (h/2) * (skew(wm) * I - skew(I * wm))
 				// Jacobian derived by Erin Catto, Ph.D. Do not attempt to do this without a Ph.D.
 				// Doubled inertia terms above fold into Iw, e.g. row 2 col 1: i00*w3 - i02*w1 - Iw3.
+				float hh = 0.5f * h;
 				b3Matrix3 J = {
-					{ i00 + h * ( w2 * i02 - w3 * i01 ), i01 + h * ( w3 * i00 - w1 * i02 - Iw3 ),
-					  i02 + h * ( w1 * i01 - w2 * i00 + Iw2 ) },
-					{ i01 + h * ( w2 * i12 - w3 * i11 + Iw3 ), i11 + h * ( w3 * i01 - w1 * i12 ),
-					  i12 + h * ( w1 * i11 - w2 * i01 - Iw1 ) },
-					{ i02 + h * ( w2 * i22 - w3 * i12 - Iw2 ), i12 + h * ( w3 * i02 - w1 * i22 + Iw1 ),
-					  i22 + h * ( w1 * i12 - w2 * i02 ) },
+					{ i00 + hh * ( w2m * i02 - w3m * i01 ), i01 + hh * ( w3m * i00 - w1m * i02 - Iw3 ),
+					  i02 + hh * ( w1m * i01 - w2m * i00 + Iw2 ) },
+					{ i01 + hh * ( w2m * i12 - w3m * i11 + Iw3 ), i11 + hh * ( w3m * i01 - w1m * i12 ),
+					  i12 + hh * ( w1m * i11 - w2m * i01 - Iw1 ) },
+					{ i02 + hh * ( w2m * i22 - w3m * i12 - Iw2 ), i12 + hh * ( w3m * i02 - w1m * i22 + Iw1 ),
+					  i22 + hh * ( w1m * i12 - w2m * i02 ) },
 				};
 
 				omega2 = b3Sub( omega2, b3Solve3( J, b ) );

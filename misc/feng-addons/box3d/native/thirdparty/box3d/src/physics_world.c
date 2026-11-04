@@ -2321,6 +2321,12 @@ void b3World_StopRecording( b3WorldId worldId )
 	b3StopRecordingInternal( world );
 }
 
+bool b3World_IsRecording( b3WorldId worldId )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	return world->recording != NULL;
+}
+
 void b3World_DumpMemoryStats( b3WorldId worldId )
 {
 	b3World* world = b3GetUnlockedWorldFromId( worldId );

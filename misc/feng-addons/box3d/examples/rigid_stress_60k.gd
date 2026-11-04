@@ -160,14 +160,19 @@ func _summary(values: Array[float]) -> Dictionary:
 	sorted.sort()
 	var total := 0.0
 	for value in sorted: total += value
-	return {"median_ms": sorted[sorted.size() / 2], "mean_ms": total / sorted.size(), "p95_ms": sorted[mini(sorted.size() - 1, int(sorted.size() * 0.95))], "samples": sorted.size()}
+	return {"median_ms": sorted[sorted.size() / 2], "mean_ms": total / sorted.size(), "p95_ms": sorted[mini(sorted.size() - 1, int(sorted.size() * 0.95))], "max_ms": sorted[sorted.size() - 1], "samples": sorted.size()}
 
 func _finish() -> void:
 	inspection = batch.call("inspect")
+	var final_state: PackedFloat32Array = batch.call("final_state_buffer")
+	var state_hash := HashingContext.new()
+	state_hash.start(HashingContext.HASH_SHA256)
+	state_hash.update(final_state.to_byte_array())
+	var rigid_state_sha256: String = state_hash.finish().hex_encode()
 	var result := {
 		"case": case_name, "count": body_count, "ticks_hz": Engine.physics_ticks_per_second,
 		"headless": headless, "renderer": RenderingServer.get_current_rendering_method(),
-		"initial_sha256": initial_hash, "creation_ms": build_ms,
+		"initial_sha256": initial_hash, "rigid_state_sha256": rigid_state_sha256, "creation_ms": build_ms,
 		"box3d_workers": ProjectSettings.get_setting("physics/box3d/worker_count", 0),
 		"godot_worker_threads": ProjectSettings.get_setting("threading/worker_pool/max_threads", -1),
 		"logical_processors": OS.get_processor_count(),
@@ -176,6 +181,9 @@ func _finish() -> void:
 		"visual_sync": _summary(upload_samples), "viewport_gpu": _summary(gpu_samples),
 		"validation": inspection,
 		"static_memory_bytes": OS.get_static_memory_usage(),
+		"collision_pairs": PhysicsServer3D.get_process_info(PhysicsServer3D.INFO_COLLISION_PAIRS),
+		"active_objects": PhysicsServer3D.get_process_info(PhysicsServer3D.INFO_ACTIVE_OBJECTS),
+		"island_count": PhysicsServer3D.get_process_info(PhysicsServer3D.INFO_ISLAND_COUNT),
 		"solver": "Box3D 4 substeps" if str(inspection.backend_body_state).begins_with("Box3D") else "Jolt 10 velocity / 2 position iterations"}
 	if collect_core_profile:
 		var summaries: Dictionary = {}

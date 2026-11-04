@@ -45,6 +45,18 @@ public:
 		b3ShapeId shape;
 		Vector3 point;
 	};
+	// Per-particle result of the read-only rigid collision pass. It owns its
+	// plane slice because b3SolvePlanes writes the accumulated push back into
+	// the planes the response pass reads. Nothing here is shared between
+	// particles, so query_rigid() has no cross-particle side effects.
+	struct RigidQueryResult {
+		bool cast_hit = false;
+		Vector3 normal, point;
+		b3ShapeId cast_shape = b3_nullShapeId;
+		b3Vec3 solved_delta = {};
+		std::vector<b3CollisionPlane> planes;
+		std::vector<RigidContact> contacts;
+	};
 	RID rid;
 	uint64_t instance_id = 0;
 	Box3DSpace3D *space = nullptr;
@@ -126,10 +138,30 @@ private:
 		// Iterations load/store whole SIMD vectors instead of gathering solver
 		// parameters from four scattered topology records for every constraint.
 		alignas(16) float target_length[4] = {}, compliance[4] = {}, inverse_effective_mass[4] = {}, lambda[4] = {};
+		// Endpoint indices are cached next to the batch so neither the substep
+		// setup nor the solver has to scatter-read Edge records just to find the
+		// two particles. Filled together with the constants above.
+		int a[4] = {}, b[4] = {};
 	};
 	std::vector<ConstraintBatch> constraint_batches;
 	std::vector<int> constraint_batch_group_ends;
 	int parallel_batch_end = 0;
+	// Constraint setup cache. alpha/compliance/inverse_effective_mass/target_length
+	// do not depend on particle positions, only on h, stiffness, shrinking,
+	// inverse masses and topology. h is shared by all four substeps of a step, so
+	// the first substep computes them and the next three only clear lambda.
+	// Invalidation: mesh rebuild bumps constraint_revision, pin changes bump it
+	// too, tearing/cut rebuilds change torn_seams, and mass/total weight are
+	// compared directly.
+	bool constraint_setup_valid = false;
+	float constraint_setup_h = 0.0f;
+	float constraint_setup_stiffness = 0.0f;
+	float constraint_setup_shrinking = 0.0f;
+	float constraint_setup_mass = 0.0f;
+	float constraint_setup_total_weight = 0.0f;
+	int constraint_setup_torn_seams = 0;
+	uint64_t constraint_setup_revision = 0;
+	uint64_t constraint_revision = 0;
 	std::vector<Seam> seams;
 	// Rest-topology neighbors stay excluded after a tear. Newly split twins
 	// start coincident; treating them as penetrating contacts would explode them.
@@ -215,8 +247,7 @@ private:
 	};
 	std::vector<ContactCache> contact_caches;
 	uint64_t contact_cache_clock = 0;
-	std::vector<b3CollisionPlane> collision_planes;
-	std::vector<RigidContact> rigid_contacts;
+	std::vector<RigidQueryResult> rigid_query_results;
 	std::vector<AABB> rigid_bounds;
 	void prepare_rigid_contacts();
 	int build_bvh(int p_begin, int p_end);
@@ -235,6 +266,13 @@ private:
 	bool collide_soft(Box3DSoftBody3D &p_other);
 	bool self_contact_excluded(int p_particle, int p_face) const;
 	void update_bounds();
-	void collide(Particle &p, float p_dt);
+	// Split of the former collide(): the query pass only reads the rigid world
+	// and writes this particle's own result, the response pass applies velocity
+	// impulses in particle order.
+	void query_rigid(Particle &p, float p_dt, RigidQueryResult &r_result);
+	void apply_rigid(Particle &p, const RigidQueryResult &p_result);
+	// Worker body of the parallel query pass. Only touches particles in
+	// [p_begin, p_end) and their own result slots.
+	static void run_rigid_queries(int p_begin, int p_end, void *p_data);
 	void respond_rigid(Particle &p, b3ShapeId p_shape, const Vector3 &p_normal, const Vector3 &p_point);
 };

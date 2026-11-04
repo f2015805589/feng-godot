@@ -123,6 +123,7 @@ void Box3DSoftBody3D::set_mesh(RID p_mesh) {
 		}
 	}
 	rebuild_constraints();
+	++constraint_revision;
 	const Vector3 origin = particles.empty() ? Vector3() : particles[0].x;
 	for (const Face &f : faces) {
 		rest_volume += (particles[f.a].x - origin).dot((particles[f.b].x - origin).cross(particles[f.c].x - origin)) / 6.0f;
@@ -188,6 +189,7 @@ void Box3DSoftBody3D::pin(int i, bool value) {
 		}
 	}
 	particles[id].velocity = Vector3();
+	++constraint_revision;
 	wake_up();
 }
 void Box3DSoftBody3D::move(int i, Vector3 p) {
@@ -302,6 +304,12 @@ bool Box3DSoftBody3D::accepts(b3ShapeId shape) const {
 	return object && !exceptions.has(object->get_rid());
 }
 namespace {
+// Context for the parallel rigid query pass. Read-only apart from the per
+// particle writes documented on Box3DSoftBody3D::run_rigid_queries().
+struct SoftRigidQueryWork {
+	Box3DSoftBody3D *body = nullptr;
+	float dt = 0;
+};
 struct Contact {
 	Box3DSoftBody3D *body;
 	float fraction = 1;
@@ -349,9 +357,14 @@ bool plane_hit(b3ShapeId shape, const b3PlaneResult *planes, int count, void *da
 	return true;
 }
 } //namespace
-void Box3DSoftBody3D::collide(Particle &p, float dt) {
+void Box3DSoftBody3D::query_rigid(Particle &p, float dt, RigidQueryResult &r) {
+	r.cast_hit = false;
+	r.solved_delta = b3Vec3_zero;
+	r.planes.clear();
+	r.contacts.clear();
+	const Vector3 motion = p.x - p.previous;
 	if (rigid_bounds.empty()) {
-		p.velocity = (p.x - p.previous) / dt;
+		p.velocity = motion / dt;
 		return;
 	}
 	AABB swept(p.previous, Vector3());
@@ -370,16 +383,13 @@ void Box3DSoftBody3D::collide(Particle &p, float dt) {
 	}
 	Contact c;
 	c.body = this;
-	collision_planes.clear();
-	rigid_contacts.clear();
-	c.planes = &collision_planes;
-	c.contacts = &rigid_contacts;
+	c.planes = &r.planes;
+	c.contacts = &r.contacts;
 	auto world = space->get_world_id();
 	b3QueryFilter filter = b3DefaultQueryFilter();
 	b3Filter f = godot_to_b3_filter(layer, mask);
 	filter.categoryBits = f.categoryBits;
 	filter.maskBits = f.maskBits;
-	Vector3 motion = p.x - p.previous;
 	// Reconstruct XPBD velocity before collision recovery. Depenetration is a
 	// position correction, not an extra launch impulse (also Jolt's ordering).
 	p.velocity = motion / dt;
@@ -392,24 +402,54 @@ void Box3DSoftBody3D::collide(Particle &p, float dt) {
 	if (motion.length_squared() > 1e-12f) {
 		b3World_CastShape(world, godot_to_b3(p.previous), &proxy, godot_to_b3(motion), filter, cast_hit, &c);
 		if (c.fraction < 1) {
+			r.cast_hit = true;
+			r.normal = c.normal;
+			r.point = c.point;
+			r.cast_shape = c.shape;
+			// Position correction belongs to the query pass; the velocity and
+			// impulse response stays in apply_rigid() to keep particle order.
 			p.x = p.previous + motion * c.fraction + c.normal * 0.0001f;
-			respond_rigid(p, c.shape, c.normal, c.point);
 		}
 	}
 	b3Capsule mover = {};
 	mover.radius = thickness;
 	c.origin = p.x;
 	b3World_CollideMover(world, godot_to_b3(p.x), &mover, filter, plane_hit, &c);
-	if (!c.planes->empty()) {
-		const b3PlaneSolverResult solved = b3SolvePlanes(b3Vec3_zero, c.planes->data(), int(c.planes->size()));
-		p.x += b3_to_godot(solved.delta);
-		for (size_t i = 0; i < collision_planes.size(); ++i) {
+	if (!r.planes.empty()) {
+		const b3PlaneSolverResult solved = b3SolvePlanes(b3Vec3_zero, r.planes.data(), int(r.planes.size()));
+		r.solved_delta = solved.delta;
+	}
+}
+
+void Box3DSoftBody3D::run_rigid_queries(int begin, int end, void *data) {
+	SoftRigidQueryWork &work = *static_cast<SoftRigidQueryWork *>(data);
+	Box3DSoftBody3D *body = work.body;
+	const float dt = work.dt;
+	for (int i = begin; i < end; ++i) {
+		Particle &p = body->particles[i];
+		if (p.pinned) {
+			continue;
+		}
+		// Writes only particles[i] (velocity, cast clamp) and result[i].
+		body->query_rigid(p, dt, body->rigid_query_results[i]);
+	}
+}
+
+void Box3DSoftBody3D::apply_rigid(Particle &p, const RigidQueryResult &r) {
+	// Cast response first, then the plane delta, then the planes in their
+	// original order: the same sequence the combined function ran.
+	if (r.cast_hit) {
+		respond_rigid(p, r.cast_shape, r.normal, r.point);
+	}
+	if (!r.planes.empty()) {
+		p.x += b3_to_godot(r.solved_delta);
+		for (size_t i = 0; i < r.planes.size(); ++i) {
 			// The positional solver intentionally tolerates small penetration.
 			// Still cancel closing velocity at those resting contacts, otherwise
 			// gravity accumulates until the next push and continually breaks sleep.
-			const b3Plane &plane = collision_planes[i].plane;
-			if (collision_planes[i].push > 0 || b3Dot(plane.normal, solved.delta) - plane.offset <= 1e-5f) {
-				respond_rigid(p, rigid_contacts[i].shape, b3_to_godot(collision_planes[i].plane.normal), rigid_contacts[i].point);
+			const b3Plane &plane = r.planes[i].plane;
+			if (r.planes[i].push > 0 || b3Dot(plane.normal, r.solved_delta) - plane.offset <= 1e-5f) {
+				respond_rigid(p, r.contacts[i].shape, b3_to_godot(r.planes[i].plane.normal), r.contacts[i].point);
 			}
 		}
 	}
@@ -481,15 +521,44 @@ void Box3DSoftBody3D::solve_constraints(float h) {
 	if (solve_volume) {
 		volume_gradients.resize(particles.size());
 	}
-	for (auto &batch : constraint_batches) {
-		for (int lane = 0; lane < batch.count; ++lane) {
-			const auto &e = edges[batch.edges[lane]];
-			batch.lambda[lane] = 0;
-			batch.compliance[lane] = alpha * (e.bend ? 20.0f : 1.0f);
-			const float weight = positions[e.a].inverse_mass + positions[e.b].inverse_mass;
-			batch.inverse_effective_mass[lane] = weight > 0 ? 1.0f / (weight + batch.compliance[lane]) : 0;
-			batch.target_length[lane] = e.length * shrink_scale;
+	// Positions do not enter these constants: only topology, inverse masses and
+	// the step parameters do, and h is shared by all four substeps. The first
+	// substep computes them, the next three only clear lambda. A mesh rebuild or
+	// pin change bumps constraint_revision, tearing/cut() changes torn_seams,
+	// and mass/total weight are compared directly.
+	const bool setup_valid = constraint_setup_valid &&
+		constraint_setup_h == h &&
+		constraint_setup_stiffness == stiffness &&
+		constraint_setup_shrinking == shrinking &&
+		constraint_setup_mass == mass &&
+		constraint_setup_total_weight == total_weight &&
+		constraint_setup_torn_seams == torn_seams &&
+		constraint_setup_revision == constraint_revision;
+	if (setup_valid) {
+		for (auto &batch : constraint_batches) {
+			std::fill(batch.lambda, batch.lambda + 4, 0.0f);
 		}
+	} else {
+		for (auto &batch : constraint_batches) {
+			for (int lane = 0; lane < batch.count; ++lane) {
+				const auto &e = edges[batch.edges[lane]];
+				batch.lambda[lane] = 0;
+				batch.compliance[lane] = alpha * (e.bend ? 20.0f : 1.0f);
+				const float weight = positions[e.a].inverse_mass + positions[e.b].inverse_mass;
+				batch.inverse_effective_mass[lane] = weight > 0 ? 1.0f / (weight + batch.compliance[lane]) : 0;
+				batch.target_length[lane] = e.length * shrink_scale;
+				batch.a[lane] = e.a;
+				batch.b[lane] = e.b;
+			}
+		}
+		constraint_setup_h = h;
+		constraint_setup_stiffness = stiffness;
+		constraint_setup_shrinking = shrinking;
+		constraint_setup_mass = mass;
+		constraint_setup_total_weight = total_weight;
+		constraint_setup_torn_seams = torn_seams;
+		constraint_setup_revision = constraint_revision;
+		constraint_setup_valid = true;
 	}
 	struct Iteration {
 		Box3DSoftBody3D *body;
@@ -551,11 +620,10 @@ void Box3DSoftBody3D::solve_batches(int begin, int end) {
 		auto &batch = constraint_batches[i];
 #if defined(__SSE2__) || defined(_M_X64)
 		if (batch.count == 4) {
-			Edge *e[4] = { &edges[batch.edges[0]], &edges[batch.edges[1]], &edges[batch.edges[2]], &edges[batch.edges[3]] };
-			__m128 ax = _mm_load_ps(&constraint_particles[e[0]->a].x.x), ay = _mm_load_ps(&constraint_particles[e[1]->a].x.x);
-			__m128 az = _mm_load_ps(&constraint_particles[e[2]->a].x.x), aw = _mm_load_ps(&constraint_particles[e[3]->a].x.x);
-			__m128 bx = _mm_load_ps(&constraint_particles[e[0]->b].x.x), by = _mm_load_ps(&constraint_particles[e[1]->b].x.x);
-			__m128 bz = _mm_load_ps(&constraint_particles[e[2]->b].x.x), bw = _mm_load_ps(&constraint_particles[e[3]->b].x.x);
+			__m128 ax = _mm_load_ps(&constraint_particles[batch.a[0]].x.x), ay = _mm_load_ps(&constraint_particles[batch.a[1]].x.x);
+			__m128 az = _mm_load_ps(&constraint_particles[batch.a[2]].x.x), aw = _mm_load_ps(&constraint_particles[batch.a[3]].x.x);
+			__m128 bx = _mm_load_ps(&constraint_particles[batch.b[0]].x.x), by = _mm_load_ps(&constraint_particles[batch.b[1]].x.x);
+			__m128 bz = _mm_load_ps(&constraint_particles[batch.b[2]].x.x), bw = _mm_load_ps(&constraint_particles[batch.b[3]].x.x);
 			_MM_TRANSPOSE4_PS(ax, ay, az, aw);
 			_MM_TRANSPOSE4_PS(bx, by, bz, bw);
 			__m128 dx = _mm_sub_ps(bx, ax), dy = _mm_sub_ps(by, ay), dz = _mm_sub_ps(bz, az);
@@ -573,17 +641,16 @@ void Box3DSoftBody3D::solve_batches(int begin, int end) {
 			bx = _mm_add_ps(bx, _mm_mul_ps(dx, bw)); by = _mm_add_ps(by, _mm_mul_ps(dy, bw)); bz = _mm_add_ps(bz, _mm_mul_ps(dz, bw));
 			_MM_TRANSPOSE4_PS(ax, ay, az, aw);
 			_MM_TRANSPOSE4_PS(bx, by, bz, bw);
-			_mm_store_ps(&constraint_particles[e[0]->a].x.x, ax); _mm_store_ps(&constraint_particles[e[0]->b].x.x, bx);
-			_mm_store_ps(&constraint_particles[e[1]->a].x.x, ay); _mm_store_ps(&constraint_particles[e[1]->b].x.x, by);
-			_mm_store_ps(&constraint_particles[e[2]->a].x.x, az); _mm_store_ps(&constraint_particles[e[2]->b].x.x, bz);
-			_mm_store_ps(&constraint_particles[e[3]->a].x.x, aw); _mm_store_ps(&constraint_particles[e[3]->b].x.x, bw);
+			_mm_store_ps(&constraint_particles[batch.a[0]].x.x, ax); _mm_store_ps(&constraint_particles[batch.b[0]].x.x, bx);
+			_mm_store_ps(&constraint_particles[batch.a[1]].x.x, ay); _mm_store_ps(&constraint_particles[batch.b[1]].x.x, by);
+			_mm_store_ps(&constraint_particles[batch.a[2]].x.x, az); _mm_store_ps(&constraint_particles[batch.b[2]].x.x, bz);
+			_mm_store_ps(&constraint_particles[batch.a[3]].x.x, aw); _mm_store_ps(&constraint_particles[batch.b[3]].x.x, bw);
 			continue;
 		}
 #endif
 		for (int lane = 0; lane < batch.count; ++lane) {
-			auto &e = edges[batch.edges[lane]];
 			if (batch.inverse_effective_mass[lane] == 0) continue;
-			auto &a = constraint_particles[e.a], &b = constraint_particles[e.b];
+			auto &a = constraint_particles[batch.a[lane]], &b = constraint_particles[batch.b[lane]];
 			Vector3 delta = b.x - a.x;
 			float length = delta.length();
 			if (length < 1e-8f) continue;
@@ -634,10 +701,51 @@ void Box3DSoftBody3D::step_all(const HashSet<Box3DSoftBody3D *> &bodies, float d
 			if (!body->constraint_batch_group_ends.empty()) body->solve_constraints(h);
 			if (!body->sleeping) {
 				body->prepare_rigid_contacts();
+				if (body->rigid_bounds.empty()) {
+					// No rigid candidate this substep: the query pass would only
+					// reconstruct velocity and the response pass would do nothing,
+					// so skip the result slots and any dispatch entirely.
+					for (size_t index = 0; index < body->particles.size(); ++index) {
+						Particle &p = body->particles[index];
+						if (!p.pinned) {
+							p.velocity = (p.x - p.previous) / h;
+						}
+					}
+					continue;
+				}
 			}
-			for (auto &p : body->particles) {
-				if (!p.pinned && !body->sleeping) {
-					body->collide(p, h);
+			// The query pass is read-only against the rigid world and each worker
+			// writes only its own particles and result slots, so it may run on the
+			// world's existing workers. Responses stay strictly serial below.
+			if (!body->sleeping) {
+				body->rigid_query_results.resize(body->particles.size());
+				const b3WorldId query_world = body->space->get_world_id();
+				// With a single worker the ranges would run inline anyway, so keep
+				// the fused A->B order there instead of paying the extra pass.
+				// A recording world also has to stay serial: recording writes every
+				// query into one shared buffer. Multi-worker keeps the two phases.
+				if (b3World_IsRecording(query_world) || b3World_GetWorkerCount(query_world) <= 1) {
+					for (size_t index = 0; index < body->particles.size(); ++index) {
+						Particle &p = body->particles[index];
+						if (p.pinned) {
+							continue;
+						}
+						RigidQueryResult &result = body->rigid_query_results[index];
+						body->query_rigid(p, h, result);
+						body->apply_rigid(p, result);
+					}
+				} else {
+					SoftRigidQueryWork work{ body, h };
+					fengSoftParallelFor(query_world, int(body->particles.size()), 256,
+							run_rigid_queries, &work);
+					for (size_t index = 0; index < body->particles.size(); ++index) {
+						Particle &p = body->particles[index];
+						if (p.pinned) {
+							continue;
+						}
+						RigidQueryResult &result = body->rigid_query_results[index];
+						body->apply_rigid(p, result);
+					}
 				}
 			}
 		}

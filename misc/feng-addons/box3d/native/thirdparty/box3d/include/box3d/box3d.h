@@ -284,6 +284,12 @@ B3_API void b3World_StartRecording( b3WorldId worldId, b3Recording* recording );
 /// @param worldId the world currently being recorded
 B3_API void b3World_StopRecording( b3WorldId worldId );
 
+/// Read-only query: true while the world has an active recording session.
+/// Callers that run world queries from several threads must stay serial while
+/// this is true, because recording writes every query into a shared buffer.
+/// @param worldId the world to inspect
+B3_API bool b3World_IsRecording( b3WorldId worldId );
+
 /// Save the recording buffer to a file. Returns true on success.
 /// @param recording the recording to save
 /// @param path file path to write
