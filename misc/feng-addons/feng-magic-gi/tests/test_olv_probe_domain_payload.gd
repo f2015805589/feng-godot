@@ -73,6 +73,7 @@ func _run() -> void:
 	_test_gather_filter_and_abstain(source, labels)
 	_test_legacy_path_without_asset(source)
 	_test_saved_label_reuse(source, labels)
+	_test_renderer_spacing_bindings()
 	_finish()
 
 
@@ -154,7 +155,7 @@ func _metadata(source: Resource, labels: Resource) -> Dictionary:
 		"feature_schema_sha256": _feature_sha,
 		"decision_policy_id": "fixture-three-seed-unanimous-confidence-gate-v1",
 		"supported_probe_spacing_m": source.spacing_m,
-		"supported_target_cell_spacings_m": PackedFloat32Array([0.25]),
+		"supported_target_cell_spacings_m": PackedFloat32Array(Inference.target_cell_spacings(source)),
 		"feature_context_extent_m": Vector3.ONE * 0.5,
 		"supported_feature_context_extents_m": PackedVector3Array([Vector3.ONE * 0.5]),
 		"source_probe_positions": source_positions,
@@ -176,8 +177,58 @@ func _context(labels: Resource, source: Resource) -> Dictionary:
 		"layout_revision": LAYOUT_REVISION,
 		"layout_signature": LAYOUT_SIGNATURE,
 		"grid_origin_world": source.origin_world,
-		"base_cell_spacing_m": 0.25,
+		"base_cell_spacing_m": source.spacing_m,
 	}
+
+
+func _test_renderer_spacing_bindings() -> void:
+	var pass_script := load("res://addons/feng-render-pipeline/passes/magic_gi_pass.gd") as Script
+	var manifest_script := load("res://addons/feng-magic-gi/feng_magic_gi_manifest.gd") as Script
+	var header_script := load("res://addons/feng-magic-gi/feng_magic_gi_prepared_source_header.gd") as Script
+	var pass_value: Resource = pass_script.new()
+	for spacing in [0.1, 0.25, 0.3, 1.0, 4.0, 5.0]:
+		var source := _valid_source()
+		source.spacing_m = spacing
+		source.source_size_m = Vector3(source.dimensions) * spacing
+		source.source_transform_world.origin = source.source_size_m * 0.5
+		source.source_bounds_world = AABB(Vector3.ZERO, source.source_size_m)
+		source.domain_bounds_world = source.source_bounds_world
+		source.origin_world = Vector3.ONE * spacing * 0.5
+		source.maximum_relocation_m = minf(0.05, spacing * 0.2)
+		source.directional_source_signature = source.make_directional_source_signature()
+		var labels := _target_labels(source)
+		var payload := _new_payload(source, PackedByteArray([1,2,1]), labels)
+		if payload == null: continue
+		var context := _context(labels, source)
+		context["labels_hash"] = labels.labels_hash
+		var manifest: Resource = manifest_script.new()
+		manifest.scene_identity = SCENE_ID
+		manifest.volume_identity = VOLUME_ID
+		var managed := {"managed": true, "enabled": true, "payload": payload,
+			"label_set": labels, "context": context, "source_binding_valid": true,
+			"manifest_instance_id": manifest.get_instance_id()}
+		var snapshot := {"manifest": manifest, "olv_binding": managed}
+		var header: Resource = header_script.new()
+		header.origin_world = source.origin_world
+		header.spacing_m = spacing
+		header.geometry_signature = source.geometry_signature
+		for input: Resource in [source, header]:
+			_check(not pass_value._validated_native_olv_binding(snapshot, input).is_empty(),
+				"independent OLV reaches the renderer at %s m for %s" % [spacing, input.get_script().resource_path])
+			managed.source_binding_valid = false
+			_check(pass_value._validated_native_olv_binding(snapshot, input).is_empty(),
+				"cached acceptance cannot bypass a now-invalid source binding")
+			managed.source_binding_valid = true
+			_check(not pass_value._validated_native_olv_binding(snapshot, input).is_empty(),
+				"a restored source binding restores OLV")
+			managed.enabled = false
+			_check(pass_value._validated_native_olv_binding(snapshot, input).is_empty(),
+				"OLV disable works independently of grid spacing")
+			managed.enabled = true
+			context.base_cell_spacing_m = spacing * 2.0
+			_check(pass_value._validated_native_olv_binding(snapshot, input).is_empty(),
+				"a different label lattice still fails closed")
+			context.base_cell_spacing_m = spacing
 
 
 func _test_payload_pair(source: Resource, payload: Resource, labels: Resource) -> void:

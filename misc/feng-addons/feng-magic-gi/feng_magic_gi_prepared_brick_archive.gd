@@ -43,6 +43,7 @@ static func _slice(source: Chunk, level: int, core: Vector3i,
 	var brick := Brick.new()
 	brick.operator_schema_version = 2
 	brick.source_origin_world = source.origin_world
+	brick.source_spacing_m = source.spacing_m
 	brick.level = level
 	brick.cell_origin = (core - Vector3i.ONE).max(Vector3i.ZERO)
 	brick.dimensions = (core + core_size + Vector3i.ONE).min(dims) - brick.cell_origin
@@ -125,6 +126,7 @@ static func save_source(source: Chunk, template: Manifest, generation: String,
 	manifest.generation = generation
 	manifest.transport_domain = DOMAIN
 	manifest.prepared_source_origin_world = source.origin_world
+	manifest.prepared_source_spacing_m = source.spacing_m
 	manifest.prepared_core_axis = core_axis
 	manifest.prepared_bake_algorithm = "prepared_clv_sh2_l0_l1_v3"
 	manifest.bake_settings_signature = hash([manifest.bake_settings_signature,
@@ -139,7 +141,7 @@ static func save_source(source: Chunk, template: Manifest, generation: String,
 	manifest.prepared_source_transform_world = source.source_transform_world
 	manifest.prepared_source_size_m = source.source_size_m
 	manifest.prepared_maximum_operator_row_l1 = float(source.clv_preparation_stats.get("maximum_operator_row_l1", 0.0))
-	manifest.page_core_size = core_axis * 0.25 * float(1 << (manifest.prepared_level_count - 1))
+	manifest.page_core_size = core_axis * source.spacing_m * float(1 << (manifest.prepared_level_count - 1))
 	manifest.management_block_size = maxf(512.0, manifest.page_core_size)
 	manifest.configure(entries)
 	return save_manifest(manifest, root)

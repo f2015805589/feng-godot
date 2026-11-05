@@ -22,7 +22,7 @@ var _pool_resize_count := 0
 var _paged_valid_cells := 0
 var _upload_budget_exceeded_count := 0
 var _maximum_uploaded_bytes := 0
-var _eviction_clear_calls := 0
+var _evicted_slots := 0
 
 func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
 		pages_revision: int, camera_world: Vector3, radius_m := 512.0,
@@ -78,7 +78,7 @@ func create_paged(rd: RenderingDevice, header: Resource, pages: Array,
 	format.depth = dimensions.z * _response_field_count
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT \
 		| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
-	texture_fields = [rd.texture_create(format, RDTextureView.new(), [])]
+	if not _create_response_fields(rd, format): return false
 	var dummy := RDTextureFormat.new()
 	dummy.texture_type = RenderingDevice.TEXTURE_TYPE_3D
 	dummy.format = RenderingDevice.DATA_FORMAT_R32G32_SFLOAT
@@ -119,7 +119,7 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 	if not force and layout.state == _clipmap_state and pages_revision == _pages_revision:
 		return true
 	_uploaded_bytes = 0
-	_eviction_clear_calls = 0
+	_evicted_slots = 0
 	_disable_olv_gate(rd)
 	var desired: Dictionary = {}
 	var bricks: Array[Resource] = []
@@ -174,7 +174,7 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 					# shading enforces the exact current per-pixel sphere separately.
 					var relative: Vector3i = global_cell - lod.cell_origin
 					var resident_index := ((level * resolution + relative.z) * resolution + relative.y) * resolution + relative.x
-					var key := "%d:%d:%d:%d" % [level, x, y, z]
+					var key := Vector4i(x, y, z, level)
 					if not desired.has(key):
 						desired[key] = Vector3i(resident_index, brick_index, source_index)
 	_loaded_bricks = bricks.size()
@@ -211,26 +211,13 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 		_gpu_bytes += target_capacity * bytes_per_probe
 		_pool_resize_count += 1
 	else:
-		var evicted_slots: Array[int] = []
 		for key in _pool_slots.keys():
 			if not desired.has(key):
-				evicted_slots.append(int(_pool_slots[key]))
 				_pool_slots.erase(key)
-		# A leaving page often owns many consecutive slots. Clear one interval
-		# per run, rather than issuing thousands of tiny RD operations.
-		evicted_slots.sort()
-		var evicted_cursor := 0
-		while evicted_cursor < evicted_slots.size():
-			var first := evicted_slots[evicted_cursor]
-			var end_slot := first + 1
-			evicted_cursor += 1
-			while evicted_cursor < evicted_slots.size() and evicted_slots[evicted_cursor] == end_slot:
-				end_slot += 1
-				evicted_cursor += 1
-			if rd.buffer_clear(_transfer, first * bytes_per_probe, (end_slot - first) * bytes_per_probe) != OK:
-				_error = "paged_clv_operator_eviction_failed"
-				return false
-			_eviction_clear_calls += 1
+				_evicted_slots += 1
+		# The complete resident index table below invalidates every leaving cell
+		# before relighting. Freed pool slots are unreachable, and are completely
+		# overwritten before reuse; clearing their old coefficients is redundant.
 	var used := PackedByteArray()
 	used.resize(_pool_capacity)
 	used.fill(0)
@@ -248,27 +235,33 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 			dirty[free_slot] = Vector2i(item.y, item.z)
 		var slot := int(_pool_slots[key])
 		indices[item.x] = slot
-	# Group consecutive destination slots into bounded uploads. Each source slice
-	# is copied by the packed-array implementation, not a GDScript float loop.
+	# Group contiguous destination slots into one upload. Within each upload,
+	# coalesce contiguous source rows too, avoiding a temporary array per cell.
 	var dirty_slots: Array = dirty.keys()
 	dirty_slots.sort()
 	var cursor := 0
+	if profile_updates: rd.capture_timestamp("Magic GI Operator Upload Begin")
 	while cursor < dirty_slots.size():
 		var first_slot := int(dirty_slots[cursor])
 		var next_slot := first_slot
 		var bytes := PackedByteArray()
-		while cursor < dirty_slots.size() and int(dirty_slots[cursor]) == next_slot \
-				and next_slot - first_slot < POOL_GRANULARITY:
+		while cursor < dirty_slots.size() and int(dirty_slots[cursor]) == next_slot:
 			var source: Vector2i = dirty[next_slot]
+			var run := 1
+			while cursor + run < dirty_slots.size() \
+					and int(dirty_slots[cursor + run]) == next_slot + run \
+					and dirty[next_slot + run] == Vector2i(source.x, source.y + run):
+				run += 1
 			var operators: PackedFloat32Array = bricks[source.x].get("operators")
 			bytes.append_array(operators.slice(source.y * rows_per_probe,
-				(source.y + 1) * rows_per_probe).to_byte_array())
-			next_slot += 1
-			cursor += 1
+				(source.y + run) * rows_per_probe).to_byte_array())
+			next_slot += run
+			cursor += run
 		if rd.buffer_update(_transfer, first_slot * bytes_per_probe, bytes.size(), bytes) != OK:
 			_error = "paged_clv_operator_upload_failed"
 			return false
 		_uploaded_bytes += bytes.size()
+	if profile_updates: rd.capture_timestamp("Magic GI Operator Upload End")
 	_maximum_uploaded_bytes = maxi(_maximum_uploaded_bytes, _uploaded_bytes)
 	if requested_upload_budget_bytes > 0 and _uploaded_bytes > requested_upload_budget_bytes:
 		_upload_budget_exceeded_count += 1
@@ -302,8 +295,8 @@ func update_pages(rd: RenderingDevice, header: Resource, pages: Array,
 	return true
 
 func _fixed_gpu_bytes() -> int:
-	return clip_cell_count * (4 + _response_partition_count() * _response_field_count * (8 if _half_fields else 16)) \
-		+ maxi(4, emitter_count * 6) * 4 + PARAMETERS_BYTES_PAGED + 28 \
+	return clip_cell_count * (4 + 2 * _response_partition_count() * _response_field_count * (8 if _half_fields else 16)) \
+		+ maxi(4, emitter_count * 6) * 4 + PARAMETERS_BYTES_PAGED + 188 \
 		+ (_olv_label_resolution * _olv_label_resolution * _olv_label_resolution * _olv_label_lod_count + clip_cell_count * 64 + 32 if _olv_label_atlas.is_valid() else 0)
 
 func _pack_parameters() -> PackedByteArray:
@@ -343,6 +336,6 @@ func get_runtime_state() -> Dictionary:
 		"maximum_uploaded_operator_bytes": _maximum_uploaded_bytes,
 		"requested_upload_budget_bytes": requested_upload_budget_bytes,
 		"upload_budget_enforced": false, "upload_budget_exceeded_count": _upload_budget_exceeded_count,
-		"eviction_clear_calls_last_update": _eviction_clear_calls,
+		"evicted_operator_slots_last_update": _evicted_slots,
 		"operator_pool_resize_count": _pool_resize_count, "prepared_pages_revision": _pages_revision}, true)
 	return state

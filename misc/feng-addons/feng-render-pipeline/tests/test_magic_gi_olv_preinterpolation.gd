@@ -32,6 +32,7 @@ func _run() -> void:
 	var source := RDShaderSource.new()
 	var tensor := FileAccess.get_file_as_string(LIB+"magic_gi_sh4_tensor.glslinc")
 	var sampling := FileAccess.get_file_as_string(LIB+"magic_gi_dynamic_volume_sample.glslinc").replace('#include "magic_gi_sh4_tensor.glslinc"','')
+	tensor += FileAccess.get_file_as_string(LIB+"magic_gi_clv_blend_bounds.glslinc")
 	source.source_compute = """#version 450
 #define MAGIC_GI_PREINTERPOLATED_ONLY
 #define MAGIC_GI_OLV_GATE

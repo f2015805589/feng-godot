@@ -86,7 +86,7 @@ func is_header_valid(expected_geometry := 0, expected_ids := PackedStringArray()
 	var count := cell_count()
 	if format_version != 1 or operator_schema_version != 2 \
 			or count <= 0 or probe_count != count \
-			or level < 0 or level >= MAX_LEVELS or source_spacing_m != SOURCE_SPACING_M \
+			or level < 0 or level >= MAX_LEVELS or not is_finite(source_spacing_m) or source_spacing_m <= 0.0 \
 			or not source_origin_world.is_finite() or not source_transform_world.is_finite() \
 			or absf(source_transform_world.basis.determinant()) < 0.00000001 \
 			or not _positive(source_size_m) or not _positive(domain_bounds_world.size) \

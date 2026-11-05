@@ -2,7 +2,7 @@
 extends RefCounted
 ## New multi-resolution transport bake. Each level is independently path traced
 ## on the same global lattice and prepared in bounded tiles. Only immutable
-## prepared bricks survive a tile; no world-sized .25 m source array is allocated.
+## prepared bricks survive a tile; no world-sized finest-level array is allocated.
 const SourceBaker = preload("feng_magic_gi_volume_source_baker.gd")
 const Placement = preload("feng_magic_gi_placement.gd")
 const Builder = preload("feng_magic_gi_clv_transfer_builder.gd")
@@ -13,6 +13,7 @@ const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const Baker = preload("feng_magic_gi_baker.gd")
 const OLVDomain = preload("feng_magic_gi_olv_domain.gd")
 const OLVLabelSet = preload("feng_magic_gi_olv_label_set.gd")
+const ProbeLayout = preload("feng_magic_gi_source_probe_layout.gd")
 const OLVInferenceRunner = preload("feng_magic_gi_olv_inference_runner.gd")
 const SOURCE_HALO_CELLS := 6 # 1 output + ceil(1.5 + 2.6 + relocation/spacing).
 
@@ -41,8 +42,9 @@ static func settings_signature(volume: Node3D, options: Dictionary = {}) -> int:
 		OLVInferenceRunner.EXPECTED_MODEL_BUNDLE_SHA256 if olv_inference_requested else ""])
 
 static func tile_layout(global_dimensions: Vector3i, level: int,
-		core_origin: Vector3i, core_axis := 16) -> Dictionary:
-	if level < 0 or level >= 10 or core_axis < 1 or core_axis > 16: return {}
+		core_origin: Vector3i, core_axis := 16, base_spacing := 0.25) -> Dictionary:
+	if level < 0 or level >= 10 or core_axis < 1 or core_axis > 16 \
+			or not is_finite(base_spacing) or base_spacing <= 0.0: return {}
 	var dims := Vector3i((Vector3(global_dimensions) / float(1 << level)).ceil())
 	for axis in 3:
 		if dims[axis] <= 0 or core_origin[axis] < 0 or core_origin[axis] >= dims[axis] \
@@ -55,7 +57,7 @@ static func tile_layout(global_dimensions: Vector3i, level: int,
 	return {"core_origin": core_origin, "core_dimensions": core_size,
 		"output_origin": output_origin, "output_dimensions": output_end - output_origin,
 		"source_origin": source_origin, "source_dimensions": source_end - source_origin,
-		"level_dimensions": dims, "spacing": 0.25 * float(1 << level)}
+		"level_dimensions": dims, "spacing": base_spacing * float(1 << level)}
 
 func bake_async(volume: Node3D, generation: String, output_root: String,
 		options: Dictionary = {}, progress := Callable(), cancelled := Callable()) -> Dictionary:
@@ -72,8 +74,11 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	if not domain.position.is_finite() or not domain.size.is_finite() \
 			or minf(domain.size.x, minf(domain.size.y, domain.size.z)) <= 0:
 		return {"ok": false, "error": "invalid_paged_world_domain"}
-	var global_dimensions := Vector3i((domain.size / 0.25).ceil())
-	var global_origin := domain.position + Vector3.ONE * 0.125
+	var base_spacing := float(volume.clv_cell_size)
+	if not is_finite(base_spacing) or base_spacing <= 0.0:
+		return {"ok": false, "error": "invalid_paged_cell_spacing"}
+	var global_dimensions := Vector3i((domain.size / base_spacing).ceil())
+	var global_origin := domain.position + Vector3.ONE * (base_spacing * 0.5)
 	var trace_distance := float(options.get("trace_distance_m", volume.bake_distance))
 	var bounces := int(options.get("bounces", volume.bake_bounces))
 	var olv_inference_requested := bool(options.get("olv_inference_requested", false))
@@ -120,6 +125,22 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 		progress.call("Preparing free-space sample coordinates", 1, 1, 0, 0)
 	var baked_settings_signature := settings_signature(volume, options)
 	var source_signature := "%x" % hash([geometry_signature, baked_settings_signature, global_origin, global_dimensions, emitter_ids, emitter_signatures])
+	var probe_layout := ProbeLayout.new()
+	if probe_layout.allocate(global_dimensions, levels):
+		probe_layout.probe_exclusions = SourceBaker.ProbeExclusion.capture(volume)
+		probe_layout.origin_world = global_origin
+		probe_layout.spacing_m = base_spacing
+		probe_layout.geometry_signature = geometry_signature
+		probe_layout.geometry_triangles_sha256 = SourceBaker.OLVProbePayload.sha256_bytes(geometry.faces.to_byte_array())
+		probe_layout.directional_source_signature = source_signature
+		probe_layout.source_transform_world = transform
+		probe_layout.source_size_m = size
+		probe_layout.source_bounds_world = domain
+		probe_layout.domain_bounds_world = domain
+		probe_layout.trace_distance_m = trace_distance
+		probe_layout.bake_bounces = bounces
+	else:
+		probe_layout = null
 	var entries: Array[Dictionary] = []
 	var peak_source_cells := 0
 	var maximum_operator_bound := 0.0
@@ -145,7 +166,7 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 			for y in range(0, dims.y, core_axis):
 				for x in range(0, dims.x, core_axis):
 					if cancelled.is_valid() and bool(cancelled.call()): return {"ok": false, "error": "cancelled"}
-					var tile := tile_layout(global_dimensions, level, Vector3i(x, y, z), core_axis)
+					var tile := tile_layout(global_dimensions, level, Vector3i(x, y, z), core_axis, base_spacing)
 					var source_dims: Vector3i = tile.source_dimensions
 					peak_source_cells = maxi(peak_source_cells, source_dims.x * source_dims.y * source_dims.z)
 					var working := options.duplicate()
@@ -162,6 +183,8 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 					var baked: Dictionary = await SourceBaker.new().bake_async(volume, working, progress, cancelled)
 					if not bool(baked.get("ok", false)): return baked
 					if not bool(baked.get("empty", false)):
+						if probe_layout != null:
+							probe_layout.copy_tile(baked.chunk, tile.core_origin, tile.core_dimensions)
 						var tile_olv_context: Dictionary = baked.get("olv_domain_filter", {})
 						if olv_inference_requested:
 							var tile_labels: Resource = baked.get("olv_label_set")
@@ -196,6 +219,7 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 						var brick := Brick.new()
 						brick.operator_schema_version = int(prepared.get("operator_schema_version", 0))
 						brick.source_origin_world = global_origin
+						brick.source_spacing_m = base_spacing
 						brick.level = level
 						brick.cell_origin = tile.output_origin
 						brick.dimensions = tile.output_dimensions
@@ -236,7 +260,7 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	manifest.transport_domain = Archive.DOMAIN
 	manifest.world_bounds = domain
 	manifest.management_block_size = 512.0
-	manifest.page_core_size = core_axis * 0.25 * float(1 << (levels - 1))
+	manifest.page_core_size = core_axis * base_spacing * float(1 << (levels - 1))
 	manifest.bake_geometry_signature = geometry_signature
 	manifest.bake_settings_signature = baked_settings_signature
 	manifest.bake_samples = samples
@@ -245,6 +269,7 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	manifest.scene_watch_signature = int(options.get("scene_watch_signature", 0))
 	manifest.scene_watch_signature_schema_version = SceneTracker.SIGNATURE_SCHEMA_CURRENT
 	manifest.prepared_source_origin_world = global_origin
+	manifest.prepared_source_spacing_m = base_spacing
 	manifest.prepared_level_count = levels
 	manifest.prepared_core_axis = core_axis
 	manifest.prepared_bake_algorithm = "multires_independent_transport_sh2_v3"
@@ -286,6 +311,11 @@ func bake_async(volume: Node3D, generation: String, output_root: String,
 	manifest.prepared_source_size_m = size
 	manifest.prepared_maximum_operator_row_l1 = maximum_operator_bound
 	manifest.prepared_operator_schema_version = Builder.OUTPUT_SCHEMA_VERSION
+	if probe_layout != null:
+		if not probe_layout.is_source_data_valid(): return {"ok": false, "error": "invalid_retained_probe_layout"}
+		manifest.prepared_probe_layout_path = root.path_join("source_probe_layout.res")
+		if ResourceSaver.save(probe_layout, manifest.prepared_probe_layout_path, ResourceSaver.FLAG_COMPRESS) != OK:
+			return {"ok": false, "error": "retained_probe_layout_save_failed"}
 	manifest.configure(entries)
 	if cancelled.is_valid() and bool(cancelled.call()): return {"ok": false, "error": "cancelled"}
 	if progress.is_valid(): progress.call("Writing prepared CLV manifest", 0, 1, 0, 0)

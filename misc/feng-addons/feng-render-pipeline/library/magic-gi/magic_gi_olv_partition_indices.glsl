@@ -11,6 +11,7 @@ layout(set = 0, binding = 3, std430) writeonly buffer PartitionIndices { ivec4 v
 layout(set = 0, binding = 4, std430) writeonly buffer PartitionWeights { vec4 values[]; } partition_weights;
 layout(push_constant, std430) uniform Config {
 	int resolution; int lod_count; int label_side; int label_encoding;
+	int lod_mask;
 } config;
 
 int source_at(ivec3 cell, int lod, int domain) {
@@ -33,6 +34,7 @@ void main() {
 	ivec3 cell = ivec3(index % width, (index / width) % r, index / (width * r));
 	int domain = cell.x / r + 1;
 	int lod = cell.z / r;
+	if ((config.lod_mask & (1 << lod)) == 0) return;
 	cell.x %= r;
 	cell.z %= r;
 	int source = source_at(cell, lod, domain);

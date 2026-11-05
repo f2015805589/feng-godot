@@ -1,0 +1,19 @@
+#ifndef MAGIC_GI_CLV_BLEND_BOUNDS_GLSLINC
+#define MAGIC_GI_CLV_BLEND_BOUNDS_GLSLINC
+
+// A cascade transition must lie on the parent's sample-center lattice. Merely
+// aligning voxel edges leaves the parent's piecewise-linear knots between fine
+// samples, so prolongation cannot reproduce it at the transition face (GDC 2026,
+// Fast CLV Cascade Blending). With an even resolution this trims at most one
+// fine sample at each end; the retained interior and the baked lattice do not move.
+void magic_gi_clv_blend_bounds(vec4 fine, vec4 coarse, int resolution,
+        out vec3 lower, out vec3 upper) {
+    vec3 parent_first = (fine.xyz - coarse.xyz) / coarse.w;
+    vec3 parent_last = parent_first + vec3(float(resolution - 1) * fine.w / coarse.w);
+    lower = clamp((ceil(parent_first - vec3(1e-4)) - parent_first) * (coarse.w / fine.w),
+            vec3(0.0), vec3(1.0));
+    upper = clamp((floor(parent_last + vec3(1e-4)) - parent_first) * (coarse.w / fine.w),
+            vec3(float(resolution - 2)), vec3(float(resolution - 1)));
+}
+
+#endif

@@ -4,6 +4,7 @@ extends RefCounted
 ## Shared scene-boundary and resource-change tracking for Magic GI.
 
 const BROADPHASE_EPSILON := 0.001
+const ProbeExclusion = preload("feng_magic_gi_probe_exclusion.gd")
 const SCENE_SCAN_TTL_MSEC := 250
 const SIGNATURE_SCHEMA_LEGACY := 0
 const SIGNATURE_SCHEMA_ROOT_RELATIVE := 1
@@ -125,6 +126,8 @@ static func _stable_scene_signature(volume: Node3D, path_root_prefix: String) ->
 	var source_bounds: AABB = (volume.global_transform * AABB(-volume.size * 0.5, volume.size)) \
 		.grow(volume.bake_distance * float(volume.bake_bounces + 1) + BROADPHASE_EPSILON)
 	var values: Array = [_physical_light_units_enabled()]
+	var exclusions := ProbeExclusion.capture(volume)
+	if not exclusions.is_empty(): values.append(exclusions)
 	_append_stable_source_signature(root, root, world, source_bounds, values, {}, path_root_prefix)
 	return hash(values)
 
@@ -143,10 +146,13 @@ static func _physical_light_units_enabled() -> bool:
 		"rendering/lights_and_shadows/use_physical_light_units", false))
 
 static func _volume_signature(volume: Node3D) -> Array:
-	return [volume.global_transform, volume.size, volume.probe_spacing,
+	var values := [volume.global_transform, volume.size, volume.probe_spacing,
 		volume.surface_offset, volume.bake_distance, volume.terrain_reflectance,
 		volume.fallback_material_reflectance, volume.adaptive_placement,
 		volume.minimum_probe_spacing, volume.bake_samples, volume.bake_bounces]
+	var exclusions := ProbeExclusion.capture(volume)
+	if not exclusions.is_empty(): values.append(exclusions)
+	return values
 
 static func _scene_scan_signature(volume: Node3D, force_uncached := false) -> int:
 	var root := scene_root(volume)

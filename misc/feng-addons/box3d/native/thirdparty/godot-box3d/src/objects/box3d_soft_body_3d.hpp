@@ -163,6 +163,13 @@ private:
 	uint64_t constraint_setup_revision = 0;
 	uint64_t constraint_revision = 0;
 	std::vector<Seam> seams;
+	// Reused contiguous topology workspace. A tear must not allocate one tree
+	// node and several small vectors for every corner/edge of the whole cloth.
+	std::vector<int> seam_parents;
+	std::vector<std::array<int, 3>> seam_corners;
+	std::vector<std::array<int, 4>> topology_links;
+	std::vector<Vector3> topology_centers;
+	std::vector<int> topology_offsets, topology_cursor;
 	// Rest-topology neighbors stay excluded after a tear. Newly split twins
 	// start coincident; treating them as penetrating contacts would explode them.
 	std::vector<std::vector<int>> neighbors;

@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <map>
 #include <numeric>
 
 namespace {
@@ -131,29 +130,49 @@ void Box3DSoftBody3D::rebuild_constraints() {
 	bvh_dirty = render_dirty = true;
 	contact_caches.clear();
 	edges.clear();
-	std::map<std::pair<int, int>, std::vector<int>> links;
+	topology_links.resize(faces.size() * 3);
+	topology_offsets.assign(particles.size() + 1, 0);
 	for (const auto &f : faces) {
-		links[std::minmax(f.a, f.b)].push_back(f.c);
-		links[std::minmax(f.b, f.c)].push_back(f.a);
-		links[std::minmax(f.c, f.a)].push_back(f.b);
+		++topology_offsets[std::min(f.a, f.b) + 1];
+		++topology_offsets[std::min(f.b, f.c) + 1];
+		++topology_offsets[std::min(f.c, f.a) + 1];
 	}
-	if (neighbors.empty()) {
+	std::partial_sum(topology_offsets.begin(), topology_offsets.end(), topology_offsets.begin());
+	topology_cursor = topology_offsets;
+	for (int fi = 0; fi < int(faces.size()); ++fi) {
+		const auto ids = vertices(faces[fi]);
+		for (int c = 0; c < 3; ++c) {
+			const auto pair = std::minmax(ids[c], ids[(c + 1) % 3]);
+			// Corner order preserves the old map's insertion order for opposite
+			// vertices, including non-manifold meshes. This keeps solver order exact.
+			topology_links[topology_cursor[pair.first]++] = { pair.first, pair.second, fi * 3 + c, ids[(c + 2) % 3] };
+		}
+	}
+	// Dense particle IDs allow a counting pass on the first key. Only the few
+	// incident links per vertex need comparison sorting, rather than all faces.
+	for (size_t i = 0; i < particles.size(); ++i) {
+		std::sort(topology_links.begin() + topology_offsets[i], topology_links.begin() + topology_offsets[i + 1]);
+	}
+	const bool build_neighbors = neighbors.empty();
+	if (build_neighbors) {
 		neighbors.resize(particles.size());
-		for (const auto &entry : links) {
-			int a = entry.first.first, b = entry.first.second;
+	}
+	for (size_t begin = 0; begin < topology_links.size();) {
+		const int a = topology_links[begin][0], b = topology_links[begin][1];
+		size_t end = begin + 1;
+		while (end < topology_links.size() && topology_links[end][0] == a && topology_links[end][1] == b) ++end;
+		if (build_neighbors) {
 			neighbors[a].push_back(b);
 			neighbors[b].push_back(a);
 		}
-	}
-	for (const auto &entry : links) {
-		int a = entry.first.first, b = entry.first.second;
 		edges.push_back({ a, b, float(transform.basis.xform(particles[a].rest - particles[b].rest).length()), false });
-		if (entry.second.size() == 2) {
-			int c = entry.second[0], d = entry.second[1];
+		if (end - begin == 2) {
+			int c = topology_links[begin][3], d = topology_links[begin + 1][3];
 			if (c != d) {
 				edges.push_back({ c, d, float(transform.basis.xform(particles[c].rest - particles[d].rest).length()), true });
 			}
 		}
+		begin = end;
 	}
 	group_constraints();
 	batch_constraints();
@@ -163,6 +182,11 @@ void Box3DSoftBody3D::rebuild_constraints() {
 	fitted_vertex_bounds.clear();
 	bvh.reserve(faces.size() * 2);
 	if (!faces.empty()) {
+		topology_centers.resize(faces.size());
+		for (size_t i = 0; i < faces.size(); ++i) {
+			const auto &f = faces[i];
+			topology_centers[i] = (particles[f.a].x + particles[f.b].x + particles[f.c].x) / 3;
+		}
 		build_bvh(0, int(faces.size()));
 	}
 	refit_bvh();
@@ -174,10 +198,18 @@ void Box3DSoftBody3D::group_constraints() {
 	if (particles.size() < 1024 || edges.empty()) {
 		return;
 	}
-	std::vector<std::vector<int>> connected(particles.size());
+	// CSR adjacency retains edge order but avoids thousands of tiny allocations
+	// when a projectile tears a large cloth in several consecutive substeps.
+	std::vector<int> offsets(particles.size() + 1, 0);
 	for (const auto &edge : edges) {
-		connected[edge.a].push_back(edge.b);
-		connected[edge.b].push_back(edge.a);
+		++offsets[edge.a + 1];
+		++offsets[edge.b + 1];
+	}
+	std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+	std::vector<int> cursor = offsets, connected(edges.size() * 2);
+	for (const auto &edge : edges) {
+		connected[cursor[edge.a]++] = edge.b;
+		connected[cursor[edge.b]++] = edge.a;
 	}
 	std::vector<int> group(particles.size(), -1), queue;
 	queue.reserve(128);
@@ -188,7 +220,8 @@ void Box3DSoftBody3D::group_constraints() {
 		queue.push_back(seed);
 		group[seed] = group_count;
 		for (size_t next = 0; next < queue.size() && queue.size() < 128; ++next) {
-			for (int vertex : connected[queue[next]]) {
+			for (int link = offsets[queue[next]]; link < offsets[queue[next] + 1]; ++link) {
+				const int vertex = connected[link];
 				if (group[vertex] >= 0) continue;
 				group[vertex] = group_count;
 				queue.push_back(vertex);
@@ -216,11 +249,12 @@ void Box3DSoftBody3D::batch_constraints() {
 	// Color each independent cluster once. Four constraints with no shared
 	// endpoint can use SIMD without turning Gauss-Seidel into a Jacobi solver.
 	std::vector<uint64_t> used(particles.size(), 0);
+	std::array<std::vector<int>, 64> colors;
 	int begin = 0;
 	for (size_t group = 0; group <= constraint_group_ends.size(); ++group) {
 		const int end = group < constraint_group_ends.size() ? constraint_group_ends[group] : int(edges.size());
 		std::fill(used.begin(), used.end(), 0);
-		std::array<std::vector<int>, 64> colors;
+		for (auto &color : colors) color.clear();
 		for (int i = begin; i < end; ++i) {
 			const auto &e = edges[i];
 			const uint64_t unavailable = used[e.a] | used[e.b];
@@ -257,14 +291,15 @@ int Box3DSoftBody3D::build_bvh(int begin, int end) {
 		bvh[index].count = end - begin;
 		return index;
 	}
-	auto center = [&](int fi) { const auto &f=faces[fi]; return (particles[f.a].x+particles[f.b].x+particles[f.c].x)/3; };
-	AABB box(center(face_order[begin]), Vector3());
+	// The partition is rebuilt after a tear. Compute each centroid once, not
+	// once per comparison per BVH level (which also scatters into Particle).
+	AABB box(topology_centers[face_order[begin]], Vector3());
 	for (int i = begin + 1; i < end; ++i) {
-		box.expand_to(center(face_order[i]));
+		box.expand_to(topology_centers[face_order[i]]);
 	}
 	int axis = box.size.max_axis_index(), middle = (begin + end) / 2;
 	std::nth_element(face_order.begin() + begin, face_order.begin() + middle, face_order.begin() + end,
-			[&](int a, int b) { return center(a)[axis] < center(b)[axis]; });
+			[&](int a, int b) { return topology_centers[a][axis] < topology_centers[b][axis]; });
 	int left = build_bvh(begin, middle), right = build_bvh(middle, end);
 	bvh[index].left = left;
 	bvh[index].right = right;
@@ -588,7 +623,8 @@ int Box3DSoftBody3D::cut(const Vector3 &from, const Vector3 &to, float radius) {
 void Box3DSoftBody3D::split_torn_seams() {
 	// Union triangle corners only across intact seams. The expanded visual mesh
 	// reserves one vertex per corner, so splitting never reallocates a GPU buffer.
-	std::vector<int> parents(faces.size() * 3);
+	auto &parents = seam_parents;
+	parents.resize(faces.size() * 3);
 	std::iota(parents.begin(), parents.end(), 0);
 	auto find = [&](int x) { while (parents[x]!=x) { parents[x]=parents[parents[x]]; x=parents[x]; } return x; };
 	for (const auto &seam : seams) {
@@ -606,27 +642,45 @@ void Box3DSoftBody3D::split_torn_seams() {
 			}
 		}
 	}
-	std::map<int, std::map<int, std::vector<int>>> groups;
+	auto &corners = seam_corners;
+	corners.resize(faces.size() * 3);
+	topology_offsets.assign(particles.size() + 1, 0);
+	for (const auto &f : faces) {
+		++topology_offsets[f.a + 1];
+		++topology_offsets[f.b + 1];
+		++topology_offsets[f.c + 1];
+	}
+	std::partial_sum(topology_offsets.begin(), topology_offsets.end(), topology_offsets.begin());
+	topology_cursor = topology_offsets;
 	for (int fi = 0; fi < int(faces.size()); ++fi) {
 		auto ids = vertices(faces[fi]);
 		for (int c = 0; c < 3; ++c) {
-			groups[ids[c]][find(fi * 3 + c)].push_back(fi * 3 + c);
+			corners[topology_cursor[ids[c]]++] = { ids[c], find(fi * 3 + c), fi * 3 + c };
 		}
 	}
-	for (auto &entry : groups) {
-		Particle original = particles[entry.first];
-		size_t corners = 0;
-		for (const auto &g : entry.second) {
-			corners += g.second.size();
-		}
+	// Sort by original particle, union root, corner. This exactly matches the
+	// previous nested maps, so split IDs, mass partition and constraint ordering
+	// remain deterministic while using a single contiguous buffer.
+	for (size_t i = 0; i < particles.size(); ++i) {
+		std::sort(corners.begin() + topology_offsets[i], corners.begin() + topology_offsets[i + 1]);
+	}
+	for (size_t begin = 0; begin < corners.size();) {
+		const int original_id = corners[begin][0];
+		const Particle original = particles[original_id];
+		size_t end = begin + 1;
+		while (end < corners.size() && corners[end][0] == original_id) ++end;
+		const size_t corner_count = end - begin;
 		bool first = true;
-		for (const auto &g : entry.second) {
-			int id = first ? entry.first : int(particles.size());
+		for (size_t group = begin; group < end;) {
+			size_t group_end = group + 1;
+			while (group_end < end && corners[group_end][1] == corners[group][1]) ++group_end;
+			int id = first ? original_id : int(particles.size());
 			Particle copy = original;
-			copy.weight = original.weight * float(g.second.size()) / float(corners);
+			copy.weight = original.weight * float(group_end - group) / float(corner_count);
 			copy.force = original.force * (copy.weight / original.weight);
 			copy.pinned = false;
-			for (int corner : g.second) {
+			for (size_t index = group; index < group_end; ++index) {
+				const int corner = corners[index][2];
 				auto &face = faces[corner / 3];
 				int c = corner % 3;
 				if (c == 0) {
@@ -647,7 +701,9 @@ void Box3DSoftBody3D::split_torn_seams() {
 				particles.push_back(copy);
 			}
 			first = false;
+			group = group_end;
 		}
+		begin = end;
 	}
 	// An opened shell can no longer sustain internal volume pressure.
 	closed = false;

@@ -12,7 +12,7 @@ const CLV_PREPARATION_REVISION_CURRENT := 5
 const SOURCE_SCHEMA_REVISION_CURRENT := 1
 const DIRECTIONAL_DATA_REVISION := 1
 const LAYOUT_REGULAR_CELL_CENTERS_V1 := "regular_cell_centers_v1"
-const CELL_SPACING_M := 0.25
+const CELL_SPACING_M := 0.25 # Serialized default, not a layout restriction.
 const MOMENT_TEXELS_PER_CELL := 64
 const MOMENT_CHANNELS := 2
 const MIN_MOMENT_RAYS := 256
@@ -22,6 +22,7 @@ const MAX_PAYLOAD_BYTES := 256 * 1024 * 1024
 const RELOCATION_STATUS_INVALID := 0
 const RELOCATION_STATUS_VALID := 1
 const RELOCATION_STATUS_RELOCATED := 2
+const ProbeExclusion = preload("feng_magic_gi_probe_exclusion.gd")
 
 # Keep the serialized default at v1: older .res files can omit this property.
 # Only an explicitly completed lossless pack changes it to v2.
@@ -62,6 +63,8 @@ const RELOCATION_STATUS_RELOCATED := 2
 @export_storage var maximum_relocation_m := 0.0
 ## 0=invalid, 1=sampled at the regular cell center, 2=sampled at a recorded offset.
 @export_storage var validity := PackedByteArray()
+## Baked exclusions also block CLV boundary extrapolation from refilling these holes.
+@export_storage var probe_exclusions: Array[Transform3D] = []
 @export_storage var relocation_offset_m := PackedVector3Array()
 ## v2 maps each logical cell to its packed payload index, or -1 for invalid
 ## cells. The physical grid, classification, and relocated world anchors remain
@@ -292,6 +295,7 @@ func estimated_gpu_payload_bytes() -> int:
 			+ MOMENT_TEXELS_PER_CELL * MOMENT_CHANNELS + 3 + 1) * 4
 
 func allocate(cell_dimensions: Vector3i, source_ids: PackedStringArray) -> bool:
+	probe_exclusions.clear()
 	format_version = FORMAT_VERSION_DENSE
 	source_storage_count = 0
 	source_storage_indices.clear()
@@ -448,7 +452,7 @@ func _storage_version_is_valid() -> bool:
 	return format_version in [FORMAT_VERSION_DENSE, FORMAT_VERSION_PACKED]
 
 func _spacing_is_valid() -> bool:
-	return is_finite(spacing_m) and absf(spacing_m - CELL_SPACING_M) <= 0.000001
+	return is_finite(spacing_m) and spacing_m > 0.0
 
 ## Validates the raw SH9 source payload and its logical-to-packed mapping without
 ## requiring the optional derived CLV operators to match the current revision.
@@ -508,6 +512,9 @@ func _validate_payload(expected_geometry_signature: int,
 		if not offset.is_finite() or offset.length() > maximum_relocation_m + 0.000001:
 			return false
 		var world_center := origin_world + Vector3(cell_coordinates(cell)) * spacing_m
+		if cell_is_valid(cell) and (ProbeExclusion.contains(world_center, probe_exclusions) \
+				or ProbeExclusion.contains(world_center + offset, probe_exclusions)):
+			return false
 		var center_local := source_inverse * world_center
 		var sample_local := source_inverse * (world_center + offset)
 		var center_inside_obb := absf(center_local.x) <= half_size.x + 0.000001 \
@@ -591,6 +598,7 @@ func make_directional_source_signature() -> String:
 		dimensions, origin_world, source_transform_world, source_size_m,
 		source_bounds_world, domain_bounds_world, trace_distance_m,
 		bake_samples, bake_bounces, moment_rays, maximum_relocation_m]
+	if not probe_exclusions.is_empty(): payload.append(probe_exclusions)
 	var low := int(hash(payload)) & 0xffffffff
 	var high := int(hash([payload, "free-space-volume-source-v1"])) & 0xffffffff
 	return "%08x%08x" % [high, low]

@@ -5,8 +5,19 @@ extends Node3D
 @onready var actor = $RagdollActor
 var projectiles: Array[RigidBody3D] = []
 var _last_shot := -1000
+var _projectile_mesh: SphereMesh
+var _projectile_shape: SphereShape3D
 
 func _ready() -> void:
+	_projectile_mesh = SphereMesh.new()
+	_projectile_mesh.radius = 0.3
+	_projectile_mesh.height = 0.6
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color("ebc966")
+	material.roughness = 0.45
+	_projectile_mesh.material = material
+	_projectile_shape = SphereShape3D.new()
+	_projectile_shape.radius = 0.3
 	camera.look_at(Vector3(0, 1.7, 0))
 	_build_ui()
 	actor.rigid_body_contact.connect(_on_actor_contact)
@@ -76,20 +87,13 @@ func shoot_ray(origin: Vector3, direction: Vector3) -> RigidBody3D:
 	ball.continuous_cd = true
 	ball.contact_monitor = true
 	ball.max_contacts_reported = 4
-	var mesh := SphereMesh.new()
-	mesh.radius = 0.3
-	mesh.height = 0.6
-	var material := StandardMaterial3D.new()
-	material.albedo_color = Color("ebc966")
-	material.roughness = 0.45
-	mesh.material = material
 	var visual := MeshInstance3D.new()
-	visual.mesh = mesh
+	# Keep the vertex/material/shape resources resident across shots. Creating
+	# identical meshes here forces fresh render uploads on every mouse click.
+	visual.mesh = _projectile_mesh
 	ball.add_child(visual)
 	var collision := CollisionShape3D.new()
-	var shape := SphereShape3D.new()
-	shape.radius = 0.3
-	collision.shape = shape
+	collision.shape = _projectile_shape
 	ball.add_child(collision)
 	ball.position = origin + direction.normalized()
 	ball.set_meta("impact_impulse", direction.normalized() * 35.0)

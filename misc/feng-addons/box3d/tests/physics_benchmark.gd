@@ -1,5 +1,6 @@
 extends SceneTree
-const GROUND_CASES = ["cloth_ground", "cloth_ground_no_balls", "cloth_ground_no_self", "cloth_reimpact", "cloth_reimpact_create"]
+const GROUND_CASES = ["cloth_ground", "cloth_ground_no_balls", "cloth_ground_no_self", "cloth_reimpact", "cloth_reimpact_create", "cloth_reimpact_tearing"]
+const Soft = preload("res://addons/box3d/soft_body_3d.gd")
 var objects: Array[Node] = []
 var frames := 0
 var samples: Array[float] = []
@@ -20,22 +21,27 @@ var reimpact_trigger_targets: Array[String] = []
 var reimpact_trigger_min_dist: Array[float] = []
 var reimpact_trigger_hit_frame: Array[int] = []
 var reimpact_windows: Array = []
+var warmup_peak_ms := 0.0
+var tearing_frames: Array = []
+var last_torn_seams := 0
 
 func _initialize() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--case="): mode = arg.trim_prefix("--case=")
 	call_deferred("setup")
 
-func _build_cloth_ground(with_balls = true, self_collision = true) -> void:
+func _build_cloth_ground(with_balls = true, self_collision = true, tearing = false) -> void:
 	# The playground's 3x2 m cloth: 62x30 subdivisions = 64x32 = 2048 particles.
 	var plane := PlaneMesh.new()
 	plane.size = Vector2(3, 2)
 	plane.subdivide_width = 62
 	plane.subdivide_depth = 30
-	var arrays: Array = plane.get_mesh_arrays()
-	var vertices: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
 	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	if tearing:
+		mesh = Soft.make_tearable_mesh(plane)
+	else:
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, plane.get_mesh_arrays())
+	var vertices: PackedVector3Array = mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX]
 	solver_meshes.append(mesh)
 	ground_cloth = PhysicsServer3D.soft_body_create()
 	soft_bodies.append(ground_cloth)
@@ -53,7 +59,7 @@ func _build_cloth_ground(with_balls = true, self_collision = true) -> void:
 	if PhysicsServer3D.has_method("soft_body_configure"):
 		PhysicsServer3D.call("soft_body_configure", ground_cloth, {
 			"can_sleep": true, "self_collision": self_collision, "soft_collision": true,
-			"collision_radius": 0.004, "tearing": false})
+			"collision_radius": 0.004, "tearing": tearing, "tear_ratio": 2.0})
 	if with_balls:
 		# Twenty playground balls (4 kg, r=0.3) fired at the hanging cloth at 20 m/s.
 		# Rows are staggered in Z so the balls do not start overlapping each other.
@@ -330,6 +336,9 @@ func setup() -> void:
 		_build_reimpact_balls()
 	elif mode == "cloth_reimpact_create":
 		_build_cloth_ground(true, true)
+	elif mode == "cloth_reimpact_tearing":
+		_build_cloth_ground(true, true, true)
+		_build_reimpact_balls()
 	else:
 		for layer in (3 if mode == "soft_stack" else 1):
 			var plane := PlaneMesh.new()
@@ -377,7 +386,11 @@ func setup() -> void:
 		if mode in GROUND_CASES and i == 120:
 			for pin in cloth_pins: PhysicsServer3D.soft_body_pin_point(ground_cloth, pin, false)
 			cloth_pins.clear()
+		var warmup_started := Time.get_ticks_usec()
 		await physics_frame
+		var elapsed := (Time.get_ticks_usec() - warmup_started) / 1000.0
+		warmup_peak_ms = maxf(warmup_peak_ms, elapsed)
+		_record_tearing(i - warmup, elapsed)
 	for body in starters: body.apply_impulse(Vector3(0, 0, 0.65), Vector3(0, 0.55, 0))
 	for i in 600:
 		if i % 120 == 0 and mode == "ragdolls":
@@ -386,14 +399,15 @@ func setup() -> void:
 		if i % 120 == 0 and mode == "soft_balls":
 			for body in soft_bodies:
 				PhysicsServer3D.soft_body_apply_central_impulse(body, Vector3(0.2, 5, 0))
-		if mode in ["cloth_reimpact", "cloth_reimpact_create"] and (i == 0 or i == 60 or i == 120):
+		if mode.begins_with("cloth_reimpact") and (i == 0 or i == 60 or i == 120):
 			var trigger_start := Time.get_ticks_usec()
 			_trigger_reimpact(i)
 			reimpact_trigger_cost_ms.append((Time.get_ticks_usec() - trigger_start) / 1000.0)
 		var started := Time.get_ticks_usec()
 		await physics_frame
 		samples.append((Time.get_ticks_usec() - started) / 1000.0)
-		if mode in ["cloth_reimpact", "cloth_reimpact_create"]:
+		_record_tearing(i, samples.back())
+		if mode.begins_with("cloth_reimpact"):
 			_update_reimpact_distances(i)
 	var raw_samples: Array[float] = samples.duplicate()
 	samples.sort()
@@ -459,7 +473,7 @@ func setup() -> void:
 	var reimpact_hit_count := 0
 	for hit in reimpact_trigger_hit_frame:
 		if hit >= 0: reimpact_hit_count += 1
-	if mode in ["cloth_reimpact", "cloth_reimpact_create"]:
+	if mode.begins_with("cloth_reimpact"):
 		for t in reimpact_trigger_frames.size():
 			var trigger_frame: int = reimpact_trigger_frames[t]
 			var window_start := maxi(0, trigger_frame - 3)
@@ -497,10 +511,24 @@ func setup() -> void:
 		push_error("cloth_ground reproduction failed: balls=%d particles=%d min_y=%s" % [balls.size(), particle_count, cloth_min_y])
 		quit(1)
 		return
-	if mode in ["cloth_reimpact", "cloth_reimpact_create"] and (balls.size() != 23 or particle_count != 2048 or not cloth_landed or reimpact_trigger_frames.size() != 3):
+	var correct_particle_count := particle_count >= 2048 if mode == "cloth_reimpact_tearing" else particle_count == 2048
+	if mode.begins_with("cloth_reimpact") and (balls.size() != 23 or not correct_particle_count or not finite_state or not cloth_landed or reimpact_trigger_frames.size() != 3 or reimpact_hit_count != 3):
 		push_error("cloth_reimpact reproduction failed: mode=%s balls=%d particles=%d triggers=%d min_y=%s" % [mode, balls.size(), particle_count, reimpact_trigger_frames.size(), cloth_min_y])
 		quit(1)
 		return
+	if mode == "cloth_reimpact_tearing" and torn_seams == 0:
+		push_error("Tearing benchmark did not exercise topology rebuilding")
+		quit(1)
+		return
 	print("BOX3D_PERF ", JSON.stringify({"case": mode, "objects": objects.size()+soft_bodies.size(), "headless_frame_median_ms": samples[samples.size()/2], "headless_frame_mean_ms": total/samples.size(), "headless_frame_p95_ms": samples[int(samples.size()*0.95)], "ticks_hz": Engine.physics_ticks_per_second, "workers": ProjectSettings.get_setting("physics/box3d/worker_count"), "backend": PhysicsServer3D.get_class(), "soft_particles": particle_count, "soft_sleeping": sleeping_count, "ragdoll_bones": actors.size()*11, "sleeping_bones": sleeping_bones, "soft_contacts_last_step": contact_count, "soft_contact_tests_last_step": contact_tests, "headless_frame_p99_ms": p99, "headless_frame_max_ms": max_frame_ms, "frame_argmax": argmax, "frame_argmax_window_ms": argmax_window, "reimpact_trigger_frames": reimpact_trigger_frames, "reimpact_trigger_balls": reimpact_trigger_balls, "reimpact_trigger_speeds": reimpact_trigger_speeds, "reimpact_trigger_cost_ms": reimpact_trigger_cost_ms, "reimpact_trigger_targets": reimpact_trigger_targets, "reimpact_trigger_min_distance": reimpact_trigger_min_dist, "reimpact_trigger_hit_frame": reimpact_trigger_hit_frame, "reimpact_hit_count": reimpact_hit_count, "reimpact_windows": reimpact_windows, "soft_maximum_speed": maximum_speed if is_finite(maximum_speed) else null, "soft_kinetic_energy": kinetic_energy if is_finite(kinetic_energy) else null, "soft_torn_seams": torn_seams, "balls": balls.size(), "balls_sleeping": sleeping_balls, "rigid_bodies": rigid_bodies, "rigid_awake": rigid_awake, "rigid_state_sha256": rigid_state_sha256, "ragdoll_state_sha256": ragdoll_state_sha256, "cloth_landed": cloth_landed, "finite_state": finite_state, "cloth_min_y": cloth_min_y if is_ground_case and is_finite(cloth_min_y) else null, "cloth_max_y": cloth_max_y if is_ground_case and is_finite(cloth_max_y) else null, "soft_bounds": soft_bounds, "soft_positions_sha256": positions_hash.finish().hex_encode()}))
+	print("BOX3D_TEAR_PERF ", JSON.stringify({"warmup_peak_ms": warmup_peak_ms, "frames": tearing_frames}))
 	for body in soft_bodies: PhysicsServer3D.free_rid(body)
 	quit()
+
+func _record_tearing(frame: int, elapsed_ms: float) -> void:
+	if mode != "cloth_reimpact_tearing":
+		return
+	var stats: Dictionary = PhysicsServer3D.call("soft_body_get_statistics", ground_cloth)
+	if int(stats.torn_seams) != last_torn_seams:
+		tearing_frames.append({"frame": frame, "ms": elapsed_ms, "new_tears": int(stats.torn_seams) - last_torn_seams, "particles": stats.particles})
+		last_torn_seams = int(stats.torn_seams)

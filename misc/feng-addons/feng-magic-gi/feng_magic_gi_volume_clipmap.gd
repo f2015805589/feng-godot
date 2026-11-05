@@ -252,7 +252,7 @@ static func _read_source_header(source: Resource) -> Dictionary:
 	var domain_bounds: AABB = domain_value
 	if not origin.is_finite() or not domain_bounds.position.is_finite() \
 			or not domain_bounds.size.is_finite() or not is_finite(spacing) \
-			or absf(spacing - SOURCE_SPACING_M) > SNAP_EPSILON:
+			or spacing <= 0.0:
 		return {"valid": false, "error": "source_spacing_or_bounds_invalid"}
 	if dimensions.x <= 0 or dimensions.y <= 0 or dimensions.z <= 0:
 		return {"valid": false, "error": "source_dimensions_invalid"}

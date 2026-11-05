@@ -27,6 +27,7 @@ func _header(bounds: AABB, levels: int) -> Resource:
 	result.source_size_m = bounds.size
 	result.prepared_level_count = levels
 	result.directional_source_signature = "paged-clv-layout-cpu-fixture"
+	result.operator_schema_version = 2
 	for level in levels:
 		var dims := Vector3i((Vector3(result.dimensions) / float(1 << level)).ceil())
 		result.clv_prepared_dimensions.append_array(PackedInt32Array([dims.x, dims.y, dims.z]))
@@ -149,6 +150,27 @@ func _test_sphere_page_selection() -> void:
 	check(not Layout.intersects_sphere(AABB(camera + Vector3.ONE * 400.0, Vector3.ONE * 8.0), camera, RADIUS_M),
 		"a diagonal page inside the bounding cube but outside the sphere is excluded")
 
+func _test_dense_small_domain() -> void:
+	var bounds := AABB(Vector3(-2.88, -0.78, -3.24), Vector3(5.76, 4.56, 6.48))
+	var header := _header(bounds, 10)
+	header.spacing_m = 0.1
+	header.origin_world = bounds.position + Vector3.ONE * 0.05
+	header.dimensions = Vector3i((bounds.size / header.spacing_m).ceil())
+	header.clv_prepared_dimensions.clear()
+	for level in 10:
+		var dims := Vector3i((Vector3(header.dimensions) / float(1 << level)).ceil())
+		header.clv_prepared_dimensions.append_array(PackedInt32Array([dims.x, dims.y, dims.z]))
+	check(header.is_header_valid(), "dense room has a valid ten-level paged header")
+	var camera := Vector3(0, 1.58, 6.7)
+	var layout := Layout.build(header, camera)
+	check(layout.valid and bounds.has_point(layout.anchor_world),
+		"switching a room to paged storage keeps the fine windows in the authored domain")
+	check(_contains_closed(layout.lods[0].clip_bounds_world,
+		Vector3(layout.anchor_world.x, layout.anchor_world.y, header.origin_world.z)),
+		"dense room rear source sample remains in the fine cascade")
+	var repeated := Layout.build(header, camera, 16, RADIUS_M, layout.state)
+	check(repeated.state == layout.state, "dense room anchor stays stable across frames")
+
 func run() -> void:
 	check(RenderingServer.get_rendering_device() == null, "paged CLV tests run without a GPU device")
 	var header := _header(AABB(Vector3.ONE * -1024.0, Vector3.ONE * 2048.0), 10)
@@ -157,6 +179,7 @@ func run() -> void:
 		"header records all ten prepared level dimensions")
 	_test_large_world(header)
 	_test_small_domain()
+	_test_dense_small_domain()
 	_test_sphere_page_selection()
 	for resolution in [0, 15, 17, 23, 25, 31, 33, 64]:
 		check(not Layout.build(header, Vector3.ZERO, resolution, RADIUS_M).valid,

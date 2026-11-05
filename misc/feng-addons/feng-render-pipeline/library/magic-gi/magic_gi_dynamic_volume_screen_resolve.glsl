@@ -1,6 +1,7 @@
 #[compute]
 // OLV atlas ABI 2: lighting-source and logical-receiver domains share one R8 texel.
 #version 450
+// The shared prepared-volume consumer reads cascade-premixed responses.
 #extension GL_GOOGLE_include_directive : require
 
 // Dynamic free-space CLV screen cache. Each invocation owns one 2x2 full-
@@ -40,6 +41,7 @@ layout(set = 1, binding = 62) uniform sampler screen_linear_sampler;
 #define FRP_MAGIC_GI_OLV_VISIBLE_RAY(world, view) (abs(frame.inverse_projection[2][3]) > 1e-6 ? frame.view_to_world[3].xyz - (world) : frame.view_to_world[2].xyz)
 #include "magic_gi_sh9_tensor.glslinc"
 #include "magic_gi_sh4_tensor.glslinc"
+#include "magic_gi_clv_blend_bounds.glslinc"
 #include "magic_gi_dynamic_volume_sample.glslinc"
 
 layout(push_constant, std430) uniform ScreenResolvePush {

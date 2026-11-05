@@ -2,11 +2,35 @@
 
 Feng Magic GI 提供两种漫反射全局光照模式。默认 `PRT MagicGI` / `clv_cache_backend=1` 烘焙自由空间 TransferMatrix，并在烘焙端把几何遮挡和插值预处理为 CLV 线性算子；运行时以当前太阳、天空和已绑定自发光重照明，再由原生 PBR 硬件插值采样。当前 prepared CLV 使用 schema 2 的 SH2 紧凑算子：整块驻留使用 layout 8/96 字节 UBO，分页驻留使用 layout 7/208 字节 UBO，响应均为四个 RGBA 字段。旧 SH9 prepared generation 会明确拒绝并要求重新 Bake；其他独立 GI 后端仍按各自格式工作。重照明和像素采样均无 BVH 查询。`Surfel MagicGI` 在运行时维护表面缓存并用光追更新间接光。两种模式共用 `FMagicGIVolume`；独立的 FengLightmap Volume 不参与本 PRT 路径。
 
+## 与 GDC 2026 MagicDawn CLV 的对应关系
+
+参考 [Illuminating Roco's Legacy](https://media.gdcvault.com/gdc2026/Slides/Sheng_Feng_IlluminatingRocosLegacyScalableGlobalIlluminationfromTheorytoPractice.pdf)。这份演讲展示的是《洛克王国：世界》的生产方案，不能把其他 MagicDawn 论文的数据布局直接套在它上面。
+
+当前 prepared CLV 已采用烘焙端预插值、有限窗口驻留、GPU 动态重光照和硬件三线性采样。白光盒子使用四级、每级 16³；大世界仍按配置扩展级数。源格中心在各级共用一个基准点，间距按 2 倍增长。输入不变时复用照明；输入变化时同次更新完成驻留格重光照，不分帧拖延太阳/TOD 响应。
+
+级联混合采用第 40–41 页描述的 compute pre-mix / center-aligned 思路：重光照先写原始 SH2 场，再在计算着色器中把相邻级的交界预混合到采样场。细级切换面落在粗级采样中心上，避免半格错位；正常像素成功采样一级后直接返回，不再额外读取粗级来混合。两格宽过渡、有效覆盖权重和缺页处理是本项目实现选择，演讲没有公开这些具体算法。原始场与采样场独立，重复更新不会反复混合旧结果。原生 PBR、屏幕 resolve 和调试视图使用同一采样函数。
+
+已有 OLV 的标签和手工修正直接复用。室内、室外各自在自己的 SH 通道内预混合，不对标签插值，也不跨域混合光照。无需重新推理 OLV 或重新烘焙 GI。预混合仅在光照/驻留映射更新时运行；四级 16³、双域 RGBA16F 增加 1 MiB 原始响应缓存和 160 字节参数。
+
+尚不能称为完整复刻：当前保留 RGB SH2 的 12 个系数及 4×4 传输算子，演讲还采用颜色＋单色方向的六系数近似、可见性数据的不同存储变体、角色逐顶点采样，以及大世界/POI/洞穴之间的区域混合。这些与本次级联预混合不同；公开幻灯片也没有给出完整拟合、混合权重和边界算法源码。保留彩色方向响应可避免对白光盒子的异色光照额外降维。
+
+演讲第 45–46 页报告 iPhone 12 / A14 上 GPU 增量约 0.83 ms、CPU 约 0.3 ms，并没有给出普遍适用的 0.5 ms 保证。其成本控制来自固定的 4×16³ 驻留窗口、烘焙端预插值、CPU 并行加载新增块、GPU block 重光照、计算阶段级联预混合，以及六系数和角色逐顶点采样等近似。0.5 ms 是本项目自己的 GPU 预算。
+
+2026-11-05 在白光盒子、RTX 3080 Ti / D3D12 / 1920×1080、四级 16³、已有 OLV 开启时，用固定相机或重复轨迹进行八组 ABBA 开关对照（每组预热 70 帧、采样 180 帧）。静止时 PBR 开关增量加准备阶段约 0.14 ms；连续旋转太阳约 0.19 ms。移动时 PBR 中位增量约 0.11–0.12 ms，更新准备阶段 GPU P95 从约 0.36–0.51 ms 降至 0.15–0.17 ms，准备阶段采样最大值 0.242 ms。增量是融合 PBR Pass 的开关差值，不是整个 PBR Pass 时间，也不是逐帧配对的 GI P95；结果仅适用于该场景、硬件和分辨率，且不含冷启动。CPU 准备阶段移动 P95 从约 12.3 ms 降至 6.5 ms，仍高于演讲的 CPU 成本，不能把上述 GPU 数字当作整帧或 CPU 预算。
+
+空间更新只重建标签或源索引改变的 OLV 级联，未移动的标签层复用 CPU 缓存；连续源行合并上传。失效池槽通过完整驻留索引表隔离，不再逐段清零 GPU 算子，复用前完整覆写。回归测试以 GPU 回读验证增量映射与全量重建一致、全部算子行一致，且移除的算子不可达。
+
 ## 512 m 分页 CLV PRT
 
 `MagicGIVolume → Page Streaming → Gi Radius M` 默认 **512 m 半径**，以实际摄像机位置为中心。它限制源块加载和接收像素的 GI 范围；不会扩大 Volume 的烘焙边界。没有烘焙数据的区域不能凭空获得间接光。原地转动视角不改变 CLV 格子或请求块。
 
-最细层仍为 0.25 m，相邻层间距倍增。每层 16³ 时，512 m 覆盖需要最多 10 层（40,960 个驻留槽位）；24³/32³ 分别使用最多 9 层，以满足 3D 纹理深度限制。小场景迁移保留实际已有的四层，不额外生成远处数据。源块数量不受 16,384 的全域上限约束，GPU 只保存当前驻留格需要的算子。
+Inspector 顶部先显示烘焙进度，其次是 GI 烘焙、OLV 开关和更新按钮。下方可折叠的「烘焙设置」集中提供 Probe 间距、每点射线数、反弹次数和追踪距离；射线数使用原有 128 / 256 / 512 / 1024 / 2048 预设下拉框，已有自定义值会保留。**Probe 间距是唯一密度设置**（序列化名 `clv_cell_size`，0.1–5 m，默认 0.25 m）：越小越密，越大越稀疏。OLV 自动标记这套 Probe，不另设密度。修改间距后，先「烘焙 GI」，再「更新 OLV 标记」；只换模型时直接更新 OLV。面板显示当前网格和已烘焙间距，旧结果不会被重新解释为新间距。数米间距适合大尺度变化，不能保留小房间的墙角、薄缝等细节。
+
+分块 Bake 会保留独立的 `source_probe_layout.res`，保存各级实际 Probe 的有效性和迁移偏移，不保存重复的传输矩阵；OLV 更新和手工编辑按各级原始位置工作，渲染管线不加载此离线文件。当前独立 OLV 的单布局上限为 262,144 个跨级逻辑 Probe；超出时 GI 仍可分页烘焙，但尚不支持该布局的独立 OLV 更新。旧分块 generation 没有保留位置文件，需要重新 Bake 一次。
+
+小房间增加密度后即使切换到十级分块存储，CLV 仍按实际源格跨度拟合房间，避免域外摄像机把细层缓存放在房外、室内误退到粗层。2026-11-05 白光盒子实测：RTX 3080 Ti / D3D12 / 1920×1080，OLV 开启、连续旋转太阳，八组 ABBA 对照的 PBR 中位增量加准备阶段，0.5 m 为约 0.154 ms，0.1 m 从修复前 0.532 ms 降至 0.223 ms。0.1 m 用低射线数结构测试烘焙，只验证布局、OLV 接入和运行时开销，不能据此评估光照噪声。结果不含冷启动，也不是所有帧、设备和场景的上限；该视角仍有球底极小标签误差。
+
+最细层使用烘焙时的 Probe 间距，相邻层间距倍增。默认间距、每层 16³ 时，512 m 覆盖需要最多 10 层（40,960 个驻留槽位）；24³/32³ 分别使用最多 9 层，以满足 3D 纹理深度限制。小场景迁移保留实际已有的四层，不额外生成远处数据。源块数量不受 16,384 的全域上限约束，GPU 只保存当前驻留格需要的算子。
 
 - 每层只请求自己的 CLV 窗口，并与半径球相交。完全在球外的块不发起加载；相机移远后释放旧 CPU 块和 GPU 算子。异步 I/O 无法强行取消，已开始的过期请求只排空释放，不发布结果，其内存仍计入在途预算。
 - 相交的边界块包含球外数据和一格插值邻接区；GPU 只取能影响球内接收点的样本，像素在距离 **大于 512 m** 时直接退出此 GI。范围外仍使用场景自身的环境照明。
@@ -38,7 +62,7 @@ Surfel 的 `Debug View` 可通过 Feng Render Pipeline 的 `Debug Buffers` → `
 
 ### 自由空间 PRT source 与 prepared SH2 v2
 
-新 Bake 保存 `FMagicGIVolumeSourceChunk`，manifest 的 `transport_domain=regular_free_space_clv_v1`，最细间距固定 0.25 m。source archive 保留 SH9 原始 Transfer 与天空数据供诊断；builder 从未准备的 source 数据重新拟合 SH2，不截取已经做过 SH9 边界拟合的矩阵。prepared schema 2 每个输出 RGB 通道保存 L0+L1 四个实正交系数；输入为 12 个 secondary RGB 系数、4 个天空系数及每个稳定发光源的 6 个方向传输值，即每 cell `4 × (16 + 6E)` floats。它在 Bake 时重做四级规则格的几何约束线性拟合：遮挡射线与接触面约束只在这一步执行，且不代入某一时刻的太阳/天空/发光强度。`clv_prepared_operators` 是 TransferMatrix，不是烘焙好的间接光 SH。该实现采用 GDC 讲稿中的 L0+L1 系数数目，不声称复现腾讯完整私有实现。
+新 Bake 保存 `FMagicGIVolumeSourceChunk`，manifest 的 `transport_domain=regular_free_space_clv_v1`，最细间距由 `CLV Cell Size` 指定，并写入源、分页 manifest 和每个 brick。source archive 保留 SH9 原始 Transfer 与天空数据供诊断；builder 从未准备的 source 数据重新拟合 SH2，不截取已经做过 SH9 边界拟合的矩阵。prepared schema 2 每个输出 RGB 通道保存 L0+L1 四个实正交系数；输入为 12 个 secondary RGB 系数、4 个天空系数及每个稳定发光源的 6 个方向传输值，即每 cell `4 × (16 + 6E)` floats。它在 Bake 时重做四级规则格的几何约束线性拟合：遮挡射线与接触面约束只在这一步执行，且不代入某一时刻的太阳/天空/发光强度。`clv_prepared_operators` 是 TransferMatrix，不是烘焙好的间接光 SH。该实现采用 GDC 讲稿中的 L0+L1 系数数目，不声称复现腾讯完整私有实现。
 
 CLV preparation revision 4 在所有 LOD 上使用同一表面传输估计，避免细层的直接表面目标与粗层的截断 Probe 目标在交界处混合出暗斑。每个约束在本级网格覆盖的表面区域内做四点积分，并把原射线预算分配给这些点；不足四条射线时仍用单点。样点必须留在连通的接收面，不能穿过薄墙借光；边缘有效样点会重新归一化。邻近表面使用相关的采样序列降低空间噪声，不使用屏幕滤波。它是有限空间分辨率的 PRT 重建，不代表能精确恢复小于网格间距的接触阴影。变化只发生在烘焙准备阶段，运行时仍为四系数、四次纹理采样，原始 source 可复用，但旧 prepared 算子需重新准备。
 
@@ -50,17 +74,23 @@ CLV preparation revision 4 在所有 LOD 上使用同一表面传输估计，避
 
 ### 源 Probe 与运行时容量
 
-**Magic GI pass → Prepared CLV Resolution** 控制整块 layout 8 每一级的边长，可选 16、24、32，默认 16；分页 layout 7 使用独立的 16³ resident window。整块四级总容量分别为 16,384、55,296、131,072 个槽。最细间距仍为 0.25 m，四级依次为 0.25 / 0.5 / 1 / 2 m；增大边长扩大覆盖范围，不增加源 Probe、不改变烘焙，也不恢复 SH2 未保留的 L2 方向细节。
+**Magic GI pass → Prepared CLV Resolution** 控制整块 layout 8 每一级的边长，可选 16、24、32，默认 16；分页 layout 7 使用独立的 16³ resident window。整块四级总容量分别为 16,384、55,296、131,072 个槽。最细间距读取烘焙数据；默认四级为 0.25 / 0.5 / 1 / 2 m，选择 0.5 m 则为 0.5 / 1 / 2 / 4 m；增大边长扩大覆盖范围，不增加源 Probe、不改变烘焙，也不恢复 SH2 未保留的 L2 方向细节。
 
 窗口随摄像机位置滚动，纯旋转不改变驻留布局。这是摄像机附近的空间缓存，不按视锥裁掉背面的探针，也不是整个烘焙场景的 Probe 数上限。无效槽不执行矩阵重照明；Inspector 分别报告有效驻留点和总槽容量。更大窗口增加缓存显存与重照明工作量，不承诺仍满足同一 GPU 时间预算。
 
-当前自由空间 source 域仍为单页，受每轴 256 格、总 262,144 槽及 256 MiB 源载荷校验上限约束；烘焙会先生成稠密数据，因此打包不会绕过烘焙峰值限制。多页大世界流送是另一项实现工作，不能由扩大 resident CLV 容量替代。
+小场景的原始 source archive 受每轴 256 格、总 262,144 槽及 256 MiB 源载荷上限约束；较大场景自动走分块多分辨率 Bake。减小间距会增加烘焙量、包体和空间更新频率；它不增加每级 16³ 的驻留格上限。
+
+## Probe 排除区
+
+在 MagicGI Inspector 点击 **添加 Probe 排除区**，创建直接子节点 `FMagicGIProbeExclusion`。移动、旋转、缩放该节点，或调整 `Size`；**与父 MagicGI Volume 相交的区域不生成有效 Probe**，不改变外面的 Probe 间距。可放多个排除区，各自有 `Enabled` 开关，支持编辑器撤销／重做。
+
+修改排除区后重新烘焙 GI，再更新 OLV。排除在源点分类前执行，跳过这些点的传输射线和 OLV 分类；迁移后的点也不得进入排除区。CLV 各级预插值保留排除空洞，不能通过边界外推补回。规则格仍保留无效槽的索引，紧凑源存储不为这些槽保存 Probe 传输载荷。旧标签不会误套到改变后的 Probe 布局。
 
 ## PRT 使用与烘焙
 
 1. 启用 `Feng Render Pipeline` 和 `Feng Magic GI`，将两个插件链接到 `res://addons/`
-2. 添加 `FMagicGIVolume`，设置 `size` 覆盖接收区域，选择 `PRT MagicGI`、`Use CLV` 和 backend 1。当前自由空间布局固定 0.25 m，隐藏不适用的旧表面偏移/自适应设置。
-3. 选择 Bake quality 或自定义 `Bake Samples`、`Bake Bounces` 和 `Bake Distance`，点击 **Bake Free-space CLV PRT**。此按钮完成传输积分、CLV 预插值、压缩资源保存和重载验证，随后保存场景。关闭旧 `chunked_baking` 不会绕过该流程。当前该域保存一个受容量约束的 source page；超限会报错，不会静默降低密度。
+2. 添加 `FMagicGIVolume`，设置 `size` 覆盖接收区域，选择 `PRT MagicGI`、`Use CLV` 和 backend 1。设置 `CLV Cell Size` 选择最细网格间距；旧表面偏移/自适应设置不参与该后端。修改间距后重新 Bake GI，再独立更新 OLV；旧标签不会被误套到新网格上。
+3. 选择 Bake quality 或自定义 `Bake Samples`、`Bake Bounces` 和 `Bake Distance`，点击 **Bake Free-space CLV PRT**。此按钮完成传输积分、CLV 预插值、压缩资源保存和重载验证，随后保存场景。关闭旧 `chunked_baking` 不会绕过该流程。小场景同时保留源档案；较大场景按实际间距生成多分辨率分页，不静默降低所选密度。
 4. Feng Renderer 中启用 **Magic GI**。layout 7/8 在 Lighting 前准备缓存并在原生 Lighting 中采样；独立 pass 负责发布与可选调试。启用 **Debug Buffers → Magic GI** 可查看当前实际 GI 贡献。
 
 每个 World3D 选择最新有效且启用的 Volume，不混合多个 Volume。快照按世界和视口渲染目标路由。修改布局、静态几何、反照率或烘焙参数后需要重烘；太阳/TOD 与已烘焙发光源的开关、颜色和强度走实时 relight。**Refresh Surface Points** 仅用于旧表面域。
@@ -81,9 +111,9 @@ Inspector 的 **Bake Streamed PRT** 重烘当前 Volume，**Bake Selected Block*
 
 新 `FMagicGIVolume` 默认选择 `clv_cache_backend=1`。新的自由空间 generation 在加载线程校验哈希、签名、系数与 HDR 界限后，直接上传已准备的线性算子；不在加载时重建 BVH 或重新做几何插值。旧 baked-SH-only 资源不能启动实时 PRT，需重新 Bake。
 
-实现参考 Tencent/MagicDawn [GDC 2026 公开演讲](https://media.gdcvault.com/gdc2026/Slides/Sheng_Feng_IlluminatingRocosLegacyScalableGlobalIlluminationfromTheorytoPractice.pdf)中的“预插值传输 → CLV block relight → 硬件插值”流程，维护 **4×16³** 驻留 cells。整块 layout 8 的窗口只依赖相机位置：沿相机到 source 域中心的空间方向拟合细级覆盖，避免域外相机把细级窗口留在空白区域；分页 layout 7 以相机和 GI 半径选择当前 resident pages。原地旋转不会改变整块 anchor 或触发重照明；平移按 0.25 m 源格及各级步长滚动。空间滚动只更新 cell 到 prepared operator 的映射。光照或映射改变时，一次 GPU dispatch 重算全部驻留 cells，固定输入不重复派发。当前 prepared 路径用 SH2 四系数重建漫反射方向响应；它会丢弃原始 source 的 L2 方向变化。
+实现参考 Tencent/MagicDawn [GDC 2026 公开演讲](https://media.gdcvault.com/gdc2026/Slides/Sheng_Feng_IlluminatingRocosLegacyScalableGlobalIlluminationfromTheorytoPractice.pdf)中的“预插值传输 → CLV block relight → 硬件插值”流程，维护 **4×16³** 驻留 cells。整块 layout 8 的窗口只依赖相机位置：沿相机到 source 域中心的空间方向拟合细级覆盖，避免域外相机把细级窗口留在空白区域；分页 layout 7 以相机和 GI 半径选择当前 resident pages。原地旋转不会改变整块 anchor 或触发重照明；平移按烘焙源格间距及各级步长滚动。空间滚动只更新 cell 到 prepared operator 的映射。光照或映射改变时，一次 GPU dispatch 重算全部驻留 cells，固定输入不重复派发。当前 prepared 路径用 SH2 四系数重建漫反射方向响应；它会丢弃原始 source 的 L2 方向变化。
 
-每个 LOD 用四次三线性采样读取四个 RGBA 字段并重建 SH2 L0+L1 漫反射响应；LOD 交界会混合邻级。算子乘法保持 FP32，输出为带统一二次幂 HDR 缩放的 RGBA16F，插值后恢复量纲。数据缺少可信算子界限时使用 RGBA32F。没有逐像素邻居循环、额外采样、额外 pass 或额外全屏 Apply。几何约束在烘焙端处理墙面、重叠 box 交界与球体接触，保留当前 source 对应的遮挡；有效黑值仍替换未遮挡天空漫反射。
+像素用四次三线性采样读取选中 LOD 的四个 RGBA 字段并重建 SH2 L0+L1 漫反射响应；交界光照已在 compute 阶段预混合。算子乘法保持 FP32，输出为带统一二次幂 HDR 缩放的 RGBA16F，插值后恢复量纲。数据缺少可信算子界限时使用 RGBA32F。没有逐像素邻居循环或额外全屏 Apply；光照或驻留变化时执行重光照和预混合 dispatch。几何约束在烘焙端处理墙面、重叠 box 交界与球体接触，保留当前 source 对应的遮挡；有效黑值仍替换未遮挡天空漫反射。
 
 `get_magicdawn_runtime_state()` 中 prepared CLV 的 `layout_version` 为 7（分页）或 8（整块驻留），使用 schema 2 与四个 SH2 响应字段；`prt_model=CLV_TRANSFER_MATRIX_RELIGHT`。`dynamic_volume.cache` 给出 `field_format`、`decode_scale`、`relight_revision`、`clipmap_update_count` 和 GPU 字节数。`dynamic_volume` 的 `lease_current`、`publication_token==consumed_token` 与 `renderer_active` 确认当前原生照明消费。旧 SH9 prepared generation 会被拒绝并提示重新 Bake。`Debug Buffers → Magic GI` 按需生成 sidecar，不改变正常 SceneColor；调试视图有单独成本，不计入关闭调试时的生产预算。
 

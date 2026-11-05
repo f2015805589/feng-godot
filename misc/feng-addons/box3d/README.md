@@ -192,11 +192,37 @@ Box3D 求解器的计时。
 所有测试的子步数、精度、碰撞半径、约束刚度均未降低。不同网格形状、接触数量、
 休眠比例和 CPU 会改变结果，低接触场景的提升不能直接套到布料堆叠。该基准直接提交
 软体 RID 的网格、姿态和固定点，避免依赖 headless 模式不会执行的渲染前固定点同步；
-检查悬挂高度，防止测到无固定点的落地布料。它不包含撕裂拓扑重建或渲染上传，撕裂
-由图形回归验证。
+检查悬挂高度，防止测到无固定点的落地布料。普通悬挂负载不包含撕裂拓扑重建或渲染上传；
+`cloth_reimpact_tearing` 单独开启与实验室相同的撕裂布局，并记录预热阶段的撕裂尖峰。
 
 `--case cloth2048|cloth4096|rigid|soft|soft_contacts|soft_stack|soft_balls|soft_rest|ragdolls|ragdolls_rest` 可选择负载；
 `--library` 可指定对照 DLL，`--workers` 可指定工作线程数（默认 4）。
+
+### 落地布料再次击打
+
+```powershell
+python misc/feng-addons/box3d/tests/benchmark.py --case cloth_reimpact_tearing --case cloth_reimpact --workers 8 --repeats 3
+bin/godot.windows.editor.x86_64.exe --path "F:/godot/PROJECT/Box3D物理测试" --fixed-fps 120 --script res://addons/box3d/tests/cloth_lab_benchmark.gd
+```
+
+第二条使用实际 FRP 管线和完整软体实验室：先击打悬挂布料，释放支撑，落地后再发射三次。
+目标取自地板范围内的真实布料顶点，避免飞散碎片扩大 AABB 后把球射向空处。
+记录逐帧物理窗口、整帧间隔、发射资源创建耗时、接触和撕裂计数，默认输出
+`res://.godot/cloth-lab-benchmark.json`；`-- --result=<路径>` 可指定结果文件。
+物理窗口从 `physics_frame` 到 `process_frame`，包含场景物理回调和服务器步进；整帧还包含
+渲染、统计脚本及发射操作，二者不能当成纯求解器或 GPU 耗时。
+
+撕裂重建使用复用的连续缓冲、按粒子编号分桶和局部排序，保持原有粒子编号、质量分配、
+约束及碰撞查询顺序；BVH 重建预先计算三角形中心。球体复用网格、材质与碰撞形状，
+避免每次发射重新创建相同资源。2048 初始粒子、4 子步、精度 6、自碰撞、互碰、撕裂均保留。
+2026-11-04 本机 8 工作线程三轮对照，开启撕裂的无渲染测试中，发生撕裂帧的峰值中位数
+从 9.17 ms 降到 3.97 ms；普通落地再次击打中位数约 1.17 ms，基本不变。
+四组软体负载的最终顶点及刚体状态 SHA-256 与修改前一致，46 项物理回归通过。
+同机完整 FRP 实验室三轮测试，撞击撕裂的物理窗口峰值中位数从 18.14 ms 降到 7.81 ms，
+再次发射资源创建从 0.373 ms 降到 0.084 ms。落地后二次击打的物理窗口中位数约
+3.18 ms、整帧中位数约 4.38 ms，均基本不变；提升主要发生在瞬时重建和资源创建。
+逐帧接触、撕裂数量与修改前一致。上述数值来自 Ryzen 7 9850X3D / RTX 3080 Ti、
+120 Hz 固定步进，不能当作其他硬件或更密集布料堆叠的通用帧预算。
 
 ## 刚体压力场景与 Jolt 对照
 

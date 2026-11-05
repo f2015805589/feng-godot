@@ -15,7 +15,6 @@ const EXPECTED_MODEL_BUNDLE_SHA256 := "fd077cc2ca7d9fc6f4a38b4d9f8f0604406cfcebb
 const EXPECTED_FEATURE_SCHEMA_ID := "feng_magic_gi_olv_surface_patch_horizon16_center4origin_ray_geometry_v2"
 const EXPECTED_FEATURE_SCHEMA_SHA256 := "c13e9ab78c57ab52010a589c09ebb07726372c3a363245b6e80c4eed2425f383"
 const EXPECTED_DECISION_POLICY_ID := "olv_binary2000_center_single_view_argmax_v2"
-const TARGET_CELL_SPACINGS_M := [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]
 const MAX_WORKER_START_MSEC := 300000
 const MAX_WORKER_STOP_MSEC := 30000
 
@@ -116,7 +115,7 @@ func infer_source(source: Resource, geometry: RefCounted, binding: Dictionary,
 		"source_positions_file": {"path": "source_positions.f32", "sha256": file_hashes["source_positions.f32"]},
 		"source_validity_file": {"path": "source_validity.u8", "sha256": file_hashes["source_validity.u8"]},
 		"feature_context_extent_m": [0.5, 0.5, 0.5],
-		"supported_target_cell_spacings_m": TARGET_CELL_SPACINGS_M.duplicate(),
+		"supported_target_cell_spacings_m": target_cell_spacings(source),
 		"scene_id": String(binding.scene_id),
 		"volume_id": String(binding.volume_id),
 		"layout_revision": int(binding.layout_revision),
@@ -320,7 +319,7 @@ func _load_request_result(request_id: String, request_root: String, source: Reso
 		if (not source.cell_is_valid(index) and label != 0) \
 				or (source.cell_is_valid(index) and label not in [1, 2]):
 			return _failure("OLV inference label code disagrees with source validity at logical probe %d." % index)
-	metadata["supported_target_cell_spacings_m"] = PackedFloat32Array(TARGET_CELL_SPACINGS_M)
+	metadata["supported_target_cell_spacings_m"] = PackedFloat32Array(target_cell_spacings(source))
 	metadata["feature_context_extent_m"] = Vector3(0.5, 0.5, 0.5)
 	metadata["supported_feature_context_extents_m"] = PackedVector3Array([Vector3(0.5, 0.5, 0.5)])
 	metadata["source_probe_positions"] = logical_positions
@@ -328,6 +327,14 @@ func _load_request_result(request_id: String, request_root: String, source: Reso
 	return {"ok": true, "labels": labels, "metadata": metadata,
 		"result": result, "worker_request_id": request_id}
 
+
+static func target_cell_spacings(source: Resource) -> Array[float]:
+	# Grid pitch is independent of the model's fixed 0.5 m feature extent.
+	# Record the actual target lattice instead of a hard-coded quarter-meter grid.
+	var base_spacing := float(source.spacing_m) / float(1 << int(source.source_lod))
+	var result: Array[float] = []
+	for level in 10: result.append(base_spacing * float(1 << level))
+	return result
 
 func _python_executable() -> String:
 	var configured := OS.get_environment("FENG_OLV_PYTHON")

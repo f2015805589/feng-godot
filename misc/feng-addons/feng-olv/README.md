@@ -4,18 +4,21 @@ OLV 是 MagicGI 的离线标签子组件，每个 MagicGI Volume 只使用一个
 
 ## 使用
 
-启用 **Feng Magic GI** 插件即可。选中 `MagicGIVolume`，点击 **打开 OLV 子节点**；没有则创建，已有则选中，重复点击不会添加新节点。OLV 直接使用父节点的 Probe 和范围，无需另选源 Volume。白光盒子项目已经放置了 `MagicGIVolume/OLV`。
+启用 **Feng Magic GI** 插件即可。选中 `MagicGIVolume`，点击 **OLV 模型 / 手工修正**；没有则创建，已有则选中，重复点击不会添加新节点。OLV 直接使用父节点的 Probe 和范围，无需另选源 Volume。白光盒子项目已经放置了 `MagicGIVolume/OLV`。
 
 单点／批量校正都在同一个 OLV 子节点中完成。误复制的第二个 OLV 会显示重复警告，并拒绝编辑或发布父 Volume 的标签；保留已有数据，删除多余节点即可。
 
 - **启用 OLV 防漏光**：立即开关标签过滤，保留数据，不重烘焙 GI。
 - **导入已有 OLV**：将旧 GI 缓存的有效标签复制到独立资源，不启动模型。
 - **烘焙 / 更新 OLV 标签**：运行当前选择的模型，更新自己的标签资源。模型变化不会使 GI 传输失效；同一格点上的手工修改会保留。
-- **单点编辑**：打开“显示 Probe”和“编辑 Probe”，在 3D 视图点击点选，Ctrl/Shift 多选。也可输入 Probe 编号选择。
-- **批量编辑**：设置 `Batch Center / Batch Size`，在白色框内选中一批 Probe，再点击“标记选中为室内／室外”。
+- **单点编辑**：选中 OLV 节点，默认显示当前视野内未被场景 Mesh 遮挡的有效源 Probe。在 3D 视图点击单选，Shift 追加、Ctrl 切换选择；也可输入编号选择。使用“显示并编辑 Probe”开关隐藏或重新显示。
+- **批量编辑**：在视口拖框选择，默认只选显示的点；Shift 框选追加、Ctrl 框选切换，Ctrl+A 选择当前视野中显示的点。需要选择墙后的点时主动开启“透视显示 / 选择”。点击“标记选中为室内／室外”立即修改整组选点。面板提供按当前类别全选（包含遮挡点）、清空选择；也可打开“空间批量框”，设置 `Batch Center / Batch Size` 按空间范围选择。
+- **显示筛选**：全部标签／仅室内／仅室外；筛选只影响预览和选择，不修改数据。点太多时开启“仅显示空间批量框内的 Probe”，在下方调整框中心和大小。遮挡按可见 Mesh 的三角形判定，不依赖物理碰撞体；场景和视角不变时复用结果。这部分仅在编辑器选中 OLV 时工作。
 - **恢复模型结果**：删除选中 Probe 的手工覆盖。编辑支持撤销／重做。
 
-点的青色为室内，黄色为室外，白色表示当前选择。Mesh 的两色预览仍在 **FRP → Debug Buffers → MagicGI → OLV 室内/室外** 中。标签不是颜色插值，也不通过预览状态启用。
+点的室内／室外颜色取自 OLV Debug 的同一组颜色及其默认显示变换，选中点添加白色圆环，保留标签颜色。面板显示两色图例、总数和选中数量，单选还显示编号与标签。尚未生成标签的有效点显示灰色；几何内部的无效槽位不作为 Probe 显示或编辑。显示的是整套烘焙源 Probe，不受 CLV 驻留范围限制。Mesh 的两色预览仍在 **FRP → Debug Buffers → MagicGI → OLV 室内/室外** 中。
+
+Probe 标记仅在选中 OLV 节点时显示，使用编辑器 GPU 批量覆盖层，避免 FRP 场景曝光把标记压黑。视角、可见几何或筛选改变时更新可见点集合，静止视角复用结果；不向游戏场景添加显示节点或逐帧分类。遮挡预览有编辑器 CPU 开销，不计作正常 GI 运行时开销。
 
 编辑后保存场景。独立标签资源默认存入项目的 `res://bake/olv/`，不会替换 GI manifest、传输矩阵或预插值算子。几何或 Probe 格点真正改变时，旧标签会拒绝绑定，需更新对应的源数据和 OLV；模型变化、开关和手工修改不属于这种情况。
 
@@ -47,8 +50,9 @@ python tools/train.py --evaluate-benchmark --bundle model --out F:/godot/feng-go
 以下入口在已经烘焙的白光盒子项目中运行；日志和测试资源仅写项目 `.godot/`：
 
 ```powershell
-godot.windows.editor.x86_64.console.exe --headless --path "F:/godot/PROJECT/白光盒子测试场景" --script res://addons/feng-olv/tests/test_independent.gd
-godot.windows.editor.x86_64.console.exe --path "F:/godot/PROJECT/白光盒子测试场景" --script res://addons/feng-olv/tests/test_rendering.gd
+godot.windows.editor.x86_64.exe --headless --editor --path "F:/godot/PROJECT/白光盒子测试场景" --script res://addons/feng-olv/tests/test_probe_editor.gd
+godot.windows.editor.x86_64.exe --headless --path "F:/godot/PROJECT/白光盒子测试场景" --script res://addons/feng-olv/tests/test_independent.gd
+godot.windows.editor.x86_64.exe --path "F:/godot/PROJECT/白光盒子测试场景" --script res://addons/feng-olv/tests/test_rendering.gd
 ```
 
 回归检查独立模型更新、单点／批量修改、恢复和开关，并验证 GI manifest 及传输数组不变。渲染回归确认手工标签实际进入 Mesh 结果，关闭 OLV 后 GI 继续生效。有限格点、薄缝及二元域自身仍有表示限制，手工编辑不会变成几何遮挡或区分两个同属室内的房间。

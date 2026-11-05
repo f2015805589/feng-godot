@@ -5,7 +5,7 @@ const LIBRARY := "res://addons/feng-render-pipeline/library/magic-gi/"
 
 func _initialize() -> void:
 	var failures := 0
-	for name: String in ["magic_gi_prepared_volume_debug.glsl", "magic_gi_paged_volume_debug.glsl", "magic_gi_dynamic_volume_debug.glsl", "magic_gi_dynamic_volume_screen_resolve.glsl", "magic_gi_olv_partition_indices.glsl", "magic_gi_clv_partition_relight.glsl", "magic_gi_clv_partition_relight_r16.glsl"]:
+	for name: String in ["magic_gi_prepared_volume_debug.glsl", "magic_gi_paged_volume_debug.glsl", "magic_gi_dynamic_volume_debug.glsl", "magic_gi_dynamic_volume_screen_resolve.glsl", "magic_gi_olv_partition_indices.glsl", "magic_gi_clv_partition_relight.glsl", "magic_gi_clv_partition_relight_r16.glsl", "magic_gi_clv_premix.glsl", "magic_gi_clv_premix_r16.glsl"]:
 		var shader := load(LIBRARY + name) as RDShaderFile
 		if shader == null or not shader.base_error.is_empty():
 			push_error("Cannot load imported shader: " + name)

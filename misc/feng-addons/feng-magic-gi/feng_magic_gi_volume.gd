@@ -28,6 +28,7 @@ const Page = preload("feng_magic_gi_page.gd")
 const SceneTracker = preload("feng_magic_gi_scene_tracker.gd")
 const Preview = preload("feng_magic_gi_preview.gd")
 const ProbeLayout = preload("feng_magic_gi_probe_layout.gd")
+const SourceProbeLayout = preload("feng_magic_gi_source_probe_layout.gd")
 const SurfelSettings = preload("feng_magic_gi_surfel_settings.gd")
 const ZERO_TRANSFER_DIAGNOSTIC := "本次几何间接传输与天空可见性均为零。请检查布点与静态采样，并确保 Volume 和 Bake Distance 覆盖可产生反弹的表面。要烘焙自发光贡献，请启用发光表面并重新 Bake。"
 const BAKE_QUALITY_NAMES := ["Preview", "Fast", "Balanced", "High quality", "Reference"]
@@ -121,9 +122,10 @@ func _validate_property(property: Dictionary) -> void:
 	elif uses_free_space_clv_bake() and property_name in [
 			"chunked_baking", "management_block_size", "core_page_size",
 			"probe_spacing", "surface_offset", "adaptive_placement", "minimum_probe_spacing",
-			"stream_distance", "stream_hysteresis"]:
+			"stream_distance", "stream_hysteresis", "clv_cells_per_frame"]:
 		# Prepared CLV uses per-level bricks and a strict spherical radius.
-		# They do not configure this baker's .25 m source/prepared lattice.
+		# Its only density control is clv_cell_size; legacy surface placement and
+		# per-frame legacy cell budgets do not configure the prepared lattice.
 		property["usage"] = PROPERTY_USAGE_STORAGE
 	elif not is_surfel_mode() and property_name == "surfel_settings":
 		property["usage"] = PROPERTY_USAGE_STORAGE
@@ -175,6 +177,16 @@ class SurfaceRefreshRequest:
 	set(value):
 		minimum_probe_spacing = clampf(value, 0.1, 1.0) if is_finite(value) else 0.25
 		_settings_changed()
+@export_group("烘焙设置")
+## Finest baked CLV cell spacing, independent of legacy surface Probe Spacing.
+## Changing it requires a new GI bake; existing data keeps its recorded lattice.
+@export_range(0.1, 5.0, 0.025, "suffix:m") var clv_cell_size := 0.25:
+	set(value):
+		var next := clampf(value, 0.1, 5.0) if is_finite(value) else 0.25
+		if is_equal_approx(clv_cell_size, next):
+			return
+		clv_cell_size = next
+		_settings_changed(false, true)
 @export_range(1, 4096, 1, "or_greater") var bake_samples := 256:
 	set(value):
 		var clamped := clampi(value, 1, 65536)
@@ -190,6 +202,7 @@ class SurfaceRefreshRequest:
 	set(value):
 		bake_distance = clampf(value, 1.0, 4096.0)
 		_settings_changed(true, false)
+@export_group("")
 ## Terrain3D has no general CPU material evaluation; this scalar supplies its diffuse albedo.
 @export_range(0.0, 1.0, 0.01) var terrain_reflectance := 0.5:
 	set(value):
@@ -220,14 +233,6 @@ class SurfaceRefreshRequest:
 		notify_property_list_changed()
 		if is_inside_tree():
 			Runtime.publish(self)
-## CLV cell spacing is independent of the PRT probe spacing.
-@export_range(0.1, 2.0, 0.025, "suffix:m") var clv_cell_size := 0.25:
-	set(value):
-		var next := clampf(value, 0.1, 2.0) if is_finite(value) else 0.25
-		if is_equal_approx(clv_cell_size, next):
-			return
-		clv_cell_size = next
-		_settings_changed(false, true)
 @export_range(32, 512, 32) var clv_cells_per_frame := 256:
 	set(value):
 		clv_cells_per_frame = clampi(value, 32, 512)
@@ -978,10 +983,6 @@ func bake_chunk(chunk_x: int, chunk_z: int) -> bool:
 	return await _bake_streamed_generation(Vector2i(chunk_x, chunk_z))
 
 func _bake_free_space_source_generation() -> bool:
-	if absf(clv_cell_size - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
-		push_warning("FMagicGI: free-space CLV PRT currently requires CLV Cell Size to be 0.25 m; no new generation was published.")
-		bake_status_changed.emit()
-		return false
 	var output_root := resolved_bake_directory()
 	if output_root.is_empty() or not output_root.begins_with("res://"):
 		push_warning("FMagicGI: free-space CLV PRT Bake requires a writable res:// output directory; the previous bake remains active.")
@@ -997,7 +998,7 @@ func _bake_free_space_source_generation() -> bool:
 	var scene_watch_signature := SceneTracker.stable_scene_signature(self)
 	var input_signature := SceneTracker.bake_content_signature(self)
 	var world_bounds := global_transform * AABB(-size * 0.5, size)
-	var source_dims := Vector3i((world_bounds.size / 0.25).ceil())
+	var source_dims := Vector3i((world_bounds.size / clv_cell_size).ceil())
 	var bounded_multires := source_dims.x > 256 or source_dims.y > 256 or source_dims.z > 256 \
 		or float(source_dims.x) * source_dims.y * source_dims.z > 32768.0
 	if _olv_cache_reuse_requested and bounded_multires:
@@ -1174,6 +1175,25 @@ func _load_active_source_page() -> Dictionary:
 			and bake_manifest.page_entries.size() == 1:
 		source_path = String(bake_manifest.page_entries[0].get("resource_path", ""))
 	if source_path.is_empty():
+		var layout_path := String(bake_manifest.prepared_probe_layout_path)
+		if not layout_path.is_empty():
+			var layout := ResourceLoader.load(layout_path) as SourceProbeLayout
+			if layout != null and layout.is_source_data_valid() and layout.matches_manifest(bake_manifest) \
+					and layout.probe_exclusions == VolumeSourceBaker.ProbeExclusion.capture(self) \
+					and is_equal_approx(layout.spacing_m, clv_cell_size) \
+					and layout.source_transform_world.is_equal_approx(global_transform) \
+					and layout.source_size_m.is_equal_approx(size):
+				return {"ok": true, "source": layout, "source_path": layout_path}
+			return {"ok": false, "error": "The retained paged probe layout does not match the current GI generation or Volume."}
+		if bake_manifest.prepared_bake_algorithm == "multires_independent_transport_sh2_v3":
+			var base_dims := Vector3i((bake_manifest.world_bounds.size / bake_manifest.prepared_source_spacing_m).ceil())
+			var total := 0.0
+			for level in bake_manifest.prepared_level_count:
+				var dims := Vector3i((Vector3(base_dims) / float(1 << level)).ceil())
+				total += float(dims.x) * dims.y * dims.z
+			if total > SourceProbeLayout.MAX_PROBES:
+				return {"ok": false, "error": "当前各级 Probe 总数超过独立 OLV 的 262,144 个容量，请增大 Probe 间距。"}
+			return {"ok": false, "error": "旧分块 GI 没有保留 Probe 布局，请重新烘焙 GI 一次；之后 OLV 可独立更新。"}
 		return {"ok": false, "error": "The active generation did not retain its source probe page; run a regular free-space source Bake first."}
 	# Generation paths are immutable; share the retained source with the OLV
 	# adapter instead of loading a second copy of its transfer arrays.
@@ -1181,9 +1201,11 @@ func _load_active_source_page() -> Dictionary:
 	if page == null or not page.is_source_data_valid():
 		return {"ok": false, "error": "The retained source page is missing, invalid, or has no usable transport samples."}
 	var source := page.free_space_volume_source as VolumeSourceChunk
-	if source == null or source.spacing_m != VolumeSourceChunk.CELL_SPACING_M \
+	if source != null and source.probe_exclusions != VolumeSourceBaker.ProbeExclusion.capture(self):
+		return {"ok": false, "error": "Probe 排除区已改变，请先重新烘焙 GI，再更新 OLV。"}
+	if source == null or not is_equal_approx(source.spacing_m, clv_cell_size) \
 			or source.source_lod != 0 or source.probe_count > OLVProbePayload.MAX_PROBES:
-		return {"ok": false, "error": "Independent OLV update currently needs one retained regular .25 m source page within the source payload limit; the active source page must be retained."}
+		return {"ok": false, "error": "Independent OLV update needs a retained regular source page matching CLV Cell Size; bake GI after changing its spacing."}
 	if source.geometry_signature != bake_manifest.bake_geometry_signature \
 			or source.source_transform_world.origin.distance_to(global_transform.origin) > 0.0001 \
 			or source.source_size_m.distance_to(size) > 0.0001:
@@ -1242,7 +1264,7 @@ func _load_active_olv_cache() -> Dictionary:
 func _recover_legacy_olv_layout_revision(source: VolumeSourceChunk, labels: Resource,
 		context: Dictionary) -> Dictionary:
 	if source == null or labels == null or not use_clv \
-			or absf(clv_cell_size - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
+			or not is_equal_approx(clv_cell_size, source.spacing_m):
 		return {"ok": false,
 			"error": "The active OLV cache is unsupported for the current CLV mode or cell spacing."}
 	var expected_bounds := global_transform * AABB(-size * 0.5, size)
@@ -1264,7 +1286,7 @@ func _recover_legacy_olv_layout_revision(source: VolumeSourceChunk, labels: Reso
 	if context_signature.is_empty() or not context.has("grid_origin_world") \
 			or String(labels.get("layout_signature")) != context_signature \
 			or Vector3(context.get("grid_origin_world", Vector3.ZERO)).distance_to(source.origin_world) > 0.0001 \
-			or absf(float(context.get("base_cell_spacing_m", 0.0)) - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
+			or not is_equal_approx(float(context.get("base_cell_spacing_m", 0.0)), source.spacing_m):
 		return {"ok": false,
 			"error": "The saved OLV binding does not match its retained source lattice; run an independent OLV update."}
 	if String(context.get("scene_id", "")) != SceneTracker.scene_identity(self) \
@@ -1975,8 +1997,6 @@ func _get_configuration_warnings() -> PackedStringArray:
 	if is_surfel_mode():
 		return warnings
 	var dims := grid_dimensions()
-	if uses_free_space_clv_bake() and absf(clv_cell_size - VolumeSourceChunk.CELL_SPACING_M) > 0.000001:
-		warnings.append("Free-space CLV PRT source cells are fixed at 0.25 m. Set CLV Cell Size to 0.25 m or use another backend.")
 	if clv_cache_backend == 1 and bake_manifest != null \
 			and bake_manifest.transport_domain.is_empty() \
 			and bake_manifest.has_baked_indirect_sh():

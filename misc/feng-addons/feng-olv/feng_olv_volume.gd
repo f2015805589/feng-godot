@@ -8,6 +8,19 @@ const SourceBaker = preload("../feng-magic-gi/feng_magic_gi_volume_source_baker.
 const Placement = preload("../feng-magic-gi/feng_magic_gi_placement.gd")
 const Payload = preload("../feng-magic-gi/feng_magic_gi_olv_probe_domain_payload.gd")
 const Tracker = preload("../feng-magic-gi/feng_magic_gi_scene_tracker.gd")
+# Linear colors shared with MagicGI's OLV domain debug shaders.
+const INTERIOR_DEBUG_COLOR := Color(0.08, 0.62, 1.0)
+const EXTERIOR_DEBUG_COLOR := Color(1.0, 0.42, 0.08)
+enum SelectionMode { REPLACE, ADD, TOGGLE }
+enum ProbeFilter { ALL, OUTDOOR, INDOOR }
+
+static func probe_display_color(label: int) -> Color:
+	if label not in [1,2]: return Color(0.5,0.5,0.5)
+	var linear := INTERIOR_DEBUG_COLOR if label == 2 else EXTERIOR_DEBUG_COLOR
+	# Match MagicGI Debug's default ACES + sRGB display, independent of exposure.
+	var value := Vector3(linear.r,linear.g,linear.b)
+	value = (value*(2.51*value+Vector3.ONE*0.03))/(value*(2.43*value+Vector3.ONE*0.59)+Vector3.ONE*0.14)
+	return Color(value.x,value.y,value.z).linear_to_srgb()
 
 signal status_changed
 signal selection_changed
@@ -27,25 +40,36 @@ signal selection_changed
 @export_storage var data: FOLVData:
 	set(value):
 		data = value
+		_probe_view_key = ""
 		_publish()
 @export_file("*.res", "*.tres") var data_path := ""
-@export_group("标签编辑")
-@export var edit_probes := false:
+@export var show_probes := true:
 	set(value):
-		edit_probes = value
-		update_gizmos()
-@export var show_probes := false:
-	set(value):
+		if show_probes == value: return
 		show_probes = value
-		update_gizmos()
-@export var batch_center := Vector3.ZERO:
+		status_changed.emit()
+@export_enum("全部", "仅室外", "仅室内") var probe_filter: int = ProbeFilter.ALL:
 	set(value):
-		batch_center = value
-		update_gizmos()
+		probe_filter = clampi(value,0,2)
+		clear_probe_selection()
+		status_changed.emit()
+@export var xray_probes := false:
+	set(value):
+		xray_probes = value
+		clear_probe_selection()
+		status_changed.emit()
+@export_group("空间批量框")
+@export var show_batch_box := false
+@export var limit_to_batch_box := false:
+	set(value):
+		limit_to_batch_box = value
+		if value: show_batch_box = true
+		clear_probe_selection()
+		status_changed.emit()
+@export var batch_center := Vector3.ZERO
 @export var batch_size := Vector3.ONE:
 	set(value):
 		batch_size = value.abs().max(Vector3.ONE * 0.001)
-		update_gizmos()
 
 var selected_probes := PackedInt32Array()
 var busy := false
@@ -56,9 +80,15 @@ var last_error := ""
 var _cancelled := false
 var _runner: RefCounted
 var _cached_source: Resource
-var _cached_manifest_path := ""
+var _cached_source_key := ""
+var _source_load_error := ""
 var _runtime_binding_key := ""
 var _runtime_binding_cache: Dictionary = {}
+var _probe_view_key := ""
+var _probe_view: Dictionary = {}
+var _probe_visibility: RefCounted
+var _filtered_view_key := ""
+var _filtered_view: Dictionary = {}
 
 func _validate_property(property: Dictionary) -> void:
 	if String(property.name) == "enabled": property.usage = PROPERTY_USAGE_STORAGE
@@ -80,9 +110,12 @@ func _ready() -> void:
 	_publish.call_deferred()
 
 func _on_source_status_changed() -> void:
-	if busy or data == null: return
+	if busy: return
 	var volume := get_source_volume()
 	if volume == null or bool(volume.call("is_baking")): return
+	if data == null:
+		status_changed.emit()
+		return
 	var manifest: Resource = volume.get("bake_manifest")
 	if manifest == null or not data.matches_manifest(manifest):
 		status = "GI 源数据已变化，请独立更新 OLV 标签"
@@ -108,18 +141,84 @@ func get_probe_source() -> Resource:
 	if volume == null: return null
 	var manifest: Resource = volume.get("bake_manifest")
 	var path := manifest.resource_path if manifest != null else ""
-	if _cached_source != null and path == _cached_manifest_path: return _cached_source
+	var key := str([path, manifest.get_instance_id() if manifest != null else 0,
+		volume.global_transform, volume.size, volume.clv_cell_size,SourceBaker.ProbeExclusion.capture(volume)])
+	if _cached_source != null and key == _cached_source_key: return _cached_source
 	var loaded: Dictionary = volume.call("_load_active_source_page")
+	_source_load_error = String(loaded.get("error", ""))
 	_cached_source = loaded.get("source") if bool(loaded.get("ok", false)) else null
-	_cached_manifest_path = path
+	_cached_source_key = key
+	_probe_view_key = ""
+	if not selected_probes.is_empty():
+		selected_probes.clear()
+		selection_changed.emit()
 	return _cached_source
+
+# Editor-only callers use the complete retained source, including every LOD of
+# a paged bake. No camera/CLV residency culling or arbitrary display limit.
+func get_probe_view() -> Dictionary:
+	var source := get_probe_source()
+	if source == null: return {}
+	var key := "%d:%d" % [source.get_instance_id(), data.get_instance_id() if data != null else 0]
+	if key == _probe_view_key: return _probe_view
+	var labels := _labels_for_source(source)
+	var positions := PackedVector3Array()
+	var indices := PackedInt32Array()
+	var classes := PackedByteArray()
+	var counts := PackedInt32Array([0, 0, 0])
+	for index in source.probe_count:
+		if not source.cell_is_valid(index): continue
+		var label := int(labels[index]) if index < labels.size() else 0
+		if label not in [1, 2]: label = 0
+		positions.append(source.cell_position(index))
+		indices.append(index)
+		classes.append(label)
+		counts[label] += 1
+	_probe_view = {"positions": positions, "indices": indices, "labels": classes,
+		"counts": counts, "slot_count": source.probe_count}
+	_probe_view_key = key
+	return _probe_view
+
+func get_filtered_probe_view() -> Dictionary:
+	var view := get_probe_view()
+	if view.is_empty() or (probe_filter == ProbeFilter.ALL and not limit_to_batch_box): return view
+	var key := str([_probe_view_key,probe_filter,limit_to_batch_box,global_transform,batch_center,batch_size])
+	if key == _filtered_view_key: return _filtered_view
+	var result := {"positions":PackedVector3Array(),"indices":PackedInt32Array(),"labels":PackedByteArray()}
+	var inverse := global_transform.affine_inverse()
+	var box := AABB(batch_center-batch_size*0.5,batch_size)
+	for i in view.indices.size():
+		if probe_filter != ProbeFilter.ALL and view.labels[i] != probe_filter: continue
+		if limit_to_batch_box and not box.has_point(inverse*view.positions[i]): continue
+		result.positions.append(view.positions[i])
+		result.indices.append(view.indices[i])
+		result.labels.append(view.labels[i])
+	_filtered_view_key = key
+	_filtered_view = result
+	return result
+
+func get_visible_probe_view(camera: Camera3D) -> Dictionary:
+	if _probe_visibility == null:
+		_probe_visibility = load("res://addons/feng-olv/editor/olv_probe_visibility.gd").new()
+	var view := get_filtered_probe_view()
+	return _probe_visibility.visible_view(self,camera,view,str([_probe_view_key,probe_filter,
+		limit_to_batch_box,global_transform,batch_center,batch_size]))
+
+func _labels_for_source(source: Resource) -> PackedByteArray:
+	var volume := get_source_volume()
+	if data != null and volume != null and volume.bake_manifest != null \
+			and data.matches_manifest(volume.bake_manifest) and data.payload != null \
+			and data.payload.labels.size() == source.probe_count:
+		return data.payload.labels
+	if source.olv_probe_domain_payload != null:
+		return source.olv_probe_domain_payload.labels
+	return PackedByteArray()
 
 func _publish() -> void:
 	if not is_inside_tree(): return
 	var volume := get_source_volume()
 	if volume != null and volume.has_method("olv_data_changed"):
 		volume.call("olv_data_changed")
-	update_gizmos()
 	status_changed.emit()
 
 func runtime_binding() -> Dictionary:
@@ -164,7 +263,9 @@ func _error(message: String) -> bool:
 
 func _context(source: Resource) -> Dictionary:
 	return SourceBaker.make_olv_layout_context(get_source_volume(), source.geometry_signature,
-		source.origin_world, source.dimensions, 4)
+		source.origin_world, source.dimensions,
+		int(source.prepared_level_count) if source.has_method("olv_cell_lod") else 4,
+		-1, float(source.spacing_m))
 
 func import_existing_labels() -> bool:
 	if busy: return false
@@ -187,9 +288,14 @@ func import_existing_labels() -> bool:
 func update_labels(force_inference := true) -> bool:
 	if busy: return false
 	var volume := get_source_volume()
+	if volume != null and volume.bake_manifest != null \
+			and not is_equal_approx(volume.clv_cell_size, volume.bake_manifest.prepared_source_spacing_m):
+		return _error("Probe 间距已从 %s m 改为 %s m；请先烘焙 GI，再更新 OLV。OLV 自动使用 GI 的 Probe，不需要另设密度。" % [
+			str(volume.bake_manifest.prepared_source_spacing_m), str(volume.clv_cell_size)])
 	var source := get_probe_source()
-	if volume == null or source == null or not bool(volume.call("has_bake")):
+	if volume == null or not bool(volume.call("has_bake")):
 		return _error("请先为当前场景完成 GI 传输烘焙；换 OLV 模型不需要重烘焙 GI")
+	if source == null: return _error("OLV Probe 布局不可用：" + _source_load_error)
 	if bool(volume.call("is_baking")): return _error("GI 正在烘焙，请完成后更新 OLV")
 	busy = true
 	_cancelled = false
@@ -301,30 +407,78 @@ func _bind_and_save(asset: FOLVData, source: Resource) -> bool:
 	return true
 
 func probe_label(index: int) -> int:
-	var labels: PackedByteArray = data.payload.labels if data != null and data.payload != null else PackedByteArray()
-	if labels.is_empty():
-		var source := get_probe_source()
-		if source != null and source.olv_probe_domain_payload != null: labels = source.olv_probe_domain_payload.labels
+	var source := get_probe_source()
+	var labels := _labels_for_source(source) if source != null else PackedByteArray()
 	return int(labels[index]) if index >= 0 and index < labels.size() else 0
 
 func select_probe(index: int, append := false) -> void:
+	select_probes(PackedInt32Array([index]), SelectionMode.TOGGLE if append else SelectionMode.REPLACE)
+
+func select_probes(indices: PackedInt32Array, mode := SelectionMode.REPLACE) -> void:
 	var source := get_probe_source()
-	if source == null or index < 0 or index >= source.probe_count or not source.cell_is_valid(index): return
-	var values := Array(selected_probes) if append else []
-	if append and values.has(index): values.erase(index)
-	else: values.append(index)
-	selected_probes = PackedInt32Array(values)
+	if source == null: return
+	var values := {}
+	if mode != SelectionMode.REPLACE:
+		for index in selected_probes:
+			if source.cell_is_valid(index): values[index] = true
+	var seen := {}
+	for index in indices:
+		if not source.cell_is_valid(index) or seen.has(index): continue
+		seen[index] = true
+		if mode == SelectionMode.TOGGLE and values.has(index): values.erase(index)
+		else: values[index] = true
+	selected_probes = PackedInt32Array(values.keys())
+	selected_probes.sort()
 	selection_changed.emit()
-	update_gizmos()
+
+func clear_probe_selection() -> void:
+	selected_probes.clear()
+	selection_changed.emit()
+
+func select_all_probes() -> void:
+	var view := get_filtered_probe_view()
+	select_probes(view.get("indices", PackedInt32Array()))
+
+func pick_probe(camera: Camera3D, screen_position: Vector2, radius := 12.0) -> int:
+	var view := get_visible_probe_view(camera)
+	var positions: PackedVector3Array = view.get("positions", PackedVector3Array())
+	var indices: PackedInt32Array = view.get("indices", PackedInt32Array())
+	var nearest := -1
+	var best := radius * radius
+	var nearest_depth := INF
+	var camera_transform := camera.get_camera_transform()
+	for i in positions.size():
+		var point := positions[i]
+		var view_depth := -camera_transform.basis.z.dot(point-camera_transform.origin)
+		if view_depth < camera.near or view_depth > camera.far: continue
+		var distance := camera.unproject_position(point).distance_squared_to(screen_position)
+		var depth := camera_transform.origin.distance_squared_to(point)
+		if distance < best - 0.01 or (absf(distance - best) < 0.01 and depth < nearest_depth):
+			best = distance
+			nearest_depth = depth
+			nearest = indices[i]
+	return nearest
+
+func select_screen_rect(camera: Camera3D, screen_rect: Rect2, mode := SelectionMode.REPLACE) -> void:
+	var view := get_visible_probe_view(camera)
+	var positions: PackedVector3Array = view.get("positions", PackedVector3Array())
+	var indices: PackedInt32Array = view.get("indices", PackedInt32Array())
+	var selected := PackedInt32Array()
+	var rect := screen_rect.abs()
+	var camera_transform := camera.get_camera_transform()
+	for i in positions.size():
+		var view_depth := -camera_transform.basis.z.dot(positions[i]-camera_transform.origin)
+		if view_depth >= camera.near and view_depth <= camera.far and rect.has_point(camera.unproject_position(positions[i])):
+			selected.append(indices[i])
+	select_probes(selected, mode)
 
 func select_in_box() -> void:
 	var source := get_probe_source()
 	if source == null: return
-	selected_probes.clear()
+	var selected := PackedInt32Array()
 	var inverse := global_transform.affine_inverse()
 	var box := AABB(batch_center - batch_size*0.5,batch_size)
-	for index in source.probe_count:
+	for index in get_filtered_probe_view().get("indices",PackedInt32Array()):
 		if source.cell_is_valid(index) and box.has_point(inverse * source.cell_position(index)):
-			selected_probes.append(index)
-	selection_changed.emit()
-	update_gizmos()
+			selected.append(index)
+	select_probes(selected)

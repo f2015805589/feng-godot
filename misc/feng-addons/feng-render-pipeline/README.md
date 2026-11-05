@@ -108,7 +108,7 @@ FRP 管线的视口。FSR 2 / MetalFX 使用自己的 jitter，与 TAA 互斥；
 - **Magic GI**：backend 1 的 prepared CLV schema 2 在 Lighting 前用当前太阳、天空和自发光
   重照明预插值 TransferMatrix，原生 Lighting 从 `4×16³` CLV 硬件插值采样；整块驻留为
   layout 8，分页驻留为 layout 7，均使用 L0+L1 四系数 SH2。运行时没有 BVH、逐像素邻居循环
-  或额外全屏 Apply。最细 source 间距 0.25 m，FP32 relight 和带 HDR 缩放的 RGBA16F 缓存。
+  或额外全屏 Apply。最细 source 间距由 Volume 的 CLV Cell Size 设置（默认 0.25 m），FP32 relight 和带 HDR 缩放的 RGBA16F 缓存。
   Bake 由 feng-magic-gi 的 **Bake Free-space CLV PRT** 提供；旧 SH9 prepared generation 需重新 Bake。
   Debug Buffers → Magic GI 按需输出当前贡献。架构参考腾讯公开的 CLV PRT 流程，不宣称复现其私有实现。
   旧 SH9 prepared 路径的 2026-10-23 profile（含 0.266 ms 增量）不代表当前 SH2。当前 SH2

@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--godot", type=Path, default=ROOT / "bin/godot.windows.editor.x86_64.exe")
     parser.add_argument("--library", type=Path, default=ADDON / "bin/box3d.dll")
-    parser.add_argument("--case", action="append", choices=["rigid", "soft", "soft_contacts", "soft_stack", "cloth4096", "cloth2048", "cloth_ground", "cloth_ground_no_balls", "cloth_ground_no_self", "cloth_reimpact", "cloth_reimpact_create", "soft_balls", "soft_rest", "ragdolls", "ragdolls_rest"])
+    parser.add_argument("--case", action="append", choices=["rigid", "soft", "soft_contacts", "soft_stack", "cloth4096", "cloth2048", "cloth_ground", "cloth_ground_no_balls", "cloth_ground_no_self", "cloth_reimpact", "cloth_reimpact_create", "cloth_reimpact_tearing", "soft_balls", "soft_rest", "ragdolls", "ragdolls_rest"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--workers", type=int, default=4, choices=range(1, 33))
     args = parser.parse_args()
@@ -29,6 +29,7 @@ def main():
     (target / "bin").mkdir(parents=True)
     shutil.copy2(args.library, target / "bin" / "box3d.dll")
     shutil.copy2(ADDON / "box3d.gdextension", target)
+    shutil.copy2(ADDON / "soft_body_3d.gd", target)
     shutil.copy2(ADDON / "tests/physics_benchmark.gd", project)
     (target / "examples").mkdir()
     for name in ["ragdoll_actor.gd", "ragdoll_actor.tscn"]:
@@ -56,6 +57,7 @@ renderer/rendering_method="gl_compatibility"
             if result.returncode or "ERROR:" in output:
                 raise RuntimeError(output)
             record = next(json.loads(line.removeprefix("BOX3D_PERF ")) for line in output.splitlines() if line.startswith("BOX3D_PERF "))
+            record["tearing"] = next(json.loads(line.removeprefix("BOX3D_TEAR_PERF ")) for line in output.splitlines() if line.startswith("BOX3D_TEAR_PERF "))
             if record["backend"] != "Box3DPhysicsServer3D":
                 raise RuntimeError("Benchmark did not activate Box3D")
             records.append(record)

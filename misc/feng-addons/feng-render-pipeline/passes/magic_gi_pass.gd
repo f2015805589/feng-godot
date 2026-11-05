@@ -1917,7 +1917,8 @@ func _validated_native_olv_binding(snapshot: Dictionary, source: Resource) -> Di
 	var labels: Resource = labels_value
 	var context: Dictionary = context_value
 	var payload: Resource = managed.get("payload") if independent else null
-	var cache_key := _make_native_olv_binding_cache_key(manifest, labels, source, context, payload) + str(independent)
+	var cache_key := _make_native_olv_binding_cache_key(manifest, labels, source, context, payload) \
+		+ str([independent, managed.get("source_binding_valid", false), managed.get("manifest_instance_id", 0)])
 	if cache_key == _native_olv_binding_cache_key:
 		_native_olv_binding_cache_hits += 1
 		return _native_olv_binding_cache
@@ -1953,8 +1954,8 @@ func _validated_native_olv_binding(snapshot: Dictionary, source: Resource) -> Di
 			or String(manifest.get("volume_identity")) != volume_id \
 			or not origin_value is Vector3 or not context_origin is Vector3 \
 			or Vector3(origin_value).distance_to(Vector3(context_origin)) > 0.0001 \
-			or absf(float(context.get("base_cell_spacing_m", 0.0)) - spacing) > 0.000001 \
-			or absf(spacing - 0.25) > 0.000001 \
+			or not is_finite(spacing) or spacing <= 0.0 \
+			or not is_equal_approx(float(context.get("base_cell_spacing_m", 0.0)), spacing) \
 			or not bool(labels.call("matches_bake", scene_id, volume_id,
 				layout_revision, int(source.get("geometry_signature")), layout_signature)):
 		return _store_native_olv_binding_cache(cache_key, {})
@@ -2106,11 +2107,14 @@ func _prepare_native_dynamic_volume(ctx: FRPPassContext,
 		_dynamic_volume_source_instance_id = source.get_instance_id()
 		_sync_owned_rid_snapshot()
 	var cache: Variant = _dynamic_volume_cache
+	if use_prepared: cache.profile_updates = gpu_timestamp_profiling_enabled and not _gpu_timestamp_outer_only
 	if paged:
 		cache.requested_upload_budget_bytes = int(snapshot.get("streaming_budget", {}).get("upload_bytes_per_frame", 0))
+	_capture_gpu_timestamp(rd, "CLV Cache Update Begin")
 	var clipmap_updated: bool = cache.update_pages(rd, source, snapshot.get("prepared_transfer_pages", []),
 		int(snapshot.get("prepared_pages_revision", 0)), camera_world, gi_radius_m) if paged \
 		else bool(cache.call("update_clipmap", rd, source, camera_world, false, camera_forward))
+	_capture_gpu_timestamp(rd, "CLV Cache Update End")
 	if paged:
 		# Paging may replace its compact GPU operator pool, including on failure.
 		_sync_owned_rid_snapshot()

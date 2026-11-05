@@ -18,7 +18,7 @@ static func build(header: Resource, camera_world: Vector3, resolution := 16,
 	var source_origin: Vector3 = header.get("origin_world")
 	var bounds: AABB = header.get("domain_bounds_world")
 	var available_levels := int(header.get("prepared_level_count"))
-	if not is_finite(base_spacing) or absf(base_spacing - 0.25) > 0.000001 \
+	if not is_finite(base_spacing) or base_spacing <= 0.0 \
 			or not source_origin.is_finite() or available_levels < 1 or available_levels > MAX_LEVELS:
 		return {"valid": false, "error": "invalid_paged_clv_source_geometry"}
 	# Reserve a half-cell for quantized center error plus a cell for the asymmetric
@@ -28,11 +28,13 @@ static func build(header: Resource, camera_world: Vector3, resolution := 16,
 	var texture_levels := mini(MAX_LEVELS, GUARANTEED_TEXTURE_DEPTH / (resolution * TENSOR_FIELDS))
 	var level_count := mini(available_levels, mini(required_levels, texture_levels))
 	var anchor := camera_world
-	# Preserve the existing small-room fit, where the camera may stand outside
-	# the entire authored source. Large worlds always center their windows on the
-	# camera; aiming toward a distant domain center would abandon nearby cells.
-	if available_levels <= 4 and bounds.size.max_axis_index() >= 0 \
-			and bounds.size[bounds.size.max_axis_index()] <= resolution * base_spacing * 4.0:
+	# Storage switches to paged baking as density increases, even for one room.
+	# Fit small domains by their sample span, not by how many LODs were stored:
+	# otherwise a finer bake moves its fine windows outside the room and forces
+	# both lighting and OLV receivers onto coarse levels. Large worlds remain
+	# centered on the camera. The span excludes the half-cell at either end.
+	var sample_span: Vector3i = header.get("dimensions") - Vector3i.ONE
+	if maxi(sample_span.x, maxi(sample_span.y, sample_span.z)) <= resolution * 4:
 		anchor = _small_domain_anchor(bounds, camera_world, resolution, base_spacing)
 	var source_key := [header.get_instance_id(), source_origin, base_spacing,
 		bounds, available_levels, resolution, level_count]

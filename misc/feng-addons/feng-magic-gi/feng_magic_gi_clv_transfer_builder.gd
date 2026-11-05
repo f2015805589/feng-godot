@@ -5,13 +5,14 @@ extends RefCounted
 ## operators, so changing the sun, sky, or an emitter still relights the field.
 
 const Boundary = preload("feng_magic_gi_boundary_tensor_builder.gd")
+const ProbeExclusion = preload("feng_magic_gi_probe_exclusion.gd")
 const Data = preload("feng_magic_gi_data.gd")
 const DirectionalBaker = preload("feng_magic_gi_directional_baker.gd")
 const DirectionalData = preload("feng_magic_gi_directional_data.gd")
 const OLVDomain = preload("feng_magic_gi_olv_domain.gd")
 const LEVELS := 4
 const REVISION := 5
-const SUPPORT_RADIUS := 0.65
+const SUPPORT_RADIUS_CELLS := 2.6
 const MAX_NEIGHBORS := 12
 const OUTPUT_SCHEMA_VERSION := 2
 const OUTPUT_COEFFICIENTS := 4 # SH2 is L0 + L1: four coefficients per RGB channel.
@@ -31,7 +32,7 @@ var _validity := PackedByteArray()
 var _dimensions := PackedInt32Array()
 var _offsets := PackedInt32Array()
 var _stats: Dictionary = {}
-var _support_radius := SUPPORT_RADIUS
+var _support_radius := 0.0
 var _surface_coordinates: Array[PackedFloat64Array] = []
 var _surface_coordinates_by_count: Dictionary = {}
 var _surface_target_cache: Dictionary = {}
@@ -88,7 +89,7 @@ func prepare_async(source: Resource, geometry: RefCounted,
 	_initialize_surface_target_cache_order()
 	_preparation_error = ""
 	_output_coefficients = OUTPUT_COEFFICIENTS
-	_support_radius = SUPPORT_RADIUS
+	_support_radius = SUPPORT_RADIUS_CELLS * source.spacing_m
 	_geometry = geometry
 	_columns = _output_coefficients * 4 + source.emitter_count * 6
 	_matrix_cache.clear()
@@ -187,7 +188,7 @@ func prepare_region_async(source: Resource, geometry: RefCounted,
 				or first_cell[axis] + dimensions[axis] > source.dimensions[axis]:
 			return {"ok": false, "error": "multires_prepare_region_out_of_bounds"}
 	if source_level < 0 or source_level >= 10 \
-			or absf(source.spacing_m - 0.25 * float(1 << source_level)) > 0.000001:
+			or source.source_lod != source_level:
 		return {"ok": false, "error": "multires_prepare_level_spacing_mismatch"}
 	_source = source
 	if not _surface_coordinates_are_valid(source, surface_coordinates):
@@ -200,7 +201,7 @@ func prepare_region_async(source: Resource, geometry: RefCounted,
 	_geometry = geometry
 	_output_coefficients = OUTPUT_COEFFICIENTS
 	_columns = _output_coefficients * 4 + source.emitter_count * 6
-	_support_radius = SUPPORT_RADIUS * source.spacing_m / 0.25
+	_support_radius = SUPPORT_RADIUS_CELLS * source.spacing_m
 	_matrix_cache.clear()
 	_solids.clear()
 	_stats = {"cells": 0, "supported": 0, "boundary_cells": 0,
@@ -249,6 +250,8 @@ func prepare_region_async(source: Resource, geometry: RefCounted,
 
 func _prepare_cell(world: Vector3, step: float, source_index: int, destination: int) -> void:
 	_stats.cells += 1
+	if ProbeExclusion.contains(world, _source.probe_exclusions):
+		return # Explicit exclusion is a hole, never a surface extrapolation target.
 	_activate_olv_target(source_index, world, step)
 	# A relocated source belongs to the free space at its actual position. A
 	# surface constraint must be reachable from that side before its lighting is
@@ -756,7 +759,8 @@ func _validate_olv_domain_context(source: Resource, context: Dictionary,
 	if not context.grid_origin_world is Vector3 \
 			or not Vector3(context.grid_origin_world).is_finite() \
 			or not is_finite(float(context.base_cell_spacing_m)) \
-			or absf(float(context.base_cell_spacing_m) - 0.25) > 0.000001:
+			or float(context.base_cell_spacing_m) <= 0.0 \
+			or not is_equal_approx(float(context.base_cell_spacing_m) * float(1 << source.source_lod), source.spacing_m):
 		return "target_grid_binding_invalid_or_unsupported_scale"
 	return ""
 
@@ -792,7 +796,9 @@ func _target_spacing_is_supported(target_spacing: float) -> bool:
 		return false
 	var supported: PackedFloat32Array = _olv_probe_payload.supported_target_cell_spacings_m
 	for spacing in supported:
-		if absf(float(spacing) - target_spacing) <= 0.000001:
+		# Target metadata is float32; non-binary pitches accumulate larger
+		# absolute rounding error at distant cascades (e.g. 0.3 m * 512).
+		if is_equal_approx(float(spacing), target_spacing):
 			return true
 	return false
 

@@ -22,7 +22,7 @@ extends Resource
 @export_storage var olv_binding_signature := ""
 
 func is_header_valid() -> bool:
-	if spacing_m != 0.25 or prepared_level_count < 1 or prepared_level_count > 10 \
+	if not is_finite(spacing_m) or spacing_m <= 0.0 or prepared_level_count < 1 or prepared_level_count > 10 \
 			or dimensions.x <= 0 or dimensions.y <= 0 or dimensions.z <= 0 \
 			or not origin_world.is_finite() or not source_transform_world.is_finite() \
 			or absf(source_transform_world.basis.determinant()) < 0.00000001 \
@@ -56,6 +56,7 @@ static func from_manifest(manifest: Resource) -> Resource:
 		return null
 	var result := new()
 	result.origin_world = manifest.prepared_source_origin_world
+	result.spacing_m = manifest.prepared_source_spacing_m
 	result.domain_bounds_world = manifest.world_bounds
 	result.dimensions = Vector3i((manifest.world_bounds.size / result.spacing_m).ceil())
 	result.prepared_level_count = manifest.prepared_level_count

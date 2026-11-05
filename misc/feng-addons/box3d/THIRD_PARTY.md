@@ -102,6 +102,13 @@ Local changes to the adapter:
   across the existing Box3D worker pool while keeping rigid impulses and mutual
   contact response ordered. This references Jolt's batched work architecture;
   soft/soft candidate caching remains an independent local implementation.
+- Reuse contiguous topology scratch for tearing. Bucket triangle corners and
+  edges by dense particle ID, then sort only each vertex's incident entries;
+  retain the old lexicographic split IDs, edge order and mass partition. Build
+  solver adjacency with CSR arrays and compute BVH centroids once per rebuild.
+  No particle, contact, substep or iteration is removed. This follows Jolt's
+  use of contiguous work arrays and preprocessing outside the iterative solve;
+  the tearable topology implementation is local, and no Jolt source was copied.
 - Add soft-body sleep islands and support-change wakeup (including deleted rigid
   and soft supports), without reducing substeps, iterations, or particle counts.
   Unchanged render callbacks reuse the filled mesh buffer; the engine's upload

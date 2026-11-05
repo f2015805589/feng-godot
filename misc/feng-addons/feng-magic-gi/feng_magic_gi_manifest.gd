@@ -18,6 +18,8 @@ const MAX_INDEXED_BLOCKS := 262144
 ## Empty remains the legacy surface-probe page format.
 @export_storage var transport_domain := ""
 @export_storage var prepared_source_origin_world := Vector3.ZERO
+## Persisted finest grid spacing. Older generations omitted it and used 0.25 m.
+@export_storage var prepared_source_spacing_m := 0.25
 @export_storage var prepared_level_count := 0
 @export_storage var prepared_emitter_ids := PackedStringArray()
 @export_storage var prepared_emitter_static_signatures := PackedInt64Array()
@@ -32,6 +34,8 @@ const MAX_INDEXED_BLOCKS := 262144
 @export_storage var prepared_bake_algorithm := ""
 ## Optional old source page path used only by explicit source-Probe diagnostics.
 @export_storage var prepared_debug_source_path := ""
+## Lightweight offline positions for independent OLV on multiresolution bakes.
+@export_storage var prepared_probe_layout_path := ""
 ## Editor-only OLV label provenance for the exact labels used while preparing
 ## immutable CLV operators. The Resource is kept once on the generation manifest
 ## rather than copied into every page.
@@ -114,6 +118,7 @@ func is_valid() -> bool:
 			and (prepared_level_count < 1 or prepared_level_count > 10 \
 			or prepared_operator_schema_version != 2 \
 			or not prepared_source_origin_world.is_finite() \
+			or not is_finite(prepared_source_spacing_m) or prepared_source_spacing_m <= 0.0 \
 			or prepared_source_signature.is_empty() \
 			or prepared_core_axis < 1 or prepared_core_axis > 32 \
 			or prepared_emitter_ids.size() > 32 \
@@ -218,7 +223,7 @@ func get_page_keys_for_level_bounds(level: int, bounds: AABB) -> PackedStringArr
 			or level >= prepared_level_count or not _valid_query_bounds(bounds): return result
 	if not _index_ready: _build_spatial_index()
 	if not _index_error.is_empty() or prepared_core_axis <= 0: return result
-	var step := 0.25 * float(1 << level)
+	var step := prepared_source_spacing_m * float(1 << level)
 	var first := Vector3i(((bounds.position - prepared_source_origin_world) / step + Vector3.ONE * 0.5).floor())
 	var last := Vector3i(((bounds.end - prepared_source_origin_world) / step + Vector3.ONE * 0.5).ceil()) - Vector3i.ONE
 	var first_brick := Vector3i((Vector3(first) / float(prepared_core_axis)).floor())
@@ -326,7 +331,7 @@ func _build_spatial_index() -> void:
 						and dims[axis] > 0 and dims[axis] <= prepared_core_axis
 			var coord := origin / maxi(prepared_core_axis, 1)
 			var prepared_key := "%d:%d,%d,%d" % [prepared_level, coord.x, coord.y, coord.z]
-			var step := 0.25 * float(1 << prepared_level)
+			var step := prepared_source_spacing_m * float(1 << prepared_level)
 			var expected_core := AABB(prepared_source_origin_world + Vector3(origin) * step - Vector3.ONE * step * 0.5, Vector3(dims) * step)
 			if not valid_core or _prepared_index.has(prepared_key) \
 					or not core.position.is_equal_approx(expected_core.position) or not core.size.is_equal_approx(expected_core.size):

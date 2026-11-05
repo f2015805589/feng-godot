@@ -9,6 +9,10 @@ const VolumeSourceBaker = preload("../feng_magic_gi_volume_source_baker.gd")
 const Builder = preload("../feng_magic_gi_clv_transfer_builder.gd")
 const SceneTracker = preload("../feng_magic_gi_scene_tracker.gd")
 const Emission = preload("../feng_magic_gi_emission.gd")
+const Header = preload("../feng_magic_gi_prepared_source_header.gd")
+const Layout = preload("../feng_magic_gi_prepared_clip_layout.gd")
+const Inference = preload("../feng_magic_gi_olv_inference_runner.gd")
+const ProbePayload = preload("../feng_magic_gi_olv_probe_domain_payload.gd")
 
 var checks := 0
 var failures := 0
@@ -26,14 +30,17 @@ func _run() -> void:
 	current_scene = scene_root
 
 	var volume := Volume.new()
+	var cell_spacing := 0.25
+	for argument in OS.get_cmdline_user_args():
+		if argument.begins_with("--cell-size="): cell_spacing = argument.get_slice("=", 1).to_float()
 	volume.name = "MagicGIVolume"
 	volume.show_probes = false
-	volume.size = Vector3(0.5, 0.5, 0.5)
+	volume.size = Vector3.ONE * (cell_spacing * 2.0)
 	volume.bake_samples = 1
 	volume.bake_bounces = 1
-	volume.bake_distance = 1.0
+	volume.bake_distance = cell_spacing * 4.0
 	volume.use_clv = true
-	volume.clv_cell_size = Chunk.CELL_SPACING_M
+	volume.clv_cell_size = cell_spacing
 	volume.clv_cache_backend = 1
 	volume.chunked_baking = false # Must still route to free-space source bake.
 	var output_root := "res://Temp/free_space_bake_integration_%d" % Time.get_ticks_usec()
@@ -43,6 +50,10 @@ func _run() -> void:
 	directional_light.name = "LiveSun"
 	scene_root.add_child(directional_light)
 	_add_emissive_wall(scene_root)
+	for name in ["BakeEmitterWall", "FixtureCeiling"]:
+		var fixture := scene_root.get_node(name) as MeshInstance3D
+		fixture.position *= cell_spacing / 0.25
+		fixture.scale = Vector3.ONE * (cell_spacing / 0.25)
 	await process_frame
 
 	var baked: bool = await volume.bake()
@@ -54,6 +65,17 @@ func _run() -> void:
 		return
 	var manifest: Manifest = volume.bake_manifest
 	var manifest_path := manifest.resource_path
+	_check(is_equal_approx(manifest.prepared_source_spacing_m, cell_spacing),
+		"published manifest persists the selected pitch")
+	var header := Header.from_manifest(manifest)
+	_check(header != null and is_equal_approx(header.spacing_m, cell_spacing),
+		"streaming header reconstructs the actual saved lattice")
+	var layout := Layout.build(header, Vector3.ZERO)
+	_check(bool(layout.get("valid", false)), "resident layout accepts the saved cell spacing")
+	if bool(layout.get("valid", false)):
+		for level in 4:
+			_check(is_equal_approx(float(layout.lods[level].spacing_m), cell_spacing * float(1 << level)),
+				"resident LOD spacing follows the baked pitch")
 	_check(manifest.transport_domain == "prepared_free_space_bricks_v1" \
 			and manifest.prepared_bake_algorithm == "prepared_clv_sh2_l0_l1_v3",
 		"small ordinary Bake publishes a fresh SH2 brick generation (domain=%s algorithm=%s)" \
@@ -68,6 +90,9 @@ func _run() -> void:
 		_check(brick_page != null and brick_page.is_valid(manifest.generation, String(entry.page_key)) \
 				and brick_page.prepared_transfer_brick != null and brick_page.free_space_volume_source == null,
 			"runtime brick page validates and does not eagerly contain the raw source archive")
+		if brick_page != null and brick_page.prepared_transfer_brick != null:
+			_check(is_equal_approx(brick_page.prepared_transfer_brick.source_spacing_m, cell_spacing),
+				"reloaded brick retains spacing for sampling, core bounds, and halo bounds")
 	var page_path := manifest.prepared_debug_source_path
 	var page := ResourceLoader.load(page_path, "", ResourceLoader.CACHE_MODE_IGNORE) as Page
 	_check(page != null and page.is_valid() and not page_path.is_empty(),
@@ -119,9 +144,26 @@ func _run() -> void:
 	_check(page.data == null and chunk.is_valid(page.geometry_signature,
 		chunk.emitter_ids, chunk.emitter_static_signatures),
 		"page contains the chunk exclusively; no legacy Data is mixed into it")
-	_check(chunk.spacing_m == 0.25 and chunk.dimensions == Vector3i(2, 2, 2)
+	_check(is_equal_approx(chunk.spacing_m, cell_spacing) and chunk.dimensions == Vector3i(2, 2, 2)
 			and chunk.probe_count == 8,
-		"source grid preserves the fixed .25 m pitch and expected fixture dimensions")
+		"source grid preserves the selected pitch and expected fixture dimensions")
+	_check(chunk.origin_world.is_equal_approx(chunk.domain_bounds_world.position + Vector3.ONE * (cell_spacing * 0.5)),
+		"first cell is centered using the selected spacing")
+	var olv_context := VolumeSourceBaker.make_olv_layout_context(volume, chunk.geometry_signature,
+		chunk.origin_world, chunk.dimensions, 4)
+	_check(is_equal_approx(float(olv_context.get("base_cell_spacing_m", 0.0)), cell_spacing),
+		"OLV labels bind to the selected lattice, independently of model feature extent")
+	_check(is_equal_approx(Inference.target_cell_spacings(chunk)[0], cell_spacing),
+		"offline OLV records the actual target spacing")
+	var olv_payload := ProbePayload.new()
+	olv_payload.supported_target_cell_spacings_m = PackedFloat32Array(Inference.target_cell_spacings(chunk))
+	var olv_builder := Builder.new()
+	olv_builder.set("_olv_probe_payload", olv_payload)
+	for level in 10:
+		_check(olv_builder.call("_target_spacing_is_supported", cell_spacing * float(1 << level)),
+			"serialized float32 OLV spacing remains accepted at every cascade")
+	_check(not olv_builder.call("_target_spacing_is_supported", cell_spacing * 1.5),
+		"OLV still rejects a genuinely different target lattice")
 	_check(chunk.emitter_count == 1 and chunk.emitter_ids.size() == 1
 			and chunk.emitter_static_signatures.size() == 1,
 		"bake persists a stable emissive-source identity and static signature")
@@ -192,8 +234,8 @@ func _run() -> void:
 			and FileAccess.file_exists(manifest_path),
 		"cancellation does not publish over or remove the previous valid generation")
 
-	print("FREE_SPACE_VOLUME_BAKE_INTEGRATION checks=%d failures=%d surface_targets=%d direct_probes=%d direct_bake_usec=%d manifest=%s page=%s" % [
-		checks, failures, int(chunk.clv_preparation_stats.get("surface_target_constraints", 0)),
+	print("FREE_SPACE_VOLUME_BAKE_INTEGRATION cell_spacing=%s checks=%d failures=%d surface_targets=%d direct_probes=%d direct_bake_usec=%d manifest=%s page=%s" % [
+		cell_spacing, checks, failures, int(chunk.clv_preparation_stats.get("surface_target_constraints", 0)),
 		int(chunk.clv_preparation_stats.get("surface_direct_probes", 0)),
 		int(chunk.clv_preparation_stats.get("surface_direct_bake_usec", 0)), manifest_path, page_path])
 	await _finish(scene_root)

@@ -12,6 +12,7 @@ const OLVDomain = preload("../../feng-magic-gi/feng_magic_gi_olv_domain.gd")
 ## Set before create(). Changing the resident window requires recreating its GPU
 ## resources; source spacing and the four baked transfer levels stay unchanged.
 var resolution := CLIPMAP_RESOLUTION
+var profile_updates := false
 var _prepared_dimensions := PackedInt32Array()
 var _prepared_offsets := PackedInt32Array()
 var _prepared_validity := PackedByteArray()
@@ -47,7 +48,19 @@ var _olv_partition_pipeline := RID()
 var _olv_partition_sampler := RID()
 var _olv_partition_uniform_set := RID()
 var _olv_resident_labels := PackedByteArray()
+var _olv_mapped_indices := PackedInt32Array()
+var _olv_lod_labels: Array[PackedByteArray] = []
+var _olv_lod_label_origins: Dictionary = {}
 var _olv_partition_update_count := 0
+var _olv_partition_updated_lods := 0
+var _raw_response := RID()
+var _premix_shader := RID()
+var _premix_pipeline := RID()
+var _premix_sampler := RID()
+var _premix_origins := RID()
+var _premix_uniforms := RID()
+var _premix_mapping_revision := -1
+var _premix_dispatch_count := 0
 
 func _clipmap_anchor_resolution() -> int:
 	return resolution
@@ -147,7 +160,7 @@ func create(rd: RenderingDevice, source: Resource, prepared_validation := false,
 	format.depth = dimensions.z * _response_field_count
 	format.usage_bits = RenderingDevice.TEXTURE_USAGE_STORAGE_BIT | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT \
 		| RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
-	texture_fields = [rd.texture_create(format, RDTextureView.new(), [])]
+	if not _create_response_fields(rd, format): return false
 	var dummy := RDTextureFormat.new()
 	dummy.texture_type = RenderingDevice.TEXTURE_TYPE_3D
 	dummy.format = RenderingDevice.DATA_FORMAT_R32G32_SFLOAT
@@ -166,7 +179,7 @@ func create(rd: RenderingDevice, source: Resource, prepared_validation := false,
 		return false
 	_shader = rd.shader_create_from_spirv(spirv, "Magic GI CLV Transfer Relight")
 	_pipeline = rd.compute_pipeline_create(_shader)
-	_gpu_bytes = operators.size() * 4 + clip_cell_count * (4 + _response_partition_count() * _response_field_count * (8 if _half_fields else 16)) + empty.size() * 4 + 124
+	_gpu_bytes = operators.size() * 4 + clip_cell_count * (4 + 2 * _response_partition_count() * _response_field_count * (8 if _half_fields else 16)) + empty.size() * 4 + 284
 	if _olv_label_atlas.is_valid():
 		_gpu_bytes += _olv_label_resolution * _olv_label_resolution * _olv_label_resolution * _olv_label_lod_count + clip_cell_count * 64 + 32
 	return update_clipmap(rd, source, camera_world, true, camera_forward) and is_ready_resources()
@@ -281,7 +294,7 @@ func relight(rd: RenderingDevice, live_gi_ubo: RID, snapshot: Dictionary,
 	var relight_indices := _olv_partition_indices if partition_count == 2 else _clip_source_indices
 	var relight_uniforms: Array[RDUniform] = [U.storage_buffer(0, _transfer),
 		U.storage_buffer(1, relight_indices), U.storage_buffer(2, _live_sources),
-		U.uniform_buffer(3, live_gi_ubo), U.image(4, texture_fields[0])]
+		U.uniform_buffer(3, live_gi_ubo), U.image(4, _raw_response)]
 	if partition_count == 2: relight_uniforms.append(U.storage_buffer(5, _olv_partition_weights))
 	var uniforms := UniformSetCacheRD.get_cache(_shader, 0, relight_uniforms)
 	if not uniforms.is_valid():
@@ -299,6 +312,7 @@ func relight(rd: RenderingDevice, live_gi_ubo: RID, snapshot: Dictionary,
 	rd.compute_list_dispatch(list, (relight_cells + 63) / 64, 1, 1)
 	rd.compute_list_end()
 	if profile_timestamps: rd.capture_timestamp("Magic GI Dynamic Volume Relight End")
+	if not _premix_response(rd, profile_timestamps): return false
 	_last_lighting_key = key.duplicate(true)
 	_last_live_sources = live.duplicate()
 	_ready = true
@@ -307,7 +321,8 @@ func relight(rd: RenderingDevice, live_gi_ubo: RID, snapshot: Dictionary,
 	return true
 
 func is_ready_resources() -> bool:
-	return _pipeline.is_valid() and _shader.is_valid() and parameters.is_valid() \
+	return _premix_pipeline.is_valid() and _raw_response.is_valid() \
+		and _pipeline.is_valid() and _shader.is_valid() and parameters.is_valid() \
 		and _transfer.is_valid() and _live_sources.is_valid() and _clip_source_indices.is_valid() \
 		and _clip_validity.is_valid() and _clip_relocation.is_valid() \
 		and texture_fields.size() == 1 and texture_fields[0].is_valid() and moment_texture.is_valid()
@@ -337,7 +352,7 @@ func _configure_olv(rd: RenderingDevice, labels: Resource, context: Dictionary,
 	if scene_id.is_empty() or volume_id.is_empty() or layout_revision < 0 \
 			or layout_signature.is_empty() or not grid_origin is Vector3 \
 			or not Vector3(grid_origin).is_finite() \
-			or not is_finite(base_spacing) or absf(base_spacing - 0.25) > 0.000001 \
+			or not is_finite(base_spacing) or base_spacing <= 0.0 \
 			or not source_origin.is_finite() or not is_finite(source_spacing) \
 			or absf(source_spacing - base_spacing) > 0.000001 \
 			or Vector3(grid_origin).distance_to(source_origin) > 0.0001:
@@ -402,6 +417,65 @@ func _configure_olv(rd: RenderingDevice, labels: Resource, context: Dictionary,
 		return false
 	return true
 
+func _create_response_fields(rd: RenderingDevice, format: RDTextureFormat) -> bool:
+	_raw_response = rd.texture_create(format, RDTextureView.new(), [])
+	texture_fields = [rd.texture_create(format, RDTextureView.new(), [])]
+	var path := "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_premix_r16.glsl" if _half_fields \
+		else "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_premix.glsl"
+	var resource := load(path) as RDShaderFile
+	if resource == null or not resource.base_error.is_empty():
+		_error = "clv_premix_shader_unavailable: " + (resource.base_error if resource != null else path)
+		return false
+	var spirv := resource.get_spirv()
+	if spirv == null or not spirv.compile_error_compute.is_empty():
+		_error = "clv_premix_shader_not_compiled: " + (spirv.compile_error_compute if spirv != null else path)
+		return false
+	_premix_shader = rd.shader_create_from_spirv(spirv, "Magic GI CLV Cascade Premix")
+	_premix_pipeline = rd.compute_pipeline_create(_premix_shader)
+	var state := RDSamplerState.new()
+	state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+	state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+	state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+	state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+	state.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+	_premix_sampler = rd.sampler_create(state)
+	_premix_origins = rd.storage_buffer_create(160)
+	return _raw_response.is_valid() and texture_fields[0].is_valid() \
+		and _premix_pipeline.is_valid() and _premix_sampler.is_valid() and _premix_origins.is_valid()
+
+func _premix_response(rd: RenderingDevice, profile_timestamps: bool) -> bool:
+	if _premix_mapping_revision != _clipmap_update_count:
+		var origins := PackedFloat32Array()
+		origins.resize(40)
+		for level in _lod_layouts.size():
+			var lod: Dictionary = _lod_layouts[level]
+			var origin: Vector3 = lod.origin_world
+			for axis in 3: origins[level * 4 + axis] = origin[axis]
+			origins[level * 4 + 3] = lod.spacing_m
+		if rd.buffer_update(_premix_origins, 0, 160, origins.to_byte_array()) != OK:
+			_error = "clv_premix_origins_upload_failed"
+			return false
+		_premix_mapping_revision = _clipmap_update_count
+	if not _premix_uniforms.is_valid():
+		_premix_uniforms = rd.uniform_set_create([
+			U.sampled(0, _premix_sampler, _raw_response), U.image(1, texture_fields[0]),
+			U.storage_buffer(2, _premix_origins)], _premix_shader, 0)
+	if not _premix_uniforms.is_valid():
+		_error = "clv_premix_uniform_set_failed"
+		return false
+	if profile_timestamps: rd.capture_timestamp("Magic GI CLV Premix Begin")
+	var list := rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(list, _premix_pipeline)
+	rd.compute_list_bind_uniform_set(list, _premix_uniforms, 0)
+	var partitions := _response_partition_count()
+	var push := PackedInt32Array([resolution, _lod_layouts.size(), partitions, _response_field_count]).to_byte_array()
+	rd.compute_list_set_push_constant(list, push, push.size())
+	rd.compute_list_dispatch(list, (clip_cell_count * partitions + 63) / 64, 1, 1)
+	rd.compute_list_end()
+	if profile_timestamps: rd.capture_timestamp("Magic GI CLV Premix End")
+	_premix_dispatch_count += 1
+	return true
+
 func _prepared_relight_shader_path() -> String:
 	if _olv_label_atlas.is_valid():
 		return "res://addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_partition_relight_r16.glsl" if _half_fields \
@@ -427,7 +501,8 @@ func _create_olv_partition_resources(rd: RenderingDevice) -> bool:
 	return _olv_partition_shader.is_valid() and _olv_partition_pipeline.is_valid() \
 		and _olv_partition_indices.is_valid() and _olv_partition_weights.is_valid() and _olv_partition_sampler.is_valid()
 
-func _update_olv_partition_indices(rd: RenderingDevice) -> bool:
+func _update_olv_partition_indices(rd: RenderingDevice, lod_mask: int) -> bool:
+	if lod_mask == 0: return true
 	if not _olv_partition_pipeline.is_valid() or not _clip_source_indices.is_valid(): return false
 	var texture_uniform := RDUniform.new()
 	texture_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_TEXTURE
@@ -442,20 +517,25 @@ func _update_olv_partition_indices(rd: RenderingDevice) -> bool:
 			U.storage_buffer(0, _clip_source_indices), texture_uniform, sampler_uniform,
 			U.storage_buffer(3, _olv_partition_indices), U.storage_buffer(4, _olv_partition_weights)], _olv_partition_shader, 0)
 	if not _olv_partition_uniform_set.is_valid(): return false
+	if profile_updates: rd.capture_timestamp("Magic GI OLV Mapping Begin")
 	var list := rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, _olv_partition_pipeline)
 	rd.compute_list_bind_uniform_set(list, _olv_partition_uniform_set, 0)
-	var push := PackedInt32Array([resolution, _olv_label_lod_count, _olv_label_resolution, _olv_label_encoding]).to_byte_array()
+	var push := PackedInt32Array([resolution, _olv_label_lod_count, _olv_label_resolution, _olv_label_encoding, lod_mask]).to_byte_array()
 	rd.compute_list_set_push_constant(list, push, push.size())
 	rd.compute_list_dispatch(list, (clip_cell_count * 2 + 63) / 64, 1, 1)
 	rd.compute_list_end()
+	if profile_updates: rd.capture_timestamp("Magic GI OLV Mapping End")
 	_olv_partition_update_count += 1
+	for lod in _olv_label_lod_count:
+		if lod_mask & (1 << lod): _olv_partition_updated_lods += 1
 	return true
 
 func _build_resident_olv_labels() -> PackedByteArray:
 	var labels := PackedByteArray()
 	var side := _olv_label_resolution
-	labels.resize(side * side * side * _olv_label_lod_count)
+	var cells_per_lod := side * side * side
+	_olv_lod_labels.resize(_olv_label_lod_count)
 	var halo := (side - resolution) / 2
 	var base_origin: Vector3 = _olv_label_context.get("grid_origin_world", Vector3.ZERO)
 	var base_spacing := float(_olv_label_context.get("base_cell_spacing_m", 0.25))
@@ -464,6 +544,10 @@ func _build_resident_olv_labels() -> PackedByteArray:
 		if level < 0 or level >= _olv_label_lod_count: continue
 		var step := base_spacing * float(1 << level)
 		var first := Vector3i(((Vector3(lod.origin_world) - base_origin) / step).round()) - Vector3i.ONE * halo
+		if _olv_lod_label_origins.get(level) == first and _olv_lod_labels[level].size() == cells_per_lod:
+			continue
+		var layer := PackedByteArray()
+		layer.resize(cells_per_lod)
 		var last := first + Vector3i.ONE * (side - 1)
 		var begin_block := Vector3i(floori(first.x / 16.0), floori(first.y / 16.0), floori(first.z / 16.0))
 		var end_block := Vector3i(floori(last.x / 16.0), floori(last.y / 16.0), floori(last.z / 16.0))
@@ -474,8 +558,11 @@ func _build_resident_olv_labels() -> PackedByteArray:
 						var relative := Vector3i(record.x, record.y, record.z) - first
 						if relative.x < 0 or relative.y < 0 or relative.z < 0 \
 								or relative.x >= side or relative.y >= side or relative.z >= side: continue
-						var slot := ((level * side + relative.z) * side + relative.y) * side + relative.x
-						labels[slot] = record.w
+						var slot := (relative.z * side + relative.y) * side + relative.x
+						layer[slot] = record.w
+		_olv_lod_labels[level] = layer
+		_olv_lod_label_origins[level] = first
+	for layer in _olv_lod_labels: labels.append_array(layer)
 	return labels
 
 func _upload_olv_labels(rd: RenderingDevice, labels: PackedByteArray) -> bool:
@@ -483,21 +570,36 @@ func _upload_olv_labels(rd: RenderingDevice, labels: PackedByteArray) -> bool:
 	var depth := _olv_label_resolution * _olv_label_lod_count
 	if rd == null or labels.size() != _olv_label_resolution * _olv_label_resolution * depth:
 		return false
+	var lod_mask := 0
+	var label_stride := _olv_label_resolution * _olv_label_resolution * _olv_label_resolution
+	var index_stride := resolution * resolution * resolution
+	if _olv_resident_labels.size() != labels.size() or _olv_mapped_indices.size() != _resident_indices.size():
+		lod_mask = (1 << _olv_label_lod_count) - 1
+	else:
+		for lod in _olv_label_lod_count:
+			if labels.slice(lod * label_stride, (lod + 1) * label_stride) \
+					!= _olv_resident_labels.slice(lod * label_stride, (lod + 1) * label_stride) \
+					or _resident_indices.slice(lod * index_stride, (lod + 1) * index_stride) \
+					!= _olv_mapped_indices.slice(lod * index_stride, (lod + 1) * index_stride):
+				lod_mask |= 1 << lod
 	var metadata_disabled := PackedInt32Array([dimensions.x, dimensions.y, dimensions.z,
 		_runtime_layout_version, _olv_label_encoding, 0, depth, _olv_label_resolution]).to_byte_array()
 	if rd.buffer_update(_olv_label_parameters, 0, metadata_disabled.size(), metadata_disabled) != OK:
 		return false
 	var payload := labels
-	if rd.texture_update(_olv_label_atlas, 0, payload) != OK:
-		return false
-	if not _update_olv_partition_indices(rd): return false
+	if payload != _olv_resident_labels:
+		if profile_updates: rd.capture_timestamp("Magic GI OLV Upload Begin")
+		if rd.texture_update(_olv_label_atlas, 0, payload) != OK: return false
+		if profile_updates: rd.capture_timestamp("Magic GI OLV Upload End")
+		_olv_upload_count += 1
+		_olv_uploaded_bytes += payload.size()
+	if not _update_olv_partition_indices(rd, lod_mask): return false
 	_olv_resident_labels = labels
+	_olv_mapped_indices = _resident_indices
 	var metadata_enabled := PackedInt32Array([dimensions.x, dimensions.y, dimensions.z,
 		_runtime_layout_version, _olv_label_encoding, 1, depth, _olv_label_resolution]).to_byte_array()
 	if rd.buffer_update(_olv_label_parameters, 0, metadata_enabled.size(), metadata_enabled) != OK:
 		return false
-	_olv_upload_count += 1
-	_olv_uploaded_bytes += payload.size()
 	_olv_enabled = true
 	return true
 
@@ -521,6 +623,9 @@ func _clear_olv_binding(rd: RenderingDevice) -> void:
 	_olv_partition_sampler = RID()
 	_olv_partition_uniform_set = RID()
 	_olv_resident_labels.clear()
+	_olv_mapped_indices.clear()
+	_olv_lod_labels.clear()
+	_olv_lod_label_origins.clear()
 	_olv_label_set = null
 	_olv_label_context.clear()
 	_olv_label_blocks.clear()
@@ -538,10 +643,12 @@ func get_olv_binding() -> Dictionary:
 
 func owned_rids() -> Array[RID]:
 	var result: Array[RID] = []
+	if _premix_uniforms.is_valid(): result.append(_premix_uniforms)
 	if _olv_partition_uniform_set.is_valid(): result.append(_olv_partition_uniform_set)
 	result.append_array(super.owned_rids())
 	for rid in [_olv_label_atlas, _olv_label_parameters,
-			_olv_partition_indices, _olv_partition_weights, _olv_partition_pipeline, _olv_partition_shader, _olv_partition_sampler]:
+			_olv_partition_indices, _olv_partition_weights, _olv_partition_pipeline, _olv_partition_shader, _olv_partition_sampler,
+			_raw_response, _premix_pipeline, _premix_shader, _premix_sampler, _premix_origins]:
 		if rid.is_valid(): result.append(rid)
 	return result
 
@@ -588,7 +695,11 @@ func get_runtime_state() -> Dictionary:
 		"operator_output_coefficients": _output_coefficient_count,
 		"response_field_count": _response_field_count,
 		"response_partition_count": _response_partition_count(),
+		"cascade_blending": "compute_premix_center_aligned",
+		"premix_dispatch_count": _premix_dispatch_count,
+		"pixel_cascade_blend_samples": 1,
 		"olv_partition_update_count": _olv_partition_update_count,
+		"olv_partition_updated_lods": _olv_partition_updated_lods,
 		"sh_basis": "real_orthonormal_l0_l1_coefficients4",
 		"runtime_geometry_queries": 0, "runtime_pixel_neighbor_loop": false,
 		"field_format": "RGBA16F" if _half_fields else "RGBA32F", "decode_scale": _decode_scale,
@@ -599,6 +710,6 @@ func get_runtime_state() -> Dictionary:
 		"clipmap_camera_world": _clipmap_camera_world, "clipmap_anchor_world": _clipmap_anchor_world,
 		"dimensions": dimensions, "origin_world": origin_world, "spacing_m": spacing_m,
 		"domain_bounds_world": domain_bounds_world, "source_signature": source_signature,
-		"texture_count": 1, "resources_valid": is_ready_resources(), "ready": _ready,
+		"texture_count": 2, "resources_valid": is_ready_resources(), "ready": _ready,
 		"relight_revision": _relight_revision, "dispatch_count": _last_dispatch_count,
 		"last_error": _error, "gpu_bytes": _gpu_bytes}

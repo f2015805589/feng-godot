@@ -16,6 +16,7 @@ vec3 frp_magic_gi_olv_visible_ray(vec3 world, int view) {
 }
 #define FRP_MAGIC_GI_OLV_VISIBLE_RAY(world, view) frp_magic_gi_olv_visible_ray(world, view)
 #include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_sh9_tensor.glslinc"
+#include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_clv_blend_bounds.glslinc"
 #include "../../../../../misc/feng-addons/feng-render-pipeline/library/magic-gi/magic_gi_dynamic_volume_sample.glslinc"
 
 #endif // FRP_MAGIC_GI_DYNAMIC_VOLUME_GLSLINC

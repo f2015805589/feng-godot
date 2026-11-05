@@ -1,0 +1,67 @@
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform sampler3D raw_field;
+#ifdef CLV_HALF_OUTPUT
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image3D mixed_field;
+#else
+layout(rgba32f, set = 0, binding = 1) uniform writeonly image3D mixed_field;
+#endif
+layout(set = 0, binding = 2, std430) readonly buffer Origins { vec4 values[]; } origins;
+layout(push_constant, std430) uniform Config {
+    int resolution; int levels; int partitions; int fields;
+} config;
+
+void main() {
+    int width = config.resolution * config.partitions;
+    int depth = config.resolution * config.levels;
+    int cell = int(gl_GlobalInvocationID.x);
+    if (cell >= width * config.resolution * depth) return;
+    ivec3 position = ivec3(cell % width, (cell / width) % config.resolution,
+            cell / (width * config.resolution));
+    int level = position.z / config.resolution;
+    int domain_index = position.x / config.resolution;
+    ivec3 local = ivec3(position.x % config.resolution, position.y, position.z % config.resolution);
+    vec4 fine[4];
+    for (int field = 0; field < 4; field++) {
+        fine[field] = texelFetch(raw_field, position + ivec3(0, 0, field * depth), 0);
+    }
+    if (level + 1 < config.levels) {
+        vec4 origin = origins.values[level];
+        vec4 parent = origins.values[level + 1];
+        vec3 lower; vec3 upper;
+        magic_gi_clv_blend_bounds(origin, parent, config.resolution, lower, upper);
+        vec3 edge = min(vec3(local) - lower, upper - vec3(local));
+        float weight = smoothstep(0.0, 2.0, min(edge.x, min(edge.y, edge.z)));
+        bool valid_fine = fine[3].a > 1e-6;
+        if (weight < 1.0 || !valid_fine) {
+            vec3 grid = (origin.xyz + vec3(local) * origin.w - parent.xyz) / parent.w;
+            // Production windows have >=16 samples and a 2:1 spacing ratio.
+            // Their transition shell lies strictly inside the parent's unblended
+            // interior. Read the immutable raw field: no in-place texture hazard,
+            // no recursive mixing or accumulated blur on subsequent relights.
+            if (all(greaterThanEqual(grid, vec3(0.0))) &&
+                    all(lessThanEqual(grid, vec3(config.resolution - 1)))) {
+                vec4 coarse[4];
+                bool valid = true;
+                for (int field = 0; field < 4; field++) {
+                    vec3 texel = grid + vec3(float(domain_index * config.resolution) + 0.5,
+                            0.5, float((level + 1) * config.resolution + field * depth) + 0.5);
+                    coarse[field] = textureLod(raw_field,
+                            texel / vec3(width, config.resolution, depth * config.fields), 0.0);
+                    valid = valid && !any(isnan(coarse[field])) && !any(isinf(coarse[field]));
+                }
+                if (valid && coarse[3].a > 1e-6) {
+                    for (int field = 0; field < 4; field++) {
+                        // Coefficients remain coverage-premultiplied. Normalize
+                        // once in shading, after spatial interpolation. Each OLV
+                        // partition mixes only with the same parent partition;
+                        // labels themselves are never filtered or rewritten.
+                        fine[field] = valid_fine ? mix(coarse[field], fine[field], weight) : coarse[field];
+                    }
+                }
+            }
+        }
+    }
+    for (int field = 0; field < 4; field++) {
+        imageStore(mixed_field, position + ivec3(0, 0, field * depth), fine[field]);
+    }
+}

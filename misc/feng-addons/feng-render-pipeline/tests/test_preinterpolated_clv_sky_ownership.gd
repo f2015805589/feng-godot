@@ -145,6 +145,7 @@ func _shader_source() -> String:
 	var tensor := FileAccess.get_file_as_string(LIBRARY + "magic_gi_sh4_tensor.glslinc")
 	var sampling := FileAccess.get_file_as_string(LIBRARY + "magic_gi_dynamic_volume_sample.glslinc")
 	sampling = sampling.replace("#include \"magic_gi_sh4_tensor.glslinc\"", "")
+	tensor += FileAccess.get_file_as_string(LIBRARY + "magic_gi_clv_blend_bounds.glslinc")
 	# Optional mutation control: the unchanged numerical assertions must FAIL
 	# with the former coverage-scaled sky subtraction (two partial-support cases).
 	if OS.get_cmdline_user_args().has("--legacy-coverage-control"):

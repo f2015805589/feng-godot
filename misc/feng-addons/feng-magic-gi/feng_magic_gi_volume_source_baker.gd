@@ -19,6 +19,7 @@ const OLVProbePayload = preload("feng_magic_gi_olv_probe_domain_payload.gd")
 const OLVDomain = preload("feng_magic_gi_olv_domain.gd")
 const OLVLabelSet = preload("feng_magic_gi_olv_label_set.gd")
 const OLVInferenceRunner = preload("feng_magic_gi_olv_inference_runner.gd")
+const ProbeExclusion = preload("feng_magic_gi_probe_exclusion.gd")
 const MIN_MOMENT_RAYS := 256
 const DEFAULT_WORK_BUDGET_PER_BATCH := 8000000
 const DEFAULT_MAX_RELOCATION_M := 0.05
@@ -58,14 +59,14 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 		return _failure("A free-space source bake requires an in-tree FMagicGIVolume.")
 	var samples := int(options.get("samples", volume.bake_samples))
 	var multires := bool(options.get("multires_working_chunk", false))
-	var source_spacing := float(options.get("source_spacing_m", Chunk.CELL_SPACING_M)) if multires else Chunk.CELL_SPACING_M
-	if source_spacing not in [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]:
+	var source_spacing := float(options.get("source_spacing_m", volume.clv_cell_size)) if multires else float(volume.clv_cell_size)
+	if not is_finite(source_spacing) or source_spacing <= 0.0:
 		return _failure("Invalid multiresolution source spacing.")
 	var bounces := int(options.get("bounces", volume.bake_bounces))
 	var trace_distance := float(options.get("trace_distance_m", volume.bake_distance))
 	var moment_rays := int(options.get("moment_rays", maxi(samples, MIN_MOMENT_RAYS)))
 	var maximum_relocation := float(options.get("maximum_relocation_m",
-			DEFAULT_MAX_RELOCATION_M))
+			minf(DEFAULT_MAX_RELOCATION_M, source_spacing * 0.2)))
 	var max_work_per_batch := int(options.get("max_work_per_batch",
 			DEFAULT_WORK_BUDGET_PER_BATCH))
 	if samples <= 0 or samples > MAX_BAKE_SAMPLES \
@@ -73,7 +74,7 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 			or not is_finite(trace_distance) or trace_distance <= 0.0 or trace_distance > 4096.0 \
 			or moment_rays < MIN_MOMENT_RAYS or moment_rays > MAX_MOMENT_RAYS \
 			or not is_finite(maximum_relocation) or maximum_relocation < 0.0 \
-			or maximum_relocation > Chunk.CELL_SPACING_M * 0.2 \
+			or maximum_relocation > source_spacing * 0.2 \
 			or max_work_per_batch <= 0:
 		return _failure("Invalid bake settings; samples are never silently reduced and moments require at least 256 rays.")
 	var source_size: Vector3 = volume.size
@@ -92,7 +93,7 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	if dimensions.x <= 0 or dimensions.y <= 0 or dimensions.z <= 0 \
 			or dimensions.x > Chunk.MAX_AXIS or dimensions.y > Chunk.MAX_AXIS \
 			or dimensions.z > Chunk.MAX_AXIS:
-		return _failure("The .25m free-space grid exceeds the supported per-axis extent.")
+		return _failure("The free-space grid exceeds the supported per-axis extent.")
 	# A path may advance one maximum-distance segment at every bounce; collecting
 	# only one segment around the volume would silently omit farther indirect hits.
 	var collection_grow := trace_distance * float(bounces + 1)
@@ -126,6 +127,7 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	source.bake_bounces = bounces
 	source.moment_rays = moment_rays
 	source.maximum_relocation_m = maximum_relocation
+	source.probe_exclusions = ProbeExclusion.capture(volume)
 	source.emitter_ids = emitter_ids
 	source.emitter_count = emitter_ids.size()
 	source.emitter_static_signatures = emitter_signatures
@@ -136,7 +138,7 @@ func bake_async(volume: Node3D, options: Dictionary = {},
 	source.source_lod = int(options.get("source_level", 0)) if multires else 0
 	if bool(options.get("olv_inference_requested", false)) and not multires:
 		var layout_context := make_olv_layout_context(volume, source.geometry_signature,
-				source_bounds_world.position + Vector3.ONE * (Chunk.CELL_SPACING_M * 0.5),
+				source.origin_world,
 				dimensions, 4)
 		if layout_context.is_empty():
 			return _failure("Could not bind the OLV classifier to the free-space CLV layout.")
@@ -377,7 +379,7 @@ func _infer_olv_for_source(source: Chunk, geometry: RefCounted,
 		1 if bool(options.get("multires_working_chunk", false)) else 4)
 
 
-func bind_olv_result(source: Chunk, inferred: Dictionary, layout_context: Dictionary,
+func bind_olv_result(source: Resource, inferred: Dictionary, layout_context: Dictionary,
 		target_lod_count := 4) -> Dictionary:
 	var labels: PackedByteArray = inferred.labels
 	var label_set := OLVLabelSet.new()
@@ -388,14 +390,16 @@ func bind_olv_result(source: Chunk, inferred: Dictionary, layout_context: Dictio
 		return _failure("Could not bind inferred OLV labels to the active bake: " +
 			String(configure_labels.get("error", "label_set_configure_failed")))
 	label_set.receiver_labels_complete = true
-	var last_lod := mini(OLVDomain.MAX_LOD + 1, source.source_lod + target_lod_count)
+	var multires := source.has_method("olv_cell_lod")
 	for logical_index in source.probe_count:
 		var label := int(labels[logical_index])
 		if not source.cell_is_valid(logical_index) or not OLVDomain.is_supervised_label(label):
 			continue
 		var local_cell: Vector3i = source.cell_coordinates(logical_index)
-		for target_lod in range(source.source_lod, last_lod):
-			var stride := 1 << (target_lod - source.source_lod)
+		var source_lod: int = source.olv_cell_lod(logical_index) if multires else source.source_lod
+		var last_lod := mini(OLVDomain.MAX_LOD + 1, source_lod + (1 if multires else target_lod_count))
+		for target_lod in range(source_lod, last_lod):
+			var stride := 1 << (target_lod - source_lod)
 			if local_cell.x % stride != 0 or local_cell.y % stride != 0 \
 					or local_cell.z % stride != 0:
 				continue
@@ -469,7 +473,7 @@ func _reuse_olv_for_source(source: Chunk, options: Dictionary) -> Dictionary:
 ## builder's exact source-to-CLV anchor check.
 static func make_olv_layout_context(volume: Node3D, geometry_signature: int,
 		grid_origin_world: Vector3, global_dimensions: Vector3i,
-		prepared_levels: int, revision_override := -1) -> Dictionary:
+		prepared_levels: int, revision_override := -1, baked_spacing_m := 0.0) -> Dictionary:
 	if not is_instance_valid(volume) or not volume.has_method("layout_revision") \
 			or not grid_origin_world.is_finite() or global_dimensions.x <= 0 \
 			or global_dimensions.y <= 0 or global_dimensions.z <= 0:
@@ -480,6 +484,10 @@ static func make_olv_layout_context(volume: Node3D, geometry_signature: int,
 			else revision_override
 	if scene_id.is_empty() or volume_id.is_empty():
 		return {}
+	# Independent edits must label the retained source, even while the inspector
+	# contains a new spacing that has not been baked yet.
+	var base_spacing := baked_spacing_m if baked_spacing_m > 0.0 else float(volume.clv_cell_size)
+	if not is_finite(base_spacing) or base_spacing <= 0.0: return {}
 	var signature_payload := {
 		"schema": "feng_magic_gi_olv_clv_layout_binding_v1",
 		"scene_id": scene_id,
@@ -488,7 +496,7 @@ static func make_olv_layout_context(volume: Node3D, geometry_signature: int,
 		"geometry_signature": geometry_signature,
 		"grid_origin_world": [grid_origin_world.x, grid_origin_world.y, grid_origin_world.z],
 		"global_dimensions": [global_dimensions.x, global_dimensions.y, global_dimensions.z],
-		"base_cell_spacing_m": Chunk.CELL_SPACING_M,
+		"base_cell_spacing_m": base_spacing,
 		"prepared_levels": prepared_levels,
 	}
 	var layout_signature := JSON.stringify(signature_payload, "", true, true).sha256_text()
@@ -499,7 +507,7 @@ static func make_olv_layout_context(volume: Node3D, geometry_signature: int,
 		"target_layout_signature": layout_signature,
 		"layout_signature": layout_signature,
 		"grid_origin_world": grid_origin_world,
-		"base_cell_spacing_m": Chunk.CELL_SPACING_M,
+		"base_cell_spacing_m": base_spacing,
 	}
 
 ## Attach a completed chunk to a source-only immutable page. The chunk has already
@@ -563,7 +571,7 @@ static func save_generation(volume: Node3D, chunk: Resource, generation: String,
 	if reloaded_page == null or not reloaded_page.is_valid(generation, page_key) \
 			or reloaded_page.data != null or reloaded_page.free_space_volume_source == null \
 			or reloaded_page.free_space_volume_source.geometry_signature != chunk.geometry_signature \
-			or reloaded_page.free_space_volume_source.spacing_m != Chunk.CELL_SPACING_M \
+			or not is_equal_approx(reloaded_page.free_space_volume_source.spacing_m, chunk.spacing_m) \
 			or reloaded_page.free_space_volume_source.emitter_ids != chunk.emitter_ids:
 		return {"error": "Saved free-space source page failed reload validation."}
 	var domain: AABB = chunk.domain_bounds_world
@@ -649,7 +657,7 @@ static func geometry_signature_for(geometry: RefCounted) -> int:
 		sampler_fingerprint])
 
 ## Source-domain bake signature. Surface-placement and paging controls do not
-## affect this fixed .25 m regular grid and therefore must not stale its data.
+## affect this regular grid and therefore must not stale its data.
 static func settings_signature(volume: Node3D, olv_enabled: Variant = null,
 		stored_olv_model_sha256 := "") -> int:
 	if not is_instance_valid(volume) or not volume is Volume:
@@ -659,12 +667,15 @@ static func settings_signature(volume: Node3D, olv_enabled: Variant = null,
 			if olv_enabled == null else bool(olv_enabled)
 	var olv_model_binding := (OLVInferenceRunner.EXPECTED_MODEL_BUNDLE_SHA256 \
 		if stored_olv_model_sha256.is_empty() else stored_olv_model_sha256) if include_olv_binding else ""
-	return hash([TRANSPORT_DOMAIN, Chunk.SOURCE_SCHEMA_REVISION_CURRENT,
-		Chunk.CELL_SPACING_M, volume.global_transform, volume.size,
+	var values := [TRANSPORT_DOMAIN, Chunk.SOURCE_SCHEMA_REVISION_CURRENT,
+		volume.clv_cell_size, volume.global_transform, volume.size,
 		volume.bake_samples, volume.bake_bounces, volume.bake_distance,
 		volume.terrain_reflectance, volume.fallback_material_reflectance,
 		olv_model_binding,
-		volume.clv_cell_size, moment_rays, DEFAULT_MAX_RELOCATION_M])
+		volume.clv_cell_size, moment_rays, DEFAULT_MAX_RELOCATION_M]
+	var exclusions := ProbeExclusion.capture(volume)
+	if not exclusions.is_empty(): values.append(exclusions)
+	return hash(values)
 
 static func current_olv_signature_binding(volume: Node3D) -> bool:
 	if not is_instance_valid(volume):
@@ -693,13 +704,15 @@ func _classify_cells(source: Chunk, volume: Node3D, geometry: RefCounted,
 		var cell := source.cell_coordinates(index)
 		var center := source.origin_world + Vector3(cell) * source.spacing_m
 		var local_center := inverse * center
+		if ProbeExclusion.contains(center, source.probe_exclusions):
+			continue # No transport rays or OLV label are generated for excluded centers.
 		if not _inside_obb(local_center, half_size):
 			continue # Ceil padding and rotated-AABB corners do not become samples.
 		if not geometry.point_is_inside_or_ambiguous_solid(center):
 			source.validity[index] = Chunk.RELOCATION_STATUS_VALID
 			continue
 		var relocated := _find_safe_local_relocation(center, inverse, half_size,
-				maximum_offset, geometry)
+				maximum_offset, geometry, source.probe_exclusions)
 		if relocated.is_empty():
 			continue
 		var actual_center: Vector3 = relocated["position"]
@@ -711,13 +724,15 @@ func _classify_cells(source: Chunk, volume: Node3D, geometry: RefCounted,
 	return true
 
 func _find_safe_local_relocation(center: Vector3, inverse: Transform3D,
-		half_size: Vector3, maximum_offset: float, geometry: RefCounted) -> Dictionary:
+		half_size: Vector3, maximum_offset: float, geometry: RefCounted,
+		exclusions: Array[Transform3D] = []) -> Dictionary:
 	if maximum_offset <= 0.0:
 		return {}
 	for radius_scale in [0.25, 0.5, 0.75, 1.0]:
 		var radius := maximum_offset * float(radius_scale)
 		for direction in RELOCATION_DIRECTIONS:
 			var candidate: Vector3 = center + direction.normalized() * radius
+			if ProbeExclusion.contains(candidate, exclusions): continue
 			if not _inside_obb(inverse * candidate, half_size):
 				continue
 			if not geometry.point_is_inside_or_ambiguous_solid(candidate):

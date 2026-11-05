@@ -5,6 +5,8 @@ const Header = preload("res://addons/feng-magic-gi/feng_magic_gi_prepared_source
 const Brick = preload("res://addons/feng-magic-gi/feng_magic_gi_prepared_transfer_brick.gd")
 const Labels = preload("res://addons/feng-magic-gi/feng_magic_gi_olv_label_set.gd")
 const Domain = preload("res://addons/feng-magic-gi/feng_magic_gi_olv_domain.gd")
+const Manifest = preload("res://addons/feng-magic-gi/feng_magic_gi_manifest.gd")
+const Pass = preload("res://addons/feng-render-pipeline/passes/magic_gi_pass.gd")
 const WholeCache = preload("res://addons/feng-render-pipeline/passes/magic_gi_preinterpolated_volume_cache.gd")
 const PagedCache = preload("res://addons/feng-render-pipeline/passes/magic_gi_paged_prepared_volume_cache.gd")
 
@@ -15,8 +17,9 @@ const VOLUME_ID := "native-cache-fixture-volume"
 const GEOMETRY_SIGNATURE := 174921
 const LAYOUT_SIGNATURE := "native-cache-fixture-layout"
 const LAYOUT_REVISION := 3
-const SOURCE_ORIGIN := Vector3(-1.875, -1.875, -1.875)
-const SOURCE_BOUNDS := AABB(Vector3(-2.0, -2.0, -2.0), Vector3(4.0, 4.0, 4.0))
+var cell_spacing := 0.25
+var source_origin := Vector3(-1.875, -1.875, -1.875)
+var source_bounds := AABB(Vector3(-2.0, -2.0, -2.0), Vector3(4.0, 4.0, 4.0))
 
 var checks := 0
 var failures := 0
@@ -37,6 +40,11 @@ func _check(condition: bool, message: String) -> void:
 
 
 func _run() -> void:
+	for argument in OS.get_cmdline_user_args():
+		if argument.begins_with("--cell-size="):
+			cell_spacing = argument.get_slice("=", 1).to_float()
+	source_bounds = AABB(Vector3.ONE * (-RES * cell_spacing * 0.5), Vector3.ONE * RES * cell_spacing)
+	source_origin = source_bounds.position + Vector3.ONE * cell_spacing * 0.5
 	rd = RenderingServer.create_local_rendering_device()
 	_check(rd != null, "local RenderingDevice must be available")
 	if rd == null:
@@ -46,6 +54,7 @@ func _run() -> void:
 	var olv_context := _make_context(label_set)
 	var source := _make_whole_source(olv_context)
 	_check(source.has_preinterpolated_clv(), "synthetic SH2 source must satisfy the production cache input contract")
+	_check_renderer_binding(source, label_set, olv_context)
 	whole_cache = WholeCache.new()
 	var whole_ok: bool = whole_cache.create(rd, source, true, 8, Vector3.ZERO,
 			Vector3.FORWARD, label_set, olv_context)
@@ -57,8 +66,10 @@ func _run() -> void:
 				"whole cache same-camera update must succeed")
 		_check(int(whole_cache.get("_olv_upload_count")) == upload_count,
 				"unchanged whole residency must not re-upload the label atlas")
+		_check_partition_update_reuse(whole_cache)
 
 	var header := _make_header()
+	_check_renderer_binding(header, label_set, olv_context)
 	var brick := _make_brick()
 	_check(header.is_header_valid(), "synthetic paged header must satisfy production validation")
 	_check(brick.is_header_valid(), "synthetic resident brick must satisfy production validation")
@@ -68,6 +79,7 @@ func _run() -> void:
 	_check(paged_ok, "paged prepared cache create failed: %s" % str(paged_cache.get("_error")))
 	if paged_ok:
 		_check_resident_upload(paged_cache, 7, Vector3i(16, 16, 16), 0)
+		_check_operator_upload(paged_cache, brick)
 		var upload_count := int(paged_cache.get("_olv_upload_count"))
 		_check(paged_cache.update_pages(rd, header, [{"brick": brick}], 1,
 				Vector3.ZERO, 512.0, false), "paged unchanged-revision update must succeed")
@@ -75,10 +87,114 @@ func _run() -> void:
 				"unchanged paged residency must not re-upload the label atlas")
 		_check(paged_cache.update_pages(rd, header, [{"brick": brick}], 2,
 				Vector3.ZERO, 512.0, false), "paged generation revision update must succeed")
-		_check(int(paged_cache.get("_olv_upload_count")) == upload_count + 1,
-				"new paged generation must refresh the resident label atlas once")
+		_check(int(paged_cache.get("_olv_upload_count")) == upload_count,
+				"page revision alone must not re-upload unchanged categorical labels")
 		_check_resident_upload(paged_cache, 7, Vector3i(16, 16, 16), 0)
+		_check_evicted_slots(paged_cache, header, brick)
 	_finish()
+
+
+func _check_renderer_binding(source: Resource, labels: Resource, context: Dictionary) -> void:
+	# Exercise the real pass gate BEFORE direct cache upload. Cache-only tests
+	# previously missed a quarter-meter-only rejection here.
+	var manifest := Manifest.new()
+	manifest.scene_identity = SCENE_ID
+	manifest.volume_identity = VOLUME_ID
+	manifest.prepared_olv_filter_enabled = true
+	manifest.prepared_olv_label_set = labels
+	manifest.prepared_olv_context = context.duplicate(true)
+	var pass_value := Pass.new()
+	var snapshot := {"manifest": manifest}
+	_check(not pass_value._validated_native_olv_binding(snapshot, source).is_empty(),
+		"renderer admits OLV at the actual baked spacing before cache creation")
+	manifest.prepared_olv_context.base_cell_spacing_m = cell_spacing * 2.0
+	_check(pass_value._validated_native_olv_binding(snapshot, source).is_empty(),
+		"renderer rejects labels for a genuinely different lattice")
+	manifest.prepared_olv_context.base_cell_spacing_m = cell_spacing
+	_check(not pass_value._validated_native_olv_binding(snapshot, source).is_empty(),
+		"restoring the matching lattice restores OLV")
+	manifest.prepared_olv_context.grid_origin_world += Vector3.RIGHT * cell_spacing
+	_check(pass_value._validated_native_olv_binding(snapshot, source).is_empty(),
+		"matching spacing cannot conceal a shifted label origin")
+
+
+func _check_evicted_slots(cache: RefCounted, header: Resource, brick: Resource) -> void:
+	var old_indices: PackedInt32Array = cache.get("_resident_indices")
+	var missing: Resource = brick.duplicate(true)
+	for i in 32: missing.validity[i] = 0
+	_check(cache.update_pages(rd, header, [{"brick": missing}], 3, Vector3.ZERO, 512.0),
+		"evicting a row preserves the current resident pool")
+	rd.submit()
+	rd.sync()
+	var indices: PackedInt32Array = cache.get("_resident_indices")
+	var mapping := rd.buffer_get_data(cache.get("_olv_partition_indices")).to_int32_array()
+	var pool := rd.buffer_get_data(cache.get("_transfer")).to_float32_array()
+	_check(indices[0] == -1 and mapping[0] == -1,
+		"evicted operators are unreachable from both source and OLV partition mappings")
+	_check(pool[old_indices[0] * brick.operator_stride()] == brick.operators[0],
+		"eviction does not issue a redundant GPU clear")
+	_check_operator_upload(cache, missing)
+	var restored: Resource = brick.duplicate(true)
+	restored.operators[0] = 0.75
+	_check(cache.update_pages(rd, header, [{"brick": restored}], 4, Vector3.ZERO, 512.0),
+		"new arrivals reuse freed slots")
+	_check_operator_upload(cache, restored)
+
+
+func _check_operator_upload(cache: RefCounted, brick: Resource) -> void:
+	rd.submit()
+	rd.sync()
+	var actual := rd.buffer_get_data(cache.get("_transfer")).to_float32_array()
+	var indices: PackedInt32Array = cache.get("_resident_indices")
+	var stride: int = brick.operator_stride()
+	var correct := true
+	for cell in CELL_COUNT:
+		if brick.validity[cell] == 0:
+			correct = correct and indices[cell] == -1
+			continue
+		var offset := indices[cell] * stride
+		if offset < 0 or offset + stride > actual.size() \
+				or actual.slice(offset, offset + stride) != brick.operators.slice(cell * stride, (cell + 1) * stride):
+			correct = false
+			break
+	_check(correct, "coalesced uploads preserve every cell's complete operator row in the GPU pool")
+
+
+func _check_partition_update_reuse(cache: RefCounted) -> void:
+	var labels: PackedByteArray = cache.get("_olv_resident_labels")
+	var original: PackedInt32Array = cache.get("_resident_indices")
+	var uploads := int(cache.get("_olv_upload_count"))
+	var updates := int(cache.get("_olv_partition_update_count"))
+	_check(cache._upload_olv_labels(rd, labels), "unchanged partition remains publishable")
+	_check(int(cache.get("_olv_partition_update_count")) == updates,
+		"unchanged source mapping and labels dispatch no reconstruction")
+	var changed := original.duplicate()
+	changed[0] = -1
+	cache.set("_resident_indices", changed)
+	_check(rd.buffer_update(cache.get("_clip_source_indices"), 0, changed.size() * 4,
+		changed.to_byte_array()) == OK, "changed fine mapping reaches its GPU source buffer")
+	var updated_lods := int(cache.get("_olv_partition_updated_lods"))
+	_check(cache._upload_olv_labels(rd, labels), "changed fine source mapping is reconstructed")
+	_check(int(cache.get("_olv_partition_updated_lods")) == updated_lods + 1,
+		"only the changed fine cascade is rebuilt")
+	_check(int(cache.get("_olv_upload_count")) == uploads,
+		"source mapping changes reuse the unchanged label texture")
+	rd.submit()
+	rd.sync()
+	var incremental := rd.buffer_get_data(cache.get("_olv_partition_indices"))
+	var incremental_weights := rd.buffer_get_data(cache.get("_olv_partition_weights"))
+	_check(incremental.to_int32_array()[0] == -1,
+		"removing the only exterior source removes its lighting support")
+	_check(cache._update_olv_partition_indices(rd, 15), "full reference rebuild succeeds")
+	rd.submit()
+	rd.sync()
+	_check(incremental == rd.buffer_get_data(cache.get("_olv_partition_indices")) \
+		and incremental_weights == rd.buffer_get_data(cache.get("_olv_partition_weights")),
+		"incremental partitions exactly match full GPU reconstruction in all four cascades")
+	cache.set("_resident_indices", original)
+	_check(rd.buffer_update(cache.get("_clip_source_indices"), 0, original.size() * 4,
+		original.to_byte_array()) == OK, "original mapping reaches its GPU source buffer")
+	_check(cache._upload_olv_labels(rd, labels), "original source mapping is restored")
 
 
 func _make_labels() -> Resource:
@@ -108,7 +224,7 @@ func _identity(cell: Vector3i) -> Dictionary:
 func _make_context(labels: Resource) -> Dictionary:
 	return {"scene_id": SCENE_ID, "volume_id": VOLUME_ID,
 		"layout_revision": LAYOUT_REVISION, "layout_signature": LAYOUT_SIGNATURE,
-		"grid_origin_world": SOURCE_ORIGIN, "base_cell_spacing_m": 0.25,
+		"grid_origin_world": source_origin, "base_cell_spacing_m": cell_spacing,
 		"labels_hash": String(labels.get("labels_hash"))}
 
 
@@ -117,11 +233,12 @@ func _make_whole_source(context: Dictionary) -> Resource:
 	source.allocate(Vector3i(RES, RES, RES), PackedStringArray())
 	source.validity.fill(Source.RELOCATION_STATUS_VALID)
 	source.geometry_signature = GEOMETRY_SIGNATURE
-	source.origin_world = SOURCE_ORIGIN
+	source.origin_world = source_origin
+	source.spacing_m = cell_spacing
 	source.source_transform_world = Transform3D.IDENTITY
-	source.source_size_m = Vector3(4.0, 4.0, 4.0)
-	source.source_bounds_world = SOURCE_BOUNDS
-	source.domain_bounds_world = SOURCE_BOUNDS
+	source.source_size_m = source_bounds.size
+	source.source_bounds_world = source_bounds
+	source.domain_bounds_world = source_bounds
 	source.trace_distance_m = 8.0
 	source.bake_samples = 1
 	source.bake_bounces = 1
@@ -148,12 +265,12 @@ func _make_whole_source(context: Dictionary) -> Resource:
 func _make_header() -> Resource:
 	var header: Resource = Header.new()
 	header.dimensions = Vector3i(RES, RES, RES)
-	header.origin_world = SOURCE_ORIGIN
-	header.spacing_m = 0.25
+	header.origin_world = source_origin
+	header.spacing_m = cell_spacing
 	header.prepared_level_count = 1
-	header.domain_bounds_world = SOURCE_BOUNDS
+	header.domain_bounds_world = source_bounds
 	header.source_transform_world = Transform3D.IDENTITY
-	header.source_size_m = Vector3(4.0, 4.0, 4.0)
+	header.source_size_m = source_bounds.size
 	header.directional_source_signature = "native-cache-fixture-source"
 	header.geometry_signature = GEOMETRY_SIGNATURE
 	header.maximum_operator_row_l1 = 1.0
@@ -165,8 +282,8 @@ func _make_header() -> Resource:
 func _make_brick() -> Resource:
 	var brick: Resource = Brick.new()
 	brick.operator_schema_version = 2
-	brick.source_origin_world = SOURCE_ORIGIN
-	brick.source_spacing_m = 0.25
+	brick.source_origin_world = source_origin
+	brick.source_spacing_m = cell_spacing
 	brick.level = 0
 	brick.cell_origin = Vector3i.ZERO
 	brick.dimensions = Vector3i(RES, RES, RES)
@@ -174,11 +291,13 @@ func _make_brick() -> Resource:
 	brick.core_dimensions = Vector3i(RES, RES, RES)
 	brick.operators.resize(CELL_COUNT * brick.operator_stride())
 	brick.operators.fill(0.0)
+	for cell in CELL_COUNT:
+		brick.operators[cell * brick.operator_stride()] = float(cell + 1) / float(CELL_COUNT)
 	brick.validity.resize(CELL_COUNT)
 	brick.validity.fill(1)
 	brick.source_transform_world = Transform3D.IDENTITY
-	brick.source_size_m = Vector3(4.0, 4.0, 4.0)
-	brick.domain_bounds_world = SOURCE_BOUNDS
+	brick.source_size_m = source_bounds.size
+	brick.domain_bounds_world = source_bounds
 	brick.geometry_signature = GEOMETRY_SIGNATURE
 	brick.directional_source_signature = "native-cache-fixture-source"
 	brick.maximum_operator_row_l1 = 1.0
@@ -299,7 +418,7 @@ void main() {
 
 
 func _finish() -> void:
-	print("OLV_NATIVE_CACHE_UPLOAD_RESULT checks=", checks, " failures=", failures)
+	print("OLV_NATIVE_CACHE_UPLOAD_RESULT cell_spacing=", cell_spacing, " checks=", checks, " failures=", failures)
 	if rd != null:
 		var freed: Dictionary = {}
 		for cache in [paged_cache, whole_cache]:

@@ -555,8 +555,14 @@ bool frp_magic_gi_preinterpolated_sample_lod(vec3 world, vec3 normal_world, int 
 	if (!(origin.w > 0.0) || layout_info.y != 4 || !schema_valid) return false;
 	vec3 grid = (world - origin.xyz) / origin.w;
 	float last = float(layout_info.w - 1);
-	if (any(lessThan(grid, vec3(0.0))) || any(greaterThan(grid, vec3(last)))) return false;
-	vec3 edges = min(grid, vec3(last) - grid);
+	vec3 lower = vec3(0.0);
+	vec3 upper = vec3(last);
+	if (lod + 1 < layout_info.z) {
+		magic_gi_clv_blend_bounds(origin, frp_magic_gi_dynamic_volume_origin_spacing(view, lod + 1),
+				layout_info.w, lower, upper);
+	}
+	if (any(lessThan(grid, lower)) || any(greaterThan(grid, upper))) return false;
+	vec3 edges = min(grid - lower, upper - grid);
 	edge_distance = min(edges.x, min(edges.y, edges.z));
 	// Clamp inside this LOD before adding the packed field/LOD Z offsets.
 	grid = clamp(grid, vec3(0.0), vec3(last));
@@ -646,18 +652,8 @@ bool frp_magic_gi_dynamic_volume_sample(vec3 world,
 			int fine_domain = 0;
 			if (!frp_magic_gi_preinterpolated_sample_lod(world, shading_normal_world, receiver_domain,
 				view, lod, incident, coverage, edge, fine_domain)) continue;
-			if (edge < 1.0 && lod + 1 < lod_count) {
-				vec3 coarse; float coarse_coverage; float coarse_edge;
-				int coarse_domain = 0;
-				if (frp_magic_gi_preinterpolated_sample_lod(world, shading_normal_world, receiver_domain,
-					view, lod + 1, coarse, coarse_coverage, coarse_edge, coarse_domain) &&
-						((fine_domain == 0 && coarse_domain == 0) ||
-							(fine_domain != 0 && fine_domain == coarse_domain))) {
-					float blend = smoothstep(0.0, 1.0, edge);
-					incident = mix(coarse, incident, blend);
-					coverage = mix(coarse_coverage, coverage, blend);
-				}
-			}
+			// Adjacent levels were pre-mixed by the producer. A successful pixel
+			// sample reads one LOD, including at the cascade transition.
 			return true;
 		}
 		return false;

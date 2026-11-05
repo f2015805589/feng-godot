@@ -96,7 +96,7 @@ func create(rd: RenderingDevice, source: Resource, prepared_validation := false,
 	if not source_dims is Vector3i or not source_origin is Vector3 \
 			or not source_bounds is AABB or source_probes <= 0 \
 			or source_emitters < 0 or source_emitters > 32 \
-			or not is_finite(source_spacing) or absf(source_spacing - 0.25) > 0.000001:
+			or not is_finite(source_spacing) or source_spacing <= 0.0:
 		_error = "free_space_source_header_invalid"
 		return false
 	source_dimensions = source_dims
